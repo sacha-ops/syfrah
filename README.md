@@ -158,6 +158,23 @@ The layers below are architecturally designed with concept documentation but hav
 
 See [handbook/ARCHITECTURE.md](handbook/ARCHITECTURE.md) for the full design.
 
+## Shell Completions
+
+Syfrah supports tab completions for Bash, Zsh, and Fish:
+
+```bash
+# Bash
+syfrah completions bash > /etc/bash_completion.d/syfrah
+
+# Zsh — add ~/.zfunc to fpath in ~/.zshrc before compinit
+syfrah completions zsh > ~/.zfunc/_syfrah
+
+# Fish
+syfrah completions fish > ~/.config/fish/completions/syfrah.fish
+```
+
+Run `syfrah completions --help` for detailed setup instructions.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
