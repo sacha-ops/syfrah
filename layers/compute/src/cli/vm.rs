@@ -252,7 +252,12 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                     "{:<20} {:<20} {:<12} {:<12} {:<6} {:<10} {:<10}",
                     "NAME", "IMAGE", "PHASE", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
                 );
-                println!("{}", &header[..header.len().min(tw)]);
+                if console::Term::stdout().is_term() {
+                    let truncated = &header[..header.len().min(tw)];
+                    println!("{}", console::Style::new().bold().apply_to(truncated));
+                } else {
+                    println!("{}", &header[..header.len().min(tw)]);
+                }
                 println!("{}", "-".repeat(90.min(tw)));
                 if vms.is_empty() {
                     println!("(no VMs)");

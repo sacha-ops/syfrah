@@ -2348,6 +2348,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "console",
  "dirs",
  "filetime",
  "flate2",

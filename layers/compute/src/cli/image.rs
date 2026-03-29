@@ -117,7 +117,12 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                     "{:<25} {:<10} {:<10} {:<12} {:<10}",
                     "NAME", "ARCH", "SIZE MB", "CLOUD-INIT", "SOURCE"
                 );
-                println!("{}", &header[..header.len().min(tw)]);
+                if console::Term::stdout().is_term() {
+                    let truncated = &header[..header.len().min(tw)];
+                    println!("{}", console::Style::new().bold().apply_to(truncated));
+                } else {
+                    println!("{}", &header[..header.len().min(tw)]);
+                }
                 println!("{}", "-".repeat(67.min(tw)));
                 if images.is_empty() {
                     println!("(no images)");
@@ -422,7 +427,12 @@ async fn run_catalog(json: bool) -> anyhow::Result<()> {
                         "{:<25} {:<10} {:<10} {:<12}",
                         "NAME", "ARCH", "SIZE MB", "CLOUD-INIT"
                     );
-                    println!("{}", &header[..header.len().min(tw)]);
+                    if console::Term::stdout().is_term() {
+                        let truncated = &header[..header.len().min(tw)];
+                        println!("{}", console::Style::new().bold().apply_to(truncated));
+                    } else {
+                        println!("{}", &header[..header.len().min(tw)]);
+                    }
                     println!("{}", "-".repeat(57.min(tw)));
                     if images.is_empty() {
                         println!("(no images in catalog)");
