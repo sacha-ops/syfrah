@@ -11,17 +11,29 @@ use crate::store::OrgStore;
 
 /// Parse a human-readable duration string into seconds.
 ///
-/// Supported suffixes: `m` (minutes), `h` (hours), `d` (days).
-/// Examples: `30m`, `2h`, `48h`, `7d`.
+/// A bare number (all digits) is treated as seconds.
+/// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+/// Examples: `3600`, `30s`, `30m`, `2h`, `48h`, `7d`.
 pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
     if s.is_empty() {
         bail!("duration cannot be empty");
     }
 
+    // If the input is a pure number (all digits), treat it as seconds.
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        let value: u64 = s
+            .parse()
+            .with_context(|| format!("invalid duration: '{s}'"))?;
+        if value == 0 {
+            bail!("duration must be greater than zero");
+        }
+        return Ok(value);
+    }
+
     let (digits, suffix) = s.split_at(s.len() - 1);
     let value: u64 = digits.parse().with_context(|| {
-        format!("invalid duration: '{s}' (expected a number followed by m, h, or d)")
+        format!("invalid duration: '{s}' (expected a number followed by s, m, h, or d)")
     })?;
 
     if value == 0 {
@@ -29,11 +41,12 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
     }
 
     match suffix {
+        "s" => Ok(value),
         "m" => Ok(value * 60),
         "h" => Ok(value * 3600),
         "d" => Ok(value * 86400),
         _ => bail!(
-            "invalid duration suffix '{suffix}' in '{s}'. Use m (minutes), h (hours), or d (days). Examples: 30m, 2h, 7d"
+            "invalid duration suffix '{suffix}' in '{s}'. Use s (seconds), m (minutes), h (hours), or d (days). Examples: 3600, 30m, 2h, 7d"
         ),
     }
 }
@@ -429,6 +442,15 @@ mod tests {
             }
             _ => panic!("expected Extend command"),
         }
+    }
+
+    #[test]
+    fn duration_parse_raw_seconds() {
+        assert_eq!(parse_duration("3600").unwrap(), 3600);
+        assert_eq!(parse_duration("1").unwrap(), 1);
+        assert_eq!(parse_duration("86400").unwrap(), 86400);
+        assert_eq!(parse_duration("30s").unwrap(), 30);
+        assert!(parse_duration("0").is_err());
     }
 
     #[test]
