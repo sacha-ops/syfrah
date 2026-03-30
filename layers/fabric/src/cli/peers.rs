@@ -212,7 +212,7 @@ fn print_peer_row(peer: &PeerRecord, wg_summary: &Option<wg::InterfaceSummary>) 
     let since_str = format_since(peer.last_seen);
     let mesh_ipv6 = peer.mesh_ipv6.to_string();
 
-    println!(
+    let row = format!(
         "{:<18} {:<12} {:<14} {:<40} {:<24} {:>8} {:<14} {:>12} {:>14}",
         truncate(&sanitize(&peer.name), 17),
         truncate(&region, 11),
@@ -224,6 +224,8 @@ fn print_peer_row(peer: &PeerRecord, wg_summary: &Option<wg::InterfaceSummary>) 
         handshake_str,
         traffic_str,
     );
+    let tw = ui::term_width();
+    println!("{}", &row[..row.len().min(tw)]);
 }
 
 /// Deduplicate peers by WireGuard public key, keeping the entry with the

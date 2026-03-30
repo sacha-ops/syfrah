@@ -141,7 +141,7 @@ pub fn info_line(key: &str, value: &str) {
 }
 
 /// Return the current terminal width, falling back to 120 columns.
-fn term_width() -> usize {
+pub fn term_width() -> usize {
     terminal_size::terminal_size()
         .map(|(w, _)| w.0 as usize)
         .unwrap_or(120)

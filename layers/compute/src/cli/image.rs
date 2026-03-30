@@ -112,16 +112,18 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&images)?);
             } else {
+                let tw = super::term_width();
                 let header = format!(
                     "{:<25} {:<10} {:<10} {:<12} {:<10}",
                     "NAME", "ARCH", "SIZE MB", "CLOUD-INIT", "SOURCE"
                 );
                 if console::Term::stdout().is_term() {
-                    println!("{}", console::Style::new().bold().apply_to(&header));
+                    let truncated = &header[..header.len().min(tw)];
+                    println!("{}", console::Style::new().bold().apply_to(truncated));
                 } else {
-                    println!("{header}");
+                    println!("{}", &header[..header.len().min(tw)]);
                 }
-                println!("{}", "-".repeat(67));
+                println!("{}", "-".repeat(67.min(tw)));
                 if images.is_empty() {
                     println!("(no images)");
                 } else {
@@ -138,7 +140,9 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .get("source_kind")
                             .and_then(|s| s.as_str())
                             .unwrap_or("?");
-                        println!("{name:<25} {arch:<10} {size:<10} {ci:<12} {source:<10}");
+                        let name = super::truncate(name, 24);
+                        let row = format!("{name:<25} {arch:<10} {size:<10} {ci:<12} {source:<10}");
+                        println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
             }
@@ -418,16 +422,18 @@ async fn run_catalog(json: bool) -> anyhow::Result<()> {
             let images = v.get("images").and_then(|i| i.as_array());
             match images {
                 Some(images) => {
+                    let tw = super::term_width();
                     let header = format!(
                         "{:<25} {:<10} {:<10} {:<12}",
                         "NAME", "ARCH", "SIZE MB", "CLOUD-INIT"
                     );
                     if console::Term::stdout().is_term() {
-                        println!("{}", console::Style::new().bold().apply_to(&header));
+                        let truncated = &header[..header.len().min(tw)];
+                        println!("{}", console::Style::new().bold().apply_to(truncated));
                     } else {
-                        println!("{header}");
+                        println!("{}", &header[..header.len().min(tw)]);
                     }
-                    println!("{}", "-".repeat(57));
+                    println!("{}", "-".repeat(57.min(tw)));
                     if images.is_empty() {
                         println!("(no images in catalog)");
                     } else {
@@ -440,7 +446,9 @@ async fn run_catalog(json: bool) -> anyhow::Result<()> {
                                 .and_then(|c| c.as_bool())
                                 .map(|b| if b { "yes" } else { "no" })
                                 .unwrap_or("?");
-                            println!("{name:<25} {arch:<10} {size:<10} {ci:<12}");
+                            let name = super::truncate(name, 24);
+                            let row = format!("{name:<25} {arch:<10} {size:<10} {ci:<12}");
+                            println!("{}", &row[..row.len().min(tw)]);
                         }
                     }
                 }

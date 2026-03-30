@@ -22,6 +22,24 @@ pub(crate) fn json_error_exit(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// Return the current terminal width, falling back to 120 columns.
+pub(crate) fn term_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(120)
+}
+
+/// Truncate a string to `max` characters, appending "..." if it exceeds the limit.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 3 {
+        s[..max].to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
+}
+
 /// Top-level compute CLI command.
 #[derive(Debug, Subcommand)]
 pub enum ComputeCommand {
