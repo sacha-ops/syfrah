@@ -1,19 +1,39 @@
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
 
 /// Unique identifier for an organization.
-pub type OrgId = String;
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrgId(pub String);
+
+impl fmt::Display for OrgId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Unique identifier for a project.
-pub type ProjectId = String;
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProjectId(pub String);
+
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Unique identifier for an environment.
-pub type EnvironmentId = String;
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnvironmentId(pub String);
 
-/// An organization — the root tenant.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+impl fmt::Display for EnvironmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An organization — the root tenant in the Syfrah hierarchy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Org {
     pub id: OrgId,
     pub name: String,
@@ -21,7 +41,7 @@ pub struct Org {
 }
 
 /// A project within an organization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
@@ -29,38 +49,15 @@ pub struct Project {
     pub created_at: u64,
 }
 
-/// An environment within a project. Where resources actually live.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// An environment — a runtime context within a project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
     pub id: EnvironmentId,
     pub name: String,
     pub project_id: ProjectId,
-    pub org_id: OrgId,
-    /// Optional TTL in seconds. When set, `expires_at` is computed.
-    pub ttl_secs: Option<u64>,
-    /// Unix timestamp when this environment expires. `None` means permanent.
-    pub expires_at: Option<u64>,
-    /// Prevent accidental deletion.
+    pub ttl: Option<u64>,
     pub deletion_protection: bool,
-    /// Arbitrary key-value labels.
     pub labels: HashMap<String, String>,
     pub created_at: u64,
-}
-
-impl Environment {
-    /// Returns true if this environment has expired based on the given timestamp.
-    pub fn is_expired(&self, now_epoch: u64) -> bool {
-        match self.expires_at {
-            Some(expires) => now_epoch > expires,
-            None => false,
-        }
-    }
-}
-
-/// Returns the current Unix epoch in seconds.
-pub fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    pub expires_at: Option<u64>,
 }

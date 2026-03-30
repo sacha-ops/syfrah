@@ -1,118 +1,101 @@
-use crate::error::{OrgError, Result};
-use crate::store::OrgStore;
-use crate::types::{now_epoch, Environment};
+//! TTL enforcement logic for ephemeral environments.
 
-/// Returns all environments whose TTL has expired.
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::error::Result;
+use crate::store::OrgStore;
+use crate::types::Environment;
+
+/// Returns the current Unix epoch in seconds.
+pub fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Returns all environments whose TTL has expired across all orgs and projects.
 ///
 /// An environment is expired when `now > expires_at`.
 /// Environments without an `expires_at` are permanent and never expire.
-pub fn check_expired_envs(store: &OrgStore) -> Result<Vec<Environment>> {
+pub fn find_expired_envs(store: &OrgStore) -> Result<Vec<(String, String, Environment)>> {
     let now = now_epoch();
-    let all_envs = store.list_envs()?;
-    Ok(all_envs.into_iter().filter(|e| e.is_expired(now)).collect())
-}
+    let mut expired = Vec::new();
 
-/// Extend an environment's TTL by adding `additional_secs` to its `expires_at`.
-///
-/// If the environment has no current `expires_at`, the new expiry is computed
-/// from the current time plus `additional_secs`.
-pub fn extend_env(
-    store: &OrgStore,
-    org: &str,
-    project: &str,
-    name: &str,
-    additional_secs: u64,
-) -> Result<Environment> {
-    let mut env = store
-        .get_env(org, project, name)?
-        .ok_or_else(|| OrgError::NotFound(format!("environment '{name}'")))?;
+    // Iterate all orgs, then all projects, then all envs
+    let orgs = store.list()?;
+    for org in &orgs {
+        let projects = store.list_projects(&org.name)?;
+        for project in &projects {
+            let envs = store.list_envs(&org.name, &project.name)?;
+            for env in envs {
+                if let Some(expires_at) = env.expires_at {
+                    if now > expires_at {
+                        expired.push((org.name.clone(), project.name.clone(), env));
+                    }
+                }
+            }
+        }
+    }
 
-    let now = now_epoch();
-    let base = env.expires_at.unwrap_or(now);
-    // If the current expiry is in the past, extend from now instead.
-    let effective_base = if base < now { now } else { base };
-    env.expires_at = Some(effective_base + additional_secs);
-    env.ttl_secs = Some(additional_secs);
-
-    store.update_env(&env)?;
-    Ok(env)
+    Ok(expired)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Environment;
     use std::collections::HashMap;
 
     fn temp_store() -> (tempfile::TempDir, OrgStore) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test-org.redb");
-        let store = OrgStore::open_at(&path).unwrap();
-        (dir, store)
-    }
-
-    fn make_env(org: &str, project: &str, name: &str, expires_at: Option<u64>) -> Environment {
-        Environment {
-            id: format!("{org}/{project}/{name}"),
-            name: name.to_string(),
-            project_id: project.to_string(),
-            org_id: org.to_string(),
-            ttl_secs: expires_at.map(|_| 3600),
-            expires_at,
-            deletion_protection: false,
-            labels: HashMap::new(),
-            created_at: 1000,
-        }
+        let path = dir.path().join("test-ttl.redb");
+        let db = syfrah_state::LayerDb::open_at(&path).unwrap();
+        (dir, OrgStore::new(db))
     }
 
     #[test]
-    fn ttl_expired_detected() {
+    fn expired_env_detected() {
         let (_dir, store) = temp_store();
-        // Create an env that expired 100 seconds ago
-        let past = now_epoch() - 100;
-        let env = make_env("acme", "backend", "ci-run", Some(past));
-        store.create_env(&env).unwrap();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
 
-        let expired = check_expired_envs(&store).unwrap();
+        // Create env with TTL of 1 second (will expire immediately)
+        store
+            .create_env("acme", "backend", "ci-run", Some(1), false, HashMap::new())
+            .unwrap();
+
+        // Wait a moment for it to expire
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let expired = find_expired_envs(&store).unwrap();
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].name, "ci-run");
+        assert_eq!(expired[0].2.name, "ci-run");
     }
 
     #[test]
-    fn ttl_not_expired_kept() {
+    fn non_expired_env_not_returned() {
         let (_dir, store) = temp_store();
-        // Create an env that expires 1 hour from now
-        let future = now_epoch() + 3600;
-        let env = make_env("acme", "backend", "staging", Some(future));
-        store.create_env(&env).unwrap();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+
+        // Create env with long TTL
+        store
+            .create_env(
+                "acme",
+                "backend",
+                "staging",
+                Some(86400),
+                false,
+                HashMap::new(),
+            )
+            .unwrap();
 
         // Also create a permanent env (no TTL)
-        let permanent = make_env("acme", "backend", "production", None);
-        store.create_env(&permanent).unwrap();
-
-        let expired = check_expired_envs(&store).unwrap();
-        assert!(expired.is_empty());
-    }
-
-    #[test]
-    fn extend_resets_ttl() {
-        let (_dir, store) = temp_store();
-        let now = now_epoch();
-        // Env expires in 10 seconds
-        let env = make_env("acme", "backend", "feat-branch", Some(now + 10));
-        store.create_env(&env).unwrap();
-
-        // Extend by 1 hour
-        let updated = extend_env(&store, "acme", "backend", "feat-branch", 3600).unwrap();
-
-        // New expires_at should be original expiry + 3600
-        assert_eq!(updated.expires_at, Some(now + 10 + 3600));
-
-        // Verify it's persisted
-        let loaded = store
-            .get_env("acme", "backend", "feat-branch")
-            .unwrap()
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
-        assert_eq!(loaded.expires_at, updated.expires_at);
+
+        let expired = find_expired_envs(&store).unwrap();
+        assert!(expired.is_empty());
     }
 }

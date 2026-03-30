@@ -1,78 +1,108 @@
-use clap::Subcommand;
+//! `syfrah project create|list|delete` handlers.
+
+use anyhow::Result;
 
 use crate::store::OrgStore;
-use crate::types::{now_epoch, Project};
+use crate::validation::validate_name;
 
-/// Project management commands.
-#[derive(Subcommand)]
-pub enum ProjectCommand {
-    /// Create a new project
-    Create {
-        /// Project name
-        name: String,
-        /// Organization name
-        #[arg(long)]
-        org: String,
-    },
-    /// List all projects
-    List {
-        /// Filter by organization
-        #[arg(long)]
-        org: Option<String>,
-    },
-    /// Delete a project
-    Delete {
-        /// Project name
-        name: String,
-        /// Organization name
-        #[arg(long)]
-        org: String,
-    },
+pub fn create(name: &str, org: &str) -> Result<()> {
+    validate_name(name)?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
+    let project = store.create_project(org, name)?;
+    println!(
+        "Project '{}' created in organization '{}'.",
+        project.name, project.org_id
+    );
+    Ok(())
 }
 
-pub fn run_project_command(cmd: &ProjectCommand) -> anyhow::Result<()> {
-    let store = OrgStore::open().map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+pub fn list(org: Option<&str>, json: bool) -> Result<()> {
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
 
-    match cmd {
-        ProjectCommand::Create { name, org } => {
-            let project = Project {
-                id: format!("{org}/{name}"),
-                name: name.clone(),
-                org_id: org.clone(),
-                created_at: now_epoch(),
-            };
-            store
-                .create_project(&project)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Created project '{name}' in org '{org}'");
-            Ok(())
-        }
-        ProjectCommand::List { org } => {
-            let projects = store.list_projects().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let filtered: Vec<_> = match org {
-                Some(o) => projects.into_iter().filter(|p| &p.org_id == o).collect(),
-                None => projects,
-            };
-            if filtered.is_empty() {
-                println!("No projects found.");
-            } else {
-                println!("{:<30} {:<20} {:<20}", "NAME", "ORG", "CREATED");
-                for p in &filtered {
-                    println!("{:<30} {:<20} {:<20}", p.name, p.org_id, p.created_at);
-                }
+    let projects = match org {
+        Some(org_name) => store.list_projects(org_name)?,
+        None => {
+            // List all projects across all orgs
+            let orgs = store.list()?;
+            let mut all = Vec::new();
+            for o in &orgs {
+                all.extend(store.list_projects(&o.name)?);
             }
-            Ok(())
+            all
         }
-        ProjectCommand::Delete { name, org } => {
-            let deleted = store
-                .delete_project(org, name)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if deleted {
-                println!("Deleted project '{name}' from org '{org}'");
-            } else {
-                anyhow::bail!("project '{name}' not found in org '{org}'");
-            }
-            Ok(())
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&projects)?);
+        return Ok(());
+    }
+
+    if projects.is_empty() {
+        if let Some(org_name) = org {
+            println!(
+                "No projects found in org '{org_name}'. Create one with: syfrah project create <name> --org {org_name}"
+            );
+        } else {
+            println!(
+                "No projects found. Create one with: syfrah project create <name> --org <org>"
+            );
+        }
+        return Ok(());
+    }
+
+    println!("{:<30} {:<20} {:<20}", "NAME", "ORG", "CREATED");
+    for p in &projects {
+        let created = format_timestamp(p.created_at);
+        println!("{:<30} {:<20} {:<20}", p.name, p.org_id, created);
+    }
+    Ok(())
+}
+
+pub fn delete(name: &str, org: &str, yes: bool) -> Result<()> {
+    if !yes {
+        eprint!("Delete project '{name}' from org '{org}'? This cannot be undone. [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
         }
     }
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
+    store.delete_project(org, name)?;
+    println!("Project '{name}' deleted from org '{org}'.");
+    Ok(())
+}
+
+fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return "-".to_string();
+    }
+    let secs = ts;
+    let days = secs / 86400;
+    let remaining = secs % 86400;
+    let hours = remaining / 3600;
+    let mins = (remaining % 3600) / 60;
+    let (year, month, day) = epoch_days_to_date(days);
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{mins:02}")
+}
+
+fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u64, m, d)
 }
