@@ -19,6 +19,8 @@ serde_json.workspace = true
 terminal_size = "0.4"
 thiserror.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
