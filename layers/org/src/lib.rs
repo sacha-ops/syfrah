@@ -13,3 +13,6 @@ pub use error::OrgError;
 pub use store::OrgStore;
 pub use types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};
 pub use validation::validate_name;
+
+#[cfg(test)]
+mod tests;
