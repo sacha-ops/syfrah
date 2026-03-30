@@ -37,6 +37,18 @@ pub enum OrgError {
     #[error("invalid {context} name: {reason}")]
     InvalidName { context: String, reason: String },
 
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
+    #[error("CIDR overlap: {new_cidr} overlaps with existing {existing_cidr}")]
+    CidrOverlap {
+        new_cidr: String,
+        existing_cidr: String,
+    },
+
+    #[error("no available CIDR block in the auto-allocation range")]
+    CidrExhausted,
+
     #[error("store error: {0}")]
     StoreError(String),
 }
