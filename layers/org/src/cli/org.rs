@@ -2,35 +2,25 @@
 //!
 //! All operations are local (redb), no daemon needed.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::store::OrgStore;
-use crate::types::{validate_org_name, Org};
+use crate::validation::validate_name;
 
 /// Create a new organization.
 pub fn run_create(name: String) -> anyhow::Result<()> {
-    if let Err(e) = validate_org_name(&name) {
+    if let Err(e) = validate_name(&name) {
         anyhow::bail!("{e}");
     }
 
-    let store = OrgStore::open().map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let org = Org {
-        name: name.clone(),
-        created_at: now,
-    };
-
-    match store.create(&org) {
-        Ok(()) => {
-            println!("Organization '{name}' created.");
+    match store.create(&name) {
+        Ok(org) => {
+            println!("Organization '{}' created.", org.name);
             Ok(())
         }
-        Err(crate::store::OrgStoreError::AlreadyExists(_)) => {
+        Err(crate::error::OrgError::AlreadyExists(_)) => {
             anyhow::bail!("org '{name}' already exists");
         }
         Err(e) => {
@@ -41,7 +31,9 @@ pub fn run_create(name: String) -> anyhow::Result<()> {
 
 /// List all organizations.
 pub fn run_list(json: bool) -> anyhow::Result<()> {
-    let store = OrgStore::open().map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
 
     let orgs = store
         .list()
@@ -79,7 +71,9 @@ pub fn run_list(json: bool) -> anyhow::Result<()> {
 
 /// Delete an organization.
 pub fn run_delete(name: String, yes: bool) -> anyhow::Result<()> {
-    let store = OrgStore::open().map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
 
     // Check it exists before prompting
     match store.get(&name) {
@@ -104,7 +98,7 @@ pub fn run_delete(name: String, yes: bool) -> anyhow::Result<()> {
             println!("Organization '{name}' deleted.");
             Ok(())
         }
-        Err(crate::store::OrgStoreError::NotFound(_)) => {
+        Err(crate::error::OrgError::NotFound(_)) => {
             anyhow::bail!("org '{name}' not found");
         }
         Err(e) => {
@@ -124,14 +118,12 @@ fn term_width() -> usize {
 fn format_timestamp(ts: u64) -> String {
     let secs = ts;
     let days = secs / 86400;
-    // Simple date calculation from days since epoch
     let (year, month, day) = days_to_date(days);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
 fn days_to_date(days: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
