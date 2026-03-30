@@ -333,6 +333,36 @@ impl LayerDb {
         Ok(())
     }
 
+    /// Atomically read, increment, and return a JSON-serialized counter.
+    ///
+    /// Performs the read and write in a single write transaction so concurrent
+    /// callers cannot observe the same value. Returns the value **before** the
+    /// increment (i.e. the allocated value).
+    pub fn atomic_next_counter(&self, table_name: &str, key: &str, start: u32) -> Result<u32> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
+
+        let write_txn = self.db.begin_write()?;
+        let current = {
+            let table = write_txn.open_table(table_def)?;
+            let access = table.get(key).map_err(StateError::Storage)?;
+            match access {
+                Some(v) => {
+                    let val: u32 = serde_json::from_slice(v.value())?;
+                    drop(v);
+                    val
+                }
+                None => start,
+            }
+        };
+        {
+            let mut table = write_txn.open_table(table_def)?;
+            let bytes = serde_json::to_vec(&(current + 1))?;
+            table.insert(key, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(current)
+    }
+
     /// Delete the entire database file for this layer.
     pub fn destroy(layer: &str) -> Result<()> {
         let path = db_path(layer);
