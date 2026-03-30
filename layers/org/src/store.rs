@@ -1426,10 +1426,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("org-persist.redb");
 
-        // First store instance: create VPC and attach
+        // First store instance: create org, VPC and attach
         {
             let db = LayerDb::open_at(&path).unwrap();
             let store = OrgStore::new(db);
+            store.create("acme").unwrap();
             store
                 .create_vpc(
                     "shared-vpc",
