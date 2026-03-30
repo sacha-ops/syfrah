@@ -1,131 +1,157 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};
+use crate::validation::validate_name;
 
-const ORGS_TABLE: &str = "orgs";
+const TABLE: &str = "orgs";
 const PROJECTS_TABLE: &str = "projects";
 const ENVIRONMENTS_TABLE: &str = "environments";
 
-/// Persistence layer for the org hierarchy.
-///
-/// Keys follow the pattern:
-/// - orgs: `{org_name}`
-/// - projects: `{org_name}/{project_name}`
-/// - environments: `{org_name}/{project_name}/{env_name}`
+/// Persistent store for organizations backed by redb.
 pub struct OrgStore {
     db: LayerDb,
 }
 
 impl OrgStore {
-    /// Create a new store backed by the given database.
+    /// Create a new `OrgStore` with the given database handle.
     pub fn new(db: LayerDb) -> Self {
         Self { db }
     }
 
-    // ── Org operations ──────────────────────────────────────────────
+    // ── Org operations ───────────────────────────────────────────────
 
-    /// Create an organization.
-    pub fn create_org(&self, name: &str) -> Result<Org> {
-        if self.db.exists(ORGS_TABLE, name)? {
-            return Err(OrgError::OrgAlreadyExists(name.to_string()));
+    /// Create a new organization. Validates the name, checks for duplicates.
+    pub fn create(&self, name: &str) -> Result<Org> {
+        validate_name(name)?;
+
+        if self.db.exists(TABLE, name)? {
+            return Err(OrgError::AlreadyExists(name.to_string()));
         }
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let org = Org {
-            id: OrgId(name.to_string()),
+            id: OrgId(format!("org-{name}")),
             name: name.to_string(),
-            created_at: now(),
+            created_at: now,
         };
 
-        self.db.set(ORGS_TABLE, name, &org)?;
+        self.db.set(TABLE, name, &org)?;
         Ok(org)
     }
 
-    /// Get an organization by name.
-    pub fn get_org(&self, name: &str) -> Result<Org> {
-        self.db
-            .get::<Org>(ORGS_TABLE, name)?
-            .ok_or_else(|| OrgError::OrgNotFound(name.to_string()))
+    /// Get an organization by name. Returns `None` if it doesn't exist.
+    pub fn get(&self, name: &str) -> Result<Option<Org>> {
+        Ok(self.db.get(TABLE, name)?)
     }
 
     /// List all organizations.
-    pub fn list_orgs(&self) -> Result<Vec<Org>> {
-        Ok(self
-            .db
-            .list::<Org>(ORGS_TABLE)?
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect())
+    pub fn list(&self) -> Result<Vec<Org>> {
+        let entries: Vec<(String, Org)> = self.db.list(TABLE)?;
+        Ok(entries.into_iter().map(|(_, org)| org).collect())
     }
 
-    /// Delete an organization.
-    pub fn delete_org(&self, name: &str) -> Result<()> {
-        if !self.db.delete(ORGS_TABLE, name)? {
-            return Err(OrgError::OrgNotFound(name.to_string()));
+    /// Delete an organization by name. Fails if it has projects.
+    pub fn delete(&self, name: &str) -> Result<()> {
+        if !self.db.exists(TABLE, name)? {
+            return Err(OrgError::NotFound(name.to_string()));
         }
+
+        // Check for child projects
+        let projects = self.list_projects(name)?;
+        if !projects.is_empty() {
+            return Err(OrgError::OrgHasProjects(name.to_string()));
+        }
+
+        self.db.delete(TABLE, name)?;
         Ok(())
     }
 
-    // ── Project operations ──────────────────────────────────────────
+    // ── Project operations ───────────────────────────────────────────
 
+    /// Build the redb key for a project: "org_name/project_name".
     fn project_key(org: &str, project: &str) -> String {
-        format!("{org}/{project}")
+        format!("{}/{}", org, project)
     }
 
-    /// Create a project within an organization.
+    /// Create a new project within an organization.
     pub fn create_project(&self, org: &str, name: &str) -> Result<Project> {
+        validate_name(name)?;
+
         // Verify org exists
-        if !self.db.exists(ORGS_TABLE, org)? {
-            return Err(OrgError::OrgNotFound(org.to_string()));
+        if !self.db.exists(TABLE, org)? {
+            return Err(OrgError::NotFound(org.to_string()));
         }
 
         let key = Self::project_key(org, name);
         if self.db.exists(PROJECTS_TABLE, &key)? {
-            return Err(OrgError::ProjectAlreadyExists(name.to_string()));
+            return Err(OrgError::ProjectAlreadyExists {
+                org: org.to_string(),
+                project: name.to_string(),
+            });
         }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let project = Project {
             id: ProjectId(key.clone()),
             name: name.to_string(),
             org_id: OrgId(org.to_string()),
-            created_at: now(),
+            created_at: now,
         };
 
         self.db.set(PROJECTS_TABLE, &key, &project)?;
         Ok(project)
     }
 
-    /// Get a project by org and name.
-    pub fn get_project(&self, org: &str, name: &str) -> Result<Project> {
+    /// Get a project by org and project name.
+    pub fn get_project(&self, org: &str, name: &str) -> Result<Option<Project>> {
         let key = Self::project_key(org, name);
-        self.db
-            .get::<Project>(PROJECTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::ProjectNotFound(name.to_string()))
+        Ok(self.db.get(PROJECTS_TABLE, &key)?)
     }
 
-    /// List all projects (optionally filtered by org).
-    pub fn list_projects(&self, org: Option<&str>) -> Result<Vec<Project>> {
-        let all: Vec<Project> = self
-            .db
-            .list::<Project>(PROJECTS_TABLE)?
+    /// List all projects in an organization.
+    pub fn list_projects(&self, org: &str) -> Result<Vec<Project>> {
+        let all: Vec<(String, Project)> = self.db.list(PROJECTS_TABLE)?;
+        let prefix = format!("{}/", org);
+        Ok(all
             .into_iter()
-            .map(|(_, v)| v)
-            .collect();
-
-        match org {
-            Some(org_name) => Ok(all.into_iter().filter(|p| p.org_id.0 == org_name).collect()),
-            None => Ok(all),
-        }
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, project)| project)
+            .collect())
     }
 
-    /// Delete a project.
+    /// Delete a project. Fails if it has any environments.
     pub fn delete_project(&self, org: &str, name: &str) -> Result<()> {
         let key = Self::project_key(org, name);
-        if !self.db.delete(PROJECTS_TABLE, &key)? {
-            return Err(OrgError::ProjectNotFound(name.to_string()));
+
+        if !self.db.exists(PROJECTS_TABLE, &key)? {
+            return Err(OrgError::ProjectNotFound {
+                org: org.to_string(),
+                project: name.to_string(),
+            });
         }
+
+        // Check for child environments
+        let envs = self.list_envs(org, name)?;
+        if !envs.is_empty() {
+            return Err(OrgError::ProjectHasEnvironments {
+                org: org.to_string(),
+                project: name.to_string(),
+            });
+        }
+
+        self.db.delete(PROJECTS_TABLE, &key)?;
         Ok(())
     }
 
@@ -145,10 +171,15 @@ impl OrgStore {
         deletion_protection: bool,
         labels: HashMap<String, String>,
     ) -> Result<Environment> {
+        validate_name(name)?;
+
         // Verify project exists
         let project_key = Self::project_key(org, project);
         if !self.db.exists(PROJECTS_TABLE, &project_key)? {
-            return Err(OrgError::ProjectNotFound(project.to_string()));
+            return Err(OrgError::ProjectNotFound {
+                org: org.to_string(),
+                project: project.to_string(),
+            });
         }
 
         let env_key = Self::env_key(org, project, name);
@@ -156,7 +187,10 @@ impl OrgStore {
             return Err(OrgError::EnvAlreadyExists(name.to_string()));
         }
 
-        let created_at = now();
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let expires_at = ttl.map(|t| created_at + t);
 
         let env = Environment {
@@ -212,14 +246,6 @@ impl OrgStore {
     }
 }
 
-/// Returns the current time as seconds since UNIX epoch.
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,8 +259,138 @@ mod tests {
 
     /// Helper: create an org and project so env tests can focus on environments.
     fn setup_org_and_project(store: &OrgStore) {
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
+    }
+
+    // ── Org tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn create_org() {
+        let (_dir, store) = temp_store();
+        let org = store.create("acme").unwrap();
+        assert_eq!(org.name, "acme");
+        assert_eq!(org.id.0, "org-acme");
+        assert!(org.created_at > 0);
+    }
+
+    #[test]
+    fn duplicate_name_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        let err = store.create("acme").unwrap_err();
+        assert!(matches!(err, OrgError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn invalid_name_rejected() {
+        let (_dir, store) = temp_store();
+
+        assert!(matches!(
+            store.create("my org").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        assert!(matches!(
+            store.create("Acme").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        assert!(matches!(
+            store.create("org@1").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        assert!(matches!(
+            store.create("ab").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        assert!(matches!(
+            store.create(&"x".repeat(64)).unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+    }
+
+    #[test]
+    fn delete_org() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.delete("acme").unwrap();
+        assert!(store.get("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_nonexistent_fails() {
+        let (_dir, store) = temp_store();
+        let err = store.delete("ghost").unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(_)));
+    }
+
+    #[test]
+    fn list_orgs() {
+        let (_dir, store) = temp_store();
+        store.create("alpha").unwrap();
+        store.create("beta").unwrap();
+        store.create("gamma").unwrap();
+
+        let orgs = store.list().unwrap();
+        assert_eq!(orgs.len(), 3);
+    }
+
+    #[test]
+    fn get_nonexistent() {
+        let (_dir, store) = temp_store();
+        assert!(store.get("does-not-exist").unwrap().is_none());
+    }
+
+    // ── Project tests ───────────────────────────────────────────────
+
+    #[test]
+    fn create_project_succeeds_with_valid_org() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+
+        let project = store.create_project("acme", "backend").unwrap();
+        assert_eq!(project.name, "backend");
+        assert_eq!(project.org_id, OrgId("acme".to_string()));
+
+        let fetched = store.get_project("acme", "backend").unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().name, "backend");
+    }
+
+    #[test]
+    fn duplicate_project_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+
+        let err = store.create_project("acme", "backend").unwrap_err();
+        assert!(matches!(err, OrgError::ProjectAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn delete_project_succeeds_when_empty() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+
+        store.delete_project("acme", "backend").unwrap();
+        assert!(store.get_project("acme", "backend").unwrap().is_none());
+    }
+
+    #[test]
+    fn org_with_projects_cannot_be_deleted() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+
+        let err = store.delete("acme").unwrap_err();
+        assert!(matches!(err, OrgError::OrgHasProjects(_)));
+    }
+
+    #[test]
+    fn create_project_fails_without_org() {
+        let (_dir, store) = temp_store();
+        let err = store.create_project("nonexistent", "backend").unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(_)));
     }
 
     // ── Environment tests ───────────────────────────────────────────
@@ -249,15 +405,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(env.name, "staging");
-        assert_eq!(env.project_id, ProjectId("acme/backend".to_string()));
+        assert_eq!(env.project_id.0, "acme/backend");
+        assert!(env.created_at > 0);
+        assert_eq!(env.ttl, None);
         assert!(!env.deletion_protection);
-        assert!(env.ttl.is_none());
-        assert!(env.expires_at.is_none());
         assert!(env.labels.is_empty());
+        assert_eq!(env.expires_at, None);
     }
 
     #[test]
-    fn duplicate_rejected() {
+    fn duplicate_env_rejected() {
         let (_dir, store) = temp_store();
         setup_org_and_project(&store);
 
@@ -269,10 +426,7 @@ mod tests {
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap_err();
 
-        assert!(
-            matches!(err, OrgError::EnvAlreadyExists(ref n) if n == "staging"),
-            "expected EnvAlreadyExists, got: {err}"
-        );
+        assert!(matches!(err, OrgError::EnvAlreadyExists(ref n) if n == "staging"));
     }
 
     #[test]
@@ -280,7 +434,7 @@ mod tests {
         let (_dir, store) = temp_store();
         setup_org_and_project(&store);
 
-        let ttl_seconds = 3600; // 1 hour
+        let ttl_seconds = 3600;
         let env = store
             .create_env(
                 "acme",
@@ -312,7 +466,6 @@ mod tests {
 
         assert_eq!(env.labels, labels);
 
-        // Verify labels survive round-trip through persistence.
         let retrieved = store.get_env("acme", "backend", "production").unwrap();
         assert_eq!(retrieved.labels, labels);
     }
@@ -328,7 +481,6 @@ mod tests {
 
         assert!(env.deletion_protection);
 
-        // Verify it persists.
         let retrieved = store.get_env("acme", "backend", "production").unwrap();
         assert!(retrieved.deletion_protection);
     }
@@ -360,10 +512,7 @@ mod tests {
         let err = store
             .delete_env("acme", "backend", "production")
             .unwrap_err();
-        assert!(
-            matches!(err, OrgError::EnvProtected(ref n) if n == "production"),
-            "expected EnvProtected, got: {err}"
-        );
+        assert!(matches!(err, OrgError::EnvProtected(ref n) if n == "production"));
     }
 
     #[test]
@@ -371,7 +520,6 @@ mod tests {
         let (_dir, store) = temp_store();
         setup_org_and_project(&store);
 
-        // Also create a second project.
         store.create_project("acme", "frontend").unwrap();
 
         store
@@ -386,9 +534,6 @@ mod tests {
 
         let backend_envs = store.list_envs("acme", "backend").unwrap();
         assert_eq!(backend_envs.len(), 2);
-        assert!(backend_envs
-            .iter()
-            .all(|e| e.project_id.0 == "acme/backend"));
 
         let frontend_envs = store.list_envs("acme", "frontend").unwrap();
         assert_eq!(frontend_envs.len(), 1);
@@ -398,16 +543,12 @@ mod tests {
     #[test]
     fn create_env_requires_project() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
-        // No project created.
+        store.create("acme").unwrap();
 
         let err = store
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap_err();
-        assert!(
-            matches!(err, OrgError::ProjectNotFound(ref n) if n == "backend"),
-            "expected ProjectNotFound, got: {err}"
-        );
+        assert!(matches!(err, OrgError::ProjectNotFound { .. }));
     }
 
     #[test]
@@ -421,28 +562,16 @@ mod tests {
         assert!(matches!(err, OrgError::EnvNotFound(_)));
     }
 
-    // ── Org and Project tests (minimal, scaffolded for #713/#715) ───
-
     #[test]
-    fn create_and_get_org() {
+    fn delete_project_with_envs_rejected() {
         let (_dir, store) = temp_store();
-        let org = store.create_org("acme").unwrap();
-        assert_eq!(org.name, "acme");
+        setup_org_and_project(&store);
 
-        let retrieved = store.get_org("acme").unwrap();
-        assert_eq!(retrieved.name, "acme");
-    }
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
 
-    #[test]
-    fn create_and_get_project() {
-        let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
-
-        let project = store.create_project("acme", "backend").unwrap();
-        assert_eq!(project.name, "backend");
-        assert_eq!(project.org_id, OrgId("acme".to_string()));
-
-        let retrieved = store.get_project("acme", "backend").unwrap();
-        assert_eq!(retrieved.name, "backend");
+        let err = store.delete_project("acme", "backend").unwrap_err();
+        assert!(matches!(err, OrgError::ProjectHasEnvironments { .. }));
     }
 }
