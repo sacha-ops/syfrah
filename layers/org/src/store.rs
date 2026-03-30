@@ -16,7 +16,6 @@ const TABLE: &str = "orgs";
 const PROJECTS_TABLE: &str = "projects";
 const ENVIRONMENTS_TABLE: &str = "environments";
 const VPCS_TABLE: &str = "vpcs";
-const SUBNETS_TABLE: &str = "subnets";
 const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
 const SUBNETS_TABLE: &str = "subnets";
 const VNI_COUNTER_TABLE: &str = "vni_counter";

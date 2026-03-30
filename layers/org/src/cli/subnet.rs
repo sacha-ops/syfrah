@@ -4,10 +4,17 @@ use anyhow::{Context, Result};
 use syfrah_state::LayerDb;
 
 use crate::store::OrgStore;
+use crate::types::EnvironmentId;
+use crate::vpc::VpcStore;
 
 fn open_store() -> Result<OrgStore> {
     let db = LayerDb::open("org").context("failed to open org database")?;
     Ok(OrgStore::new(db))
+}
+
+fn open_vpc_store() -> Result<VpcStore> {
+    let db = LayerDb::open("org").context("failed to open org database")?;
+    Ok(VpcStore::new(db))
 }
 
 pub fn run_create(
@@ -19,21 +26,36 @@ pub fn run_create(
     cidr: Option<&str>,
 ) -> Result<()> {
     let store = open_store()?;
+    let vpc_store = open_vpc_store()?;
+
+    // Resolve VPC name: explicit or default for project
+    let vpc_name = match vpc {
+        Some(v) => v.to_string(),
+        None => {
+            let default_vpc = vpc_store
+                .ensure_default_vpc(org, project)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            default_vpc.name
+        }
+    };
+
+    // Build environment ID
+    let env_id = EnvironmentId(format!("{org}/{project}/{env}"));
 
     let subnet = store
-        .create_subnet(name, org, project, env, vpc, cidr)
+        .create_subnet(&vpc_name, &env_id, name, cidr)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Resolve VPC name for display
-    let vpc_name = store
+    let display_vpc = store
         .get_vpc_by_id(&subnet.vpc_id)
         .ok()
         .flatten()
         .map(|v| v.name)
-        .unwrap_or_else(|| subnet.vpc_id.0.clone());
+        .unwrap_or_else(|| vpc_name.clone());
 
     println!("Subnet created: {}", subnet.name);
-    println!("  VPC:      {vpc_name}");
+    println!("  VPC:      {display_vpc}");
     println!("  Env:      {env}");
     println!("  CIDR:     {}", subnet.cidr);
     println!("  Gateway:  {}", subnet.gateway);
@@ -51,9 +73,18 @@ pub fn run_list(
 ) -> Result<()> {
     let store = open_store()?;
 
-    let subnets = store
-        .list_subnets(env, vpc, org, project)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subnets = if let Some(vpc_name) = vpc {
+        store
+            .list_subnets(vpc_name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else if let (Some(env_name), Some(proj), Some(org_name)) = (env, project, org) {
+        let env_id = EnvironmentId(format!("{org_name}/{proj}/{env_name}"));
+        store
+            .list_subnets_by_env(&env_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        anyhow::bail!("specify --vpc or --env/--project/--org to list subnets");
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&subnets)?);
@@ -115,7 +146,7 @@ pub fn run_delete(name: &str, vpc: &str, yes: bool) -> Result<()> {
 
     let store = open_store()?;
     store
-        .delete_subnet_by_name(name, vpc)
+        .delete_subnet(vpc, name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Subnet '{name}' deleted from VPC '{vpc}'.");
