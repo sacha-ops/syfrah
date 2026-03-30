@@ -31,6 +31,25 @@ pub enum OrgError {
     #[error("invalid {context} name: {reason}")]
     InvalidName { context: String, reason: String },
 
+    // ── VPC errors ──────────────────────────────────────────────────
+    #[error("vpc already exists: {0}")]
+    VpcAlreadyExists(String),
+
+    #[error("vpc not found: {0}")]
+    VpcNotFound(String),
+
+    #[error("cannot delete vpc '{name}': has {count} active subnet(s)")]
+    VpcHasSubnets { name: String, count: usize },
+
+    #[error("cannot delete vpc '{name}': has {count} active peering(s)")]
+    VpcHasPeerings { name: String, count: usize },
+
+    #[error("cannot delete vpc '{name}': has {count} vm(s) in its subnets")]
+    VpcHasVms { name: String, count: usize },
+
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }
