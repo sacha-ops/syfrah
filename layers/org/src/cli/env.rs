@@ -59,9 +59,9 @@ fn open_store() -> anyhow::Result<OrgStore> {
 fn format_ttl(seconds: Option<u64>) -> String {
     match seconds {
         None => "-".to_string(),
-        Some(s) if s >= 86400 && s % 86400 == 0 => format!("{}d", s / 86400),
-        Some(s) if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
-        Some(s) if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        Some(s) if s >= 86400 && s.is_multiple_of(86400) => format!("{}d", s / 86400),
+        Some(s) if s >= 3600 && s.is_multiple_of(3600) => format!("{}h", s / 3600),
+        Some(s) if s >= 60 && s.is_multiple_of(60) => format!("{}m", s / 60),
         Some(s) => format!("{s}s"),
     }
 }
@@ -131,7 +131,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && !y % 100 == 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 // ── Commands ────────────────────────────────────────────────────────
