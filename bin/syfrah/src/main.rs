@@ -42,6 +42,21 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_compute::cli::ComputeCommand,
     },
+    /// Manage organizations
+    Org {
+        #[command(subcommand)]
+        command: syfrah_org::OrgCommand,
+    },
+    /// Manage projects within organizations
+    Project {
+        #[command(subcommand)]
+        command: syfrah_org::ProjectCommand,
+    },
+    /// Manage environments within projects
+    Env {
+        #[command(subcommand)]
+        command: syfrah_org::EnvCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -914,6 +929,9 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Compute { command } => syfrah_compute::cli::run(command).await,
+        Commands::Org { command } => syfrah_org::cli::run(command),
+        Commands::Project { command } => syfrah_org::cli::run_project(command),
+        Commands::Env { command } => syfrah_org::cli::run_env(command),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
@@ -1089,5 +1107,68 @@ mod tests {
         let long = "a".repeat(65);
         let s = suggest_fix(&long);
         assert!(s.contains("max 64"), "unexpected: {s}");
+    }
+
+    // ── project CLI parsing ──────────────────────────────────────
+
+    #[test]
+    fn project_create_parse() {
+        let cli = Cli::try_parse_from(["syfrah", "project", "create", "backend", "--org", "acme"])
+            .unwrap();
+        match cli.command {
+            Commands::Project {
+                command: syfrah_org::ProjectCommand::Create { name, org },
+            } => {
+                assert_eq!(name, "backend");
+                assert_eq!(org, "acme");
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn project_list_parse() {
+        // With --org filter and --json
+        let cli =
+            Cli::try_parse_from(["syfrah", "project", "list", "--org", "acme", "--json"]).unwrap();
+        match cli.command {
+            Commands::Project {
+                command: syfrah_org::ProjectCommand::List { org, json },
+            } => {
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert!(json);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+
+        // Without flags
+        let cli = Cli::try_parse_from(["syfrah", "project", "list"]).unwrap();
+        match cli.command {
+            Commands::Project {
+                command: syfrah_org::ProjectCommand::List { org, json },
+            } => {
+                assert!(org.is_none());
+                assert!(!json);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn project_delete_parse() {
+        let cli = Cli::try_parse_from([
+            "syfrah", "project", "delete", "backend", "--org", "acme", "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project {
+                command: syfrah_org::ProjectCommand::Delete { name, org, yes },
+            } => {
+                assert_eq!(name, "backend");
+                assert_eq!(org, "acme");
+                assert!(yes);
+            }
+            _ => panic!("unexpected command variant"),
+        }
     }
 }
