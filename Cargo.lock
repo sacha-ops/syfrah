@@ -2456,6 +2456,7 @@ dependencies = [
  "async-trait",
  "clap",
  "console",
+ "ipnet",
  "serde",
  "serde_json",
  "syfrah-api",

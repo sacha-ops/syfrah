@@ -28,15 +28,26 @@ pub enum OrgError {
     #[error("environment is protected from deletion: {0}")]
     EnvProtected(String),
 
-    #[error("invalid {context} name: {reason}")]
-    InvalidName { context: String, reason: String },
-
-    // ── VPC errors ──────────────────────────────────────────────────
     #[error("vpc already exists: {0}")]
     VpcAlreadyExists(String),
 
     #[error("vpc not found: {0}")]
     VpcNotFound(String),
+
+    #[error("invalid {context} name: {reason}")]
+    InvalidName { context: String, reason: String },
+
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
+    #[error("CIDR overlap: {new_cidr} overlaps with existing {existing_cidr}")]
+    CidrOverlap {
+        new_cidr: String,
+        existing_cidr: String,
+    },
+
+    #[error("no available CIDR block in the auto-allocation range")]
+    CidrExhausted,
 
     #[error("cannot delete vpc '{name}': has {count} active subnet(s)")]
     VpcHasSubnets { name: String, count: usize },
@@ -47,8 +58,14 @@ pub enum OrgError {
     #[error("cannot delete vpc '{name}': has {count} vm(s) in its subnets")]
     VpcHasVms { name: String, count: usize },
 
-    #[error("invalid CIDR: {0}")]
-    InvalidCidr(String),
+    #[error("vpc is not shared: {0}")]
+    VpcNotShared(String),
+
+    #[error("project '{project}' is already attached to vpc '{vpc}'")]
+    VpcAlreadyAttached { vpc: String, project: String },
+
+    #[error("project '{project}' is not attached to vpc '{vpc}'")]
+    VpcNotAttached { vpc: String, project: String },
 
     #[error("store error: {0}")]
     StoreError(String),

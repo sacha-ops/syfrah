@@ -1,8 +1,9 @@
-//! CLI commands for `syfrah org ...`, `syfrah project ...`, and `syfrah env ...`.
+//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, and `syfrah vpc ...`.
 
 pub mod env;
 pub mod org;
 pub mod project;
+pub mod vpc;
 
 use clap::Subcommand;
 
@@ -151,6 +152,77 @@ pub enum EnvCommand {
     },
 }
 
+/// Top-level VPC CLI command.
+#[derive(Debug, Subcommand)]
+pub enum VpcCommand {
+    /// Create a new VPC
+    #[command(
+        after_help = "Examples:\n  syfrah vpc create my-vpc --project backend --org acme\n  syfrah vpc create shared-net --org acme --shared --cidr 10.100.0.0/16"
+    )]
+    Create {
+        /// VPC name (lowercase alphanumeric and hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Organization the VPC belongs to
+        #[arg(long)]
+        org: String,
+        /// Project the VPC belongs to (omit for shared VPCs)
+        #[arg(long, conflicts_with = "shared")]
+        project: Option<String>,
+        /// Create a shared (org-level) VPC
+        #[arg(long)]
+        shared: bool,
+        /// CIDR block for the VPC (default: 10.1.0.0/16 for project, 10.100.0.0/16 for shared)
+        #[arg(long)]
+        cidr: Option<String>,
+    },
+    /// List VPCs
+    #[command(
+        after_help = "Examples:\n  syfrah vpc list --org acme\n  syfrah vpc list --project backend --org acme --json"
+    )]
+    List {
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by organization name
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a VPC
+    #[command(
+        after_help = "Examples:\n  syfrah vpc delete my-vpc --org acme\n  syfrah vpc delete my-vpc --org acme --yes"
+    )]
+    Delete {
+        /// VPC name
+        name: String,
+        /// Organization the VPC belongs to
+        #[arg(long)]
+        org: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Attach a project to a shared VPC
+    Attach {
+        /// VPC name
+        vpc: String,
+        /// Project to attach (format: org/project)
+        #[arg(long)]
+        project: String,
+    },
+    /// Detach a project from a shared VPC
+    Detach {
+        /// VPC name
+        vpc: String,
+        /// Project to detach (format: org/project)
+        #[arg(long)]
+        project: String,
+    },
+}
+
 /// Execute an org CLI command.
 pub fn run(cmd: OrgCommand) -> anyhow::Result<()> {
     match cmd {
@@ -215,5 +287,24 @@ pub fn run_env(cmd: EnvCommand) -> anyhow::Result<()> {
             deletion_protection,
             no_deletion_protection,
         ),
+    }
+}
+
+/// Execute a VPC CLI command.
+pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
+    match cmd {
+        VpcCommand::Create {
+            name,
+            org,
+            project,
+            shared,
+            cidr,
+        } => vpc::run_create(&name, &org, project.as_deref(), shared, cidr.as_deref()),
+        VpcCommand::List { project, org, json } => {
+            vpc::run_list(org.as_deref(), project.as_deref(), json)
+        }
+        VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes),
+        VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
+        VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
     }
 }
