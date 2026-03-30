@@ -430,4 +430,116 @@ mod tests {
         assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0 MiB");
         assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
+
+    #[test]
+    fn status_json_serializes_all_fields() {
+        let output = StatusJson {
+            mesh_name: "test-mesh",
+            node_name: "node-1",
+            region: Some("eu-west"),
+            zone: Some("par-1"),
+            mesh_prefix: "fd12:3456:7890::".to_string(),
+            mesh_ipv6: "fd12:3456:7890::1".to_string(),
+            wg_listen_port: 51820,
+            peering_port: 51821,
+            daemon_pid: Some(1234),
+            interface_up: true,
+            peers_total: 3,
+            peers_active: 2,
+            peers_unreachable: 1,
+            secret: "abc***".to_string(),
+            traffic_rx: 1024,
+            traffic_tx: 2048,
+            gateway: JsonGateway {
+                enabled: true,
+                port: Some(8080),
+            },
+            metrics: JsonMetrics {
+                daemon_started_at: 1000,
+                peers_discovered: 5,
+                wg_reconciliations: 10,
+                peers_marked_unreachable: 1,
+                announcements_failed: 0,
+                announces_queued: 3,
+                announces_queue_full: 0,
+            },
+            config: JsonConfig {
+                health_check_interval_secs: 30,
+                reconcile_interval_secs: 60,
+                persist_interval_secs: 120,
+                unreachable_timeout_secs: 300,
+            },
+        };
+
+        let json_str = serde_json::to_string(&output).expect("serialization failed");
+        let val: serde_json::Value = serde_json::from_str(&json_str).expect("invalid JSON");
+
+        assert_eq!(val["mesh_name"], "test-mesh");
+        assert_eq!(val["node_name"], "node-1");
+        assert_eq!(val["region"], "eu-west");
+        assert_eq!(val["zone"], "par-1");
+        assert_eq!(val["wg_listen_port"], 51820);
+        assert_eq!(val["daemon_pid"], 1234);
+        assert_eq!(val["interface_up"], true);
+        assert_eq!(val["peers_total"], 3);
+        assert_eq!(val["peers_active"], 2);
+        assert_eq!(val["peers_unreachable"], 1);
+        assert_eq!(val["traffic_rx"], 1024);
+        assert_eq!(val["traffic_tx"], 2048);
+        assert_eq!(val["gateway"]["enabled"], true);
+        assert_eq!(val["gateway"]["port"], 8080);
+        assert_eq!(val["metrics"]["peers_discovered"], 5);
+        assert_eq!(val["config"]["health_check_interval_secs"], 30);
+    }
+
+    #[test]
+    fn status_json_omits_null_region_zone() {
+        let output = StatusJson {
+            mesh_name: "mesh",
+            node_name: "node",
+            region: None,
+            zone: None,
+            mesh_prefix: "fd00::".to_string(),
+            mesh_ipv6: "fd00::1".to_string(),
+            wg_listen_port: 51820,
+            peering_port: 51821,
+            daemon_pid: None,
+            interface_up: false,
+            peers_total: 0,
+            peers_active: 0,
+            peers_unreachable: 0,
+            secret: "***".to_string(),
+            traffic_rx: 0,
+            traffic_tx: 0,
+            gateway: JsonGateway {
+                enabled: false,
+                port: None,
+            },
+            metrics: JsonMetrics {
+                daemon_started_at: 0,
+                peers_discovered: 0,
+                wg_reconciliations: 0,
+                peers_marked_unreachable: 0,
+                announcements_failed: 0,
+                announces_queued: 0,
+                announces_queue_full: 0,
+            },
+            config: JsonConfig {
+                health_check_interval_secs: 30,
+                reconcile_interval_secs: 60,
+                persist_interval_secs: 120,
+                unreachable_timeout_secs: 300,
+            },
+        };
+
+        let json_str = serde_json::to_string(&output).expect("serialization failed");
+        let val: serde_json::Value = serde_json::from_str(&json_str).expect("invalid JSON");
+
+        assert!(val["region"].is_null());
+        assert!(val["zone"].is_null());
+        assert!(val["daemon_pid"].is_null());
+        assert_eq!(val["gateway"]["enabled"], false);
+        // port should be omitted (skip_serializing_if)
+        assert!(val["gateway"].get("port").is_none());
+    }
 }
