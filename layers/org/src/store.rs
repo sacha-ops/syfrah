@@ -258,6 +258,26 @@ impl OrgStore {
         Ok(env)
     }
 
+    /// Toggle deletion protection on an environment.
+    pub fn update_env_protection(
+        &self,
+        org: &str,
+        project: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<Environment> {
+        let key = Self::env_key(org, project, name);
+
+        let mut env = self
+            .db
+            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
+            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+
+        env.deletion_protection = enabled;
+        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        Ok(env)
+    }
+
     /// Delete an environment. Fails if deletion protection is enabled.
     pub fn delete_env(&self, org: &str, project: &str, name: &str) -> Result<()> {
         let key = Self::env_key(org, project, name);

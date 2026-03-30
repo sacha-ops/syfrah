@@ -268,6 +268,40 @@ pub fn run_extend(name: &str, project: &str, org: &str, ttl_str: &str) -> anyhow
     Ok(())
 }
 
+pub fn run_update(
+    name: &str,
+    project: &str,
+    org: &str,
+    deletion_protection: bool,
+    no_deletion_protection: bool,
+) -> anyhow::Result<()> {
+    let store = open_store()?;
+
+    if deletion_protection {
+        let env = store
+            .update_env_protection(org, project, name, true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(
+            "Deletion protection enabled for environment '{}'.",
+            env.name
+        );
+    } else if no_deletion_protection {
+        let env = store
+            .update_env_protection(org, project, name, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(
+            "Deletion protection disabled for environment '{}'.",
+            env.name
+        );
+    } else {
+        anyhow::bail!(
+            "specify --deletion-protection or --no-deletion-protection to update the environment"
+        );
+    }
+
+    Ok(())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

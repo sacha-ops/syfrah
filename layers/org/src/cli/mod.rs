@@ -129,6 +129,23 @@ pub enum EnvCommand {
         #[arg(long)]
         ttl: String,
     },
+    /// Update environment settings (e.g. deletion protection)
+    Update {
+        /// Environment name
+        name: String,
+        /// Parent project name
+        #[arg(long)]
+        project: String,
+        /// Parent organization name
+        #[arg(long)]
+        org: String,
+        /// Enable deletion protection
+        #[arg(long, conflicts_with = "no_deletion_protection")]
+        deletion_protection: bool,
+        /// Disable deletion protection
+        #[arg(long, conflicts_with = "deletion_protection")]
+        no_deletion_protection: bool,
+    },
 }
 
 /// Execute an org CLI command.
@@ -182,5 +199,18 @@ pub fn run_env(cmd: EnvCommand) -> anyhow::Result<()> {
             org,
             ttl,
         } => env::run_extend(&name, &project, &org, &ttl),
+        EnvCommand::Update {
+            name,
+            project,
+            org,
+            deletion_protection,
+            no_deletion_protection,
+        } => env::run_update(
+            &name,
+            &project,
+            &org,
+            deletion_protection,
+            no_deletion_protection,
+        ),
     }
 }
