@@ -2476,8 +2476,10 @@ dependencies = [
  "serde",
  "serde_json",
  "syfrah-api",
+ "syfrah-core",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
