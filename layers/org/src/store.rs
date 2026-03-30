@@ -351,9 +351,39 @@ impl OrgStore {
     }
 
     /// Create a VPC. Validates the name and CIDR, allocates a VNI, persists.
+    ///
+    /// Returns `OrgError::NotFound` if the org does not exist, or
+    /// `OrgError::ProjectNotFound` if the project does not exist.
     pub fn create_vpc(&self, name: &str, cidr: &str, owner: VpcOwner, shared: bool) -> Result<Vpc> {
         validate_name(name, "vpc")?;
         Self::validate_cidr(cidr)?;
+
+        // Validate that the parent org (and project, if applicable) exist.
+        match &owner {
+            VpcOwner::Org(org_id) => {
+                if !self.db.exists(TABLE, &org_id.0)? {
+                    return Err(OrgError::NotFound(org_id.0.clone()));
+                }
+            }
+            VpcOwner::Project(proj_id) => {
+                // Project IDs are "org/project"
+                let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                let (org_name, project_name) = match parts.as_slice() {
+                    [org, proj] => (*org, *proj),
+                    _ => return Err(OrgError::NotFound(proj_id.0.clone())),
+                };
+                if !self.db.exists(TABLE, org_name)? {
+                    return Err(OrgError::NotFound(org_name.to_string()));
+                }
+                let project_key = Self::project_key(org_name, project_name);
+                if !self.db.exists(PROJECTS_TABLE, &project_key)? {
+                    return Err(OrgError::ProjectNotFound {
+                        org: org_name.to_string(),
+                        project: project_name.to_string(),
+                    });
+                }
+            }
+        }
 
         if self.db.exists(VPCS_TABLE, name)? {
             return Err(OrgError::VpcAlreadyExists(name.to_string()));
@@ -827,6 +857,7 @@ mod tests {
     #[test]
     fn create_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         let vpc = store
             .create_vpc(
                 "default",
@@ -851,6 +882,7 @@ mod tests {
     #[test]
     fn vni_increments() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         let vpc1 = store
             .create_vpc(
                 "vpc-one",
@@ -875,6 +907,7 @@ mod tests {
     #[test]
     fn duplicate_vpc_name_rejected() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "default",
@@ -898,6 +931,7 @@ mod tests {
     #[test]
     fn delete_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "default",
@@ -921,6 +955,9 @@ mod tests {
     #[test]
     fn list_vpcs_returns_all() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store.create_project("acme", "frontend").unwrap();
         store
             .create_vpc(
                 "vpc-one",
@@ -953,6 +990,9 @@ mod tests {
     #[test]
     fn list_vpcs_by_project_filters() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store.create_project("acme", "frontend").unwrap();
         let pid = ProjectId("acme/backend".to_string());
 
         store
@@ -988,6 +1028,8 @@ mod tests {
     #[test]
     fn list_vpcs_by_org_filters() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
         let oid = OrgId("acme".to_string());
 
         store
@@ -1047,11 +1089,57 @@ mod tests {
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
 
+    #[test]
+    fn create_vpc_fails_when_org_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Org(OrgId("nonexistent".to_string())),
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(ref name) if name == "nonexistent"));
+    }
+
+    #[test]
+    fn create_vpc_fails_when_project_org_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("ghost-org/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(ref name) if name == "ghost-org"));
+    }
+
+    #[test]
+    fn create_vpc_fails_when_project_not_found() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/nonexistent".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::ProjectNotFound { ref org, ref project } if org == "acme" && project == "nonexistent")
+        );
+    }
+
     // ── VPC attachment tests ─────────────────────────────────────────
 
     #[test]
     fn attach_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1070,6 +1158,7 @@ mod tests {
     #[test]
     fn attach_non_shared_vpc_rejected() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "private-vpc",
@@ -1088,6 +1177,7 @@ mod tests {
     #[test]
     fn attach_duplicate_rejected() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1105,6 +1195,7 @@ mod tests {
     #[test]
     fn detach_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1123,6 +1214,7 @@ mod tests {
     #[test]
     fn detach_not_attached_rejected() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1139,6 +1231,7 @@ mod tests {
     #[test]
     fn list_attachments_multiple() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
