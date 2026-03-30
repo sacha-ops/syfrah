@@ -6,7 +6,7 @@ pub mod types;
 pub mod validation;
 
 pub use api::OrgHandler;
-pub use cli::{OrgCommand, ProjectCommand};
+pub use cli::{EnvCommand, OrgCommand, ProjectCommand};
 pub use error::OrgError;
 pub use store::OrgStore;
 pub use types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};

@@ -52,6 +52,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::ProjectCommand,
     },
+    /// Manage environments within projects
+    Env {
+        #[command(subcommand)]
+        command: syfrah_org::EnvCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -926,6 +931,7 @@ async fn run() -> Result<()> {
         Commands::Compute { command } => syfrah_compute::cli::run(command).await,
         Commands::Org { command } => syfrah_org::cli::run(command),
         Commands::Project { command } => syfrah_org::cli::run_project(command),
+        Commands::Env { command } => syfrah_org::cli::run_env(command),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();

@@ -228,6 +228,36 @@ impl OrgStore {
             .collect())
     }
 
+    /// Extend (or set) the TTL of an environment.
+    ///
+    /// The new TTL is measured from **now**, not from the original creation
+    /// time, so `extend_env("acme", "backend", "ci", 7200)` always gives
+    /// 2 hours from the current moment.
+    pub fn extend_env(
+        &self,
+        org: &str,
+        project: &str,
+        name: &str,
+        ttl: u64,
+    ) -> Result<Environment> {
+        let key = Self::env_key(org, project, name);
+
+        let mut env = self
+            .db
+            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
+            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        env.ttl = Some(ttl);
+        env.expires_at = Some(now + ttl);
+
+        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        Ok(env)
+    }
+
     /// Delete an environment. Fails if deletion protection is enabled.
     pub fn delete_env(&self, org: &str, project: &str, name: &str) -> Result<()> {
         let key = Self::env_key(org, project, name);
