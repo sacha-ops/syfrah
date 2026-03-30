@@ -18,6 +18,7 @@ const ENVIRONMENTS_TABLE: &str = "environments";
 const VPCS_TABLE: &str = "vpcs";
 const SUBNETS_TABLE: &str = "subnets";
 const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
+const SUBNETS_TABLE: &str = "subnets";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
@@ -553,275 +554,232 @@ impl OrgStore {
             .collect())
     }
 
-    // ── Subnet operations ───────────────────────────────────────────
+    // ── Subnet operations ──────────────────────────────────────────
 
-    /// Create a subnet within a VPC.
+    /// Build the redb key for a subnet: "vpc_name/subnet_name".
+    fn subnet_key(vpc_name: &str, subnet_name: &str) -> String {
+        format!("{vpc_name}/{subnet_name}")
+    }
+
+    /// Compute the gateway address (.1) from a subnet CIDR.
     ///
-    /// Validates the name, resolves the VPC (auto-creating a default VPC if
-    /// the project has none and `--vpc` is omitted), auto-allocates a /24 CIDR
-    /// if none is given, and persists the subnet.
-    pub fn create_subnet(
-        &self,
-        name: &str,
-        org: &str,
-        project: &str,
-        env: &str,
-        vpc_name: Option<&str>,
-        cidr: Option<&str>,
-    ) -> Result<Subnet> {
-        validate_name(name, "subnet")?;
+    /// For example, "10.1.1.0/24" -> "10.1.1.1".
+    fn compute_gateway(cidr: &Ipv4Net) -> std::net::Ipv4Addr {
+        let network = cidr.network();
+        let octets = network.octets();
+        std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 1)
+    }
 
-        // Resolve environment
-        let _ = self.get_env(org, project, env)?;
-        let env_id = EnvironmentId(Self::env_key(org, project, env));
+    /// Auto-allocate the next available /24 within a VPC's CIDR that does
+    /// not overlap with any existing subnets in that VPC.
+    fn auto_allocate_subnet_cidr(vpc_cidr: &Ipv4Net, existing: &[Ipv4Net]) -> Result<Ipv4Net> {
+        let vpc_octets = vpc_cidr.network().octets();
+        let vpc_prefix = vpc_cidr.prefix_len();
 
-        // Resolve VPC: explicit or default
-        let vpc = match vpc_name {
-            Some(vn) => self
-                .get_vpc(vn)?
-                .ok_or_else(|| OrgError::VpcNotFound(vn.to_string()))?,
-            None => self.ensure_default_vpc(org, project)?,
-        };
-
-        // Parse VPC CIDR for subnet allocation
-        let vpc_cidr: Ipv4Net = vpc
-            .cidr
-            .parse()
-            .map_err(|_| OrgError::InvalidCidr(format!("VPC CIDR '{}' is invalid", vpc.cidr)))?;
-
-        // Get existing subnets in this VPC to check for duplicates and CIDR overlap
-        let existing_subnets = self.list_subnets_by_vpc(&vpc.id)?;
-
-        // Check name uniqueness within the VPC
-        if existing_subnets.iter().any(|s| s.name == name) {
-            return Err(OrgError::SubnetAlreadyExists {
-                name: name.to_string(),
-                vpc: vpc.name.clone(),
-            });
-        }
-
-        let subnet_cidr = match cidr {
-            Some(c) => {
-                let net = parse_and_validate_cidr(c)?;
-                // Verify the subnet CIDR fits within the VPC CIDR
-                if !vpc_cidr.contains(&net.network()) || !vpc_cidr.contains(&net.broadcast()) {
-                    return Err(OrgError::SubnetOutsideVpc {
-                        subnet_cidr: net.to_string(),
-                        vpc_cidr: vpc.cidr.clone(),
-                    });
-                }
-                // Check overlap with existing subnets
-                for existing in &existing_subnets {
-                    if let Ok(existing_net) = existing.cidr.parse::<Ipv4Net>() {
-                        if cidrs_overlap(&net, &existing_net) {
-                            return Err(OrgError::CidrOverlap {
-                                new_cidr: net.to_string(),
-                                existing_cidr: existing_net.to_string(),
-                            });
+        // Iterate over all possible /24 blocks within the VPC CIDR.
+        // For a /16 (e.g., 10.1.0.0/16), iterate third octet 0..=255.
+        // For a /8 (e.g., 10.0.0.0/8), iterate second octet 0..=255 and third 0..=255.
+        // For a /24 (e.g., 10.1.1.0/24), only one candidate.
+        match vpc_prefix {
+            8 => {
+                for o2 in vpc_octets[1]..=255u8 {
+                    for o3 in 0..=255u8 {
+                        let candidate =
+                            Ipv4Net::new(std::net::Ipv4Addr::new(vpc_octets[0], o2, o3, 0), 24)
+                                .unwrap();
+                        if !existing.iter().any(|e| cidrs_overlap(&candidate, e)) {
+                            return Ok(candidate);
                         }
                     }
                 }
+            }
+            9..=16 => {
+                // For /9 to /16, the second octet range is determined by the VPC.
+                // We iterate over the third octet for each valid second octet.
+                let net_start = u32::from(vpc_cidr.network());
+                let net_end = u32::from(vpc_cidr.broadcast());
+                let mut addr = net_start;
+                while addr <= net_end {
+                    let ip = std::net::Ipv4Addr::from(addr);
+                    let candidate = Ipv4Net::new(ip, 24).unwrap();
+                    // Ensure candidate is within VPC
+                    if vpc_cidr.contains(&candidate.network())
+                        && vpc_cidr.contains(&candidate.broadcast())
+                        && !existing.iter().any(|e| cidrs_overlap(&candidate, e))
+                    {
+                        return Ok(candidate);
+                    }
+                    addr += 256; // next /24
+                }
+            }
+            17..=24 => {
+                let net_start = u32::from(vpc_cidr.network());
+                let net_end = u32::from(vpc_cidr.broadcast());
+                let mut addr = net_start;
+                while addr <= net_end {
+                    let ip = std::net::Ipv4Addr::from(addr);
+                    if let Ok(candidate) = Ipv4Net::new(ip, 24) {
+                        if u32::from(candidate.broadcast()) <= net_end
+                            && !existing.iter().any(|e| cidrs_overlap(&candidate, e))
+                        {
+                            return Ok(candidate);
+                        }
+                    }
+                    addr += 256;
+                }
+            }
+            _ => {}
+        }
+
+        Err(OrgError::SubnetCidrExhausted(vpc_cidr.to_string()))
+    }
+
+    /// Create a subnet within a VPC.
+    ///
+    /// Validates:
+    /// - VPC exists
+    /// - Environment exists
+    /// - Subnet name is unique within the VPC
+    /// - If CIDR is provided, it must be a valid /24 (or other prefix) within the VPC range
+    /// - If CIDR is not provided, auto-allocate the next available /24
+    /// - No overlap with existing subnets in the same VPC
+    ///
+    /// Gateway is always computed as .1 of the subnet CIDR.
+    pub fn create_subnet(
+        &self,
+        vpc_name: &str,
+        env_id: &EnvironmentId,
+        name: &str,
+        cidr_opt: Option<&str>,
+    ) -> Result<Subnet> {
+        validate_name(name, "subnet")?;
+
+        // Verify VPC exists
+        let vpc = self
+            .db
+            .get::<Vpc>(VPCS_TABLE, vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+
+        // Verify environment exists
+        if !self.db.exists(ENVIRONMENTS_TABLE, &env_id.0)? {
+            return Err(OrgError::EnvNotFound(env_id.0.clone()));
+        }
+
+        // Check subnet name uniqueness within VPC
+        let key = Self::subnet_key(vpc_name, name);
+        if self.db.exists(SUBNETS_TABLE, &key)? {
+            return Err(OrgError::SubnetAlreadyExists {
+                vpc: vpc_name.to_string(),
+                subnet: name.to_string(),
+            });
+        }
+
+        // Parse VPC CIDR
+        let vpc_cidr: Ipv4Net = vpc
+            .cidr
+            .parse()
+            .map_err(|_| OrgError::InvalidCidr(format!("VPC CIDR is invalid: {}", vpc.cidr)))?;
+
+        // Get existing subnets in this VPC
+        let existing_subnets = self.list_subnets(vpc_name)?;
+        let existing_cidrs: Vec<Ipv4Net> = existing_subnets
+            .iter()
+            .filter_map(|s| s.cidr.parse::<Ipv4Net>().ok())
+            .collect();
+
+        // Determine subnet CIDR
+        let subnet_cidr = match cidr_opt {
+            Some(cidr_str) => {
+                let net: Ipv4Net = cidr_str.parse().map_err(|_| {
+                    OrgError::InvalidCidr(format!("'{cidr_str}': invalid CIDR format"))
+                })?;
+
+                // Verify the subnet CIDR is within the VPC range
+                if !vpc_cidr.contains(&net.network()) || !vpc_cidr.contains(&net.broadcast()) {
+                    return Err(OrgError::SubnetCidrOutOfRange {
+                        cidr: net.to_string(),
+                        vpc_cidr: vpc_cidr.to_string(),
+                    });
+                }
+
+                // Check overlap with existing subnets
+                for existing in &existing_cidrs {
+                    if cidrs_overlap(&net, existing) {
+                        return Err(OrgError::SubnetCidrOverlap {
+                            new_cidr: net.to_string(),
+                            existing_cidr: existing.to_string(),
+                        });
+                    }
+                }
+
                 net
             }
-            None => self.auto_allocate_subnet_cidr(&vpc_cidr, &existing_subnets)?,
+            None => Self::auto_allocate_subnet_cidr(&vpc_cidr, &existing_cidrs)?,
         };
 
-        // Gateway is always .1 of the subnet
-        let gateway_octets = subnet_cidr.network().octets();
-        let gateway =
-            std::net::Ipv4Addr::new(gateway_octets[0], gateway_octets[1], gateway_octets[2], 1);
+        let gateway = Self::compute_gateway(&subnet_cidr);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let subnet_id = SubnetId(format!("{}/{}/{}/{}", org, project, env, name));
         let subnet = Subnet {
-            id: subnet_id.clone(),
+            id: SubnetId(key.clone()),
             name: name.to_string(),
             vpc_id: vpc.id.clone(),
-            env_id,
+            env_id: env_id.clone(),
             cidr: subnet_cidr.to_string(),
             gateway: gateway.to_string(),
             created_at: now,
         };
 
-        self.db.set(SUBNETS_TABLE, &subnet_id.0, &subnet)?;
+        self.db.set(SUBNETS_TABLE, &key, &subnet)?;
         Ok(subnet)
     }
 
-    /// Auto-allocate the next available /24 within the VPC's CIDR.
-    fn auto_allocate_subnet_cidr(
-        &self,
-        vpc_cidr: &Ipv4Net,
-        existing: &[Subnet],
-    ) -> Result<Ipv4Net> {
-        let existing_nets: Vec<Ipv4Net> = existing
-            .iter()
-            .filter_map(|s| s.cidr.parse::<Ipv4Net>().ok())
-            .collect();
-
-        let base = vpc_cidr.network().octets();
-        // Iterate through possible /24 subnets within the VPC CIDR
-        let vpc_prefix = vpc_cidr.prefix_len();
-        if vpc_prefix > 24 {
-            return Err(OrgError::InvalidCidr(
-                "VPC CIDR is too small for /24 subnets".to_string(),
-            ));
-        }
-
-        // Calculate the range of third-octet values
-        let num_subnets = 1u32 << (24 - vpc_prefix);
-        for i in 0..num_subnets {
-            let third_octet_base = base[2] as u32 + i;
-            if third_octet_base > 255 {
-                break;
-            }
-            let candidate = Ipv4Net::new(
-                std::net::Ipv4Addr::new(base[0], base[1], third_octet_base as u8, 0),
-                24,
-            )
-            .unwrap();
-
-            if !existing_nets.iter().any(|e| cidrs_overlap(&candidate, e)) {
-                return Ok(candidate);
-            }
-        }
-
-        Err(OrgError::CidrExhausted)
+    /// Get a subnet by VPC name and subnet name.
+    pub fn get_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<Subnet> {
+        let key = Self::subnet_key(vpc_name, subnet_name);
+        self.db
+            .get::<Subnet>(SUBNETS_TABLE, &key)?
+            .ok_or_else(|| OrgError::SubnetNotFound {
+                vpc: vpc_name.to_string(),
+                subnet: subnet_name.to_string(),
+            })
     }
 
-    /// Ensure a default VPC exists for a project. If the project already has
-    /// VPCs, return the first one. Otherwise, auto-create one.
-    pub fn ensure_default_vpc(&self, org: &str, project: &str) -> Result<Vpc> {
-        let project_id = ProjectId(format!("{org}/{project}"));
-        let vpcs = self.list_vpcs_by_project(&project_id)?;
-        if let Some(vpc) = vpcs.into_iter().next() {
-            return Ok(vpc);
-        }
-
-        // Auto-create a default VPC
-        let default_name = format!("{org}-{project}-default");
-        let owner = VpcOwner::Project(project_id);
-
-        // Auto-allocate CIDR by collecting existing CIDRs in the org
-        let org_id = OrgId(org.to_string());
-        let org_vpcs = self.list_vpcs_by_org(&org_id)?;
-        let existing_cidrs: Vec<Ipv4Net> = org_vpcs
-            .iter()
-            .filter_map(|v| v.cidr.parse::<Ipv4Net>().ok())
-            .collect();
-
-        // Find available /16
-        let cidr = self.auto_allocate_vpc_cidr(&existing_cidrs)?;
-
-        let vni = self.next_vni()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let vpc = Vpc {
-            id: VpcId(format!("vpc-{default_name}")),
-            name: default_name.clone(),
-            cidr: cidr.to_string(),
-            vni,
-            owner,
-            shared: false,
-            created_at: now,
-        };
-
-        self.db.set(VPCS_TABLE, &default_name, &vpc)?;
-        Ok(vpc)
-    }
-
-    /// Find an available /16 in 10.0.0.0/8.
-    fn auto_allocate_vpc_cidr(&self, existing: &[Ipv4Net]) -> Result<Ipv4Net> {
-        for second_octet in 0..=255u8 {
-            let candidate =
-                Ipv4Net::new(std::net::Ipv4Addr::new(10, second_octet, 0, 0), 16).unwrap();
-            if !existing.iter().any(|e| cidrs_overlap(&candidate, e)) {
-                return Ok(candidate);
-            }
-        }
-        Err(OrgError::CidrExhausted)
-    }
-
-    /// Get a subnet by its full ID (org/project/env/name).
-    pub fn get_subnet(
-        &self,
-        org: &str,
-        project: &str,
-        env: &str,
-        name: &str,
-    ) -> Result<Option<Subnet>> {
-        let key = format!("{org}/{project}/{env}/{name}");
-        Ok(self.db.get(SUBNETS_TABLE, &key)?)
-    }
-
-    /// List all subnets, optionally filtered.
-    pub fn list_subnets(
-        &self,
-        env_filter: Option<&str>,
-        vpc_filter: Option<&str>,
-        org: Option<&str>,
-        project: Option<&str>,
-    ) -> Result<Vec<Subnet>> {
-        let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
-        let mut subnets: Vec<Subnet> = all.into_iter().map(|(_, s)| s).collect();
-
-        if let Some(env_name) = env_filter {
-            subnets.retain(|s| {
-                // env_id format: org/project/env
-                s.env_id.0.split('/').nth(2) == Some(env_name)
-            });
-        }
-
-        if let Some(vpc_name) = vpc_filter {
-            // Resolve VPC name to VPC ID
-            if let Ok(Some(vpc)) = self.get_vpc(vpc_name) {
-                subnets.retain(|s| s.vpc_id == vpc.id);
-            } else {
-                return Ok(Vec::new());
-            }
-        }
-
-        if let (Some(o), Some(p)) = (org, project) {
-            let prefix = format!("{o}/{p}/");
-            subnets.retain(|s| s.id.0.starts_with(&prefix));
-        }
-
-        Ok(subnets)
-    }
-
-    /// List all subnets belonging to a specific VPC.
-    pub fn list_subnets_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<Subnet>> {
+    /// List all subnets in a VPC.
+    pub fn list_subnets(&self, vpc_name: &str) -> Result<Vec<Subnet>> {
+        let prefix = format!("{vpc_name}/");
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         Ok(all
             .into_iter()
-            .filter(|(_, s)| s.vpc_id == *vpc_id)
+            .filter(|(k, _)| k.starts_with(&prefix))
             .map(|(_, s)| s)
             .collect())
     }
 
-    /// Delete a subnet by name within a VPC.
-    pub fn delete_subnet_by_name(&self, name: &str, vpc_name: &str) -> Result<()> {
-        let vpc = self
-            .get_vpc(vpc_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+    /// List all subnets belonging to a specific environment.
+    pub fn list_subnets_by_env(&self, env_id: &EnvironmentId) -> Result<Vec<Subnet>> {
+        let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, s)| s.env_id == *env_id)
+            .map(|(_, s)| s)
+            .collect())
+    }
 
-        let subnets = self.list_subnets_by_vpc(&vpc.id)?;
-        let subnet =
-            subnets
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| OrgError::SubnetNotFound {
-                    name: name.to_string(),
-                    vpc: vpc_name.to_string(),
-                })?;
-
-        self.db.delete(SUBNETS_TABLE, &subnet.id.0)?;
+    /// Delete a subnet by VPC name and subnet name.
+    pub fn delete_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<()> {
+        let key = Self::subnet_key(vpc_name, subnet_name);
+        if !self.db.exists(SUBNETS_TABLE, &key)? {
+            return Err(OrgError::SubnetNotFound {
+                vpc: vpc_name.to_string(),
+                subnet: subnet_name.to_string(),
+            });
+        }
+        self.db.delete(SUBNETS_TABLE, &key)?;
         Ok(())
     }
 }
@@ -1750,5 +1708,288 @@ mod tests {
 
         let attachments = store.list_attachments("shared-vpc").unwrap();
         assert_eq!(attachments.len(), 2);
+    }
+
+    // ── Subnet tests ────────────────────────────────────────────────
+
+    /// Helper: set up org, project, env, and VPC for subnet tests.
+    fn setup_for_subnet(store: &OrgStore) -> (String, EnvironmentId) {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+        store
+            .create_vpc(
+                "default",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+        (
+            "default".to_string(),
+            EnvironmentId("acme/backend/production".to_string()),
+        )
+    }
+
+    #[test]
+    fn create_subnet_succeeds_with_gateway() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        let subnet = store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+
+        assert_eq!(subnet.name, "frontend");
+        assert_eq!(subnet.cidr, "10.1.1.0/24");
+        assert_eq!(subnet.gateway, "10.1.1.1");
+        assert_eq!(subnet.vpc_id.0, "vpc-default");
+        assert_eq!(subnet.env_id, env_id);
+        assert!(subnet.created_at > 0);
+    }
+
+    #[test]
+    fn auto_cidr_allocation_first_subnet() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        let subnet = store
+            .create_subnet(&vpc_name, &env_id, "frontend", None)
+            .unwrap();
+
+        // First auto-allocated /24 within 10.1.0.0/16 should be 10.1.0.0/24
+        assert_eq!(subnet.cidr, "10.1.0.0/24");
+        assert_eq!(subnet.gateway, "10.1.0.1");
+    }
+
+    #[test]
+    fn sequential_cidrs_auto_allocation() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        let s1 = store
+            .create_subnet(&vpc_name, &env_id, "subnet-aaa", None)
+            .unwrap();
+        let s2 = store
+            .create_subnet(&vpc_name, &env_id, "subnet-bbb", None)
+            .unwrap();
+
+        assert_eq!(s1.cidr, "10.1.0.0/24");
+        assert_eq!(s2.cidr, "10.1.1.0/24");
+    }
+
+    #[test]
+    fn custom_cidr_accepted() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        let subnet = store
+            .create_subnet(&vpc_name, &env_id, "database", Some("10.1.50.0/24"))
+            .unwrap();
+
+        assert_eq!(subnet.cidr, "10.1.50.0/24");
+        assert_eq!(subnet.gateway, "10.1.50.1");
+    }
+
+    #[test]
+    fn gateway_is_dot_1() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        let cases = vec![
+            ("sub-aaa", "10.1.0.0/24", "10.1.0.1"),
+            ("sub-bbb", "10.1.100.0/24", "10.1.100.1"),
+            ("sub-ccc", "10.1.255.0/24", "10.1.255.1"),
+        ];
+
+        for (name, cidr, expected_gw) in cases {
+            let subnet = store
+                .create_subnet(&vpc_name, &env_id, name, Some(cidr))
+                .unwrap();
+            assert_eq!(
+                subnet.gateway, expected_gw,
+                "gateway for {} should be {}",
+                cidr, expected_gw
+            );
+        }
+    }
+
+    #[test]
+    fn subnet_duplicate_name_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+
+        let err = store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.2.0/24"))
+            .unwrap_err();
+        assert!(matches!(err, OrgError::SubnetAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn subnet_cidr_out_of_range_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        // VPC is 10.1.0.0/16, so 10.2.0.0/24 is out of range
+        let err = store
+            .create_subnet(&vpc_name, &env_id, "bad-subnet", Some("10.2.0.0/24"))
+            .unwrap_err();
+        assert!(matches!(err, OrgError::SubnetCidrOutOfRange { .. }));
+    }
+
+    #[test]
+    fn subnet_cidr_overlap_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+
+        let err = store
+            .create_subnet(&vpc_name, &env_id, "overlap", Some("10.1.1.0/24"))
+            .unwrap_err();
+        assert!(matches!(err, OrgError::SubnetCidrOverlap { .. }));
+    }
+
+    #[test]
+    fn subnet_vpc_not_found_rejected() {
+        let (_dir, store) = temp_store();
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+
+        let err = store
+            .create_subnet("nonexistent", &env_id, "frontend", None)
+            .unwrap_err();
+        assert!(matches!(err, OrgError::VpcNotFound(_)));
+    }
+
+    #[test]
+    fn subnet_env_not_found_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store
+            .create_vpc(
+                "default",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let bad_env = EnvironmentId("acme/backend/nonexistent".to_string());
+        let err = store
+            .create_subnet("default", &bad_env, "frontend", None)
+            .unwrap_err();
+        assert!(matches!(err, OrgError::EnvNotFound(_)));
+    }
+
+    #[test]
+    fn get_subnet_succeeds() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+
+        let subnet = store.get_subnet("default", "frontend").unwrap();
+        assert_eq!(subnet.name, "frontend");
+        assert_eq!(subnet.cidr, "10.1.1.0/24");
+    }
+
+    #[test]
+    fn get_subnet_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store.get_subnet("default", "ghost").unwrap_err();
+        assert!(matches!(err, OrgError::SubnetNotFound { .. }));
+    }
+
+    #[test]
+    fn list_subnets_by_vpc() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+        store
+            .create_subnet(&vpc_name, &env_id, "database", Some("10.1.2.0/24"))
+            .unwrap();
+
+        let subnets = store.list_subnets("default").unwrap();
+        assert_eq!(subnets.len(), 2);
+    }
+
+    #[test]
+    fn list_subnets_by_env_filters() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        // Create second env
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+        let staging_env = EnvironmentId("acme/backend/staging".to_string());
+
+        store
+            .create_subnet(&vpc_name, &env_id, "prod-sub", Some("10.1.1.0/24"))
+            .unwrap();
+        store
+            .create_subnet(&vpc_name, &staging_env, "stg-sub", Some("10.1.2.0/24"))
+            .unwrap();
+
+        let prod_subs = store.list_subnets_by_env(&env_id).unwrap();
+        assert_eq!(prod_subs.len(), 1);
+        assert_eq!(prod_subs[0].name, "prod-sub");
+
+        let stg_subs = store.list_subnets_by_env(&staging_env).unwrap();
+        assert_eq!(stg_subs.len(), 1);
+        assert_eq!(stg_subs[0].name, "stg-sub");
+    }
+
+    #[test]
+    fn delete_subnet_succeeds() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        store
+            .create_subnet(&vpc_name, &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+
+        store.delete_subnet("default", "frontend").unwrap();
+
+        let err = store.get_subnet("default", "frontend").unwrap_err();
+        assert!(matches!(err, OrgError::SubnetNotFound { .. }));
+    }
+
+    #[test]
+    fn delete_subnet_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store.delete_subnet("default", "ghost").unwrap_err();
+        assert!(matches!(err, OrgError::SubnetNotFound { .. }));
+    }
+
+    #[test]
+    fn auto_allocation_skips_used_cidr() {
+        let (_dir, store) = temp_store();
+        let (vpc_name, env_id) = setup_for_subnet(&store);
+
+        // Manually occupy 10.1.0.0/24
+        store
+            .create_subnet(&vpc_name, &env_id, "first", Some("10.1.0.0/24"))
+            .unwrap();
+
+        // Auto-allocate should skip to 10.1.1.0/24
+        let subnet = store
+            .create_subnet(&vpc_name, &env_id, "second", None)
+            .unwrap();
+        assert_eq!(subnet.cidr, "10.1.1.0/24");
     }
 }
