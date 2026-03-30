@@ -7,7 +7,7 @@ use crate::validation::validate_name;
 
 /// Create a new organization.
 pub fn run_create(name: String) -> anyhow::Result<()> {
-    if let Err(e) = validate_name(&name) {
+    if let Err(e) = validate_name(&name, "org") {
         anyhow::bail!("{e}");
     }
 

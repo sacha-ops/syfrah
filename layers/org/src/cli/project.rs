@@ -6,7 +6,7 @@ use crate::store::OrgStore;
 use crate::validation::validate_name;
 
 pub fn create(name: &str, org: &str) -> Result<()> {
-    validate_name(name)?;
+    validate_name(name, "project")?;
     let db = syfrah_state::LayerDb::open("org")
         .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
     let store = OrgStore::new(db);
