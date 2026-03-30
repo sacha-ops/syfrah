@@ -79,6 +79,39 @@ pub enum OrgError {
     #[error("project '{project}' is not attached to vpc '{vpc}'")]
     VpcNotAttached { vpc: String, project: String },
 
+    #[error("subnet already exists: {vpc}/{subnet}")]
+    SubnetAlreadyExists { vpc: String, subnet: String },
+
+    #[error("subnet not found: {vpc}/{subnet}")]
+    SubnetNotFound { vpc: String, subnet: String },
+
+    #[error("subnet CIDR {cidr} is outside VPC range {vpc_cidr}")]
+    SubnetCidrOutOfRange { cidr: String, vpc_cidr: String },
+
+    #[error("subnet CIDR {new_cidr} overlaps with existing subnet {existing_cidr}")]
+    SubnetCidrOverlap {
+        new_cidr: String,
+        existing_cidr: String,
+    },
+
+    #[error("no available /24 block in VPC CIDR {0}")]
+    SubnetCidrExhausted(String),
+
+    #[error("subnet CIDR {subnet_cidr} is not within VPC CIDR {vpc_cidr}")]
+    SubnetOutsideVpc {
+        subnet_cidr: String,
+        vpc_cidr: String,
+    },
+
+    #[error("subnet CIDR {new_cidr} overlaps with existing subnet {existing_cidr}")]
+    SubnetOverlap {
+        new_cidr: String,
+        existing_cidr: String,
+    },
+
+    #[error("invalid subnet prefix length: expected /{min} to /{max}, got /{actual}")]
+    SubnetPrefixLength { min: u8, max: u8, actual: u8 },
+
     #[error("store error: {0}")]
     StoreError(String),
 }

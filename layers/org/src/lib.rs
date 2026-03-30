@@ -17,7 +17,7 @@ pub use types::{
     SubnetId, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
-pub use vpc::{cidrs_overlap, parse_and_validate_cidr, VpcStore};
+pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};
 
 #[cfg(test)]
 mod tests;

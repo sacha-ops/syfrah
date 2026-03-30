@@ -28,6 +28,12 @@ const MIN_PREFIX_LEN: u8 = 8;
 /// Maximum allowed prefix length for a VPC CIDR.
 const MAX_PREFIX_LEN: u8 = 28;
 
+/// Minimum allowed prefix length for a subnet CIDR.
+const SUBNET_MIN_PREFIX: u8 = 24;
+
+/// Maximum allowed prefix length for a subnet CIDR.
+const SUBNET_MAX_PREFIX: u8 = 28;
+
 /// Starting VNI for auto-allocation.
 const VNI_START: u32 = 100;
 
@@ -109,6 +115,51 @@ fn auto_allocate_cidr(existing: &[Ipv4Net]) -> Result<Ipv4Net> {
     }
 
     Err(OrgError::CidrExhausted)
+}
+
+/// Validate a subnet CIDR string against its parent VPC CIDR and existing siblings.
+///
+/// Checks:
+/// 1. Valid CIDR format and within a private range (delegates to `parse_and_validate_cidr`)
+/// 2. Prefix length is between `/24` and `/28`
+/// 3. Subnet CIDR is entirely contained within the VPC's CIDR
+/// 4. Subnet CIDR does not overlap with any existing sibling subnets
+pub fn validate_subnet_cidr(
+    subnet_cidr_str: &str,
+    vpc_cidr: &Ipv4Net,
+    existing_subnets: &[Ipv4Net],
+) -> Result<Ipv4Net> {
+    let net = parse_and_validate_cidr(subnet_cidr_str)?;
+
+    // Check subnet-specific prefix length bounds (/24 to /28)
+    let prefix = net.prefix_len();
+    if !(SUBNET_MIN_PREFIX..=SUBNET_MAX_PREFIX).contains(&prefix) {
+        return Err(OrgError::SubnetPrefixLength {
+            min: SUBNET_MIN_PREFIX,
+            max: SUBNET_MAX_PREFIX,
+            actual: prefix,
+        });
+    }
+
+    // Check that the subnet is entirely within the VPC's CIDR
+    if !vpc_cidr.contains(&net.network()) || !vpc_cidr.contains(&net.broadcast()) {
+        return Err(OrgError::SubnetOutsideVpc {
+            subnet_cidr: net.to_string(),
+            vpc_cidr: vpc_cidr.to_string(),
+        });
+    }
+
+    // Check for overlap with existing subnets in the same VPC
+    for existing in existing_subnets {
+        if cidrs_overlap(&net, existing) {
+            return Err(OrgError::SubnetOverlap {
+                new_cidr: net.to_string(),
+                existing_cidr: existing.to_string(),
+            });
+        }
+    }
+
+    Ok(net)
 }
 
 /// Persistent store for VPCs.
@@ -312,7 +363,47 @@ impl VpcStore {
     // ── Subnet operations ───────────────────────────────────────────
 
     /// Create a subnet within a VPC.
+    ///
+    /// Validates:
+    /// - Subnet CIDR prefix length is between /24 and /28
+    /// - Subnet CIDR is contained within the VPC's CIDR
+    /// - Subnet CIDR does not overlap with existing subnets in the same VPC
     pub fn create_subnet(&self, subnet: &Subnet) -> Result<()> {
+        // Look up the parent VPC to get its CIDR
+        let vpc = self
+            .db
+            .get::<Vpc>(
+                VPCS_TABLE,
+                subnet
+                    .vpc_id
+                    .0
+                    .strip_prefix("vpc-")
+                    .unwrap_or(&subnet.vpc_id.0),
+            )?
+            .or_else(|| {
+                // Try by VPC ID directly (iterate all VPCs)
+                let all: Vec<(String, Vpc)> = self.db.list(VPCS_TABLE).unwrap_or_default();
+                all.into_iter()
+                    .find(|(_, v)| v.id == subnet.vpc_id)
+                    .map(|(_, v)| v)
+            })
+            .ok_or_else(|| OrgError::VpcNotFound(subnet.vpc_id.0.clone()))?;
+
+        let vpc_cidr: Ipv4Net = vpc
+            .cidr
+            .parse()
+            .map_err(|_| OrgError::InvalidCidr(format!("VPC has invalid CIDR: {}", vpc.cidr)))?;
+
+        // Collect existing subnet CIDRs in this VPC
+        let siblings = self.list_subnets_for_vpc(&subnet.vpc_id)?;
+        let existing_cidrs: Vec<Ipv4Net> = siblings
+            .iter()
+            .filter_map(|s| s.cidr.parse::<Ipv4Net>().ok())
+            .collect();
+
+        // Validate the subnet CIDR
+        validate_subnet_cidr(&subnet.cidr, &vpc_cidr, &existing_cidrs)?;
+
         let key = subnet.id.0.clone();
         self.db.set(SUBNETS_TABLE, &key, subnet)?;
         Ok(())
@@ -728,14 +819,14 @@ mod tests {
 
     // ── Deletion guard tests ────────────────────────────────────────
 
-    fn make_subnet(vpc_id: &VpcId, name: &str) -> Subnet {
+    fn make_subnet(vpc_id: &VpcId, name: &str, cidr: &str, gateway: &str) -> Subnet {
         Subnet {
             id: SubnetId(format!("subnet-{name}")),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             env_id: crate::types::EnvironmentId("acme/backend/production".to_string()),
-            cidr: "10.1.1.0/24".to_string(),
-            gateway: "10.1.1.1".to_string(),
+            cidr: cidr.to_string(),
+            gateway: gateway.to_string(),
             created_at: 1000,
         }
     }
@@ -777,8 +868,15 @@ mod tests {
             )
             .unwrap();
 
-        for name in &["frontend", "backend", "database"] {
-            store.create_subnet(&make_subnet(&vpc.id, name)).unwrap();
+        let cidrs = [
+            ("frontend", "10.1.1.0/24", "10.1.1.1"),
+            ("backend", "10.1.2.0/24", "10.1.2.1"),
+            ("database", "10.1.3.0/24", "10.1.3.1"),
+        ];
+        for (name, cidr, gw) in &cidrs {
+            store
+                .create_subnet(&make_subnet(&vpc.id, name, cidr, gw))
+                .unwrap();
         }
 
         let err = store.delete("default").unwrap_err();
@@ -837,7 +935,7 @@ mod tests {
             )
             .unwrap();
 
-        let subnet = make_subnet(&vpc.id, "frontend");
+        let subnet = make_subnet(&vpc.id, "frontend", "10.1.1.0/24", "10.1.1.1");
         store.create_subnet(&subnet).unwrap();
         assert!(store.delete("default").is_err());
 
@@ -941,5 +1039,161 @@ mod tests {
 
         store.delete_peering(&peering.id).unwrap();
         store.delete("vpc-hub").unwrap();
+    }
+
+    // ── Subnet CIDR validation tests ───────────────────────────────
+
+    #[test]
+    fn cidr_outside_vpc_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let subnet = make_subnet(&vpc.id, "outside", "10.2.0.0/24", "10.2.0.1");
+        let err = store.create_subnet(&subnet).unwrap_err();
+        assert!(
+            matches!(err, OrgError::SubnetOutsideVpc { .. }),
+            "expected SubnetOutsideVpc, got: {err}"
+        );
+    }
+
+    #[test]
+    fn overlapping_subnets_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // Create first subnet
+        let s1 = make_subnet(&vpc.id, "first", "10.1.1.0/24", "10.1.1.1");
+        store.create_subnet(&s1).unwrap();
+
+        // Second subnet overlaps the first (same /24)
+        let s2 = make_subnet(&vpc.id, "second", "10.1.1.0/24", "10.1.1.1");
+        let err = store.create_subnet(&s2).unwrap_err();
+        assert!(
+            matches!(err, OrgError::SubnetOverlap { .. }),
+            "expected SubnetOverlap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn valid_within_vpc() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let subnet = make_subnet(&vpc.id, "web", "10.1.1.0/24", "10.1.1.1");
+        store.create_subnet(&subnet).unwrap();
+
+        // Verify it was stored
+        let subnets = store.list_subnets_for_vpc(&vpc.id).unwrap();
+        assert_eq!(subnets.len(), 1);
+        assert_eq!(subnets[0].cidr, "10.1.1.0/24");
+    }
+
+    #[test]
+    fn subnet_prefix_too_small_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // /16 is too large for a subnet (minimum is /24)
+        let subnet = make_subnet(&vpc.id, "huge", "10.1.0.0/16", "10.1.0.1");
+        let err = store.create_subnet(&subnet).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrgError::SubnetPrefixLength {
+                    min: 24,
+                    max: 28,
+                    actual: 16
+                }
+            ),
+            "expected SubnetPrefixLength, got: {err}"
+        );
+    }
+
+    #[test]
+    fn subnet_prefix_too_large_rejected() {
+        let vpc_cidr: Ipv4Net = "10.1.0.0/16".parse().unwrap();
+        // /29 exceeds the max subnet prefix of /28
+        let err = validate_subnet_cidr("10.1.1.0/29", &vpc_cidr, &[]).unwrap_err();
+        assert!(
+            matches!(err, OrgError::InvalidCidr(_)),
+            "expected InvalidCidr (from parse_and_validate_cidr /29 > /28 global max), got: {err}"
+        );
+    }
+
+    #[test]
+    fn multiple_non_overlapping_subnets_ok() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let s1 = make_subnet(&vpc.id, "web", "10.1.1.0/24", "10.1.1.1");
+        let s2 = make_subnet(&vpc.id, "db", "10.1.2.0/24", "10.1.2.1");
+        let s3 = make_subnet(&vpc.id, "cache", "10.1.3.0/28", "10.1.3.1");
+
+        store.create_subnet(&s1).unwrap();
+        store.create_subnet(&s2).unwrap();
+        store.create_subnet(&s3).unwrap();
+
+        let subnets = store.list_subnets_for_vpc(&vpc.id).unwrap();
+        assert_eq!(subnets.len(), 3);
+    }
+
+    #[test]
+    fn partial_overlap_subnets_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // Create a /24 first
+        let s1 = make_subnet(&vpc.id, "big", "10.1.1.0/24", "10.1.1.1");
+        store.create_subnet(&s1).unwrap();
+
+        // Try a /28 that falls inside the /24
+        let s2 = make_subnet(&vpc.id, "small", "10.1.1.0/28", "10.1.1.1");
+        let err = store.create_subnet(&s2).unwrap_err();
+        assert!(
+            matches!(err, OrgError::SubnetOverlap { .. }),
+            "expected SubnetOverlap, got: {err}"
+        );
     }
 }
