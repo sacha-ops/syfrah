@@ -232,13 +232,10 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 Err(e) => ComputeResponse::Error(e.to_string()),
             }
         }
-        ComputeRequest::ResizeVm { id, .. } => {
-            // Resize not yet implemented; return current info
-            match mgr.info(&id).await {
-                Ok(status) => ComputeResponse::Vm(vm_status_to_json(&status)),
-                Err(e) => ComputeResponse::Error(e.to_string()),
-            }
-        }
+        ComputeRequest::ResizeVm { .. } => ComputeResponse::Error(
+            "resize is not yet implemented — stop the VM and re-create it with the new specs"
+                .to_string(),
+        ),
         ComputeRequest::Status => {
             let vms = mgr.list().await;
             let total = vms.len() as u32;
