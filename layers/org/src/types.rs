@@ -130,8 +130,8 @@ pub enum PeeringStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpcPeering {
     pub id: PeeringId,
-    pub vpc_a: VpcId,
-    pub vpc_b: VpcId,
+    pub vpc_a: String,
+    pub vpc_b: String,
     pub status: PeeringStatus,
     pub created_at: u64,
 }

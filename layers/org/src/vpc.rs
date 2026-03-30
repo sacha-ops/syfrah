@@ -597,10 +597,11 @@ impl VpcStore {
     /// List all active peerings that reference a given VPC.
     pub fn list_active_peerings_for_vpc(&self, vpc_id: &VpcId) -> Result<Vec<VpcPeering>> {
         let all: Vec<(String, VpcPeering)> = self.db.list(PEERINGS_TABLE)?;
+        let id_str = &vpc_id.0;
         Ok(all
             .into_iter()
             .filter(|(_, p)| {
-                (p.vpc_a == *vpc_id || p.vpc_b == *vpc_id) && p.status == PeeringStatus::Active
+                (p.vpc_a == *id_str || p.vpc_b == *id_str) && p.status == PeeringStatus::Active
             })
             .map(|(_, p)| p)
             .collect())
@@ -968,8 +969,8 @@ mod tests {
     fn make_peering(vpc_a: &VpcId, vpc_b: &VpcId) -> VpcPeering {
         VpcPeering {
             id: PeeringId(format!("peer-{}-{}", vpc_a, vpc_b)),
-            vpc_a: vpc_a.clone(),
-            vpc_b: vpc_b.clone(),
+            vpc_a: vpc_a.0.clone(),
+            vpc_b: vpc_b.0.clone(),
             status: PeeringStatus::Active,
             created_at: 1000,
         }
