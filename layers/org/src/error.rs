@@ -49,6 +49,15 @@ pub enum OrgError {
     #[error("no available CIDR block in the auto-allocation range")]
     CidrExhausted,
 
+    #[error("vpc is not shared: {0}")]
+    VpcNotShared(String),
+
+    #[error("project '{project}' is already attached to vpc '{vpc}'")]
+    VpcAlreadyAttached { vpc: String, project: String },
+
+    #[error("project '{project}' is not attached to vpc '{vpc}'")]
+    VpcNotAttached { vpc: String, project: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }

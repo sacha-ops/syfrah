@@ -12,7 +12,9 @@ pub use api::OrgHandler;
 pub use cli::{EnvCommand, OrgCommand, ProjectCommand, VpcCommand};
 pub use error::OrgError;
 pub use store::OrgStore;
-pub use types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Vpc, VpcId, VpcOwner};
+pub use types::{
+    Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Vpc, VpcAttachment, VpcId, VpcOwner,
+};
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, VpcStore};
 

@@ -78,6 +78,14 @@ pub struct Project {
     pub created_at: u64,
 }
 
+/// A record of a shared VPC being attached to a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpcAttachment {
+    pub vpc_name: String,
+    pub project_id: ProjectId,
+    pub attached_at: u64,
+}
+
 /// An environment — a runtime context within a project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {

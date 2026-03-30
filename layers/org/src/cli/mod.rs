@@ -205,6 +205,22 @@ pub enum VpcCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Attach a project to a shared VPC
+    Attach {
+        /// VPC name
+        vpc: String,
+        /// Project to attach (format: org/project)
+        #[arg(long)]
+        project: String,
+    },
+    /// Detach a project from a shared VPC
+    Detach {
+        /// VPC name
+        vpc: String,
+        /// Project to detach (format: org/project)
+        #[arg(long)]
+        project: String,
+    },
 }
 
 /// Execute an org CLI command.
@@ -288,5 +304,7 @@ pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
             vpc::run_list(org.as_deref(), project.as_deref(), json)
         }
         VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes),
+        VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
+        VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
     }
 }

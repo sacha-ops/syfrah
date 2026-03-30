@@ -153,6 +153,24 @@ pub fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn run_attach(vpc_name: &str, project: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .attach_vpc(vpc_name, project)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Project '{project}' attached to VPC '{vpc_name}'.");
+    Ok(())
+}
+
+pub fn run_detach(vpc_name: &str, project: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .detach_vpc(vpc_name, project)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Project '{project}' detached from VPC '{vpc_name}'.");
+    Ok(())
+}
+
 fn format_timestamp(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
