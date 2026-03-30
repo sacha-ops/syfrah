@@ -1,8 +1,9 @@
-//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, and `syfrah vpc ...`.
+//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, and `syfrah subnet ...`.
 
 pub mod env;
 pub mod org;
 pub mod project;
+pub mod subnet;
 pub mod vpc;
 
 use clap::Subcommand;
@@ -223,6 +224,70 @@ pub enum VpcCommand {
     },
 }
 
+/// Top-level subnet CLI command.
+#[derive(Debug, Subcommand)]
+pub enum SubnetCommand {
+    /// Create a new subnet
+    #[command(
+        after_help = "Examples:\n  syfrah subnet create frontend --env production --project backend --org acme\n  syfrah subnet create database --env production --project backend --org acme --vpc my-vpc --cidr 10.1.2.0/24"
+    )]
+    Create {
+        /// Subnet name (lowercase alphanumeric and hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Environment the subnet belongs to
+        #[arg(long)]
+        env: String,
+        /// Project the subnet belongs to
+        #[arg(long)]
+        project: String,
+        /// Organization the subnet belongs to
+        #[arg(long)]
+        org: String,
+        /// VPC to create the subnet in (default: project's default VPC, auto-created if needed)
+        #[arg(long)]
+        vpc: Option<String>,
+        /// CIDR block for the subnet (default: auto-allocate next /24 within VPC)
+        #[arg(long)]
+        cidr: Option<String>,
+    },
+    /// List subnets
+    #[command(
+        after_help = "Examples:\n  syfrah subnet list --env production --project backend --org acme\n  syfrah subnet list --vpc my-vpc --json"
+    )]
+    List {
+        /// Filter by environment name
+        #[arg(long)]
+        env: Option<String>,
+        /// Filter by VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by organization name
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a subnet
+    #[command(
+        after_help = "Examples:\n  syfrah subnet delete frontend --vpc my-vpc\n  syfrah subnet delete frontend --vpc my-vpc --yes"
+    )]
+    Delete {
+        /// Subnet name
+        name: String,
+        /// VPC the subnet belongs to
+        #[arg(long)]
+        vpc: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
 /// Execute an org CLI command.
 pub fn run(cmd: OrgCommand) -> anyhow::Result<()> {
     match cmd {
@@ -306,5 +371,33 @@ pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
         VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes),
         VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
         VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
+    }
+}
+
+/// Execute a subnet CLI command.
+pub fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
+    match cmd {
+        SubnetCommand::Create {
+            name,
+            env,
+            project,
+            org,
+            vpc,
+            cidr,
+        } => subnet::run_create(&name, &env, &project, &org, vpc.as_deref(), cidr.as_deref()),
+        SubnetCommand::List {
+            env,
+            vpc,
+            project,
+            org,
+            json,
+        } => subnet::run_list(
+            env.as_deref(),
+            vpc.as_deref(),
+            project.as_deref(),
+            org.as_deref(),
+            json,
+        ),
+        SubnetCommand::Delete { name, vpc, yes } => subnet::run_delete(&name, &vpc, yes),
     }
 }

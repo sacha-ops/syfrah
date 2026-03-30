@@ -62,6 +62,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::VpcCommand,
     },
+    /// Manage subnets within VPCs
+    Subnet {
+        #[command(subcommand)]
+        command: syfrah_org::SubnetCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -938,6 +943,7 @@ async fn run() -> Result<()> {
         Commands::Project { command } => syfrah_org::cli::run_project(command),
         Commands::Env { command } => syfrah_org::cli::run_env(command),
         Commands::Vpc { command } => syfrah_org::cli::run_vpc(command),
+        Commands::Subnet { command } => syfrah_org::cli::run_subnet(command),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();

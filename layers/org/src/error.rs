@@ -61,6 +61,18 @@ pub enum OrgError {
     #[error("cannot delete vpc '{name}': has {count} vm(s) in its subnets")]
     VpcHasVms { name: String, count: usize },
 
+    #[error("subnet already exists: '{name}' in vpc '{vpc}'")]
+    SubnetAlreadyExists { name: String, vpc: String },
+
+    #[error("subnet not found: '{name}' in vpc '{vpc}'")]
+    SubnetNotFound { name: String, vpc: String },
+
+    #[error("subnet CIDR {subnet_cidr} is outside VPC CIDR {vpc_cidr}")]
+    SubnetOutsideVpc {
+        subnet_cidr: String,
+        vpc_cidr: String,
+    },
+
     #[error("vpc is not shared: {0}")]
     VpcNotShared(String),
 
