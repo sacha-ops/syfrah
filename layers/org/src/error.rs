@@ -127,6 +127,21 @@ pub enum OrgError {
     #[error("already peered")]
     DuplicatePeering,
 
+    #[error("IP address pool exhausted for subnet: {0}")]
+    IpExhausted(String),
+
+    #[error("IP not allocated: {0}")]
+    IpNotAllocated(String),
+
+    #[error("IP already allocated: {0}")]
+    IpAlreadyAllocated(String),
+
+    #[error("IP is reserved and cannot be released: {0}")]
+    IpReserved(String),
+
+    #[error("IP {ip} is not in subnet {subnet}")]
+    IpNotInSubnet { ip: String, subnet: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }
