@@ -474,8 +474,8 @@ impl OrgStore {
     // ── VPC attachment operations ────────────────────────────────────
 
     /// Build a storage key for a VPC attachment.
-    fn attachment_key(vpc_name: &str, project_name: &str) -> String {
-        format!("{vpc_name}/{project_name}")
+    fn attachment_key(vpc_name: &str, project_id: &str) -> String {
+        format!("{vpc_name}/{project_id}")
     }
 
     /// Attach a shared VPC to a project.
@@ -1419,6 +1419,37 @@ mod tests {
 
         let err = store.detach_vpc("shared-vpc", "acme/backend").unwrap_err();
         assert!(matches!(err, OrgError::VpcNotAttached { .. }));
+    }
+
+    #[test]
+    fn attach_then_detach_across_store_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("org-persist.redb");
+
+        // First store instance: create org, VPC and attach
+        {
+            let db = LayerDb::open_at(&path).unwrap();
+            let store = OrgStore::new(db);
+            store.create("acme").unwrap();
+            store
+                .create_vpc(
+                    "shared-vpc",
+                    "10.100.0.0/16",
+                    VpcOwner::Org(OrgId("acme".to_string())),
+                    true,
+                )
+                .unwrap();
+            store.attach_vpc("shared-vpc", "acme/backend").unwrap();
+        }
+
+        // Second store instance: detach should find the attachment
+        {
+            let db = LayerDb::open_at(&path).unwrap();
+            let store = OrgStore::new(db);
+            store.detach_vpc("shared-vpc", "acme/backend").unwrap();
+            let attachments = store.list_attachments("shared-vpc").unwrap();
+            assert!(attachments.is_empty());
+        }
     }
 
     #[test]
