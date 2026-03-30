@@ -2333,6 +2333,7 @@ dependencies = [
  "syfrah-compute",
  "syfrah-core",
  "syfrah-fabric",
+ "syfrah-org",
  "syfrah-state",
  "tar",
  "tokio",
@@ -2451,12 +2452,16 @@ dependencies = [
 name = "syfrah-org"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "clap",
+ "console",
  "serde",
  "serde_json",
  "syfrah-api",
  "syfrah-state",
  "tempfile",
+ "terminal_size",
  "thiserror 2.0.18",
  "tokio",
 ]
