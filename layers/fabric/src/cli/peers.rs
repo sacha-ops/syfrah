@@ -93,14 +93,18 @@ fn print_topology(peers: &[PeerRecord]) -> Result<()> {
 
     for region in &regions {
         let region_peers = view.peers_in_region(region);
-        println!("{} ({} nodes)", region.as_str(), region_peers.len());
+        ui::heading(&format!(
+            "{} ({} nodes)",
+            region.as_str(),
+            region_peers.len()
+        ));
 
         let mut zones: Vec<&Zone> = view.zones_in_region(region);
         zones.sort();
 
         for zone in &zones {
             let zone_peers = view.peers_in_zone(zone);
-            println!("  {} ({})", zone.as_str(), zone_peers.len());
+            ui::info_line(zone.as_str(), &format!("{} nodes", zone_peers.len()));
 
             let mut sorted_peers: Vec<&PeerRecord> = zone_peers.iter().collect();
             sorted_peers.sort_by(|a, b| a.name.cmp(&b.name));
