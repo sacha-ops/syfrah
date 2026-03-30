@@ -167,6 +167,65 @@ pub fn generate_remove_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
 /// No nftables block rule is applied. This is a no-op for documentation symmetry.
 pub fn same_subnet_policy() {}
 
+// ── SNAT masquerade ─────────────────────────────────────────────────
+
+/// NAT table name used for SNAT rules.
+const NAT_TABLE: &str = "syfrah_nat";
+const NAT_CHAIN: &str = "postrouting";
+
+/// Generate nftables rules for SNAT masquerade on a subnet.
+///
+/// This enables outbound internet access for VMs behind a bridge.
+pub fn generate_nat_rules(bridge: &str, subnet_cidr: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "add table ip {NAT_TABLE}").unwrap();
+    writeln!(
+        buf,
+        "add chain ip {NAT_TABLE} {NAT_CHAIN} {{ type nat hook postrouting priority 100; policy accept; }}"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule ip {NAT_TABLE} {NAT_CHAIN} oif != \"{bridge}\" ip saddr {subnet_cidr} masquerade"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rule text for the masquerade expression.
+pub fn masquerade_rule_expr(bridge: &str, subnet_cidr: &str) -> String {
+    format!("oif != \"{bridge}\" ip saddr {subnet_cidr} masquerade")
+}
+
+// ── Peering FORWARD rules ───────────────────────────────────────────
+
+/// Generate nftables rules to allow forwarding between two peered VPC bridges.
+///
+/// Both directions are added:
+/// - `iif {bridge_a} oif {bridge_b} accept`
+/// - `iif {bridge_b} oif {bridge_a} accept`
+pub fn generate_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} accept"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables commands to remove peering rules between two VPC bridges.
+pub fn generate_remove_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove peering rules {bridge_a} <-> {bridge_b}").unwrap();
+    buf
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -261,5 +320,36 @@ mod tests {
     fn subnet_isolation_uses_bridge_name() {
         let rules = generate_subnet_isolation("syfbr-vpc42", "10.0.1.0/24", "10.0.2.0/24");
         assert!(rules.contains("iif syfbr-vpc42 oif syfbr-vpc42"));
+    }
+
+    // ── SNAT tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn snat_rule_generated() {
+        let rules = generate_nat_rules("syfbr-100", "10.1.1.0/24");
+        assert!(rules.contains("masquerade"));
+        assert!(rules.contains("10.1.1.0/24"));
+        assert!(rules.contains("syfbr-100"));
+    }
+
+    #[test]
+    fn masquerade_per_bridge() {
+        let expr = masquerade_rule_expr("syfbr-200", "10.2.0.0/16");
+        assert_eq!(expr, "oif != \"syfbr-200\" ip saddr 10.2.0.0/16 masquerade");
+    }
+
+    // ── Peering tests ───────────────────────────────────────────────
+
+    #[test]
+    fn peering_forward_rules() {
+        let rules = generate_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 accept"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 accept"));
+    }
+
+    #[test]
+    fn peering_rules_removed() {
+        let rules = generate_remove_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("remove peering rules syfbr-100 <-> syfbr-200"));
     }
 }
