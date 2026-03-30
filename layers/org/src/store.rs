@@ -431,6 +431,12 @@ impl OrgStore {
         Ok(self.db.get(VPCS_TABLE, name)?)
     }
 
+    /// Get a VPC by its ID (e.g. "vpc-my-vpc").
+    pub fn get_vpc_by_id(&self, vpc_id: &VpcId) -> Result<Option<Vpc>> {
+        let all = self.list_vpcs()?;
+        Ok(all.into_iter().find(|v| v.id == *vpc_id))
+    }
+
     /// List all VPCs.
     pub fn list_vpcs(&self) -> Result<Vec<Vpc>> {
         let entries: Vec<(String, Vpc)> = self.db.list(VPCS_TABLE)?;
