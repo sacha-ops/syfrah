@@ -12,7 +12,7 @@ pub mod vpc;
 pub use api::OrgHandler;
 pub use cli::{EnvCommand, OrgCommand, ProjectCommand, SubnetCommand, VpcCommand};
 pub use error::OrgError;
-pub use ipam::IpamAllocator;
+pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use store::OrgStore;
 pub use types::{
     Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
