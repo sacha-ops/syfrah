@@ -7,7 +7,9 @@ use ipnet::Ipv4Net;
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::{PeeringId, PeeringStatus, Subnet, SubnetId, Vpc, VpcId, VpcOwner, VpcPeering};
+use crate::types::{
+    EnvironmentId, PeeringId, PeeringStatus, Subnet, SubnetId, Vpc, VpcId, VpcOwner, VpcPeering,
+};
 use crate::validation::validate_name;
 
 const VPCS_TABLE: &str = "vpcs";
@@ -107,6 +109,44 @@ fn auto_allocate_cidr(existing: &[Ipv4Net]) -> Result<Ipv4Net> {
             AUTO_ALLOC_PREFIX,
         )
         .unwrap();
+
+        let overlaps = existing.iter().any(|e| cidrs_overlap(&candidate, e));
+        if !overlaps {
+            return Ok(candidate);
+        }
+    }
+
+    Err(OrgError::CidrExhausted)
+}
+
+/// Find the next available /24 within a VPC's CIDR that doesn't overlap with existing subnets.
+fn auto_allocate_subnet_cidr(vpc_cidr: &Ipv4Net, existing: &[Ipv4Net]) -> Result<Ipv4Net> {
+    let vpc_prefix = vpc_cidr.prefix_len();
+
+    // Calculate how many /24 blocks fit in the VPC CIDR
+    if vpc_prefix > 24 {
+        return Err(OrgError::InvalidCidr(
+            "VPC CIDR is smaller than /24, cannot allocate subnets".to_string(),
+        ));
+    }
+
+    let num_blocks: u32 = 1 << (24 - vpc_prefix);
+
+    for i in 0..num_blocks {
+        // Compute the candidate /24 address
+        let offset = i << 8; // each /24 block is 256 addresses
+        let base_u32 = u32::from(vpc_cidr.network());
+        let candidate_addr = Ipv4Addr::from(base_u32 + offset);
+
+        let candidate = match Ipv4Net::new(candidate_addr, 24) {
+            Ok(net) => net,
+            Err(_) => continue,
+        };
+
+        // Ensure the candidate is within the VPC CIDR
+        if !vpc_cidr.contains(&candidate.network()) {
+            continue;
+        }
 
         let overlaps = existing.iter().any(|e| cidrs_overlap(&candidate, e));
         if !overlaps {
@@ -409,12 +449,103 @@ impl VpcStore {
         Ok(())
     }
 
+    /// Create a subnet with optional auto-CIDR allocation.
+    ///
+    /// If `cidr_str` is `None`, auto-allocates the next available `/24`
+    /// within the VPC's CIDR. The gateway is always `.1` of the subnet.
+    pub fn create_subnet_auto(
+        &self,
+        name: &str,
+        vpc_id: &VpcId,
+        env_id: &EnvironmentId,
+        cidr_str: Option<&str>,
+    ) -> Result<Subnet> {
+        let vpc = self
+            .db
+            .get::<Vpc>(
+                VPCS_TABLE,
+                vpc_id.0.strip_prefix("vpc-").unwrap_or(&vpc_id.0),
+            )?
+            .or_else(|| {
+                // Try looking up by iterating all VPCs and matching id
+                self.list()
+                    .ok()
+                    .and_then(|vpcs| vpcs.into_iter().find(|v| v.id == *vpc_id))
+            })
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_id.0.clone()))?;
+
+        let vpc_cidr: Ipv4Net = vpc
+            .cidr
+            .parse()
+            .map_err(|_| OrgError::InvalidCidr(format!("vpc has invalid cidr: {}", vpc.cidr)))?;
+
+        let existing_subnets = self.list_subnets_for_vpc(vpc_id)?;
+        let existing_cidrs: Vec<Ipv4Net> = existing_subnets
+            .iter()
+            .filter_map(|s| s.cidr.parse::<Ipv4Net>().ok())
+            .collect();
+
+        let subnet_cidr = match cidr_str {
+            Some(s) => {
+                let net = parse_and_validate_cidr(s)?;
+                // Ensure subnet is within VPC CIDR
+                if !vpc_cidr.contains(&net.network()) || !vpc_cidr.contains(&net.broadcast()) {
+                    return Err(OrgError::InvalidCidr(format!(
+                        "subnet CIDR {net} is not within VPC CIDR {vpc_cidr}"
+                    )));
+                }
+                // Check overlap with existing subnets
+                for existing in &existing_cidrs {
+                    if cidrs_overlap(&net, existing) {
+                        return Err(OrgError::CidrOverlap {
+                            new_cidr: net.to_string(),
+                            existing_cidr: existing.to_string(),
+                        });
+                    }
+                }
+                net
+            }
+            None => auto_allocate_subnet_cidr(&vpc_cidr, &existing_cidrs)?,
+        };
+
+        let gateway_octets = subnet_cidr.network().octets();
+        let gateway = Ipv4Addr::new(gateway_octets[0], gateway_octets[1], gateway_octets[2], 1);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let subnet = Subnet {
+            id: SubnetId(format!("subnet-{name}")),
+            name: name.to_string(),
+            vpc_id: vpc_id.clone(),
+            env_id: env_id.clone(),
+            cidr: subnet_cidr.to_string(),
+            gateway: gateway.to_string(),
+            created_at: now,
+        };
+
+        self.create_subnet(&subnet)?;
+        Ok(subnet)
+    }
+
     /// List all subnets belonging to a VPC.
     pub fn list_subnets_for_vpc(&self, vpc_id: &VpcId) -> Result<Vec<Subnet>> {
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         Ok(all
             .into_iter()
             .filter(|(_, s)| s.vpc_id == *vpc_id)
+            .map(|(_, s)| s)
+            .collect())
+    }
+
+    /// List all subnets belonging to an environment.
+    pub fn list_subnets_by_env(&self, env_id: &EnvironmentId) -> Result<Vec<Subnet>> {
+        let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, s)| s.env_id == *env_id)
             .map(|(_, s)| s)
             .collect())
     }
@@ -1198,5 +1329,134 @@ mod tests {
             matches!(err, OrgError::SubnetOverlap { .. }),
             "expected SubnetOverlap, got: {err}"
         );
+    }
+
+    // ── Multi-subnet per environment tests ──────────────────────────
+
+    #[test]
+    fn two_subnets_same_env() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "test-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+
+        let subnet_a = store
+            .create_subnet_auto("frontend", &vpc.id, &env_id, None)
+            .unwrap();
+        let subnet_b = store
+            .create_subnet_auto("database", &vpc.id, &env_id, None)
+            .unwrap();
+
+        // Both should exist in the same env
+        let env_subnets = store.list_subnets_by_env(&env_id).unwrap();
+        assert_eq!(env_subnets.len(), 2);
+
+        // Both should exist in the same VPC
+        let vpc_subnets = store.list_subnets_for_vpc(&vpc.id).unwrap();
+        assert_eq!(vpc_subnets.len(), 2);
+
+        // CIDRs should be different
+        assert_ne!(subnet_a.cidr, subnet_b.cidr);
+
+        // Both gateways should end in .1
+        assert!(subnet_a.gateway.ends_with(".1"), "gateway should be .1");
+        assert!(subnet_b.gateway.ends_with(".1"), "gateway should be .1");
+    }
+
+    #[test]
+    fn three_subnets_different_cidrs() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "multi-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+
+        let s1 = store
+            .create_subnet_auto("web", &vpc.id, &env_id, None)
+            .unwrap();
+        let s2 = store
+            .create_subnet_auto("api", &vpc.id, &env_id, None)
+            .unwrap();
+        let s3 = store
+            .create_subnet_auto("db", &vpc.id, &env_id, None)
+            .unwrap();
+
+        // Parse all CIDRs
+        let c1: Ipv4Net = s1.cidr.parse().unwrap();
+        let c2: Ipv4Net = s2.cidr.parse().unwrap();
+        let c3: Ipv4Net = s3.cidr.parse().unwrap();
+
+        // No overlaps between any pair
+        assert!(!cidrs_overlap(&c1, &c2), "s1 and s2 should not overlap");
+        assert!(!cidrs_overlap(&c1, &c3), "s1 and s3 should not overlap");
+        assert!(!cidrs_overlap(&c2, &c3), "s2 and s3 should not overlap");
+
+        // All should be /24
+        assert_eq!(c1.prefix_len(), 24);
+        assert_eq!(c2.prefix_len(), 24);
+        assert_eq!(c3.prefix_len(), 24);
+
+        // Verify sequential allocation: 10.1.0.0/24, 10.1.1.0/24, 10.1.2.0/24
+        assert_eq!(s1.cidr, "10.1.0.0/24");
+        assert_eq!(s2.cidr, "10.1.1.0/24");
+        assert_eq!(s3.cidr, "10.1.2.0/24");
+    }
+
+    /// Placeholder test documenting expected behavior for compute integration:
+    /// when an environment has multiple subnets, `vm create` must specify `--subnet`.
+    /// When a single subnet exists, it is auto-selected.
+    #[test]
+    fn vm_requires_subnet_flag() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "compute-vpc",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+
+        // With a single subnet, auto-selection should work
+        let _s1 = store
+            .create_subnet_auto("only-subnet", &vpc.id, &env_id, None)
+            .unwrap();
+        let env_subnets = store.list_subnets_by_env(&env_id).unwrap();
+        assert_eq!(
+            env_subnets.len(),
+            1,
+            "single subnet: auto-select should be possible"
+        );
+
+        // With multiple subnets, --subnet flag is required
+        let _s2 = store
+            .create_subnet_auto("second-subnet", &vpc.id, &env_id, None)
+            .unwrap();
+        let env_subnets = store.list_subnets_by_env(&env_id).unwrap();
+        assert!(
+            env_subnets.len() > 1,
+            "multiple subnets: vm create must require --subnet flag"
+        );
+
+        // Compute integration: when env_subnets.len() > 1 and no --subnet
+        // is given, vm create should return an error like:
+        //   "environment has 2 subnets -- specify --subnet <name>"
+        // This is enforced in the compute layer, not here. This test
+        // documents the expected behavior for when compute is wired.
     }
 }
