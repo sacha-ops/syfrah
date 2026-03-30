@@ -88,7 +88,7 @@ pub enum VmCommand {
         #[arg(value_name = "NAME")]
         id: String,
     },
-    /// Hot-resize CPU and memory of a running virtual machine
+    /// Resize CPU and memory (not yet implemented — stop and re-create the VM)
     Resize {
         /// VM name
         #[arg(value_name = "NAME")]
