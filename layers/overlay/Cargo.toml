@@ -9,10 +9,14 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+syfrah-core = { path = "../core" }
 syfrah-api = { path = "../api" }
 async-trait = "0.1"
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
