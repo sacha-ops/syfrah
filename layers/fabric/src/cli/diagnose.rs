@@ -567,4 +567,85 @@ mod tests {
         assert!(causes.is_empty());
         assert!(steps.is_empty());
     }
+
+    #[test]
+    fn diagnose_output_json_serializes_all_fields() {
+        let output = DiagnoseOutput {
+            checks: vec![
+                DiagnoseCheck {
+                    name: "Mesh state exists".to_string(),
+                    passed: true,
+                    detail: None,
+                },
+                DiagnoseCheck {
+                    name: "Daemon process".to_string(),
+                    passed: false,
+                    detail: Some("daemon is not running".to_string()),
+                },
+            ],
+            passed: 1,
+            failed: 1,
+            total: 2,
+            zone_diagnosis: None,
+        };
+
+        let json_str = serde_json::to_string(&output).expect("serialization failed");
+        let val: serde_json::Value = serde_json::from_str(&json_str).expect("invalid JSON");
+
+        assert_eq!(val["passed"], 1);
+        assert_eq!(val["failed"], 1);
+        assert_eq!(val["total"], 2);
+        assert_eq!(val["checks"].as_array().unwrap().len(), 2);
+        assert_eq!(val["checks"][0]["name"], "Mesh state exists");
+        assert_eq!(val["checks"][0]["passed"], true);
+        assert!(val["checks"][0].get("detail").is_none());
+        assert_eq!(val["checks"][1]["passed"], false);
+        assert_eq!(val["checks"][1]["detail"], "daemon is not running");
+        assert!(val.get("zone_diagnosis").is_none());
+    }
+
+    #[test]
+    fn diagnose_output_json_with_zone_diagnosis() {
+        let output = DiagnoseOutput {
+            checks: vec![],
+            passed: 0,
+            failed: 0,
+            total: 0,
+            zone_diagnosis: Some(ZoneDiagnosis {
+                zone: "par-1".to_string(),
+                total_nodes: 3,
+                active_nodes: 2,
+                health: "Degraded".to_string(),
+                nodes: vec![
+                    ZoneNodeStatus {
+                        name: "node-1".to_string(),
+                        status: "ACTIVE".to_string(),
+                        last_handshake_ago: Some("5s ago".to_string()),
+                    },
+                    ZoneNodeStatus {
+                        name: "node-2".to_string(),
+                        status: "UNREACHABLE".to_string(),
+                        last_handshake_ago: None,
+                    },
+                ],
+                possible_causes: vec!["1 of 3 nodes unreachable".to_string()],
+                next_steps: vec!["SSH into unreachable nodes".to_string()],
+            }),
+        };
+
+        let json_str = serde_json::to_string(&output).expect("serialization failed");
+        let val: serde_json::Value = serde_json::from_str(&json_str).expect("invalid JSON");
+
+        let zd = &val["zone_diagnosis"];
+        assert_eq!(zd["zone"], "par-1");
+        assert_eq!(zd["total_nodes"], 3);
+        assert_eq!(zd["active_nodes"], 2);
+        assert_eq!(zd["health"], "Degraded");
+        assert_eq!(zd["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(zd["nodes"][0]["name"], "node-1");
+        assert_eq!(zd["nodes"][1]["status"], "UNREACHABLE");
+        assert!(zd["nodes"][1].get("last_handshake_ago").is_none());
+        assert_eq!(zd["possible_causes"].as_array().unwrap().len(), 1);
+        assert_eq!(zd["next_steps"].as_array().unwrap().len(), 1);
+    }
 }

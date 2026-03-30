@@ -112,18 +112,29 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&images)?);
             } else {
+<<<<<<< HEAD
                 let tw = super::term_width();
+=======
+>>>>>>> origin/main
                 let header = format!(
                     "{:<25} {:<10} {:<10} {:<12} {:<10}",
                     "NAME", "ARCH", "SIZE MB", "CLOUD-INIT", "SOURCE"
                 );
                 if console::Term::stdout().is_term() {
+<<<<<<< HEAD
                     let truncated = &header[..header.len().min(tw)];
                     println!("{}", console::Style::new().bold().apply_to(truncated));
                 } else {
                     println!("{}", &header[..header.len().min(tw)]);
                 }
                 println!("{}", "-".repeat(67.min(tw)));
+=======
+                    println!("{}", console::Style::new().bold().apply_to(&header));
+                } else {
+                    println!("{header}");
+                }
+                println!("{}", "-".repeat(67));
+>>>>>>> origin/main
                 if images.is_empty() {
                     println!("(no images)");
                 } else {
@@ -422,18 +433,29 @@ async fn run_catalog(json: bool) -> anyhow::Result<()> {
             let images = v.get("images").and_then(|i| i.as_array());
             match images {
                 Some(images) => {
+<<<<<<< HEAD
                     let tw = super::term_width();
+=======
+>>>>>>> origin/main
                     let header = format!(
                         "{:<25} {:<10} {:<10} {:<12}",
                         "NAME", "ARCH", "SIZE MB", "CLOUD-INIT"
                     );
                     if console::Term::stdout().is_term() {
+<<<<<<< HEAD
                         let truncated = &header[..header.len().min(tw)];
                         println!("{}", console::Style::new().bold().apply_to(truncated));
                     } else {
                         println!("{}", &header[..header.len().min(tw)]);
                     }
                     println!("{}", "-".repeat(57.min(tw)));
+=======
+                        println!("{}", console::Style::new().bold().apply_to(&header));
+                    } else {
+                        println!("{header}");
+                    }
+                    println!("{}", "-".repeat(57));
+>>>>>>> origin/main
                     if images.is_empty() {
                         println!("(no images in catalog)");
                     } else {
