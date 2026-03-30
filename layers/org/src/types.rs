@@ -86,6 +86,56 @@ pub struct VpcAttachment {
     pub attached_at: u64,
 }
 
+/// Unique identifier for a subnet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SubnetId(pub String);
+
+impl fmt::Display for SubnetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A subnet within a VPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subnet {
+    pub id: SubnetId,
+    pub name: String,
+    pub vpc_id: VpcId,
+    pub env_id: EnvironmentId,
+    pub cidr: String,
+    pub gateway: String,
+    pub created_at: u64,
+}
+
+/// Unique identifier for a VPC peering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PeeringId(pub String);
+
+impl fmt::Display for PeeringId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Status of a VPC peering connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeeringStatus {
+    Active,
+    Pending,
+    Deleted,
+}
+
+/// A VPC peering connection between two VPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpcPeering {
+    pub id: PeeringId,
+    pub vpc_a: VpcId,
+    pub vpc_b: VpcId,
+    pub status: PeeringStatus,
+    pub created_at: u64,
+}
+
 /// An environment — a runtime context within a project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {

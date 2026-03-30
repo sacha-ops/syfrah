@@ -7,10 +7,12 @@ use ipnet::Ipv4Net;
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::{Vpc, VpcId, VpcOwner};
+use crate::types::{PeeringId, PeeringStatus, Subnet, SubnetId, Vpc, VpcId, VpcOwner, VpcPeering};
 use crate::validation::validate_name;
 
 const VPCS_TABLE: &str = "vpcs";
+const SUBNETS_TABLE: &str = "subnets";
+const PEERINGS_TABLE: &str = "vpc_peerings";
 const VNI_COUNTER_KEY: &str = "vni_counter";
 
 /// The RFC 1918 private address ranges that are allowed for VPC CIDRs.
@@ -266,13 +268,105 @@ impl VpcStore {
         self.create(&default_name, owner, None, false)
     }
 
-    /// Delete a VPC by name.
+    /// Delete a VPC by name. Enforces deletion guards:
+    /// 1. Cannot delete if subnets reference this VPC.
+    /// 2. Cannot delete if active peerings reference this VPC.
+    /// 3. Cannot delete if VMs exist in subnets of this VPC.
     pub fn delete(&self, name: &str) -> Result<()> {
-        if !self.db.exists(VPCS_TABLE, name)? {
-            return Err(OrgError::VpcNotFound(name.to_string()));
+        let vpc = self
+            .db
+            .get::<Vpc>(VPCS_TABLE, name)?
+            .ok_or_else(|| OrgError::VpcNotFound(name.to_string()))?;
+
+        // Guard 1: check subnets
+        let subnets = self.list_subnets_for_vpc(&vpc.id)?;
+        if !subnets.is_empty() {
+            return Err(OrgError::VpcHasSubnets {
+                name: name.to_string(),
+                count: subnets.len(),
+            });
         }
+
+        // Guard 2: check peerings
+        let peerings = self.list_active_peerings_for_vpc(&vpc.id)?;
+        if !peerings.is_empty() {
+            return Err(OrgError::VpcHasPeerings {
+                name: name.to_string(),
+                count: peerings.len(),
+            });
+        }
+
+        // Guard 3: check VMs (placeholder — always 0 until compute layer is wired)
+        let vm_count = self.count_vms_in_vpc(&vpc.id)?;
+        if vm_count > 0 {
+            return Err(OrgError::VpcHasVms {
+                name: name.to_string(),
+                count: vm_count,
+            });
+        }
+
         self.db.delete(VPCS_TABLE, name)?;
         Ok(())
+    }
+
+    // ── Subnet operations ───────────────────────────────────────────
+
+    /// Create a subnet within a VPC.
+    pub fn create_subnet(&self, subnet: &Subnet) -> Result<()> {
+        let key = subnet.id.0.clone();
+        self.db.set(SUBNETS_TABLE, &key, subnet)?;
+        Ok(())
+    }
+
+    /// List all subnets belonging to a VPC.
+    pub fn list_subnets_for_vpc(&self, vpc_id: &VpcId) -> Result<Vec<Subnet>> {
+        let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, s)| s.vpc_id == *vpc_id)
+            .map(|(_, s)| s)
+            .collect())
+    }
+
+    /// Delete a subnet by ID.
+    pub fn delete_subnet(&self, subnet_id: &SubnetId) -> Result<()> {
+        self.db.delete(SUBNETS_TABLE, &subnet_id.0)?;
+        Ok(())
+    }
+
+    // ── Peering operations ──────────────────────────────────────────
+
+    /// Create a VPC peering.
+    pub fn create_peering(&self, peering: &VpcPeering) -> Result<()> {
+        let key = peering.id.0.clone();
+        self.db.set(PEERINGS_TABLE, &key, peering)?;
+        Ok(())
+    }
+
+    /// List all active peerings that reference a given VPC.
+    pub fn list_active_peerings_for_vpc(&self, vpc_id: &VpcId) -> Result<Vec<VpcPeering>> {
+        let all: Vec<(String, VpcPeering)> = self.db.list(PEERINGS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, p)| {
+                (p.vpc_a == *vpc_id || p.vpc_b == *vpc_id) && p.status == PeeringStatus::Active
+            })
+            .map(|(_, p)| p)
+            .collect())
+    }
+
+    /// Delete a peering by ID.
+    pub fn delete_peering(&self, peering_id: &PeeringId) -> Result<()> {
+        self.db.delete(PEERINGS_TABLE, &peering_id.0)?;
+        Ok(())
+    }
+
+    // ── VM guard (placeholder) ──────────────────────────────────────
+
+    /// Count VMs in all subnets of a VPC.
+    /// Placeholder: always returns 0 until compute layer VM tracking is wired.
+    fn count_vms_in_vpc(&self, _vpc_id: &VpcId) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -604,5 +698,153 @@ mod tests {
         let vpc2 = store.ensure_default_vpc("acme", "bravo").unwrap();
         assert_ne!(vpc1.vni, vpc2.vni);
         assert!(vpc2.vni > vpc1.vni);
+    }
+
+    // ── Deletion guard tests ────────────────────────────────────────
+
+    fn make_subnet(vpc_id: &VpcId, name: &str) -> Subnet {
+        Subnet {
+            id: SubnetId(format!("subnet-{name}")),
+            name: name.to_string(),
+            vpc_id: vpc_id.clone(),
+            env_id: crate::types::EnvironmentId("acme/backend/production".to_string()),
+            cidr: "10.1.1.0/24".to_string(),
+            gateway: "10.1.1.1".to_string(),
+            created_at: 1000,
+        }
+    }
+
+    fn make_peering(vpc_a: &VpcId, vpc_b: &VpcId) -> VpcPeering {
+        VpcPeering {
+            id: PeeringId(format!("peer-{}-{}", vpc_a, vpc_b)),
+            vpc_a: vpc_a.clone(),
+            vpc_b: vpc_b.clone(),
+            status: PeeringStatus::Active,
+            created_at: 1000,
+        }
+    }
+
+    #[test]
+    fn delete_empty_vpc_ok() {
+        let (_dir, store) = temp_store();
+        store
+            .create(
+                "default",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        store.delete("default").unwrap();
+        assert!(store.get("default").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_with_subnets_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "default",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        for name in &["frontend", "backend", "database"] {
+            store.create_subnet(&make_subnet(&vpc.id, name)).unwrap();
+        }
+
+        let err = store.delete("default").unwrap_err();
+        match &err {
+            OrgError::VpcHasSubnets { name, count } => {
+                assert_eq!(name, "default");
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected VpcHasSubnets, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn delete_with_peerings_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc_a = store
+            .create(
+                "vpc-hub",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        let vpc_b = store
+            .create(
+                "vpc-spoke",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.2.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        store
+            .create_peering(&make_peering(&vpc_a.id, &vpc_b.id))
+            .unwrap();
+
+        let err = store.delete("vpc-hub").unwrap_err();
+        match &err {
+            OrgError::VpcHasPeerings { name, count } => {
+                assert_eq!(name, "vpc-hub");
+                assert_eq!(*count, 1);
+            }
+            other => panic!("expected VpcHasPeerings, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn delete_after_removing_subnets_ok() {
+        let (_dir, store) = temp_store();
+        let vpc = store
+            .create(
+                "default",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let subnet = make_subnet(&vpc.id, "frontend");
+        store.create_subnet(&subnet).unwrap();
+        assert!(store.delete("default").is_err());
+
+        store.delete_subnet(&subnet.id).unwrap();
+        store.delete("default").unwrap();
+        assert!(store.get("default").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_after_removing_peerings_ok() {
+        let (_dir, store) = temp_store();
+        let vpc_a = store
+            .create(
+                "vpc-hub",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        let vpc_b = store
+            .create(
+                "vpc-spoke",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.2.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let peering = make_peering(&vpc_a.id, &vpc_b.id);
+        store.create_peering(&peering).unwrap();
+        assert!(store.delete("vpc-hub").is_err());
+
+        store.delete_peering(&peering.id).unwrap();
+        store.delete("vpc-hub").unwrap();
     }
 }

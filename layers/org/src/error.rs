@@ -49,6 +49,15 @@ pub enum OrgError {
     #[error("no available CIDR block in the auto-allocation range")]
     CidrExhausted,
 
+    #[error("cannot delete vpc '{name}': has {count} active subnet(s)")]
+    VpcHasSubnets { name: String, count: usize },
+
+    #[error("cannot delete vpc '{name}': has {count} active peering(s)")]
+    VpcHasPeerings { name: String, count: usize },
+
+    #[error("cannot delete vpc '{name}': has {count} vm(s) in its subnets")]
+    VpcHasVms { name: String, count: usize },
+
     #[error("vpc is not shared: {0}")]
     VpcNotShared(String),
 
