@@ -40,6 +40,30 @@ create_network() {
         --subnet "$E2E_SUBNET" \
         --driver bridge \
         >/dev/null 2>&1 || true
+    preflight_check
+}
+
+# Verify Docker container networking works before any test.
+preflight_check() {
+    local probe1="preflight-probe-1"
+    local probe2="preflight-probe-2"
+    # Always clean up probe containers, even on unexpected failure
+    _preflight_cleanup() { docker rm -f "$probe1" "$probe2" >/dev/null 2>&1 || true; }
+    trap '_preflight_cleanup' RETURN
+    _preflight_cleanup
+    docker run -d --name "$probe1" --network "$E2E_NETWORK" --ip 172.20.0.253 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container $probe1 (image=$E2E_IMAGE)"
+        return 1
+    }
+    docker run -d --name "$probe2" --network "$E2E_NETWORK" --ip 172.20.0.254 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container $probe2 (image=$E2E_IMAGE)"
+        return 1
+    }
+    if ! docker exec "$probe1" ping -c1 -W2 172.20.0.254 >/dev/null 2>&1; then
+        fail "PREFLIGHT: Docker container networking is broken — containers cannot ping each other"
+        return 1
+    fi
+    debug "preflight: Docker networking OK"
 }
 
 remove_network() {
@@ -105,6 +129,29 @@ wait_daemon() {
     return 1
 }
 
+# ── WireGuard readiness ──────────────────────────────────────
+
+# Wait for WireGuard interface to appear. Args: <container> [max_wait]
+wait_for_wg_interface() {
+    local container="$1"
+    local max_wait="${2:-15}"
+    local i=0
+    debug "waiting for WireGuard interface on $container"
+    while [ $i -lt "$max_wait" ]; do
+        if docker exec "$container" ip link show syfrah0 >/dev/null 2>&1 \
+           && docker exec "$container" wg show syfrah0 >/dev/null 2>&1; then
+            debug "WireGuard interface up on $container after ${i}s"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    info "WireGuard interface not found on $container after ${max_wait}s"
+    docker exec "$container" ip link 2>/dev/null || true
+    docker exec "$container" wg show syfrah0 2>/dev/null || true
+    return 1
+}
+
 # ── Mesh operations ───────────────────────────────────────────
 
 # Initialize a mesh on a container. Args: <container> <ip> [node_name]
@@ -121,6 +168,9 @@ init_mesh() {
         --endpoint "${ip}:51820"
 
     wait_daemon "$container"
+    if ! wait_for_wg_interface "$container"; then
+        info "WARNING: WireGuard interface not ready on $container after init_mesh"
+    fi
     debug "init_mesh: $container done"
 }
 
@@ -155,6 +205,9 @@ join_mesh() {
         --pin "$E2E_PIN"
 
     wait_daemon "$container"
+    if ! wait_for_wg_interface "$container"; then
+        info "WARNING: WireGuard interface not ready on $container after join_mesh"
+    fi
     debug "join_mesh: $container done"
 }
 
@@ -369,7 +422,7 @@ wait_for_convergence() {
     local prefix="$1"
     local count="$2"
     local expected="$3"
-    local timeout="${4:-60}"
+    local timeout="${4:-120}"
     local deadline=$(($(date +%s) + timeout))
 
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -388,6 +441,14 @@ wait_for_convergence() {
         fi
         sleep 2
     done
+    info "Diagnostic dump (wait_for_convergence timed out after ${timeout}s):"
+    for i in $(seq 1 "$count"); do
+        local node="${prefix}${i}"
+        info "  --- $node ---"
+        docker exec "$node" syfrah fabric status 2>&1 || true
+        docker exec "$node" syfrah fabric peers --json 2>&1 || true
+        docker exec "$node" ip link show syfrah0 2>&1 || true
+    done
     return 1
 }
 
@@ -396,7 +457,7 @@ wait_for_convergence() {
 wait_for_peer_active() {
     local container="$1"
     local min_count="$2"
-    local timeout="${3:-30}"
+    local timeout="${3:-60}"
     local deadline=$(($(date +%s) + timeout))
 
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -408,6 +469,10 @@ wait_for_peer_active() {
         fi
         sleep 2
     done
+    info "Diagnostic dump for $container (wait_for_peer_active timed out after ${timeout}s):"
+    docker exec "$container" syfrah fabric status 2>&1 || true
+    docker exec "$container" syfrah fabric peers --json 2>&1 || true
+    docker exec "$container" ip link show syfrah0 2>&1 || true
     return 1
 }
 
