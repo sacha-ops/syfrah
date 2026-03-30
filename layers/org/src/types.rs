@@ -1,7 +1,35 @@
-use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+
+/// Unique identifier for a VPC.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VpcId(pub String);
+
+impl fmt::Display for VpcId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The owner of a VPC — either a project or an org (for shared VPCs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VpcOwner {
+    Project(ProjectId),
+    Org(OrgId),
+}
+
+/// A Virtual Private Cloud — one VPC = one VXLAN VNI = one isolated L2 domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vpc {
+    pub id: VpcId,
+    pub name: String,
+    pub cidr: String,
+    pub vni: u32,
+    pub owner: VpcOwner,
+    pub shared: bool,
+    pub created_at: u64,
+}
 
 /// Unique identifier for an organization.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,35 +75,6 @@ pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub org_id: OrgId,
-    pub created_at: u64,
-}
-
-/// Unique identifier for a VPC.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VpcId(pub String);
-
-impl fmt::Display for VpcId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Who owns a VPC — either a project or an org (for shared VPCs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VpcOwner {
-    Project(ProjectId),
-    Org(OrgId),
-}
-
-/// A Virtual Private Cloud — one VPC = one VXLAN VNI = one isolated L2 domain.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Vpc {
-    pub id: VpcId,
-    pub name: String,
-    pub cidr: Ipv4Net,
-    pub vni: u32,
-    pub owner: VpcOwner,
-    pub shared: bool,
     pub created_at: u64,
 }
 

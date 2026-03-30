@@ -37,8 +37,8 @@ pub enum OrgError {
     #[error("vpc not found: {0}")]
     VpcNotFound(String),
 
-    #[error("invalid CIDR '{cidr}': {reason}")]
-    InvalidCidr { cidr: String, reason: String },
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
 
     #[error("CIDR overlap: {new_cidr} overlaps with existing {existing_cidr}")]
     CidrOverlap {

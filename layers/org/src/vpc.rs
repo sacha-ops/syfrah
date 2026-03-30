@@ -43,42 +43,32 @@ const AUTO_ALLOC_PREFIX: u8 = 16;
 /// - Prefix length is between 8 and 28
 /// - The address is the network address (no host bits set)
 pub fn parse_and_validate_cidr(cidr_str: &str) -> Result<Ipv4Net> {
-    let net: Ipv4Net = cidr_str.parse().map_err(|_| OrgError::InvalidCidr {
-        cidr: cidr_str.to_string(),
-        reason: "invalid CIDR format".to_string(),
-    })?;
+    let net: Ipv4Net = cidr_str
+        .parse()
+        .map_err(|_| OrgError::InvalidCidr(format!("'{cidr_str}': invalid CIDR format")))?;
 
     let prefix_len = net.prefix_len();
 
     // Check prefix length bounds
     if !(MIN_PREFIX_LEN..=MAX_PREFIX_LEN).contains(&prefix_len) {
-        return Err(OrgError::InvalidCidr {
-            cidr: cidr_str.to_string(),
-            reason: format!(
-                "prefix length must be between {MIN_PREFIX_LEN} and {MAX_PREFIX_LEN}, got {prefix_len}"
-            ),
-        });
+        return Err(OrgError::InvalidCidr(format!(
+            "'{cidr_str}': prefix length must be between {MIN_PREFIX_LEN} and {MAX_PREFIX_LEN}, got {prefix_len}"
+        )));
     }
 
     // Ensure the address is the network address (no host bits set)
     if net.addr() != net.network() {
-        return Err(OrgError::InvalidCidr {
-            cidr: cidr_str.to_string(),
-            reason: format!(
-                "address has host bits set; did you mean {}?",
-                Ipv4Net::new(net.network(), prefix_len).unwrap()
-            ),
-        });
+        return Err(OrgError::InvalidCidr(format!(
+            "'{cidr_str}': address has host bits set; did you mean {}?",
+            Ipv4Net::new(net.network(), prefix_len).unwrap()
+        )));
     }
 
     // Check that the CIDR falls within a private range
     if !is_private_range(&net) {
-        return Err(OrgError::InvalidCidr {
-            cidr: cidr_str.to_string(),
-            reason:
-                "CIDR must be within a private range (10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16)"
-                    .to_string(),
-        });
+        return Err(OrgError::InvalidCidr(format!(
+            "'{cidr_str}': CIDR must be within a private range (10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16)"
+        )));
     }
 
     Ok(net)
@@ -203,7 +193,10 @@ impl VpcStore {
 
         // Get existing VPCs in the same org for overlap checking
         let org_vpcs = self.list_by_org(&org_name)?;
-        let existing_cidrs: Vec<Ipv4Net> = org_vpcs.iter().map(|v| v.cidr).collect();
+        let existing_cidrs: Vec<Ipv4Net> = org_vpcs
+            .iter()
+            .filter_map(|v| v.cidr.parse::<Ipv4Net>().ok())
+            .collect();
 
         // Parse/validate or auto-allocate CIDR
         let cidr = match cidr_str {
@@ -233,7 +226,7 @@ impl VpcStore {
         let vpc = Vpc {
             id: VpcId(format!("vpc-{name}")),
             name: name.to_string(),
-            cidr,
+            cidr: cidr.to_string(),
             vni,
             owner,
             shared,
@@ -367,7 +360,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vpc.name, "test-vpc");
-        assert_eq!(vpc.cidr, "10.1.0.0/16".parse::<Ipv4Net>().unwrap());
+        assert_eq!(vpc.cidr, "10.1.0.0/16");
         assert_eq!(vpc.vni, VNI_START);
     }
 
@@ -382,7 +375,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(vpc.cidr, "10.0.0.0/16".parse::<Ipv4Net>().unwrap());
+        assert_eq!(vpc.cidr, "10.0.0.0/16");
     }
 
     #[test]
@@ -407,7 +400,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(vpc2.cidr, "10.1.0.0/16".parse::<Ipv4Net>().unwrap());
+        assert_eq!(vpc2.cidr, "10.1.0.0/16");
     }
 
     #[test]
@@ -477,7 +470,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(vpc2.cidr, "10.1.0.0/16".parse::<Ipv4Net>().unwrap());
+        assert_eq!(vpc2.cidr, "10.1.0.0/16");
     }
 
     #[test]
