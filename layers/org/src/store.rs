@@ -434,11 +434,19 @@ impl OrgStore {
     }
 
     /// List VPCs owned by a specific org.
+    ///
+    /// Returns both org-level (shared) VPCs **and** project-scoped VPCs
+    /// whose project belongs to the given org. Project IDs use the
+    /// `{org_name}/{project_name}` convention.
     pub fn list_vpcs_by_org(&self, org_id: &OrgId) -> Result<Vec<Vpc>> {
+        let prefix = format!("{}/", org_id.0);
         let all = self.list_vpcs()?;
         Ok(all
             .into_iter()
-            .filter(|vpc| matches!(&vpc.owner, VpcOwner::Org(oid) if oid == org_id))
+            .filter(|vpc| match &vpc.owner {
+                VpcOwner::Org(oid) => oid == org_id,
+                VpcOwner::Project(pid) => pid.0.starts_with(&prefix),
+            })
             .collect())
     }
 
@@ -1054,8 +1062,16 @@ mod tests {
             .unwrap();
 
         let by_org = store.list_vpcs_by_org(&oid).unwrap();
-        assert_eq!(by_org.len(), 1);
-        assert_eq!(by_org[0].name, "vpc-shared");
+        assert_eq!(by_org.len(), 2);
+        let names: Vec<&str> = by_org.iter().map(|v| v.name.as_str()).collect();
+        assert!(
+            names.contains(&"vpc-one"),
+            "should include project-scoped VPC"
+        );
+        assert!(
+            names.contains(&"vpc-shared"),
+            "should include org-level VPC"
+        );
     }
 
     #[test]
