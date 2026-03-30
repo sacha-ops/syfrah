@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli;
 pub mod daemon;
 pub mod error;
+pub mod ipam;
 pub mod store;
 pub mod ttl;
 pub mod types;
@@ -11,6 +12,7 @@ pub mod vpc;
 pub use api::OrgHandler;
 pub use cli::{EnvCommand, OrgCommand, ProjectCommand, SubnetCommand, VpcCommand};
 pub use error::OrgError;
+pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use store::OrgStore;
 pub use types::{
     Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
