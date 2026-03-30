@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ipnet::Ipv4Net;
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
@@ -8,6 +9,7 @@ use crate::types::{
     Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Vpc, VpcAttachment, VpcId, VpcOwner,
 };
 use crate::validation::validate_name;
+use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
 
 const TABLE: &str = "orgs";
 const PROJECTS_TABLE: &str = "projects";
@@ -305,40 +307,27 @@ impl OrgStore {
     // ── VPC operations ──────────────────────────────────────────────
 
     /// Validate a CIDR string. Accepts patterns like "10.0.0.0/16", "10.1.0.0/24".
-    fn validate_cidr(cidr: &str) -> Result<()> {
-        let parts: Vec<&str> = cidr.split('/').collect();
-        if parts.len() != 2 {
-            return Err(OrgError::InvalidCidr(format!(
-                "expected format A.B.C.D/N, got: {cidr}"
-            )));
-        }
+    /// Collect parsed CIDRs of all VPCs belonging to the same org as `owner`.
+    fn existing_cidrs_for_org(&self, owner: &VpcOwner) -> Result<Vec<Ipv4Net>> {
+        let org_name = match owner {
+            VpcOwner::Org(org_id) => org_id.0.clone(),
+            VpcOwner::Project(proj_id) => proj_id
+                .0
+                .split('/')
+                .next()
+                .unwrap_or(&proj_id.0)
+                .to_string(),
+        };
 
-        let octets: Vec<&str> = parts[0].split('.').collect();
-        if octets.len() != 4 {
-            return Err(OrgError::InvalidCidr(format!(
-                "expected 4 octets in network address, got: {}",
-                parts[0]
-            )));
-        }
-
-        for octet in &octets {
-            let val: u8 = octet
-                .parse()
-                .map_err(|_| OrgError::InvalidCidr(format!("invalid octet: {octet}")))?;
-            // Allow any valid octet (0-255), parse already checks this
-            let _ = val;
-        }
-
-        let prefix_len: u8 = parts[1]
-            .parse()
-            .map_err(|_| OrgError::InvalidCidr(format!("invalid prefix length: {}", parts[1])))?;
-        if prefix_len > 32 {
-            return Err(OrgError::InvalidCidr(format!(
-                "prefix length must be 0-32, got: {prefix_len}"
-            )));
-        }
-
-        Ok(())
+        let all_vpcs = self.list_vpcs()?;
+        Ok(all_vpcs
+            .into_iter()
+            .filter(|v| match &v.owner {
+                VpcOwner::Org(oid) => oid.0 == org_name,
+                VpcOwner::Project(pid) => pid.0.starts_with(&format!("{org_name}/")),
+            })
+            .filter_map(|v| v.cidr.parse::<Ipv4Net>().ok())
+            .collect())
     }
 
     /// Allocate the next VNI. Starts at 100, monotonically increasing.
@@ -350,13 +339,58 @@ impl OrgStore {
         Ok(vni)
     }
 
-    /// Create a VPC. Validates the name and CIDR, allocates a VNI, persists.
+    /// Create a VPC. Validates the name and CIDR (RFC 1918, prefix 8-28,
+    /// no host bits), checks for overlap with existing VPCs in the same org,
+    /// allocates a VNI, and persists.
+    ///
+    /// Returns `OrgError::NotFound` if the org does not exist, or
+    /// `OrgError::ProjectNotFound` if the project does not exist.
     pub fn create_vpc(&self, name: &str, cidr: &str, owner: VpcOwner, shared: bool) -> Result<Vpc> {
         validate_name(name, "vpc")?;
-        Self::validate_cidr(cidr)?;
+
+        // Full CIDR validation: format, RFC 1918, prefix bounds, host bits
+        let net = parse_and_validate_cidr(cidr)?;
+
+        // Validate that the parent org (and project, if applicable) exist.
+        match &owner {
+            VpcOwner::Org(org_id) => {
+                if !self.db.exists(TABLE, &org_id.0)? {
+                    return Err(OrgError::NotFound(org_id.0.clone()));
+                }
+            }
+            VpcOwner::Project(proj_id) => {
+                // Project IDs are "org/project"
+                let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                let (org_name, project_name) = match parts.as_slice() {
+                    [org, proj] => (*org, *proj),
+                    _ => return Err(OrgError::NotFound(proj_id.0.clone())),
+                };
+                if !self.db.exists(TABLE, org_name)? {
+                    return Err(OrgError::NotFound(org_name.to_string()));
+                }
+                let project_key = Self::project_key(org_name, project_name);
+                if !self.db.exists(PROJECTS_TABLE, &project_key)? {
+                    return Err(OrgError::ProjectNotFound {
+                        org: org_name.to_string(),
+                        project: project_name.to_string(),
+                    });
+                }
+            }
+        }
 
         if self.db.exists(VPCS_TABLE, name)? {
             return Err(OrgError::VpcAlreadyExists(name.to_string()));
+        }
+
+        // Check overlap with existing VPCs in the same org
+        let existing = self.existing_cidrs_for_org(&owner)?;
+        for existing_cidr in &existing {
+            if cidrs_overlap(&net, existing_cidr) {
+                return Err(OrgError::CidrOverlap {
+                    new_cidr: net.to_string(),
+                    existing_cidr: existing_cidr.to_string(),
+                });
+            }
         }
 
         let vni = self.next_vni()?;
@@ -835,6 +869,7 @@ mod tests {
     #[test]
     fn create_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         let vpc = store
             .create_vpc(
                 "default",
@@ -859,6 +894,7 @@ mod tests {
     #[test]
     fn vni_increments() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         let vpc1 = store
             .create_vpc(
                 "vpc-one",
@@ -883,6 +919,7 @@ mod tests {
     #[test]
     fn duplicate_vpc_name_rejected() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "default",
@@ -906,6 +943,7 @@ mod tests {
     #[test]
     fn delete_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "default",
@@ -929,6 +967,9 @@ mod tests {
     #[test]
     fn list_vpcs_returns_all() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store.create_project("acme", "frontend").unwrap();
         store
             .create_vpc(
                 "vpc-one",
@@ -961,6 +1002,9 @@ mod tests {
     #[test]
     fn list_vpcs_by_project_filters() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store.create_project("acme", "frontend").unwrap();
         let pid = ProjectId("acme/backend".to_string());
 
         store
@@ -996,6 +1040,8 @@ mod tests {
     #[test]
     fn list_vpcs_by_org_filters() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
         let oid = OrgId("acme".to_string());
 
         store
@@ -1063,11 +1109,186 @@ mod tests {
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
 
+    #[test]
+    fn non_private_cidr_rejected() {
+        let (_dir, store) = temp_store();
+
+        let err = store
+            .create_vpc(
+                "pub-vpc",
+                "8.8.8.0/24",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+
+        let err = store
+            .create_vpc(
+                "pub-vpc",
+                "1.0.0.0/8",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn extreme_prefix_rejected() {
+        let (_dir, store) = temp_store();
+
+        // Too small (< 8)
+        let err = store
+            .create_vpc(
+                "huge-vpc",
+                "10.0.0.0/7",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+
+        // Too large (> 28)
+        let err = store
+            .create_vpc(
+                "tiny-vpc",
+                "10.0.0.0/29",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn overlapping_cidr_in_same_org_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+
+        store
+            .create_vpc(
+                "vpc-one",
+                "10.1.0.0/16",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let err = store
+            .create_vpc(
+                "vpc-two",
+                "10.1.0.0/24",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::CidrOverlap { .. }));
+    }
+
+    #[test]
+    fn same_cidr_different_orgs_ok() {
+        let (_dir, store) = temp_store();
+        store.create("alpha").unwrap();
+        store.create("beta").unwrap();
+
+        store
+            .create_vpc(
+                "vpc-alpha",
+                "10.1.0.0/16",
+                VpcOwner::Org(OrgId("alpha".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let vpc2 = store
+            .create_vpc(
+                "vpc-beta",
+                "10.1.0.0/16",
+                VpcOwner::Org(OrgId("beta".to_string())),
+                false,
+            )
+            .unwrap();
+        assert_eq!(vpc2.cidr, "10.1.0.0/16");
+    }
+
+    #[test]
+    fn project_cidr_overlap_within_org_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+
+        store
+            .create_vpc(
+                "proj-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let err = store
+            .create_vpc(
+                "org-vpc",
+                "10.1.5.0/24",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::CidrOverlap { .. }));
+    }
+
+    #[test]
+    fn create_vpc_fails_when_org_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Org(OrgId("nonexistent".to_string())),
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(ref name) if name == "nonexistent"));
+    }
+
+    #[test]
+    fn create_vpc_fails_when_project_org_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("ghost-org/backend".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(ref name) if name == "ghost-org"));
+    }
+
+    #[test]
+    fn create_vpc_fails_when_project_not_found() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        let err = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/nonexistent".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::ProjectNotFound { ref org, ref project } if org == "acme" && project == "nonexistent")
+        );
+    }
+
     // ── VPC attachment tests ─────────────────────────────────────────
 
     #[test]
     fn attach_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1086,6 +1307,7 @@ mod tests {
     #[test]
     fn attach_non_shared_vpc_rejected() {
         let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
         store
             .create_vpc(
                 "private-vpc",
@@ -1104,6 +1326,7 @@ mod tests {
     #[test]
     fn attach_duplicate_rejected() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1121,6 +1344,7 @@ mod tests {
     #[test]
     fn detach_vpc_succeeds() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1139,6 +1363,7 @@ mod tests {
     #[test]
     fn detach_not_attached_rejected() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
@@ -1155,6 +1380,7 @@ mod tests {
     #[test]
     fn list_attachments_multiple() {
         let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
         store
             .create_vpc(
                 "shared-vpc",
