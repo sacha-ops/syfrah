@@ -26,7 +26,7 @@ impl OrgStore {
 
     /// Create a new organization. Validates the name, checks for duplicates.
     pub fn create(&self, name: &str) -> Result<Org> {
-        validate_name(name)?;
+        validate_name(name, "org")?;
 
         if self.db.exists(TABLE, name)? {
             return Err(OrgError::AlreadyExists(name.to_string()));
@@ -83,7 +83,7 @@ impl OrgStore {
 
     /// Create a new project within an organization.
     pub fn create_project(&self, org: &str, name: &str) -> Result<Project> {
-        validate_name(name)?;
+        validate_name(name, "project")?;
 
         // Verify org exists
         if !self.db.exists(TABLE, org)? {
@@ -171,7 +171,7 @@ impl OrgStore {
         deletion_protection: bool,
         labels: HashMap<String, String>,
     ) -> Result<Environment> {
-        validate_name(name)?;
+        validate_name(name, "environment")?;
 
         // Verify project exists
         let project_key = Self::project_key(org, project);
@@ -338,23 +338,23 @@ mod tests {
 
         assert!(matches!(
             store.create("my org").unwrap_err(),
-            OrgError::InvalidName(_)
+            OrgError::InvalidName { .. }
         ));
         assert!(matches!(
             store.create("Acme").unwrap_err(),
-            OrgError::InvalidName(_)
+            OrgError::InvalidName { .. }
         ));
         assert!(matches!(
             store.create("org@1").unwrap_err(),
-            OrgError::InvalidName(_)
+            OrgError::InvalidName { .. }
         ));
         assert!(matches!(
             store.create("ab").unwrap_err(),
-            OrgError::InvalidName(_)
+            OrgError::InvalidName { .. }
         ));
         assert!(matches!(
             store.create(&"x".repeat(64)).unwrap_err(),
-            OrgError::InvalidName(_)
+            OrgError::InvalidName { .. }
         ));
     }
 

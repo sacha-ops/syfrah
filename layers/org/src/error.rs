@@ -28,8 +28,8 @@ pub enum OrgError {
     #[error("environment is protected from deletion: {0}")]
     EnvProtected(String),
 
-    #[error("invalid org name: {0}")]
-    InvalidName(String),
+    #[error("invalid {context} name: {reason}")]
+    InvalidName { context: String, reason: String },
 
     #[error("store error: {0}")]
     StoreError(String),
