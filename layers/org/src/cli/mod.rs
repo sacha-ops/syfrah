@@ -13,6 +13,7 @@ pub enum OrgCommand {
     #[command(after_help = "Examples:\n  syfrah org create acme\n  syfrah org create my-company")]
     Create {
         /// Organization name (lowercase alphanumeric and hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
         name: String,
     },
     /// List all organizations
@@ -39,6 +40,7 @@ pub enum ProjectCommand {
     /// Create a new project under an organization
     Create {
         /// Project name (lowercase alphanumeric + hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
         name: String,
         /// Organization this project belongs to
         #[arg(long)]
@@ -72,6 +74,7 @@ pub enum EnvCommand {
     /// Create a new environment
     Create {
         /// Environment name (lowercase alphanumeric + hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
         name: String,
         /// Parent project name
         #[arg(long)]
