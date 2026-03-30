@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -96,7 +97,7 @@ impl RuntimeDir {
         &self.base
     }
 
-    /// Write meta.json atomically (write to .tmp, then rename).
+    /// Write meta.json atomically (write to .tmp, fsync, then rename).
     pub fn write_meta(&self, meta: &VmMeta) -> Result<(), ProcessError> {
         let tmp_path = self.base.join(".meta.json.tmp");
         let final_path = self.meta_path();
@@ -105,8 +106,15 @@ impl RuntimeDir {
             reason: format!("failed to serialize meta.json: {e}"),
         })?;
 
-        fs::write(&tmp_path, json).map_err(|e| ProcessError::SpawnFailed {
-            reason: format!("failed to write {}: {e}", tmp_path.display()),
+        let mut f = fs::File::create(&tmp_path).map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to create {}: {e}", tmp_path.display()),
+        })?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to write {}: {e}", tmp_path.display()),
+            })?;
+        f.sync_all().map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to sync {}: {e}", tmp_path.display()),
         })?;
 
         fs::rename(&tmp_path, &final_path).map_err(|e| ProcessError::SpawnFailed {
