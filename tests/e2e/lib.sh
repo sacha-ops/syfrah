@@ -45,24 +45,24 @@ create_network() {
 
 # Verify Docker container networking works before any test.
 preflight_check() {
-    local probe1="preflight-probe-1"
-    local probe2="preflight-probe-2"
-    # Always clean up probe containers, even on unexpected failure
-    _preflight_cleanup() { docker rm -f "$probe1" "$probe2" >/dev/null 2>&1 || true; }
-    trap '_preflight_cleanup' RETURN
-    _preflight_cleanup
-    docker run -d --name "$probe1" --network "$E2E_NETWORK" --ip 172.20.0.253 "$E2E_IMAGE" sleep 10 || {
-        fail "PREFLIGHT: Failed to start probe container $probe1 (image=$E2E_IMAGE)"
+    # Clean up any leftover probe containers
+    docker rm -f preflight-probe-1 preflight-probe-2 >/dev/null 2>&1 || true
+    docker run -d --name preflight-probe-1 --network "$E2E_NETWORK" --ip 172.20.0.253 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container (image=$E2E_IMAGE)"
+        docker rm -f preflight-probe-1 preflight-probe-2 >/dev/null 2>&1 || true
         return 1
     }
-    docker run -d --name "$probe2" --network "$E2E_NETWORK" --ip 172.20.0.254 "$E2E_IMAGE" sleep 10 || {
-        fail "PREFLIGHT: Failed to start probe container $probe2 (image=$E2E_IMAGE)"
+    docker run -d --name preflight-probe-2 --network "$E2E_NETWORK" --ip 172.20.0.254 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container (image=$E2E_IMAGE)"
+        docker rm -f preflight-probe-1 preflight-probe-2 >/dev/null 2>&1 || true
         return 1
     }
-    if ! docker exec "$probe1" ping -c1 -W2 172.20.0.254 >/dev/null 2>&1; then
+    if ! docker exec preflight-probe-1 ping -c1 -W2 172.20.0.254 >/dev/null 2>&1; then
         fail "PREFLIGHT: Docker container networking is broken — containers cannot ping each other"
+        docker rm -f preflight-probe-1 preflight-probe-2 >/dev/null 2>&1 || true
         return 1
     fi
+    docker rm -f preflight-probe-1 preflight-probe-2 >/dev/null 2>&1 || true
     debug "preflight: Docker networking OK"
 }
 
