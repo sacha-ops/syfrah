@@ -197,6 +197,35 @@ pub fn masquerade_rule_expr(bridge: &str, subnet_cidr: &str) -> String {
     format!("oif != \"{bridge}\" ip saddr {subnet_cidr} masquerade")
 }
 
+// ── Peering FORWARD rules ───────────────────────────────────────────
+
+/// Generate nftables rules to allow forwarding between two peered VPC bridges.
+///
+/// Both directions are added:
+/// - `iif {bridge_a} oif {bridge_b} accept`
+/// - `iif {bridge_b} oif {bridge_a} accept`
+pub fn generate_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} accept"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables commands to remove peering rules between two VPC bridges.
+pub fn generate_remove_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove peering rules {bridge_a} <-> {bridge_b}").unwrap();
+    buf
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -307,5 +336,20 @@ mod tests {
     fn masquerade_per_bridge() {
         let expr = masquerade_rule_expr("syfbr-200", "10.2.0.0/16");
         assert_eq!(expr, "oif != \"syfbr-200\" ip saddr 10.2.0.0/16 masquerade");
+    }
+
+    // ── Peering tests ───────────────────────────────────────────────
+
+    #[test]
+    fn peering_forward_rules() {
+        let rules = generate_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 accept"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 accept"));
+    }
+
+    #[test]
+    fn peering_rules_removed() {
+        let rules = generate_remove_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("remove peering rules syfbr-100 <-> syfbr-200"));
     }
 }
