@@ -135,9 +135,32 @@ pub fn run_list(
     Ok(())
 }
 
-pub fn run_delete(name: &str, vpc: &str, yes: bool) -> Result<()> {
+pub fn run_delete(name: &str, vpc: Option<&str>, yes: bool) -> Result<()> {
+    let store = open_store()?;
+
+    // Resolve VPC: if provided use it directly, otherwise search all VPCs.
+    let vpc_name = match vpc {
+        Some(v) => v.to_string(),
+        None => {
+            let matches = store
+                .find_subnets_by_name(name)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match matches.len() {
+                0 => anyhow::bail!("subnet '{name}' not found"),
+                1 => matches.into_iter().next().unwrap().0,
+                _ => {
+                    let vpc_names: Vec<String> = matches.into_iter().map(|(v, _)| v).collect();
+                    anyhow::bail!(
+                        "subnet '{name}' exists in multiple VPCs: {}. Specify --vpc",
+                        vpc_names.join(", ")
+                    );
+                }
+            }
+        }
+    };
+
     if !yes {
-        eprint!("Delete subnet '{name}' from VPC '{vpc}'? This cannot be undone. [y/N] ");
+        eprint!("Delete subnet '{name}' from VPC '{vpc_name}'? This cannot be undone. [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim();
@@ -147,12 +170,11 @@ pub fn run_delete(name: &str, vpc: &str, yes: bool) -> Result<()> {
         }
     }
 
-    let store = open_store()?;
     store
-        .delete_subnet(vpc, name)
+        .delete_subnet(&vpc_name, name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    println!("Subnet '{name}' deleted from VPC '{vpc}'.");
+    println!("Subnet '{name}' deleted from VPC '{vpc_name}'.");
     Ok(())
 }
 
@@ -331,12 +353,12 @@ mod tests {
 
     #[test]
     fn subnet_delete_parse() {
-        // With --yes
+        // With --vpc and --yes
         let cmd = parse(&["delete", "frontend", "--vpc", "my-vpc", "--yes"]);
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
                 assert_eq!(name, "frontend");
-                assert_eq!(vpc, "my-vpc");
+                assert_eq!(vpc.as_deref(), Some("my-vpc"));
                 assert!(yes);
             }
             other => panic!("expected Delete, got {other:?}"),
@@ -347,7 +369,7 @@ mod tests {
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
                 assert_eq!(name, "frontend");
-                assert_eq!(vpc, "my-vpc");
+                assert_eq!(vpc.as_deref(), Some("my-vpc"));
                 assert!(!yes);
             }
             other => panic!("expected Delete, got {other:?}"),
@@ -358,7 +380,18 @@ mod tests {
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
                 assert_eq!(name, "frontend");
-                assert_eq!(vpc, "my-vpc");
+                assert_eq!(vpc.as_deref(), Some("my-vpc"));
+                assert!(yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+
+        // Without --vpc (auto-resolve mode)
+        let cmd = parse(&["delete", "frontend", "--yes"]);
+        match cmd {
+            SubnetCommand::Delete { name, vpc, yes } => {
+                assert_eq!(name, "frontend");
+                assert!(vpc.is_none());
                 assert!(yes);
             }
             other => panic!("expected Delete, got {other:?}"),
