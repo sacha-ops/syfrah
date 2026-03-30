@@ -1,53 +1,73 @@
-//! NetworkBackend trait — abstraction over Linux networking commands.
-//!
-//! Production code calls real `ip`, `nft`, `bridge` commands.
-//! Tests use `MockBackend` which records every call for assertion.
+use crate::error::Result;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-/// Result type for backend operations.
-pub type Result<T> = std::result::Result<T, BackendError>;
-
-/// Errors from network backend operations.
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    #[error("command failed: {0}")]
-    CommandFailed(String),
-
-    #[error("interface not found: {0}")]
-    InterfaceNotFound(String),
-
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-/// Abstraction over Linux networking primitives.
+/// Abstraction over Linux networking primitives (VXLAN, bridge, TAP, nftables).
 ///
-/// Every method is idempotent: calling it twice with the same arguments
-/// must succeed without side effects.
+/// All operations are idempotent. The real implementation shells out to
+/// `ip`, `bridge`, and `nft`; the mock records calls for testing.
+#[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
-    // ── VXLAN ───────────────────────────────────────────────────────
-    fn create_vxlan(&self, name: &str, vni: u32, local_ip: Ipv6Addr, port: u16) -> Result<()>;
-    fn delete_vxlan(&self, name: &str) -> Result<()>;
-    fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: Ipv6Addr) -> Result<()>;
-    fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()>;
-    fn add_arp_proxy(&self, vxlan: &str, ip: Ipv4Addr, mac: &str) -> Result<()>;
+    // ── VXLAN ──────────────────────────────────────────────────────────
 
-    // ── Bridge ──────────────────────────────────────────────────────
-    fn create_bridge(&self, name: &str) -> Result<()>;
-    fn add_bridge_ip(&self, bridge: &str, gateway: Ipv4Addr, prefix_len: u8) -> Result<()>;
-    fn remove_bridge_ip(&self, bridge: &str, gateway: Ipv4Addr) -> Result<()>;
-    fn delete_bridge(&self, name: &str) -> Result<()>;
-    fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<()>;
+    /// Create a VXLAN interface with the given VNI, bound to `local_ip` on `port`.
+    async fn create_vxlan(&self, name: &str, vni: u32, local_ip: &str, port: u16) -> Result<()>;
 
-    // ── TAP / veth ──────────────────────────────────────────────────
-    fn create_tap(&self, name: &str) -> Result<()>;
-    fn delete_tap(&self, name: &str) -> Result<()>;
-    fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
+    /// Delete a VXLAN interface.
+    async fn delete_vxlan(&self, name: &str) -> Result<()>;
 
-    // ── Firewall (nftables) ─────────────────────────────────────────
-    fn apply_vm_rules(&self, tap: &str, mac: &str, ip: Ipv4Addr) -> Result<()>;
-    fn remove_vm_rules(&self, tap: &str) -> Result<()>;
-    fn apply_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
-    fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
+    /// Add a static FDB entry so the bridge knows which VTEP hosts a given MAC.
+    async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()>;
+
+    /// Remove a static FDB entry.
+    async fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()>;
+
+    /// Populate the ARP proxy table on a VXLAN interface.
+    async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()>;
+
+    // ── Bridge ─────────────────────────────────────────────────────────
+
+    /// Create a Linux bridge.
+    async fn create_bridge(&self, name: &str) -> Result<()>;
+
+    /// Add a gateway IP to a bridge (e.g. subnet gateway).
+    async fn add_bridge_ip(&self, bridge: &str, ip: &str, prefix_len: u8) -> Result<()>;
+
+    /// Remove an IP from a bridge.
+    async fn remove_bridge_ip(&self, bridge: &str, ip: &str) -> Result<()>;
+
+    /// Delete a Linux bridge.
+    async fn delete_bridge(&self, name: &str) -> Result<()>;
+
+    /// Attach a network interface to a bridge.
+    async fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<()>;
+
+    // ── TAP / veth ─────────────────────────────────────────────────────
+
+    /// Create a TAP device (used by Cloud Hypervisor VMs).
+    async fn create_tap(&self, name: &str) -> Result<()>;
+
+    /// Delete a TAP device.
+    async fn delete_tap(&self, name: &str) -> Result<()>;
+
+    /// Create a veth pair (used by containers).
+    async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
+
+    // ── Firewall ───────────────────────────────────────────────────────
+
+    /// Apply anti-spoofing + default ingress/egress rules for a VM.
+    async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
+
+    /// Remove all firewall rules for a VM.
+    async fn remove_vm_rules(&self, tap: &str) -> Result<()>;
+
+    /// Enable SNAT/masquerade for a subnet behind a bridge.
+    async fn apply_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
+
+    /// Remove NAT rules for a subnet.
+    async fn remove_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
+
+    /// Allow forwarding between two peered VPC bridges.
+    async fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
+
+    /// Remove peering forwarding rules.
+    async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
 }
