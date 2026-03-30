@@ -15,7 +15,9 @@ mod update;
 #[command(
     name = "syfrah",
     about = "Syfrah — turn dedicated servers into a programmable cloud",
-    version
+    version,
+    after_help = "TIP: Generate shell completions with 'syfrah completions {bash,zsh,fish}'. \
+                  Run 'syfrah completions --help' for setup instructions."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +42,22 @@ enum Commands {
         command: StateCommand,
     },
     /// Generate shell completions for bash, zsh, or fish
+    #[command(after_help = "\
+Setup instructions:
+
+  Bash:
+    syfrah completions bash > /etc/bash_completion.d/syfrah
+
+  Zsh:
+    syfrah completions zsh > ~/.zfunc/_syfrah
+    # Then add ~/.zfunc to your fpath in ~/.zshrc (before compinit):
+    #   fpath=(~/.zfunc $fpath)
+    #   autoload -Uz compinit && compinit
+
+  Fish:
+    syfrah completions fish > ~/.config/fish/completions/syfrah.fish
+
+After installing, restart your shell or source the completions file.")]
     Completions {
         /// The shell to generate completions for
         shell: Shell,
