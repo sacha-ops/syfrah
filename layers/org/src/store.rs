@@ -344,12 +344,13 @@ impl OrgStore {
     }
 
     /// Allocate the next VNI. Starts at 100, monotonically increasing.
+    ///
+    /// Uses a single write transaction to read-then-increment the counter,
+    /// preventing concurrent callers from observing the same value.
     fn next_vni(&self) -> Result<u32> {
-        let current: Option<u32> = self.db.get(VNI_COUNTER_TABLE, VNI_COUNTER_KEY)?;
-        let vni = current.unwrap_or(VNI_START);
-        self.db
-            .set(VNI_COUNTER_TABLE, VNI_COUNTER_KEY, &(vni + 1))?;
-        Ok(vni)
+        Ok(self
+            .db
+            .atomic_next_counter(VNI_COUNTER_TABLE, VNI_COUNTER_KEY, VNI_START)?)
     }
 
     /// Create a VPC. Validates the name and CIDR (RFC 1918, prefix 8-28,
@@ -1212,6 +1213,27 @@ mod tests {
 
         assert_eq!(vpc1.vni, 100);
         assert_eq!(vpc2.vni, 101);
+    }
+
+    #[test]
+    fn vni_unique_and_sequential_for_five_vpcs() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        let mut vnis = Vec::new();
+        for i in 0..5u8 {
+            let vpc = store
+                .create_vpc(
+                    &format!("vpc-{i}"),
+                    &format!("10.{i}.0.0/16"),
+                    VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                    false,
+                )
+                .unwrap();
+            vnis.push(vpc.vni);
+        }
+
+        assert_eq!(vnis, vec![100, 101, 102, 103, 104]);
     }
 
     #[test]
