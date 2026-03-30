@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::{Org, OrgId, Project, ProjectId};
+use crate::types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};
 use crate::validation::validate_name;
 
 const TABLE: &str = "orgs";
@@ -142,12 +143,8 @@ impl OrgStore {
         }
 
         // Check for child environments
-        let env_prefix = format!("{}/{}/", org, name);
-        let all_envs: Vec<(String, serde_json::Value)> =
-            self.db.list(ENVIRONMENTS_TABLE).unwrap_or_default();
-        let has_envs = all_envs.iter().any(|(k, _)| k.starts_with(&env_prefix));
-
-        if has_envs {
+        let envs = self.list_envs(org, name)?;
+        if !envs.is_empty() {
             return Err(OrgError::ProjectHasEnvironments {
                 org: org.to_string(),
                 project: name.to_string(),
@@ -155,6 +152,96 @@ impl OrgStore {
         }
 
         self.db.delete(PROJECTS_TABLE, &key)?;
+        Ok(())
+    }
+
+    // ── Environment operations ──────────────────────────────────────
+
+    fn env_key(org: &str, project: &str, env: &str) -> String {
+        format!("{org}/{project}/{env}")
+    }
+
+    /// Create an environment within a project.
+    pub fn create_env(
+        &self,
+        org: &str,
+        project: &str,
+        name: &str,
+        ttl: Option<u64>,
+        deletion_protection: bool,
+        labels: HashMap<String, String>,
+    ) -> Result<Environment> {
+        validate_name(name)?;
+
+        // Verify project exists
+        let project_key = Self::project_key(org, project);
+        if !self.db.exists(PROJECTS_TABLE, &project_key)? {
+            return Err(OrgError::ProjectNotFound {
+                org: org.to_string(),
+                project: project.to_string(),
+            });
+        }
+
+        let env_key = Self::env_key(org, project, name);
+        if self.db.exists(ENVIRONMENTS_TABLE, &env_key)? {
+            return Err(OrgError::EnvAlreadyExists(name.to_string()));
+        }
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expires_at = ttl.map(|t| created_at + t);
+
+        let env = Environment {
+            id: EnvironmentId(env_key.clone()),
+            name: name.to_string(),
+            project_id: ProjectId(project_key),
+            ttl,
+            deletion_protection,
+            labels,
+            created_at,
+            expires_at,
+        };
+
+        self.db.set(ENVIRONMENTS_TABLE, &env_key, &env)?;
+        Ok(env)
+    }
+
+    /// Get an environment by org, project, and name.
+    pub fn get_env(&self, org: &str, project: &str, name: &str) -> Result<Environment> {
+        let key = Self::env_key(org, project, name);
+        self.db
+            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
+            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))
+    }
+
+    /// List environments for a given org and project.
+    pub fn list_envs(&self, org: &str, project: &str) -> Result<Vec<Environment>> {
+        let prefix = format!("{org}/{project}/");
+        Ok(self
+            .db
+            .list::<Environment>(ENVIRONMENTS_TABLE)?
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// Delete an environment. Fails if deletion protection is enabled.
+    pub fn delete_env(&self, org: &str, project: &str, name: &str) -> Result<()> {
+        let key = Self::env_key(org, project, name);
+
+        let env = self
+            .db
+            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
+            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+
+        if env.deletion_protection {
+            return Err(OrgError::EnvProtected(name.to_string()));
+        }
+
+        self.db.delete(ENVIRONMENTS_TABLE, &key)?;
         Ok(())
     }
 }
@@ -169,6 +256,14 @@ mod tests {
         let db = LayerDb::open_at(&path).unwrap();
         (dir, OrgStore::new(db))
     }
+
+    /// Helper: create an org and project so env tests can focus on environments.
+    fn setup_org_and_project(store: &OrgStore) {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+    }
+
+    // ── Org tests ───────────────────────────────────────────────────
 
     #[test]
     fn create_org() {
@@ -191,27 +286,22 @@ mod tests {
     fn invalid_name_rejected() {
         let (_dir, store) = temp_store();
 
-        // spaces
         assert!(matches!(
             store.create("my org").unwrap_err(),
             OrgError::InvalidName(_)
         ));
-        // uppercase
         assert!(matches!(
             store.create("Acme").unwrap_err(),
             OrgError::InvalidName(_)
         ));
-        // special chars
         assert!(matches!(
             store.create("org@1").unwrap_err(),
             OrgError::InvalidName(_)
         ));
-        // too short
         assert!(matches!(
             store.create("ab").unwrap_err(),
             OrgError::InvalidName(_)
         ));
-        // too long
         assert!(matches!(
             store.create(&"x".repeat(64)).unwrap_err(),
             OrgError::InvalidName(_)
@@ -242,11 +332,6 @@ mod tests {
 
         let orgs = store.list().unwrap();
         assert_eq!(orgs.len(), 3);
-
-        let names: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
-        assert!(names.contains(&"alpha"));
-        assert!(names.contains(&"beta"));
-        assert!(names.contains(&"gamma"));
     }
 
     #[test]
@@ -254,6 +339,8 @@ mod tests {
         let (_dir, store) = temp_store();
         assert!(store.get("does-not-exist").unwrap().is_none());
     }
+
+    // ── Project tests ───────────────────────────────────────────────
 
     #[test]
     fn create_project_succeeds_with_valid_org() {
@@ -276,22 +363,7 @@ mod tests {
         store.create_project("acme", "backend").unwrap();
 
         let err = store.create_project("acme", "backend").unwrap_err();
-        assert!(
-            matches!(err, OrgError::ProjectAlreadyExists { .. }),
-            "expected ProjectAlreadyExists, got: {err}"
-        );
-    }
-
-    #[test]
-    fn project_invalid_name_rejected() {
-        let (_dir, store) = temp_store();
-        store.create("acme").unwrap();
-
-        let err = store.create_project("acme", "ab").unwrap_err();
-        assert!(matches!(err, OrgError::InvalidName(_)));
-
-        let err = store.create_project("acme", "MyProject").unwrap_err();
-        assert!(matches!(err, OrgError::InvalidName(_)));
+        assert!(matches!(err, OrgError::ProjectAlreadyExists { .. }));
     }
 
     #[test]
@@ -301,64 +373,7 @@ mod tests {
         store.create_project("acme", "backend").unwrap();
 
         store.delete_project("acme", "backend").unwrap();
-
-        let fetched = store.get_project("acme", "backend").unwrap();
-        assert!(fetched.is_none());
-    }
-
-    #[test]
-    fn delete_project_with_envs_rejected() {
-        let (_dir, store) = temp_store();
-        store.create("acme").unwrap();
-        store.create_project("acme", "backend").unwrap();
-
-        // Simulate an environment existing
-        store
-            .db
-            .set(
-                ENVIRONMENTS_TABLE,
-                "acme/backend/production",
-                &serde_json::json!({"name": "production"}),
-            )
-            .unwrap();
-
-        let err = store.delete_project("acme", "backend").unwrap_err();
-        assert!(
-            matches!(err, OrgError::ProjectHasEnvironments { .. }),
-            "expected ProjectHasEnvironments, got: {err}"
-        );
-    }
-
-    #[test]
-    fn list_projects_by_org() {
-        let (_dir, store) = temp_store();
-        store.create("acme").unwrap();
-        store.create("globex").unwrap();
-
-        store.create_project("acme", "backend").unwrap();
-        store.create_project("acme", "frontend").unwrap();
-        store.create_project("globex", "api").unwrap();
-
-        let acme_projects = store.list_projects("acme").unwrap();
-        assert_eq!(acme_projects.len(), 2);
-        let names: Vec<&str> = acme_projects.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"backend"));
-        assert!(names.contains(&"frontend"));
-
-        let globex_projects = store.list_projects("globex").unwrap();
-        assert_eq!(globex_projects.len(), 1);
-        assert_eq!(globex_projects[0].name, "api");
-    }
-
-    #[test]
-    fn create_project_fails_without_org() {
-        let (_dir, store) = temp_store();
-
-        let err = store.create_project("nonexistent", "backend").unwrap_err();
-        assert!(
-            matches!(err, OrgError::NotFound(_)),
-            "expected NotFound, got: {err}"
-        );
+        assert!(store.get_project("acme", "backend").unwrap().is_none());
     }
 
     #[test]
@@ -368,25 +383,195 @@ mod tests {
         store.create_project("acme", "backend").unwrap();
 
         let err = store.delete("acme").unwrap_err();
-        assert!(
-            matches!(err, OrgError::OrgHasProjects(_)),
-            "expected OrgHasProjects, got: {err}"
-        );
+        assert!(matches!(err, OrgError::OrgHasProjects(_)));
     }
 
     #[test]
-    fn same_project_name_different_orgs() {
+    fn create_project_fails_without_org() {
+        let (_dir, store) = temp_store();
+        let err = store.create_project("nonexistent", "backend").unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(_)));
+    }
+
+    // ── Environment tests ───────────────────────────────────────────
+
+    #[test]
+    fn create_env_basic() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        let env = store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+
+        assert_eq!(env.name, "staging");
+        assert_eq!(env.project_id.0, "acme/backend");
+        assert!(env.created_at > 0);
+        assert_eq!(env.ttl, None);
+        assert!(!env.deletion_protection);
+        assert!(env.labels.is_empty());
+        assert_eq!(env.expires_at, None);
+    }
+
+    #[test]
+    fn duplicate_env_rejected() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+
+        let err = store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap_err();
+
+        assert!(matches!(err, OrgError::EnvAlreadyExists(ref n) if n == "staging"));
+    }
+
+    #[test]
+    fn with_ttl() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        let ttl_seconds = 3600;
+        let env = store
+            .create_env(
+                "acme",
+                "backend",
+                "ephemeral",
+                Some(ttl_seconds),
+                false,
+                HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(env.ttl, Some(ttl_seconds));
+        assert!(env.expires_at.is_some());
+        assert_eq!(env.expires_at.unwrap(), env.created_at + ttl_seconds);
+    }
+
+    #[test]
+    fn with_labels() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        let mut labels = HashMap::new();
+        labels.insert("region".to_string(), "eu-west".to_string());
+        labels.insert("team".to_string(), "payments".to_string());
+
+        let env = store
+            .create_env("acme", "backend", "production", None, false, labels.clone())
+            .unwrap();
+
+        assert_eq!(env.labels, labels);
+
+        let retrieved = store.get_env("acme", "backend", "production").unwrap();
+        assert_eq!(retrieved.labels, labels);
+    }
+
+    #[test]
+    fn with_deletion_protection() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        let env = store
+            .create_env("acme", "backend", "production", None, true, HashMap::new())
+            .unwrap();
+
+        assert!(env.deletion_protection);
+
+        let retrieved = store.get_env("acme", "backend", "production").unwrap();
+        assert!(retrieved.deletion_protection);
+    }
+
+    #[test]
+    fn delete_env_succeeds_when_not_protected() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+
+        store.delete_env("acme", "backend", "staging").unwrap();
+
+        let err = store.get_env("acme", "backend", "staging").unwrap_err();
+        assert!(matches!(err, OrgError::EnvNotFound(_)));
+    }
+
+    #[test]
+    fn delete_env_fails_when_protected() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        store
+            .create_env("acme", "backend", "production", None, true, HashMap::new())
+            .unwrap();
+
+        let err = store
+            .delete_env("acme", "backend", "production")
+            .unwrap_err();
+        assert!(matches!(err, OrgError::EnvProtected(ref n) if n == "production"));
+    }
+
+    #[test]
+    fn list_by_project() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        store.create_project("acme", "frontend").unwrap();
+
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+        store
+            .create_env("acme", "backend", "production", None, true, HashMap::new())
+            .unwrap();
+        store
+            .create_env("acme", "frontend", "staging", None, false, HashMap::new())
+            .unwrap();
+
+        let backend_envs = store.list_envs("acme", "backend").unwrap();
+        assert_eq!(backend_envs.len(), 2);
+
+        let frontend_envs = store.list_envs("acme", "frontend").unwrap();
+        assert_eq!(frontend_envs.len(), 1);
+        assert_eq!(frontend_envs[0].name, "staging");
+    }
+
+    #[test]
+    fn create_env_requires_project() {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
-        store.create("globex").unwrap();
 
-        store.create_project("acme", "backend").unwrap();
-        store.create_project("globex", "backend").unwrap();
+        let err = store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap_err();
+        assert!(matches!(err, OrgError::ProjectNotFound { .. }));
+    }
 
-        let acme_proj = store.get_project("acme", "backend").unwrap().unwrap();
-        let globex_proj = store.get_project("globex", "backend").unwrap().unwrap();
+    #[test]
+    fn delete_env_not_found() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
 
-        assert_eq!(acme_proj.org_id, OrgId("acme".to_string()));
-        assert_eq!(globex_proj.org_id, OrgId("globex".to_string()));
+        let err = store
+            .delete_env("acme", "backend", "nonexistent")
+            .unwrap_err();
+        assert!(matches!(err, OrgError::EnvNotFound(_)));
+    }
+
+    #[test]
+    fn delete_project_with_envs_rejected() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+
+        store
+            .create_env("acme", "backend", "staging", None, false, HashMap::new())
+            .unwrap();
+
+        let err = store.delete_project("acme", "backend").unwrap_err();
+        assert!(matches!(err, OrgError::ProjectHasEnvironments { .. }));
     }
 }

@@ -7,5 +7,5 @@ pub mod validation;
 pub use api::OrgHandler;
 pub use error::OrgError;
 pub use store::OrgStore;
-pub use types::{Org, OrgId, Project, ProjectId};
+pub use types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};
 pub use validation::validate_name;

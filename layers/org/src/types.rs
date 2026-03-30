@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Unique identifier for an organization.
@@ -21,6 +22,16 @@ impl fmt::Display for ProjectId {
     }
 }
 
+/// Unique identifier for an environment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnvironmentId(pub String);
+
+impl fmt::Display for EnvironmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// An organization — the root tenant in the Syfrah hierarchy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Org {
@@ -36,4 +47,17 @@ pub struct Project {
     pub name: String,
     pub org_id: OrgId,
     pub created_at: u64,
+}
+
+/// An environment — a runtime context within a project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Environment {
+    pub id: EnvironmentId,
+    pub name: String,
+    pub project_id: ProjectId,
+    pub ttl: Option<u64>,
+    pub deletion_protection: bool,
+    pub labels: HashMap<String, String>,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
 }
