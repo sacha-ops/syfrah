@@ -68,14 +68,8 @@ mod tests {
         let backend = MockBackend::new();
         let bridge = "syfbr-100";
 
-        backend
-            .add_bridge_ip(bridge, "10.1.1.1", 24)
-            .await
-            .unwrap();
-        backend
-            .add_bridge_ip(bridge, "10.1.2.1", 24)
-            .await
-            .unwrap();
+        backend.add_bridge_ip(bridge, "10.1.1.1", 24).await.unwrap();
+        backend.add_bridge_ip(bridge, "10.1.2.1", 24).await.unwrap();
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);

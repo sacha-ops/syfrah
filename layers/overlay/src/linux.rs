@@ -135,63 +135,97 @@ impl NetworkBackend for LinuxBackend {
 
     // ── VXLAN (placeholder — implemented by future PRs) ────────────
 
-    async fn create_vxlan(&self, _name: &str, _vni: u32, _local_ip: &str, _port: u16) -> Result<()> {
-        Err(OverlayError::CommandFailed("vxlan: not yet implemented".into()))
+    async fn create_vxlan(
+        &self,
+        _name: &str,
+        _vni: u32,
+        _local_ip: &str,
+        _port: u16,
+    ) -> Result<()> {
+        Err(OverlayError::CommandFailed(
+            "vxlan: not yet implemented".into(),
+        ))
     }
 
     async fn delete_vxlan(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("vxlan: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "vxlan: not yet implemented".into(),
+        ))
     }
 
     async fn add_fdb_entry(&self, _bridge: &str, _mac: &str, _vtep: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("fdb: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "fdb: not yet implemented".into(),
+        ))
     }
 
     async fn remove_fdb_entry(&self, _bridge: &str, _mac: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("fdb: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "fdb: not yet implemented".into(),
+        ))
     }
 
     async fn add_arp_proxy(&self, _vxlan: &str, _ip: &str, _mac: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("arp_proxy: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "arp_proxy: not yet implemented".into(),
+        ))
     }
 
     // ── TAP / veth (placeholder) ───────────────────────────────────
 
     async fn create_tap(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("tap: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "tap: not yet implemented".into(),
+        ))
     }
 
     async fn delete_tap(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("tap: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "tap: not yet implemented".into(),
+        ))
     }
 
     async fn create_veth_pair(&self, _name_a: &str, _name_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("veth: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "veth: not yet implemented".into(),
+        ))
     }
 
     // ── Firewall (placeholder) ─────────────────────────────────────
 
     async fn apply_vm_rules(&self, _tap: &str, _mac: &str, _ip: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 
     async fn remove_vm_rules(&self, _tap: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 
     async fn apply_nat(&self, _bridge: &str, _subnet_cidr: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 
     async fn remove_nat(&self, _bridge: &str, _subnet_cidr: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 
     async fn apply_peering_rules(&self, _bridge_a: &str, _bridge_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 
     async fn remove_peering_rules(&self, _bridge_a: &str, _bridge_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed("nft: not yet implemented".into()))
+        Err(OverlayError::CommandFailed(
+            "nft: not yet implemented".into(),
+        ))
     }
 }
