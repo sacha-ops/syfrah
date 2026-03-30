@@ -3,6 +3,7 @@ pub mod backend;
 pub mod error;
 pub mod linux;
 pub mod mock;
+pub mod tap;
 pub mod vxlan;
 
 pub use api::OverlayHandler;
