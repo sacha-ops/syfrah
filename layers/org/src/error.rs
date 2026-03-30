@@ -127,6 +127,13 @@ pub enum OrgError {
     #[error("already peered")]
     DuplicatePeering,
 
+    #[error("subnet '{subnet_name}' has no available IPs ({available}/{total}). Create a new subnet to add capacity.")]
+    IpExhausted {
+        subnet_name: String,
+        available: u32,
+        total: u32,
+    },
+
     #[error("store error: {0}")]
     StoreError(String),
 }
