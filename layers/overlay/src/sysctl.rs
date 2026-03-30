@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::Command;
 
-use crate::backend::{BackendError, Result};
+use crate::error::{OverlayError, Result};
 
 /// Path to the kernel parameter for IPv4 forwarding.
 const IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -11,8 +11,7 @@ const IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 /// Ensure `net.ipv4.ip_forward=1` is set.
 ///
 /// Reads the current value first. If already enabled, this is a no-op.
-/// If not enabled, sets it via `sysctl`. Logs a warning via `tracing` if
-/// the value was previously disabled.
+/// If not enabled, sets it via `sysctl`.
 pub fn ensure_ip_forwarding() -> Result<()> {
     let current = fs::read_to_string(IP_FORWARD_PATH)
         .map(|s| s.trim().to_string())
@@ -27,11 +26,11 @@ pub fn ensure_ip_forwarding() -> Result<()> {
     let output = Command::new("sysctl")
         .args(["-w", "net.ipv4.ip_forward=1"])
         .output()
-        .map_err(BackendError::Io)?;
+        .map_err(|e| OverlayError::CommandFailed(e.to_string()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError::CommandFailed(format!(
+        return Err(OverlayError::CommandFailed(format!(
             "failed to enable ip_forward: {stderr}"
         )));
     }

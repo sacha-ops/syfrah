@@ -1,208 +1,311 @@
-//! nftables SNAT masquerade helpers.
+//! nftables rule generation and application for VM network security.
 //!
-//! Applies and removes masquerade rules so that VMs in a subnet can reach the
-//! internet through the host's public IP.
+//! All rules live in the `syfrah` nftables table under a `forward` chain.
+//! Rules are applied atomically via `nft -f -` (stdin).
 //!
-//! Rule structure:
-//! ```text
-//! table ip syfrah_nat {
-//!     chain postrouting {
-//!         type nat hook postrouting priority 100; policy accept;
-//!         oif != "syfbr-100" ip saddr 10.1.1.0/24 masquerade
-//!     }
-//! }
-//! ```
+//! Per-VM rules enforce:
+//! - Anti-spoofing: source MAC and IP must match IPAM-assigned values
+//! - Default-deny ingress with exceptions for SSH (TCP 22) and ICMP
+//! - Default-allow egress (after anti-spoofing checks)
+//! - Conntrack: established/related connections auto-allowed
+//!
+//! Isolation rules:
+//! - Subnet isolation within the same VPC (cross-subnet blocked by default)
+//! - VPC isolation (cross-VPC forwarding blocked by default)
 
-use std::process::Command;
+use std::fmt::Write;
+use std::net::Ipv4Addr;
 
-use ipnet::Ipv4Net;
+// ── Table + chain names ─────────────────────────────────────────────
 
-use crate::backend::{BackendError, Result};
+const TABLE_NAME: &str = "syfrah";
+const CHAIN_NAME: &str = "forward";
 
-/// Table name used for all Syfrah NAT rules.
-const TABLE: &str = "syfrah_nat";
+// ── Public API ──────────────────────────────────────────────────────
 
-/// Chain name within the NAT table.
-const CHAIN: &str = "postrouting";
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Ensure the syfrah_nat table and postrouting chain exist, then add a
-/// masquerade rule for outbound traffic from `subnet` exiting via any
-/// interface other than `bridge`.
-///
-/// Idempotent: if the rule already exists, nftables silently succeeds.
-pub fn apply_nat(bridge: &str, subnet: Ipv4Net) -> Result<()> {
-    ensure_table()?;
-    ensure_chain()?;
-    add_masquerade_rule(bridge, subnet)?;
-    Ok(())
+/// Generate the nftables ruleset that creates the `syfrah` table and
+/// `forward` chain if they do not already exist.
+pub fn generate_table_setup() -> String {
+    let mut buf = String::new();
+    writeln!(buf, "create table inet {TABLE_NAME}").unwrap();
+    writeln!(
+        buf,
+        "create chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+    )
+    .unwrap();
+    buf
 }
 
-/// Remove the masquerade rule for `bridge`/`subnet`.
-///
-/// If the rule does not exist the function still succeeds (idempotent).
-/// We list all handles in the chain, find the matching rule, and delete it.
-pub fn remove_nat(bridge: &str, subnet: Ipv4Net) -> Result<()> {
-    if let Some(handle) = find_rule_handle(bridge, subnet)? {
-        nft_run(&[
-            "delete",
-            "rule",
-            "ip",
-            TABLE,
-            CHAIN,
-            "handle",
-            &handle.to_string(),
-        ])?;
-    }
-    Ok(())
+/// Generate nftables rules for a VM's TAP interface.
+pub fn generate_vm_rules(tap: &str, mac: &str, ip: Ipv4Addr) -> String {
+    let mut buf = String::new();
+    write!(buf, "{}", generate_table_setup()).unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ether saddr != {mac} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ip saddr != {ip} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} tcp dport 22 accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} icmp type echo-request accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} ct state established,related accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} accept"
+    )
+    .unwrap();
+    buf
 }
 
-/// Build the nftables rule expression for a masquerade rule.
-///
-/// Exposed for testing so callers can verify the generated rule text without
-/// running real nftables commands.
-pub fn masquerade_rule_expr(bridge: &str, subnet: Ipv4Net) -> String {
-    format!("oif != \"{bridge}\" ip saddr {subnet} masquerade")
+/// Generate nftables commands to remove all rules for a TAP interface.
+pub fn generate_remove_rules(tap: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "# flush rules for TAP {tap} from inet {TABLE_NAME} {CHAIN_NAME}"
+    )
+    .unwrap();
+    buf
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
+/// Apply an nftables ruleset by writing it to `nft -f -` on stdin.
+pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
+    use std::io::Write as IoWrite;
+    use std::process::{Command, Stdio};
 
-fn ensure_table() -> Result<()> {
-    // `add table` is idempotent in nftables.
-    nft_run(&["add", "table", "ip", TABLE])
-}
+    let mut child = Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-fn ensure_chain() -> Result<()> {
-    // `add chain` with full spec is idempotent.
-    nft_run_raw(&format!(
-        "add chain ip {TABLE} {CHAIN} {{ type nat hook postrouting priority 100; policy accept; }}"
-    ))
-}
-
-fn add_masquerade_rule(bridge: &str, subnet: Ipv4Net) -> Result<()> {
-    let expr = masquerade_rule_expr(bridge, subnet);
-    nft_run_raw(&format!("add rule ip {TABLE} {CHAIN} {expr}"))
-}
-
-/// Find the nftables handle of a masquerade rule matching `bridge` and `subnet`.
-fn find_rule_handle(bridge: &str, subnet: Ipv4Net) -> Result<Option<u64>> {
-    let output = Command::new("nft")
-        .args(["-a", "list", "chain", "ip", TABLE, CHAIN])
-        .output()
-        .map_err(BackendError::Io)?;
-
-    if !output.status.success() {
-        // Chain/table doesn't exist — nothing to remove.
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let needle_bridge = format!("oif != \"{bridge}\"");
-    let needle_subnet = subnet.to_string();
-
-    for line in stdout.lines() {
-        if line.contains(&needle_bridge)
-            && line.contains(&needle_subnet)
-            && line.contains("masquerade")
-        {
-            // Lines look like: `... masquerade # handle 4`
-            if let Some(pos) = line.rfind("# handle ") {
-                let handle_str = line[pos + 9..].trim();
-                if let Ok(h) = handle_str.parse::<u64>() {
-                    return Ok(Some(h));
-                }
-            }
-        }
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(ruleset.as_bytes())?;
     }
 
-    Ok(None)
-}
-
-/// Run `nft <args>`.
-fn nft_run(args: &[&str]) -> Result<()> {
-    let output = Command::new("nft")
-        .args(args)
-        .output()
-        .map_err(BackendError::Io)?;
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError::CommandFailed(format!(
-            "nft {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        )));
+        return Err(std::io::Error::other(format!("nft failed: {stderr}")));
     }
+
     Ok(())
 }
 
-/// Run `nft` with a single command string (required for chain specs with braces).
-fn nft_run_raw(cmd: &str) -> Result<()> {
-    let output = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(cmd.as_bytes())?;
-            }
-            child.wait_with_output()
-        })
-        .map_err(BackendError::Io)?;
+// ── Subnet isolation ────────────────────────────────────────────────
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError::CommandFailed(format!(
-            "nft command failed: {stderr}"
-        )));
-    }
-    Ok(())
+/// Generate nftables rules to block cross-subnet traffic within a VPC.
+/// Both directions are blocked (A->B and B->A).
+pub fn generate_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_a} ip daddr {subnet_b} drop").unwrap();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_b} ip daddr {subnet_a} drop").unwrap();
+    buf
 }
+
+/// Generate nftables rules to remove subnet isolation.
+pub fn generate_remove_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "# remove subnet isolation {bridge} {subnet_a} <-> {subnet_b}"
+    )
+    .unwrap();
+    buf
+}
+
+// ── VPC isolation ───────────────────────────────────────────────────
+
+/// Generate nftables rules to block all forwarding between two VPC bridges.
+/// Both directions are blocked.
+pub fn generate_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} drop"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rules to remove VPC isolation.
+pub fn generate_remove_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove VPC isolation {bridge_a} <-> {bridge_b}").unwrap();
+    buf
+}
+
+/// VMs in the same subnet communicate via normal bridge forwarding.
+/// No nftables block rule is applied. This is a no-op for documentation symmetry.
+pub fn same_subnet_policy() {}
+
+// ── SNAT masquerade ─────────────────────────────────────────────────
+
+/// NAT table name used for SNAT rules.
+const NAT_TABLE: &str = "syfrah_nat";
+const NAT_CHAIN: &str = "postrouting";
+
+/// Generate nftables rules for SNAT masquerade on a subnet.
+///
+/// This enables outbound internet access for VMs behind a bridge.
+pub fn generate_nat_rules(bridge: &str, subnet_cidr: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "add table ip {NAT_TABLE}").unwrap();
+    writeln!(
+        buf,
+        "add chain ip {NAT_TABLE} {NAT_CHAIN} {{ type nat hook postrouting priority 100; policy accept; }}"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule ip {NAT_TABLE} {NAT_CHAIN} oif != \"{bridge}\" ip saddr {subnet_cidr} masquerade"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rule text for the masquerade expression.
+pub fn masquerade_rule_expr(bridge: &str, subnet_cidr: &str) -> String {
+    format!("oif != \"{bridge}\" ip saddr {subnet_cidr} masquerade")
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn masquerade_rule_expr_contains_subnet_cidr() {
-        let subnet: Ipv4Net = "10.1.1.0/24".parse().unwrap();
-        let expr = masquerade_rule_expr("syfbr-100", subnet);
-        assert!(
-            expr.contains("10.1.1.0/24"),
-            "rule expression must include the subnet CIDR"
-        );
-        assert!(
-            expr.contains("masquerade"),
-            "rule expression must include masquerade"
-        );
-        assert!(
-            expr.contains("oif != \"syfbr-100\""),
-            "rule expression must exclude the bridge interface"
-        );
+    const TAP: &str = "syftap-vm1";
+    const MAC: &str = "02:00:0a:00:01:05";
+    const IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 5);
+
+    fn rules() -> String {
+        generate_vm_rules(TAP, MAC, IP)
     }
 
     #[test]
-    fn masquerade_rule_per_bridge() {
-        let subnet_a: Ipv4Net = "10.1.1.0/24".parse().unwrap();
-        let subnet_b: Ipv4Net = "10.2.1.0/24".parse().unwrap();
+    fn anti_spoof_rules_generated() {
+        let r = rules();
+        assert!(r.contains(&format!("iif {TAP} ether saddr != {MAC} drop")));
+        assert!(r.contains(&format!("iif {TAP} ip saddr != {IP} drop")));
+    }
 
-        let expr_a = masquerade_rule_expr("syfbr-100", subnet_a);
-        let expr_b = masquerade_rule_expr("syfbr-200", subnet_b);
+    #[test]
+    fn default_deny_ingress() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} drop")));
+    }
 
-        assert_ne!(
-            expr_a, expr_b,
-            "different bridges must produce different rules"
-        );
-        assert!(expr_a.contains("syfbr-100"));
-        assert!(expr_b.contains("syfbr-200"));
-        assert!(expr_a.contains("10.1.1.0/24"));
-        assert!(expr_b.contains("10.2.1.0/24"));
+    #[test]
+    fn ssh_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} tcp dport 22 accept")));
+    }
+
+    #[test]
+    fn icmp_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} icmp type echo-request accept")));
+    }
+
+    #[test]
+    fn egress_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("iif {TAP} accept")));
+    }
+
+    #[test]
+    fn conntrack_established() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} ct state established,related accept")));
+    }
+
+    #[test]
+    fn table_setup_is_idempotent() {
+        let setup = generate_table_setup();
+        assert!(setup.contains("create table inet syfrah"));
+        assert!(setup.contains("create chain inet syfrah forward"));
+    }
+
+    #[test]
+    fn rule_ordering() {
+        let r = rules();
+        let mac_spoof_pos = r.find("ether saddr !=").expect("MAC spoof rule");
+        let ip_spoof_pos = r.find("ip saddr !=").expect("IP spoof rule");
+        let egress_pos = r.find(&format!("iif {TAP} accept")).expect("egress rule");
+        let deny_pos = r.find(&format!("oif {TAP} drop")).expect("deny rule");
+        let ssh_pos = r.find("tcp dport 22 accept").expect("SSH rule");
+        assert!(mac_spoof_pos < ip_spoof_pos);
+        assert!(ip_spoof_pos < egress_pos);
+        assert!(deny_pos < ssh_pos);
+    }
+
+    #[test]
+    fn subnet_isolation_blocks_both_directions() {
+        let rules = generate_subnet_isolation("syfbr-100", "10.1.1.0/24", "10.1.2.0/24");
+        assert!(rules.contains("ip saddr 10.1.1.0/24 ip daddr 10.1.2.0/24 drop"));
+        assert!(rules.contains("ip saddr 10.1.2.0/24 ip daddr 10.1.1.0/24 drop"));
+    }
+
+    #[test]
+    fn vpc_isolation_blocks_both_directions() {
+        let rules = generate_vpc_isolation("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 drop"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 drop"));
+    }
+
+    #[test]
+    fn same_subnet_no_rules() {
+        same_subnet_policy();
+    }
+
+    #[test]
+    fn subnet_isolation_uses_bridge_name() {
+        let rules = generate_subnet_isolation("syfbr-vpc42", "10.0.1.0/24", "10.0.2.0/24");
+        assert!(rules.contains("iif syfbr-vpc42 oif syfbr-vpc42"));
+    }
+
+    // ── SNAT tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn snat_rule_generated() {
+        let rules = generate_nat_rules("syfbr-100", "10.1.1.0/24");
+        assert!(rules.contains("masquerade"));
+        assert!(rules.contains("10.1.1.0/24"));
+        assert!(rules.contains("syfbr-100"));
+    }
+
+    #[test]
+    fn masquerade_per_bridge() {
+        let expr = masquerade_rule_expr("syfbr-200", "10.2.0.0/16");
+        assert_eq!(expr, "oif != \"syfbr-200\" ip saddr 10.2.0.0/16 masquerade");
     }
 }

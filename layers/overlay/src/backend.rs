@@ -1,164 +1,73 @@
-use std::fmt;
-use std::sync::{Arc, Mutex};
+use crate::error::Result;
 
-use ipnet::Ipv4Net;
-
-/// Errors from network backend operations.
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    #[error("command failed: {0}")]
-    CommandFailed(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-pub type Result<T> = std::result::Result<T, BackendError>;
-
-/// Abstraction over Linux networking primitives for testability.
+/// Abstraction over Linux networking primitives (VXLAN, bridge, TAP, nftables).
 ///
-/// All operations are idempotent: applying the same rule twice is a no-op,
-/// removing a non-existent rule succeeds silently.
+/// All operations are idempotent. The real implementation shells out to
+/// `ip`, `bridge`, and `nft`; the mock records calls for testing.
+#[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
-    /// Apply SNAT masquerade for a subnet behind a bridge.
-    ///
-    /// Creates the `syfrah_nat` table and postrouting chain if they don't exist,
-    /// then adds a masquerade rule for traffic from `subnet` exiting via any
-    /// interface other than `bridge`.
-    fn apply_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()>;
+    // ── VXLAN ──────────────────────────────────────────────────────────
 
-    /// Remove SNAT masquerade for a subnet behind a bridge.
-    fn remove_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()>;
-}
+    /// Create a VXLAN interface with the given VNI, bound to `local_ip` on `port`.
+    async fn create_vxlan(&self, name: &str, vni: u32, local_ip: &str, port: u16) -> Result<()>;
 
-// ---------------------------------------------------------------------------
-// LinuxBackend — real nftables commands
-// ---------------------------------------------------------------------------
+    /// Delete a VXLAN interface.
+    async fn delete_vxlan(&self, name: &str) -> Result<()>;
 
-/// Production backend that executes real nftables commands.
-pub struct LinuxBackend;
+    /// Add a static FDB entry so the bridge knows which VTEP hosts a given MAC.
+    async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()>;
 
-impl NetworkBackend for LinuxBackend {
-    fn apply_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()> {
-        crate::nft::apply_nat(bridge, subnet)
-    }
+    /// Remove a static FDB entry.
+    async fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()>;
 
-    fn remove_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()> {
-        crate::nft::remove_nat(bridge, subnet)
-    }
-}
+    /// Populate the ARP proxy table on a VXLAN interface.
+    async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()>;
 
-// ---------------------------------------------------------------------------
-// MockBackend — records calls for unit tests
-// ---------------------------------------------------------------------------
+    // ── Bridge ─────────────────────────────────────────────────────────
 
-/// A recorded NAT operation for test assertions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NatCall {
-    ApplyNat { bridge: String, subnet: Ipv4Net },
-    RemoveNat { bridge: String, subnet: Ipv4Net },
-}
+    /// Create a Linux bridge.
+    async fn create_bridge(&self, name: &str) -> Result<()>;
 
-impl fmt::Display for NatCall {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NatCall::ApplyNat { bridge, subnet } => {
-                write!(f, "apply_nat({bridge}, {subnet})")
-            }
-            NatCall::RemoveNat { bridge, subnet } => {
-                write!(f, "remove_nat({bridge}, {subnet})")
-            }
-        }
-    }
-}
+    /// Add a gateway IP to a bridge (e.g. subnet gateway).
+    async fn add_bridge_ip(&self, bridge: &str, ip: &str, prefix_len: u8) -> Result<()>;
 
-/// Test-only backend that records every call without touching the system.
-#[derive(Debug, Clone, Default)]
-pub struct MockBackend {
-    calls: Arc<Mutex<Vec<NatCall>>>,
-}
+    /// Remove an IP from a bridge.
+    async fn remove_bridge_ip(&self, bridge: &str, ip: &str) -> Result<()>;
 
-impl MockBackend {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    /// Delete a Linux bridge.
+    async fn delete_bridge(&self, name: &str) -> Result<()>;
 
-    /// Return a snapshot of all recorded calls.
-    pub fn calls(&self) -> Vec<NatCall> {
-        self.calls.lock().unwrap().clone()
-    }
+    /// Attach a network interface to a bridge.
+    async fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<()>;
 
-    /// Clear recorded calls.
-    pub fn clear(&self) {
-        self.calls.lock().unwrap().clear();
-    }
-}
+    // ── TAP / veth ─────────────────────────────────────────────────────
 
-impl NetworkBackend for MockBackend {
-    fn apply_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()> {
-        self.calls.lock().unwrap().push(NatCall::ApplyNat {
-            bridge: bridge.to_string(),
-            subnet,
-        });
-        Ok(())
-    }
+    /// Create a TAP device (used by Cloud Hypervisor VMs).
+    async fn create_tap(&self, name: &str) -> Result<()>;
 
-    fn remove_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<()> {
-        self.calls.lock().unwrap().push(NatCall::RemoveNat {
-            bridge: bridge.to_string(),
-            subnet,
-        });
-        Ok(())
-    }
-}
+    /// Delete a TAP device.
+    async fn delete_tap(&self, name: &str) -> Result<()>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Create a veth pair (used by containers).
+    async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
 
-    #[test]
-    fn snat_rule_generated() {
-        let mock = MockBackend::new();
-        let subnet: Ipv4Net = "10.1.1.0/24".parse().unwrap();
+    // ── Firewall ───────────────────────────────────────────────────────
 
-        mock.apply_nat("syfbr-100", subnet).unwrap();
+    /// Apply anti-spoofing + default ingress/egress rules for a VM.
+    async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
 
-        let calls = mock.calls();
-        assert_eq!(calls.len(), 1);
-        match &calls[0] {
-            NatCall::ApplyNat { bridge, subnet: s } => {
-                assert_eq!(bridge, "syfbr-100");
-                assert_eq!(s.to_string(), "10.1.1.0/24");
-            }
-            other => panic!("expected ApplyNat, got {other}"),
-        }
-    }
+    /// Remove all firewall rules for a VM.
+    async fn remove_vm_rules(&self, tap: &str) -> Result<()>;
 
-    #[test]
-    fn masquerade_per_bridge() {
-        let mock = MockBackend::new();
-        let subnet_a: Ipv4Net = "10.1.1.0/24".parse().unwrap();
-        let subnet_b: Ipv4Net = "10.2.1.0/24".parse().unwrap();
+    /// Enable SNAT/masquerade for a subnet behind a bridge.
+    async fn apply_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
 
-        mock.apply_nat("syfbr-100", subnet_a).unwrap();
-        mock.apply_nat("syfbr-200", subnet_b).unwrap();
+    /// Remove NAT rules for a subnet.
+    async fn remove_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
 
-        let calls = mock.calls();
-        assert_eq!(calls.len(), 2);
+    /// Allow forwarding between two peered VPC bridges.
+    async fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
 
-        // Each bridge/subnet pair gets its own rule.
-        assert_eq!(
-            calls[0],
-            NatCall::ApplyNat {
-                bridge: "syfbr-100".to_string(),
-                subnet: subnet_a,
-            }
-        );
-        assert_eq!(
-            calls[1],
-            NatCall::ApplyNat {
-                bridge: "syfbr-200".to_string(),
-                subnet: subnet_b,
-            }
-        );
-    }
+    /// Remove peering forwarding rules.
+    async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
 }
