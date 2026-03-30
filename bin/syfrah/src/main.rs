@@ -7,6 +7,7 @@ use clap_complete::{generate, Shell};
 use syfrah_core::mesh::{Region, Zone};
 use syfrah_fabric::cli;
 use syfrah_fabric::daemon::{self, DaemonConfig};
+use syfrah_org::cli::{EnvCommand, OrgCommand, ProjectCommand};
 use syfrah_state::cli::StateCommand;
 
 mod update;
@@ -41,6 +42,21 @@ enum Commands {
     Compute {
         #[command(subcommand)]
         command: syfrah_compute::cli::ComputeCommand,
+    },
+    /// Manage organizations
+    Org {
+        #[command(subcommand)]
+        command: OrgCommand,
+    },
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    /// Manage environments
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
     },
     /// Inspect and manage layer state databases
     State {
@@ -914,6 +930,9 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Compute { command } => syfrah_compute::cli::run(command).await,
+        Commands::Org { command } => syfrah_org::cli::run_org(command).await,
+        Commands::Project { command } => syfrah_org::cli::run_project(command).await,
+        Commands::Env { command } => syfrah_org::cli::run_env(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
