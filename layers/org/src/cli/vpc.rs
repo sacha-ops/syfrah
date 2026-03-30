@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use syfrah_state::LayerDb;
 
 use crate::store::OrgStore;
-use crate::types::VpcOwner;
+use crate::types::{OrgId, ProjectId, VpcOwner};
 
 const DEFAULT_PROJECT_CIDR: &str = "10.1.0.0/16";
 const DEFAULT_SHARED_CIDR: &str = "10.100.0.0/16";
@@ -32,39 +32,59 @@ pub fn run_create(
 
     let store = open_store()?;
 
-    if shared {
-        let cidr = cidr.unwrap_or(DEFAULT_SHARED_CIDR);
-        let vpc = store
-            .create_shared_vpc(name, org, cidr)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!("VPC created: {}", vpc.name);
-        println!("  Org:      {org}");
-        println!("  Shared:   yes");
-        println!("  CIDR:     {}", vpc.cidr);
-        println!("  VNI:      {}", vpc.vni);
-        println!("  Created:  {}", format_timestamp(vpc.created_at));
+    let (owner, cidr_str) = if shared {
+        let owner = VpcOwner::Org(OrgId(org.to_string()));
+        let cidr_str = cidr.unwrap_or(DEFAULT_SHARED_CIDR);
+        (owner, cidr_str)
     } else {
         let project = project.unwrap();
-        let cidr = cidr.unwrap_or(DEFAULT_PROJECT_CIDR);
-        let vpc = store
-            .create_vpc(name, org, project, cidr)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!("VPC created: {}", vpc.name);
-        println!("  Org:      {org}");
-        println!("  Project:  {project}");
-        println!("  CIDR:     {}", vpc.cidr);
-        println!("  VNI:      {}", vpc.vni);
-        println!("  Created:  {}", format_timestamp(vpc.created_at));
+        let owner = VpcOwner::Project(ProjectId(format!("{org}/{project}")));
+        let cidr_str = cidr.unwrap_or(DEFAULT_PROJECT_CIDR);
+        (owner, cidr_str)
+    };
+
+    let vpc = store
+        .create_vpc(name, cidr_str, owner, shared)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("VPC created: {}", vpc.name);
+    match &vpc.owner {
+        VpcOwner::Org(org_id) => {
+            println!("  Org:      {}", org_id.0);
+            println!("  Shared:   yes");
+        }
+        VpcOwner::Project(proj_id) => {
+            println!("  Org:      {org}");
+            if let Some(p) = proj_id.0.split('/').nth(1) {
+                println!("  Project:  {p}");
+            }
+        }
     }
+    println!("  CIDR:     {}", vpc.cidr);
+    println!("  VNI:      {}", vpc.vni);
+    println!("  Created:  {}", format_timestamp(vpc.created_at));
 
     Ok(())
 }
 
 pub fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<()> {
     let store = open_store()?;
-    let vpcs = store
-        .list_vpcs(org, project)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vpcs = match (org, project) {
+        (Some(org_name), Some(proj_name)) => {
+            let project_id = ProjectId(format!("{org_name}/{proj_name}"));
+            store
+                .list_vpcs_by_project(&project_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        (Some(org_name), None) => {
+            let org_id = OrgId(org_name.to_string());
+            store
+                .list_vpcs_by_org(&org_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        _ => store.list_vpcs().map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&vpcs)?);
@@ -89,8 +109,8 @@ pub fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<
 
     for vpc in &vpcs {
         let owner = match &vpc.owner {
-            VpcOwner::Project { org, project } => format!("{org}/{project}"),
-            VpcOwner::Org(o) => o.clone(),
+            VpcOwner::Project(pid) => pid.0.clone(),
+            VpcOwner::Org(oid) => oid.0.clone(),
         };
         let shared = if vpc.shared { "yes" } else { "no" };
         println!(
@@ -107,18 +127,18 @@ pub fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<
     Ok(())
 }
 
-pub fn run_delete(name: &str, org: &str, yes: bool) -> Result<()> {
+pub fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
     let store = open_store()?;
 
     // Check it exists first
-    match store.get_vpc(org, name) {
+    match store.get_vpc(name) {
         Ok(Some(_)) => {}
-        Ok(None) => bail!("vpc '{name}' not found in org '{org}'"),
+        Ok(None) => bail!("vpc '{name}' not found"),
         Err(e) => bail!("failed to look up vpc: {e}"),
     }
 
     if !yes {
-        eprint!("Delete VPC '{name}' from org '{org}'? This cannot be undone. [y/N] ");
+        eprint!("Delete VPC '{name}'? This cannot be undone. [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim();
@@ -128,9 +148,7 @@ pub fn run_delete(name: &str, org: &str, yes: bool) -> Result<()> {
         }
     }
 
-    store
-        .delete_vpc(org, name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    store.delete_vpc(name).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("VPC '{name}' deleted.");
     Ok(())
 }
@@ -264,7 +282,6 @@ mod tests {
 
     #[test]
     fn vpc_list_parse() {
-        // With filters and --json
         let cmd = parse(&["list", "--project", "backend", "--org", "acme", "--json"]);
         match cmd {
             VpcCommand::List { project, org, json } => {
@@ -275,7 +292,6 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
 
-        // No filters
         let cmd = parse(&["list"]);
         match cmd {
             VpcCommand::List { project, org, json } => {
@@ -286,7 +302,6 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
 
-        // Only org filter
         let cmd = parse(&["list", "--org", "acme"]);
         match cmd {
             VpcCommand::List { project, org, json } => {
@@ -300,7 +315,6 @@ mod tests {
 
     #[test]
     fn vpc_delete_parse() {
-        // With --yes
         let cmd = parse(&["delete", "my-vpc", "--org", "acme", "--yes"]);
         match cmd {
             VpcCommand::Delete { name, org, yes } => {
@@ -311,7 +325,6 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
 
-        // Without --yes
         let cmd = parse(&["delete", "my-vpc", "--org", "acme"]);
         match cmd {
             VpcCommand::Delete { name, org, yes } => {
@@ -322,7 +335,6 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
 
-        // Short -y flag
         let cmd = parse(&["delete", "-y", "my-vpc", "--org", "acme"]);
         match cmd {
             VpcCommand::Delete { name, org, yes } => {
