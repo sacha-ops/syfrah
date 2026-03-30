@@ -126,6 +126,16 @@ pub enum PeeringStatus {
     Deleted,
 }
 
+impl fmt::Display for PeeringStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeeringStatus::Active => f.write_str("Active"),
+            PeeringStatus::Pending => f.write_str("Pending"),
+            PeeringStatus::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
 /// A VPC peering connection between two VPCs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpcPeering {

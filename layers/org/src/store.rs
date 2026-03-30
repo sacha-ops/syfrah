@@ -6,8 +6,8 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Subnet, SubnetId, Vpc,
-    VpcAttachment, VpcId, VpcOwner,
+    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
+    SubnetId, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -21,6 +21,7 @@ const SUBNETS_TABLE: &str = "subnets";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
+const PEERINGS_TABLE: &str = "vpc_peerings";
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -798,6 +799,110 @@ impl OrgStore {
         }
         self.db.delete(SUBNETS_TABLE, &key)?;
         Ok(())
+    }
+
+    // ── Peering operations ──────────────────────────────────────────
+
+    /// Create a VPC peering between two VPCs.
+    ///
+    /// Validates both VPCs exist, are distinct, and are not already peered.
+    pub fn create_peering(&self, vpc_a_name: &str, vpc_b_name: &str) -> Result<VpcPeering> {
+        if vpc_a_name == vpc_b_name {
+            return Err(OrgError::SelfPeer(vpc_a_name.to_string()));
+        }
+
+        let vpc_a = self
+            .get_vpc(vpc_a_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a_name.to_string()))?;
+        let vpc_b = self
+            .get_vpc(vpc_b_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b_name.to_string()))?;
+
+        // Check for existing active peering
+        let existing = self.list_peerings()?;
+        let already = existing.iter().any(|p| {
+            p.status == PeeringStatus::Active
+                && ((p.vpc_a == vpc_a.id && p.vpc_b == vpc_b.id)
+                    || (p.vpc_a == vpc_b.id && p.vpc_b == vpc_a.id))
+        });
+        if already {
+            return Err(OrgError::AlreadyPeered {
+                vpc_a: vpc_a_name.to_string(),
+                vpc_b: vpc_b_name.to_string(),
+            });
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let peering = VpcPeering {
+            id: PeeringId(format!("peer-{}-{}", vpc_a.id, vpc_b.id)),
+            vpc_a: vpc_a.id,
+            vpc_b: vpc_b.id,
+            status: PeeringStatus::Active,
+            created_at: now,
+        };
+
+        self.db.set(PEERINGS_TABLE, &peering.id.0, &peering)?;
+        Ok(peering)
+    }
+
+    /// Delete a peering between two VPCs.
+    pub fn delete_peering(&self, vpc_a_name: &str, vpc_b_name: &str) -> Result<()> {
+        let vpc_a = self
+            .get_vpc(vpc_a_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a_name.to_string()))?;
+        let vpc_b = self
+            .get_vpc(vpc_b_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b_name.to_string()))?;
+
+        let all = self.list_peerings()?;
+        let peering = all.into_iter().find(|p| {
+            p.status == PeeringStatus::Active
+                && ((p.vpc_a == vpc_a.id && p.vpc_b == vpc_b.id)
+                    || (p.vpc_a == vpc_b.id && p.vpc_b == vpc_a.id))
+        });
+
+        match peering {
+            Some(p) => {
+                self.db.delete(PEERINGS_TABLE, &p.id.0)?;
+                Ok(())
+            }
+            None => Err(OrgError::PeeringNotFound {
+                vpc_a: vpc_a_name.to_string(),
+                vpc_b: vpc_b_name.to_string(),
+            }),
+        }
+    }
+
+    /// List all active peerings, optionally filtered by VPC name.
+    pub fn list_peerings(&self) -> Result<Vec<VpcPeering>> {
+        let entries: Vec<(String, VpcPeering)> = self.db.list(PEERINGS_TABLE)?;
+        Ok(entries.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// List active peerings filtered by a specific VPC name.
+    pub fn list_peerings_for_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+        let all = self.list_peerings()?;
+        Ok(all
+            .into_iter()
+            .filter(|p| {
+                (p.vpc_a == vpc.id || p.vpc_b == vpc.id) && p.status == PeeringStatus::Active
+            })
+            .collect())
+    }
+
+    /// Resolve a VPC ID to its name. Returns the ID string if not found.
+    pub fn resolve_vpc_name(&self, vpc_id: &VpcId) -> String {
+        match self.get_vpc_by_id(vpc_id) {
+            Ok(Some(vpc)) => vpc.name,
+            _ => vpc_id.0.clone(),
+        }
     }
 }
 
