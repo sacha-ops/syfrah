@@ -81,14 +81,38 @@ async fn run_status(json: bool) -> anyhow::Result<()> {
                 let runtime = v.get("runtime").and_then(|r| r.as_str()).unwrap_or("?");
                 let total = v.get("total_vms").and_then(|t| t.as_u64()).unwrap_or(0);
                 let running = v.get("running_vms").and_then(|r| r.as_u64()).unwrap_or(0);
-                println!("Compute Status");
-                println!("  Status:      {status}");
-                println!("  Runtime:     {runtime}");
-                println!("  Total VMs:   {total}");
-                println!("  Running VMs: {running}");
+
+                let is_tty = console::Term::stdout().is_term();
+                if is_tty {
+                    let bold = console::Style::new().bold().underlined();
+                    println!("{}", bold.apply_to("Compute Status"));
+                } else {
+                    println!("Compute Status");
+                    println!("{}", "=".repeat(14));
+                }
+
+                let print_kv = |key: &str, val: &str| {
+                    if is_tty {
+                        let bold = console::Style::new().bold();
+                        println!("  {}: {val}", bold.apply_to(key));
+                    } else {
+                        println!("  {key}: {val}");
+                    }
+                };
+
+                print_kv("Status", status);
+                print_kv("Runtime", runtime);
+                print_kv("Total VMs", &total.to_string());
+                print_kv("Running VMs", &running.to_string());
+
                 if let Some(warnings) = v.get("warnings").and_then(|w| w.as_array()) {
                     if !warnings.is_empty() {
-                        println!("  Warnings:");
+                        if is_tty {
+                            let yellow = console::Style::new().yellow();
+                            println!("  {}:", yellow.apply_to("Warnings"));
+                        } else {
+                            println!("  Warnings:");
+                        }
                         for w in warnings {
                             if let Some(msg) = w.as_str() {
                                 println!("    - {msg}");
