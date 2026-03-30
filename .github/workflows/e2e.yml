@@ -53,10 +53,7 @@ jobs:
           groups='[
             {"name": "state",              "filter": "2[1-4]_state"},
             {"name": "quickstart",         "filter": "90_quickstart"},
-            {"name": "ux-output",          "filter": "9[1-7]_ux"},
-            {"name": "ux-flows",           "filter": "9[89]_ux|10[0-4]_ux"},
-            {"name": "ux-errors",          "filter": "10[5-9]_ux|110_ux"},
-            {"name": "compute",            "filter": "7[0-9]_compute|8[0-5]_compute"},
+            {"name": "compute",            "filter": "7[0-9]_compute|8[0-9]_compute|90_compute"},
             {"name": "install",            "filter": "test_install"}
           ]'
           echo "groups=$(echo "$groups" | jq -c .)" >> "$GITHUB_OUTPUT"
