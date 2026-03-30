@@ -660,9 +660,9 @@ impl VpcStore {
 
         // Normalize vpc_a/vpc_b order to match the key
         let (norm_a, norm_b) = if vpc_a.id.0 <= vpc_b.id.0 {
-            (vpc_a.id.clone(), vpc_b.id.clone())
+            (vpc_a.id.0.clone(), vpc_b.id.0.clone())
         } else {
-            (vpc_b.id.clone(), vpc_a.id.clone())
+            (vpc_b.id.0.clone(), vpc_a.id.0.clone())
         };
 
         let peering = VpcPeering {
@@ -1704,7 +1704,7 @@ mod tests {
 
         // vpc_a should be the lexicographically smaller ID
         assert!(
-            peering.vpc_a.0 < peering.vpc_b.0,
+            peering.vpc_a < peering.vpc_b,
             "vpc_a ({}) should be < vpc_b ({})",
             peering.vpc_a,
             peering.vpc_b
