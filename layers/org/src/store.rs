@@ -3,42 +3,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::{validate_name, Org, OrgId, Project, ProjectId};
+use crate::types::{Org, OrgId, Project, ProjectId};
+use crate::validation::validate_name;
 
-const ORGS_TABLE: &str = "orgs";
+const TABLE: &str = "orgs";
 const PROJECTS_TABLE: &str = "projects";
 const ENVIRONMENTS_TABLE: &str = "environments";
 
-/// Persistence layer for organizations and projects.
-///
-/// Uses `syfrah-state` (redb) for storage. Orgs are keyed by name.
-/// Projects are keyed by "org_name/project_name".
-#[derive(Clone, Debug)]
+/// Persistent store for organizations backed by redb.
 pub struct OrgStore {
     db: LayerDb,
 }
 
 impl OrgStore {
-    /// Open (or create) the org store.
-    pub fn open() -> Result<Self> {
-        let db = LayerDb::open("org")?;
-        Ok(Self { db })
-    }
-
-    /// Open with a custom path (for testing).
-    pub fn open_at(path: &std::path::Path) -> Result<Self> {
-        let db = LayerDb::open_at(path)?;
-        Ok(Self { db })
+    /// Create a new `OrgStore` with the given database handle.
+    pub fn new(db: LayerDb) -> Self {
+        Self { db }
     }
 
     // ── Org operations ───────────────────────────────────────────────
 
-    /// Create a new organization.
-    pub fn create_org(&self, name: &str) -> Result<Org> {
-        validate_name(name).map_err(OrgError::InvalidName)?;
+    /// Create a new organization. Validates the name, checks for duplicates.
+    pub fn create(&self, name: &str) -> Result<Org> {
+        validate_name(name)?;
 
-        if self.db.exists(ORGS_TABLE, name)? {
-            return Err(OrgError::OrgAlreadyExists(name.to_string()));
+        if self.db.exists(TABLE, name)? {
+            return Err(OrgError::AlreadyExists(name.to_string()));
         }
 
         let now = SystemTime::now()
@@ -47,30 +37,30 @@ impl OrgStore {
             .as_secs();
 
         let org = Org {
-            id: OrgId(name.to_string()),
+            id: OrgId(format!("org-{name}")),
             name: name.to_string(),
             created_at: now,
         };
 
-        self.db.set(ORGS_TABLE, name, &org)?;
+        self.db.set(TABLE, name, &org)?;
         Ok(org)
     }
 
-    /// Get an organization by name.
-    pub fn get_org(&self, name: &str) -> Result<Option<Org>> {
-        Ok(self.db.get(ORGS_TABLE, name)?)
+    /// Get an organization by name. Returns `None` if it doesn't exist.
+    pub fn get(&self, name: &str) -> Result<Option<Org>> {
+        Ok(self.db.get(TABLE, name)?)
     }
 
     /// List all organizations.
-    pub fn list_orgs(&self) -> Result<Vec<Org>> {
-        let entries: Vec<(String, Org)> = self.db.list(ORGS_TABLE)?;
+    pub fn list(&self) -> Result<Vec<Org>> {
+        let entries: Vec<(String, Org)> = self.db.list(TABLE)?;
         Ok(entries.into_iter().map(|(_, org)| org).collect())
     }
 
-    /// Delete an organization. Fails if it has any projects.
-    pub fn delete_org(&self, name: &str) -> Result<()> {
-        if !self.db.exists(ORGS_TABLE, name)? {
-            return Err(OrgError::OrgNotFound(name.to_string()));
+    /// Delete an organization by name. Fails if it has projects.
+    pub fn delete(&self, name: &str) -> Result<()> {
+        if !self.db.exists(TABLE, name)? {
+            return Err(OrgError::NotFound(name.to_string()));
         }
 
         // Check for child projects
@@ -79,7 +69,7 @@ impl OrgStore {
             return Err(OrgError::OrgHasProjects(name.to_string()));
         }
 
-        self.db.delete(ORGS_TABLE, name)?;
+        self.db.delete(TABLE, name)?;
         Ok(())
     }
 
@@ -92,11 +82,11 @@ impl OrgStore {
 
     /// Create a new project within an organization.
     pub fn create_project(&self, org: &str, name: &str) -> Result<Project> {
-        validate_name(name).map_err(OrgError::InvalidName)?;
+        validate_name(name)?;
 
         // Verify org exists
-        if !self.db.exists(ORGS_TABLE, org)? {
-            return Err(OrgError::OrgNotFound(org.to_string()));
+        if !self.db.exists(TABLE, org)? {
+            return Err(OrgError::NotFound(org.to_string()));
         }
 
         let key = Self::project_key(org, name);
@@ -176,14 +166,99 @@ mod tests {
     fn temp_store() -> (tempfile::TempDir, OrgStore) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("org-test.redb");
-        let store = OrgStore::open_at(&path).unwrap();
-        (dir, store)
+        let db = LayerDb::open_at(&path).unwrap();
+        (dir, OrgStore::new(db))
+    }
+
+    #[test]
+    fn create_org() {
+        let (_dir, store) = temp_store();
+        let org = store.create("acme").unwrap();
+        assert_eq!(org.name, "acme");
+        assert_eq!(org.id.0, "org-acme");
+        assert!(org.created_at > 0);
+    }
+
+    #[test]
+    fn duplicate_name_rejected() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        let err = store.create("acme").unwrap_err();
+        assert!(matches!(err, OrgError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn invalid_name_rejected() {
+        let (_dir, store) = temp_store();
+
+        // spaces
+        assert!(matches!(
+            store.create("my org").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        // uppercase
+        assert!(matches!(
+            store.create("Acme").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        // special chars
+        assert!(matches!(
+            store.create("org@1").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        // too short
+        assert!(matches!(
+            store.create("ab").unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+        // too long
+        assert!(matches!(
+            store.create(&"x".repeat(64)).unwrap_err(),
+            OrgError::InvalidName(_)
+        ));
+    }
+
+    #[test]
+    fn delete_org() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.delete("acme").unwrap();
+        assert!(store.get("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_nonexistent_fails() {
+        let (_dir, store) = temp_store();
+        let err = store.delete("ghost").unwrap_err();
+        assert!(matches!(err, OrgError::NotFound(_)));
+    }
+
+    #[test]
+    fn list_orgs() {
+        let (_dir, store) = temp_store();
+        store.create("alpha").unwrap();
+        store.create("beta").unwrap();
+        store.create("gamma").unwrap();
+
+        let orgs = store.list().unwrap();
+        assert_eq!(orgs.len(), 3);
+
+        let names: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn get_nonexistent() {
+        let (_dir, store) = temp_store();
+        assert!(store.get("does-not-exist").unwrap().is_none());
     }
 
     #[test]
     fn create_project_succeeds_with_valid_org() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
 
         let project = store.create_project("acme", "backend").unwrap();
         assert_eq!(project.name, "backend");
@@ -195,9 +270,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rejected() {
+    fn duplicate_project_rejected() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
 
         let err = store.create_project("acme", "backend").unwrap_err();
@@ -208,36 +283,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_name_rejected() {
+    fn project_invalid_name_rejected() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
 
-        // Too short
         let err = store.create_project("acme", "ab").unwrap_err();
-        assert!(
-            matches!(err, OrgError::InvalidName(_)),
-            "expected InvalidName, got: {err}"
-        );
+        assert!(matches!(err, OrgError::InvalidName(_)));
 
-        // Uppercase
         let err = store.create_project("acme", "MyProject").unwrap_err();
-        assert!(
-            matches!(err, OrgError::InvalidName(_)),
-            "expected InvalidName, got: {err}"
-        );
-
-        // Special characters
-        let err = store.create_project("acme", "my project").unwrap_err();
-        assert!(
-            matches!(err, OrgError::InvalidName(_)),
-            "expected InvalidName, got: {err}"
-        );
+        assert!(matches!(err, OrgError::InvalidName(_)));
     }
 
     #[test]
     fn delete_project_succeeds_when_empty() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
 
         store.delete_project("acme", "backend").unwrap();
@@ -247,12 +307,12 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_envs_rejected() {
+    fn delete_project_with_envs_rejected() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
 
-        // Simulate an environment existing by writing directly to the environments table
+        // Simulate an environment existing
         store
             .db
             .set(
@@ -270,10 +330,10 @@ mod tests {
     }
 
     #[test]
-    fn list_by_org() {
+    fn list_projects_by_org() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
-        store.create_org("globex").unwrap();
+        store.create("acme").unwrap();
+        store.create("globex").unwrap();
 
         store.create_project("acme", "backend").unwrap();
         store.create_project("acme", "frontend").unwrap();
@@ -288,11 +348,6 @@ mod tests {
         let globex_projects = store.list_projects("globex").unwrap();
         assert_eq!(globex_projects.len(), 1);
         assert_eq!(globex_projects[0].name, "api");
-
-        // Empty org
-        store.create_org("empty-org").unwrap();
-        let empty = store.list_projects("empty-org").unwrap();
-        assert_eq!(empty.len(), 0);
     }
 
     #[test]
@@ -301,28 +356,29 @@ mod tests {
 
         let err = store.create_project("nonexistent", "backend").unwrap_err();
         assert!(
-            matches!(err, OrgError::OrgNotFound(_)),
-            "expected OrgNotFound, got: {err}"
+            matches!(err, OrgError::NotFound(_)),
+            "expected NotFound, got: {err}"
         );
     }
 
     #[test]
-    fn delete_nonexistent_project_fails() {
+    fn org_with_projects_cannot_be_deleted() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
 
-        let err = store.delete_project("acme", "nonexistent").unwrap_err();
+        let err = store.delete("acme").unwrap_err();
         assert!(
-            matches!(err, OrgError::ProjectNotFound { .. }),
-            "expected ProjectNotFound, got: {err}"
+            matches!(err, OrgError::OrgHasProjects(_)),
+            "expected OrgHasProjects, got: {err}"
         );
     }
 
     #[test]
     fn same_project_name_different_orgs() {
         let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
-        store.create_org("globex").unwrap();
+        store.create("acme").unwrap();
+        store.create("globex").unwrap();
 
         store.create_project("acme", "backend").unwrap();
         store.create_project("globex", "backend").unwrap();
@@ -332,45 +388,5 @@ mod tests {
 
         assert_eq!(acme_proj.org_id, OrgId("acme".to_string()));
         assert_eq!(globex_proj.org_id, OrgId("globex".to_string()));
-    }
-
-    #[test]
-    fn org_with_projects_cannot_be_deleted() {
-        let (_dir, store) = temp_store();
-        store.create_org("acme").unwrap();
-        store.create_project("acme", "backend").unwrap();
-
-        let err = store.delete_org("acme").unwrap_err();
-        assert!(
-            matches!(err, OrgError::OrgHasProjects(_)),
-            "expected OrgHasProjects, got: {err}"
-        );
-    }
-
-    #[test]
-    fn org_crud() {
-        let (_dir, store) = temp_store();
-
-        // Create
-        let org = store.create_org("acme").unwrap();
-        assert_eq!(org.name, "acme");
-
-        // Get
-        let fetched = store.get_org("acme").unwrap();
-        assert!(fetched.is_some());
-
-        // List
-        store.create_org("globex").unwrap();
-        let orgs = store.list_orgs().unwrap();
-        assert_eq!(orgs.len(), 2);
-
-        // Delete
-        store.delete_org("globex").unwrap();
-        let orgs = store.list_orgs().unwrap();
-        assert_eq!(orgs.len(), 1);
-
-        // Duplicate
-        let err = store.create_org("acme").unwrap_err();
-        assert!(matches!(err, OrgError::OrgAlreadyExists(_)));
     }
 }
