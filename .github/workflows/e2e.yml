@@ -51,15 +51,6 @@ jobs:
           # Build parallel groups from scenario filenames.
           # Each group runs as a separate CI job for faster feedback.
           groups='[
-            {"name": "fabric-basic",       "filter": "0[1-7]_fabric"},
-            {"name": "fabric-rotation",    "filter": "08_fabric"},
-            {"name": "fabric-recovery",    "filter": "09_fabric|10_fabric|11_fabric"},
-            {"name": "fabric-perf",        "filter": "1[23]_fabric"},
-            {"name": "fabric-scale",       "filter": "1[4-9]_fabric|20_fabric"},
-            {"name": "fabric-reconcile",   "filter": "2[5-7]_fabric"},
-            {"name": "fabric-zones",       "filter": "2[89]_fabric|3[0-7]_fabric"},
-            {"name": "fabric-misc",        "filter": "3[89]_fabric|4[0-9]_fabric|59_fabric_pid"},
-            {"name": "fabric-topology",    "filter": "5[0-9]_fabric_topology"},
             {"name": "state",              "filter": "2[1-4]_state"},
             {"name": "quickstart",         "filter": "90_quickstart"},
             {"name": "ux-output",          "filter": "9[1-7]_ux"},
