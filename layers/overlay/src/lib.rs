@@ -7,6 +7,7 @@ pub mod mock;
 pub mod nft;
 pub mod sysctl;
 pub mod tap;
+pub mod veth_peer;
 pub mod vxlan;
 
 pub use api::OverlayHandler;
