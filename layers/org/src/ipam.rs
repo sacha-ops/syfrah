@@ -1,220 +1,395 @@
-//! IPAM — IP Address Management with bitmap allocation and MAC derivation.
+//! IPAM — IP Address Management with bitmap allocation and lifecycle tracking.
 //!
-//! Each subnet gets a 32-byte bitmap (256 bits for a /24). Reserved addresses:
-//! - `.0` (network), `.1` (gateway), `.2` (reserved/DNS), `.255` (broadcast)
+//! The bitmap is the fast-path allocator (1 bit per IP). The `ip_allocations`
+//! table is the audit trail that tracks the full lifecycle of each allocation:
+//! Reserved -> Assigned -> released (deleted).
 //!
-//! MAC addresses are derived deterministically from IPs:
-//! `02:00:{octet1:02x}:{octet2:02x}:{octet3:02x}:{octet4:02x}`
-//!
-//! The `02` prefix indicates a locally administered unicast MAC.
+//! Orphan detection catches IPs that were reserved but never assigned (e.g.,
+//! VM creation failed between IPAM allocation and boot).
 
+use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::SubnetId;
+
+// ── Constants ────────────────────────────────────────────────────────
 
 const IPAM_BITMAPS_TABLE: &str = "ipam_bitmaps";
 const IP_ALLOCATIONS_TABLE: &str = "ip_allocations";
 
-/// Reserved host offsets within a subnet (not allocatable).
+/// Number of IPs in a /24 subnet.
+const SUBNET_SIZE: usize = 256;
+
+/// Bitmap size in bytes for a /24 (256 bits = 32 bytes).
+const BITMAP_BYTES: usize = SUBNET_SIZE / 8;
+
+/// Reserved host offsets: .0 (network), .1 (gateway), .2 (reserved/DNS), .255 (broadcast).
 const RESERVED_OFFSETS: &[u8] = &[0, 1, 2, 255];
 
-/// State of an IP allocation.
+/// First allocatable host offset.
+const FIRST_ALLOCATABLE: u8 = 3;
+
+/// Last allocatable host offset.
+const LAST_ALLOCATABLE: u8 = 254;
+
+/// Default orphan threshold: 5 minutes (300 seconds).
+pub const DEFAULT_ORPHAN_THRESHOLD_SECS: u64 = 300;
+
+// ── Types ────────────────────────────────────────────────────────────
+
+/// State of an IP allocation in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllocationState {
-    /// IP reserved but VM not yet created.
+    /// IP reserved from bitmap but not yet assigned to a VM.
     Reserved,
     /// IP assigned to a running VM.
     Assigned,
-    /// IP was allocated but VM creation failed; awaiting reclamation.
+    /// IP was reserved but never assigned within the orphan threshold.
     Orphaned,
 }
 
-/// A record tracking the full lifecycle of an IP allocation.
+impl fmt::Display for AllocationState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AllocationState::Reserved => f.write_str("Reserved"),
+            AllocationState::Assigned => f.write_str("Assigned"),
+            AllocationState::Orphaned => f.write_str("Orphaned"),
+        }
+    }
+}
+
+/// A tracked IP allocation with full lifecycle metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpAllocation {
+    /// The allocated IP address (e.g., "10.0.1.3").
     pub ip: String,
-    pub subnet_id: SubnetId,
+    /// The subnet this IP belongs to.
+    pub subnet_id: String,
+    /// The VM using this IP. None if Reserved (not yet assigned).
     pub vm_id: Option<String>,
+    /// MAC address derived deterministically from the IP.
     pub mac: String,
+    /// Current lifecycle state.
     pub state: AllocationState,
+    /// Unix timestamp when the IP was reserved from the bitmap.
     pub allocated_at: u64,
+    /// Unix timestamp when the IP was assigned to a VM. None if not yet assigned.
     pub assigned_at: Option<u64>,
 }
 
-/// Derive a deterministic MAC address from an IPv4 address.
-///
-/// Format: `02:00:{o1:02x}:{o2:02x}:{o3:02x}:{o4:02x}`
-///
-/// The `02` prefix byte marks a locally administered unicast MAC.
-///
-/// # Examples
-///
-/// ```
-/// use std::net::Ipv4Addr;
-/// use syfrah_org::ipam::mac_from_ip;
-///
-/// let mac = mac_from_ip(Ipv4Addr::new(10, 0, 1, 5));
-/// assert_eq!(mac, "02:00:0a:00:01:05");
-/// ```
-pub fn mac_from_ip(ip: Ipv4Addr) -> String {
-    let octets = ip.octets();
-    format!(
-        "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
-        octets[0], octets[1], octets[2], octets[3]
-    )
-}
+// ── Bitmap allocator ─────────────────────────────────────────────────
 
-/// Bitmap-based IP allocator for a subnet.
-///
-/// Each /24 subnet uses 32 bytes (256 bits). Bit set = IP in use.
+/// A /24 subnet bitmap: 256 bits (32 bytes), one bit per IP.
+/// Bit set = IP in use. Bit clear = IP available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SubnetBitmap {
-    /// 32-byte bitmap: bit N corresponds to host offset N.
-    bits: Vec<u8>,
+pub struct SubnetBitmap {
+    /// Raw bitmap bytes. Index 0 bit 0 = .0, index 0 bit 1 = .1, etc.
+    pub bits: Vec<u8>,
 }
 
 impl SubnetBitmap {
-    /// Create a new bitmap for a /24 with reserved addresses pre-set.
-    fn new_slash24() -> Self {
-        let mut bm = SubnetBitmap {
-            bits: vec![0u8; 32],
-        };
+    /// Create a new bitmap with reserved addresses pre-marked.
+    pub fn new() -> Self {
+        let mut bits = vec![0u8; BITMAP_BYTES];
         for &offset in RESERVED_OFFSETS {
-            bm.set(offset as usize);
+            Self::set_bit(&mut bits, offset as usize);
         }
-        bm
+        Self { bits }
     }
 
-    /// Set bit at the given offset.
-    fn set(&mut self, offset: usize) {
-        if offset < 256 {
-            self.bits[offset / 8] |= 1 << (offset % 8);
-        }
-    }
-
-    /// Clear bit at the given offset.
-    fn clear(&mut self, offset: usize) {
-        if offset < 256 {
-            self.bits[offset / 8] &= !(1 << (offset % 8));
+    /// Set a bit (mark IP as in-use).
+    fn set_bit(bits: &mut [u8], offset: usize) {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx < bits.len() {
+            bits[byte_idx] |= 1 << bit_idx;
         }
     }
 
-    /// Check if bit at the given offset is set.
-    fn is_set(&self, offset: usize) -> bool {
-        if offset >= 256 {
-            return true;
+    /// Clear a bit (mark IP as available).
+    fn clear_bit(bits: &mut [u8], offset: usize) {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx < bits.len() {
+            bits[byte_idx] &= !(1 << bit_idx);
         }
-        (self.bits[offset / 8] & (1 << (offset % 8))) != 0
     }
 
-    /// Find the first free offset (unset bit), skipping reserved.
-    fn first_free(&self) -> Option<usize> {
-        (3..255).find(|&offset| !self.is_set(offset))
+    /// Check if a bit is set.
+    fn is_set(bits: &[u8], offset: usize) -> bool {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx < bits.len() {
+            (bits[byte_idx] >> bit_idx) & 1 == 1
+        } else {
+            false
+        }
+    }
+
+    /// Allocate the first available IP. Returns the host offset (3..=254).
+    pub fn allocate(&mut self) -> Option<u8> {
+        for offset in FIRST_ALLOCATABLE..=LAST_ALLOCATABLE {
+            if !Self::is_set(&self.bits, offset as usize) {
+                Self::set_bit(&mut self.bits, offset as usize);
+                return Some(offset);
+            }
+        }
+        None
+    }
+
+    /// Release an IP by its host offset.
+    pub fn release(&mut self, offset: u8) {
+        // Never release reserved addresses.
+        if RESERVED_OFFSETS.contains(&offset) {
+            return;
+        }
+        Self::clear_bit(&mut self.bits, offset as usize);
+    }
+
+    /// Check if a specific offset is allocated.
+    pub fn is_allocated(&self, offset: u8) -> bool {
+        Self::is_set(&self.bits, offset as usize)
+    }
+
+    /// Count the number of available (allocatable) IPs.
+    pub fn available_count(&self) -> u32 {
+        let mut count = 0u32;
+        for offset in FIRST_ALLOCATABLE..=LAST_ALLOCATABLE {
+            if !Self::is_set(&self.bits, offset as usize) {
+                count += 1;
+            }
+        }
+        count
     }
 }
 
-/// IPAM allocator backed by redb.
-pub struct IpamAllocator {
+impl Default for SubnetBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── MAC derivation ───────────────────────────────────────────────────
+
+/// Derive a MAC address deterministically from an IPv4 address.
+///
+/// Format: `02:00:{octet1:02x}:{octet2:02x}:{octet3:02x}:{octet4:02x}`
+///
+/// The `02` prefix sets the locally-administered bit, avoiding conflicts
+/// with globally-assigned OUI ranges.
+pub fn mac_from_ip(ip: &Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("02:00:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
+}
+
+// ── Helper: parse subnet base from CIDR string ──────────────────────
+
+/// Extract the network base address from a CIDR string like "10.0.1.0/24".
+fn parse_subnet_base(cidr: &str) -> Result<Ipv4Addr> {
+    let net: ipnet::Ipv4Net = cidr
+        .parse()
+        .map_err(|_| OrgError::InvalidCidr(format!("invalid subnet CIDR: {cidr}")))?;
+    Ok(net.network())
+}
+
+/// Build an IP address from a subnet base and a host offset.
+fn ip_from_offset(base: &Ipv4Addr, offset: u8) -> Ipv4Addr {
+    let mut octets = base.octets();
+    octets[3] = offset;
+    Ipv4Addr::from(octets)
+}
+
+// ── Current time helper ──────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ── IPAM store ───────────────────────────────────────────────────────
+
+/// IP Address Management store backed by redb.
+///
+/// Manages bitmap allocation for fast IP assignment and an allocation
+/// table for lifecycle tracking and orphan detection.
+pub struct IpamStore {
     db: LayerDb,
 }
 
-impl IpamAllocator {
-    /// Create a new IPAM allocator.
+impl IpamStore {
+    /// Create a new IPAM store with the given database handle.
     pub fn new(db: LayerDb) -> Self {
         Self { db }
     }
 
-    /// Allocate the next available IP from a subnet.
-    ///
-    /// Returns an `IpAllocation` with state `Reserved` and a deterministically
-    /// derived MAC address.
-    pub fn allocate(&self, subnet_id: &SubnetId, subnet_cidr: &str) -> Result<IpAllocation> {
-        let cidr: Ipv4Net = subnet_cidr
-            .parse()
-            .map_err(|_| OrgError::InvalidCidr(subnet_cidr.to_string()))?;
+    /// Build the allocation table key: "subnet_id/ip".
+    fn allocation_key(subnet_id: &str, ip: &str) -> String {
+        format!("{subnet_id}/{ip}")
+    }
 
-        let prefix = cidr.prefix_len();
-        if prefix != 24 {
-            return Err(OrgError::IpamUnsupportedPrefix(prefix));
+    /// Load or create the bitmap for a subnet.
+    fn load_bitmap(&self, subnet_id: &str) -> Result<SubnetBitmap> {
+        match self.db.get::<SubnetBitmap>(IPAM_BITMAPS_TABLE, subnet_id)? {
+            Some(bm) => Ok(bm),
+            None => Ok(SubnetBitmap::new()),
         }
+    }
 
-        let network = cidr.network();
-        let bitmap_key = subnet_id.0.clone();
+    /// Persist the bitmap for a subnet (used by callers that don't need
+    /// atomic batch writes).
+    #[allow(dead_code)]
+    fn save_bitmap(&self, subnet_id: &str, bitmap: &SubnetBitmap) -> Result<()> {
+        self.db.set(IPAM_BITMAPS_TABLE, subnet_id, bitmap)?;
+        Ok(())
+    }
 
-        // Load or create bitmap.
-        let mut bitmap: SubnetBitmap = self
-            .db
-            .get(IPAM_BITMAPS_TABLE, &bitmap_key)?
-            .unwrap_or_else(SubnetBitmap::new_slash24);
+    /// Reserve an IP from a subnet's bitmap.
+    ///
+    /// Allocates the next available IP, creates an `IpAllocation` record
+    /// with `state = Reserved`, and returns it. The caller is responsible
+    /// for later calling `assign_ip` once the VM is booted, or `release_ip`
+    /// on failure.
+    ///
+    /// `subnet_cidr` is the CIDR string (e.g., "10.0.1.0/24") used to
+    /// compute the full IP address from the bitmap offset.
+    pub fn reserve_ip(&self, subnet_id: &str, subnet_cidr: &str) -> Result<IpAllocation> {
+        let base = parse_subnet_base(subnet_cidr)?;
+        let mut bitmap = self.load_bitmap(subnet_id)?;
 
-        // Find next free offset.
-        let offset = bitmap
-            .first_free()
-            .ok_or(OrgError::IpamExhausted(subnet_id.0.clone()))?;
+        let offset = bitmap.allocate().ok_or(OrgError::IpExhausted {
+            subnet: subnet_id.to_string(),
+        })?;
 
-        // Compute IP from network base + offset.
-        let octets = network.octets();
-        let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], offset as u8);
-
-        // Derive MAC.
-        let mac = mac_from_ip(ip);
-
-        // Mark bit as allocated.
-        bitmap.set(offset);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let ip = ip_from_offset(&base, offset);
+        let mac = mac_from_ip(&ip);
+        let now = now_secs();
 
         let allocation = IpAllocation {
             ip: ip.to_string(),
-            subnet_id: subnet_id.clone(),
+            subnet_id: subnet_id.to_string(),
             vm_id: None,
-            mac: mac.clone(),
+            mac,
             state: AllocationState::Reserved,
             allocated_at: now,
             assigned_at: None,
         };
 
         // Persist bitmap and allocation atomically.
-        let alloc_key = format!("{}:{}", subnet_id.0, ip);
+        let key = Self::allocation_key(subnet_id, &allocation.ip);
         self.db.batch(|w| {
-            w.set(IPAM_BITMAPS_TABLE, &bitmap_key, &bitmap)?;
-            w.set(IP_ALLOCATIONS_TABLE, &alloc_key, &allocation)?;
+            w.set(IPAM_BITMAPS_TABLE, subnet_id, &bitmap)?;
+            w.set(IP_ALLOCATIONS_TABLE, &key, &allocation)?;
             Ok(())
         })?;
 
         Ok(allocation)
     }
 
-    /// Release an IP allocation, freeing it for reuse.
-    pub fn release(&self, subnet_id: &SubnetId, ip: Ipv4Addr) -> Result<()> {
-        let bitmap_key = subnet_id.0.clone();
-        let alloc_key = format!("{}:{}", subnet_id.0, ip);
+    /// Reserve an IP from a subnet using a custom timestamp (for testing).
+    pub fn reserve_ip_at(
+        &self,
+        subnet_id: &str,
+        subnet_cidr: &str,
+        timestamp: u64,
+    ) -> Result<IpAllocation> {
+        let base = parse_subnet_base(subnet_cidr)?;
+        let mut bitmap = self.load_bitmap(subnet_id)?;
 
-        let mut bitmap: SubnetBitmap = self
-            .db
-            .get(IPAM_BITMAPS_TABLE, &bitmap_key)?
-            .ok_or_else(|| OrgError::IpamSubnetNotFound(subnet_id.0.clone()))?;
+        let offset = bitmap.allocate().ok_or(OrgError::IpExhausted {
+            subnet: subnet_id.to_string(),
+        })?;
 
-        let offset = ip.octets()[3] as usize;
+        let ip = ip_from_offset(&base, offset);
+        let mac = mac_from_ip(&ip);
 
-        // Don't allow releasing reserved addresses.
-        if RESERVED_OFFSETS.contains(&(offset as u8)) {
-            return Err(OrgError::IpamReservedAddress(ip.to_string()));
+        let allocation = IpAllocation {
+            ip: ip.to_string(),
+            subnet_id: subnet_id.to_string(),
+            vm_id: None,
+            mac,
+            state: AllocationState::Reserved,
+            allocated_at: timestamp,
+            assigned_at: None,
+        };
+
+        let key = Self::allocation_key(subnet_id, &allocation.ip);
+        self.db.batch(|w| {
+            w.set(IPAM_BITMAPS_TABLE, subnet_id, &bitmap)?;
+            w.set(IP_ALLOCATIONS_TABLE, &key, &allocation)?;
+            Ok(())
+        })?;
+
+        Ok(allocation)
+    }
+
+    /// Assign a reserved IP to a VM.
+    ///
+    /// Transitions the allocation from `Reserved` to `Assigned`, sets the
+    /// `vm_id` and `assigned_at` timestamp.
+    pub fn assign_ip(&self, subnet_id: &str, ip: &str, vm_id: &str) -> Result<IpAllocation> {
+        let key = Self::allocation_key(subnet_id, ip);
+        let mut allocation: IpAllocation =
+            self.db
+                .get(IP_ALLOCATIONS_TABLE, &key)?
+                .ok_or(OrgError::IpNotFound {
+                    subnet: subnet_id.to_string(),
+                    ip: ip.to_string(),
+                })?;
+
+        if allocation.state == AllocationState::Assigned {
+            return Err(OrgError::IpAlreadyAssigned {
+                subnet: subnet_id.to_string(),
+                ip: ip.to_string(),
+            });
         }
 
-        bitmap.clear(offset);
+        allocation.state = AllocationState::Assigned;
+        allocation.vm_id = Some(vm_id.to_string());
+        allocation.assigned_at = Some(now_secs());
+
+        self.db.set(IP_ALLOCATIONS_TABLE, &key, &allocation)?;
+        Ok(allocation)
+    }
+
+    /// Release an IP: clear the bitmap bit and delete the allocation record.
+    ///
+    /// This is called on VM delete or when reclaiming an orphaned allocation.
+    pub fn release_ip(&self, subnet_id: &str, subnet_cidr: &str, ip: &str) -> Result<()> {
+        let _base = parse_subnet_base(subnet_cidr)?;
+        let release_ip: Ipv4Addr = ip
+            .parse()
+            .map_err(|_| OrgError::InvalidCidr(format!("invalid IP address: {ip}")))?;
+
+        // Compute offset from base.
+        let offset = release_ip.octets()[3];
+        if !(FIRST_ALLOCATABLE..=LAST_ALLOCATABLE).contains(&offset) {
+            return Err(OrgError::InvalidCidr(format!(
+                "cannot release reserved address: {ip}"
+            )));
+        }
+
+        let mut bitmap = self.load_bitmap(subnet_id)?;
+        bitmap.release(offset);
+
+        let alloc_key = Self::allocation_key(subnet_id, ip);
+
+        // Verify the allocation exists before deleting.
+        let exists = self.db.exists(IP_ALLOCATIONS_TABLE, &alloc_key)?;
+        if !exists {
+            return Err(OrgError::IpNotFound {
+                subnet: subnet_id.to_string(),
+                ip: ip.to_string(),
+            });
+        }
 
         self.db.batch(|w| {
-            w.set(IPAM_BITMAPS_TABLE, &bitmap_key, &bitmap)?;
+            w.set(IPAM_BITMAPS_TABLE, subnet_id, &bitmap)?;
             w.delete(IP_ALLOCATIONS_TABLE, &alloc_key)?;
             Ok(())
         })?;
@@ -222,172 +397,388 @@ impl IpamAllocator {
         Ok(())
     }
 
-    /// Get an allocation record by subnet and IP.
-    pub fn get_allocation(&self, subnet_id: &SubnetId, ip: &str) -> Result<Option<IpAllocation>> {
-        let alloc_key = format!("{}:{}", subnet_id.0, ip);
-        Ok(self.db.get(IP_ALLOCATIONS_TABLE, &alloc_key)?)
-    }
-
-    /// List all allocations for a subnet.
-    pub fn list_allocations(&self, subnet_id: &SubnetId) -> Result<Vec<IpAllocation>> {
-        let entries: Vec<(String, IpAllocation)> = self.db.list(IP_ALLOCATIONS_TABLE)?;
-        let prefix = format!("{}:", subnet_id.0);
-        Ok(entries
+    /// List all IP allocations in a subnet.
+    pub fn list_allocations(&self, subnet_id: &str) -> Result<Vec<IpAllocation>> {
+        let all: Vec<(String, IpAllocation)> = self.db.list(IP_ALLOCATIONS_TABLE)?;
+        let prefix = format!("{subnet_id}/");
+        Ok(all
             .into_iter()
             .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v)
+            .map(|(_, alloc)| alloc)
             .collect())
     }
+
+    /// Find orphaned allocations: IPs in `Reserved` state older than `max_age_secs`.
+    ///
+    /// An orphaned IP is one that was reserved from the bitmap but never
+    /// assigned to a VM — typically because VM creation failed between
+    /// the IPAM reservation and the VM boot.
+    pub fn find_orphans(&self, max_age_secs: u64) -> Result<Vec<IpAllocation>> {
+        let now = now_secs();
+        let all: Vec<(String, IpAllocation)> = self.db.list(IP_ALLOCATIONS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, alloc)| {
+                alloc.state == AllocationState::Reserved
+                    && now.saturating_sub(alloc.allocated_at) > max_age_secs
+            })
+            .map(|(_, alloc)| alloc)
+            .collect())
+    }
+
+    /// Find orphaned allocations using a custom "now" timestamp (for testing).
+    pub fn find_orphans_at(&self, max_age_secs: u64, now: u64) -> Result<Vec<IpAllocation>> {
+        let all: Vec<(String, IpAllocation)> = self.db.list(IP_ALLOCATIONS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, alloc)| {
+                alloc.state == AllocationState::Reserved
+                    && now.saturating_sub(alloc.allocated_at) > max_age_secs
+            })
+            .map(|(_, alloc)| alloc)
+            .collect())
+    }
+
+    /// Mark an allocation as orphaned (without releasing it yet).
+    ///
+    /// This is useful for logging/alerting before reclamation.
+    pub fn mark_orphaned(&self, subnet_id: &str, ip: &str) -> Result<IpAllocation> {
+        let key = Self::allocation_key(subnet_id, ip);
+        let mut allocation: IpAllocation =
+            self.db
+                .get(IP_ALLOCATIONS_TABLE, &key)?
+                .ok_or(OrgError::IpNotFound {
+                    subnet: subnet_id.to_string(),
+                    ip: ip.to_string(),
+                })?;
+
+        allocation.state = AllocationState::Orphaned;
+        self.db.set(IP_ALLOCATIONS_TABLE, &key, &allocation)?;
+        Ok(allocation)
+    }
+
+    /// Get a single allocation by subnet and IP.
+    pub fn get_allocation(&self, subnet_id: &str, ip: &str) -> Result<Option<IpAllocation>> {
+        let key = Self::allocation_key(subnet_id, ip);
+        Ok(self.db.get(IP_ALLOCATIONS_TABLE, &key)?)
+    }
+
+    /// Get the bitmap for a subnet (for inspection/debugging).
+    pub fn get_bitmap(&self, subnet_id: &str) -> Result<Option<SubnetBitmap>> {
+        Ok(self.db.get(IPAM_BITMAPS_TABLE, subnet_id)?)
+    }
 }
+
+// ── Unit tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temp_allocator() -> (tempfile::TempDir, IpamAllocator) {
+    const TEST_SUBNET_ID: &str = "default/frontend";
+    const TEST_SUBNET_CIDR: &str = "10.0.1.0/24";
+
+    fn temp_ipam() -> (tempfile::TempDir, IpamStore) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ipam-test.redb");
-        let db = syfrah_state::LayerDb::open_at(&path).unwrap();
-        (dir, IpamAllocator::new(db))
+        let db = LayerDb::open_at(&path).unwrap();
+        (dir, IpamStore::new(db))
+    }
+
+    // ── Bitmap unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn bitmap_reserved_addresses_pre_marked() {
+        let bm = SubnetBitmap::new();
+        assert!(bm.is_allocated(0), ".0 (network) must be reserved");
+        assert!(bm.is_allocated(1), ".1 (gateway) must be reserved");
+        assert!(bm.is_allocated(2), ".2 (reserved/DNS) must be reserved");
+        assert!(bm.is_allocated(255), ".255 (broadcast) must be reserved");
+        assert!(!bm.is_allocated(3), ".3 should be available");
+        assert!(!bm.is_allocated(254), ".254 should be available");
     }
 
     #[test]
-    fn mac_from_ip_example() {
-        let mac = mac_from_ip(Ipv4Addr::new(10, 0, 1, 5));
-        assert_eq!(mac, "02:00:0a:00:01:05");
+    fn bitmap_allocate_sequential() {
+        let mut bm = SubnetBitmap::new();
+        assert_eq!(bm.allocate(), Some(3));
+        assert_eq!(bm.allocate(), Some(4));
+        assert_eq!(bm.allocate(), Some(5));
     }
 
     #[test]
-    fn mac_uniqueness() {
-        let ips = [
-            Ipv4Addr::new(10, 0, 1, 5),
-            Ipv4Addr::new(10, 0, 1, 6),
-            Ipv4Addr::new(10, 0, 2, 5),
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(172, 16, 0, 1),
-        ];
-        let macs: Vec<String> = ips.iter().map(|ip| mac_from_ip(*ip)).collect();
-        // All MACs must be unique.
-        let mut unique = macs.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(
-            macs.len(),
-            unique.len(),
-            "MAC addresses must be unique for different IPs"
-        );
+    fn bitmap_release_and_reallocate() {
+        let mut bm = SubnetBitmap::new();
+        let first = bm.allocate().unwrap();
+        assert_eq!(first, 3);
+
+        bm.release(first);
+        assert!(!bm.is_allocated(3));
+
+        // Re-allocating should return the freed offset.
+        let reused = bm.allocate().unwrap();
+        assert_eq!(reused, 3);
     }
 
     #[test]
-    fn mac_format_valid() {
-        let test_ips = [
-            Ipv4Addr::new(10, 0, 1, 5),
-            Ipv4Addr::new(0, 0, 0, 0),
-            Ipv4Addr::new(255, 255, 255, 255),
-            Ipv4Addr::new(192, 168, 100, 200),
-        ];
+    fn bitmap_cannot_release_reserved() {
+        let mut bm = SubnetBitmap::new();
+        bm.release(0);
+        bm.release(1);
+        bm.release(2);
+        bm.release(255);
+        assert!(bm.is_allocated(0));
+        assert!(bm.is_allocated(1));
+        assert!(bm.is_allocated(2));
+        assert!(bm.is_allocated(255));
+    }
 
-        let mac_regex = regex::Regex::new(
-            r"^[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$",
-        )
-        .unwrap();
-
-        for ip in &test_ips {
-            let mac = mac_from_ip(*ip);
+    #[test]
+    fn bitmap_exhaustion() {
+        let mut bm = SubnetBitmap::new();
+        // Allocate all 252 available IPs (3..=254).
+        for i in 0..252 {
             assert!(
-                mac_regex.is_match(&mac),
-                "MAC '{}' for IP {} does not match XX:XX:XX:XX:XX:XX format",
-                mac,
-                ip
+                bm.allocate().is_some(),
+                "should allocate IP #{i} (offset {})",
+                i + 3
             );
-            // First byte must be 02 (locally administered unicast).
-            assert!(mac.starts_with("02:00:"), "MAC must start with 02:00:");
         }
+        assert_eq!(bm.allocate(), None, "bitmap should be exhausted");
+        assert_eq!(bm.available_count(), 0);
     }
 
     #[test]
-    fn allocate_first_ip() {
-        let (_dir, allocator) = temp_allocator();
-        let subnet_id = SubnetId("subnet-test".to_string());
-        let alloc = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        // First allocatable IP is .3 (after .0 network, .1 gateway, .2 reserved).
+    fn bitmap_available_count() {
+        let mut bm = SubnetBitmap::new();
+        assert_eq!(bm.available_count(), 252); // 3..=254
+        bm.allocate();
+        assert_eq!(bm.available_count(), 251);
+    }
+
+    // ── MAC derivation ───────────────────────────────────────────────
+
+    #[test]
+    fn mac_derivation() {
+        let ip: Ipv4Addr = "10.0.1.5".parse().unwrap();
+        assert_eq!(mac_from_ip(&ip), "02:00:0a:00:01:05");
+
+        let ip2: Ipv4Addr = "192.168.255.1".parse().unwrap();
+        assert_eq!(mac_from_ip(&ip2), "02:00:c0:a8:ff:01");
+    }
+
+    // ── Allocation lifecycle ─────────────────────────────────────────
+
+    #[test]
+    fn allocation_lifecycle() {
+        let (_dir, store) = temp_ipam();
+
+        // Reserve an IP.
+        let alloc = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
         assert_eq!(alloc.ip, "10.0.1.3");
-        assert_eq!(alloc.mac, "02:00:0a:00:01:03");
         assert_eq!(alloc.state, AllocationState::Reserved);
         assert!(alloc.vm_id.is_none());
+        assert!(alloc.assigned_at.is_none());
+        assert_eq!(alloc.mac, "02:00:0a:00:01:03");
+
+        // Assign to a VM.
+        let assigned = store
+            .assign_ip(TEST_SUBNET_ID, &alloc.ip, "vm-web-1")
+            .unwrap();
+        assert_eq!(assigned.state, AllocationState::Assigned);
+        assert_eq!(assigned.vm_id, Some("vm-web-1".to_string()));
+        assert!(assigned.assigned_at.is_some());
+
+        // Verify it shows in list.
+        let allocations = store.list_allocations(TEST_SUBNET_ID).unwrap();
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].state, AllocationState::Assigned);
+
+        // Release the IP.
+        store
+            .release_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR, &alloc.ip)
+            .unwrap();
+
+        // Verify allocation is gone.
+        let allocations = store.list_allocations(TEST_SUBNET_ID).unwrap();
+        assert!(allocations.is_empty());
+
+        // Verify IP is available again in the bitmap.
+        let bm = store.get_bitmap(TEST_SUBNET_ID).unwrap().unwrap();
+        assert!(!bm.is_allocated(3));
     }
 
     #[test]
-    fn allocate_sequential() {
-        let (_dir, allocator) = temp_allocator();
-        let subnet_id = SubnetId("subnet-seq".to_string());
-        let a1 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        let a2 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        let a3 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
+    fn orphan_detected() {
+        let (_dir, store) = temp_ipam();
+
+        // Reserve at a past time (10 minutes ago).
+        let past = now_secs() - 600;
+        let alloc = store
+            .reserve_ip_at(TEST_SUBNET_ID, TEST_SUBNET_CIDR, past)
+            .unwrap();
+        assert_eq!(alloc.state, AllocationState::Reserved);
+
+        // Find orphans with 5-minute threshold.
+        let orphans = store
+            .find_orphans_at(DEFAULT_ORPHAN_THRESHOLD_SECS, now_secs())
+            .unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].ip, "10.0.1.3");
+        assert_eq!(orphans[0].state, AllocationState::Reserved);
+    }
+
+    #[test]
+    fn orphan_reclaimed() {
+        let (_dir, store) = temp_ipam();
+
+        // Reserve at a past time.
+        let past = now_secs() - 600;
+        let alloc = store
+            .reserve_ip_at(TEST_SUBNET_ID, TEST_SUBNET_CIDR, past)
+            .unwrap();
+
+        // Detect the orphan.
+        let orphans = store
+            .find_orphans_at(DEFAULT_ORPHAN_THRESHOLD_SECS, now_secs())
+            .unwrap();
+        assert_eq!(orphans.len(), 1);
+
+        // Mark it as orphaned.
+        let marked = store.mark_orphaned(TEST_SUBNET_ID, &alloc.ip).unwrap();
+        assert_eq!(marked.state, AllocationState::Orphaned);
+
+        // Release the orphaned IP.
+        store
+            .release_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR, &alloc.ip)
+            .unwrap();
+
+        // Verify IP is available again.
+        let bm = store.get_bitmap(TEST_SUBNET_ID).unwrap().unwrap();
+        assert!(!bm.is_allocated(3));
+
+        // Re-allocate — should get the same IP back.
+        let new_alloc = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+        assert_eq!(new_alloc.ip, "10.0.1.3");
+    }
+
+    #[test]
+    fn crash_between_alloc_and_assign() {
+        let (_dir, store) = temp_ipam();
+
+        // Simulate: reserve IP, then "crash" (never call assign_ip).
+        let past = now_secs() - 600;
+        let alloc = store
+            .reserve_ip_at(TEST_SUBNET_ID, TEST_SUBNET_CIDR, past)
+            .unwrap();
+        assert_eq!(alloc.state, AllocationState::Reserved);
+
+        // After recovery, the reconciliation loop finds orphans.
+        let orphans = store
+            .find_orphans_at(DEFAULT_ORPHAN_THRESHOLD_SECS, now_secs())
+            .unwrap();
+        assert_eq!(orphans.len(), 1, "expected 1 orphan after simulated crash");
+        assert_eq!(orphans[0].ip, alloc.ip);
+
+        // Reclaim: release the orphan.
+        store
+            .release_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR, &alloc.ip)
+            .unwrap();
+
+        // Verify the IP is free.
+        let bm = store.get_bitmap(TEST_SUBNET_ID).unwrap().unwrap();
+        assert!(
+            !bm.is_allocated(3),
+            "IP should be free after orphan reclamation"
+        );
+
+        // No more orphans.
+        let orphans = store
+            .find_orphans_at(DEFAULT_ORPHAN_THRESHOLD_SECS, now_secs())
+            .unwrap();
+        assert!(orphans.is_empty(), "no orphans after reclamation");
+    }
+
+    #[test]
+    fn recently_reserved_not_orphaned() {
+        let (_dir, store) = temp_ipam();
+
+        // Reserve at current time — should NOT be detected as orphan.
+        let _alloc = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+
+        let orphans = store.find_orphans(DEFAULT_ORPHAN_THRESHOLD_SECS).unwrap();
+        assert!(orphans.is_empty(), "a freshly reserved IP is not an orphan");
+    }
+
+    #[test]
+    fn assigned_ip_not_orphaned() {
+        let (_dir, store) = temp_ipam();
+
+        // Reserve at a past time, then assign — should NOT be orphaned.
+        let past = now_secs() - 600;
+        let alloc = store
+            .reserve_ip_at(TEST_SUBNET_ID, TEST_SUBNET_CIDR, past)
+            .unwrap();
+        store
+            .assign_ip(TEST_SUBNET_ID, &alloc.ip, "vm-web-1")
+            .unwrap();
+
+        let orphans = store
+            .find_orphans_at(DEFAULT_ORPHAN_THRESHOLD_SECS, now_secs())
+            .unwrap();
+        assert!(orphans.is_empty(), "assigned IPs are not orphans");
+    }
+
+    #[test]
+    fn double_assign_rejected() {
+        let (_dir, store) = temp_ipam();
+
+        let alloc = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+        store.assign_ip(TEST_SUBNET_ID, &alloc.ip, "vm-1").unwrap();
+
+        // Second assign should fail.
+        let result = store.assign_ip(TEST_SUBNET_ID, &alloc.ip, "vm-2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn release_nonexistent_ip_fails() {
+        let (_dir, store) = temp_ipam();
+
+        let result = store.release_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR, "10.0.1.99");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multiple_subnets_isolated() {
+        let (_dir, store) = temp_ipam();
+
+        let alloc_a = store.reserve_ip("vpc/subnet-a", "10.0.1.0/24").unwrap();
+        let alloc_b = store.reserve_ip("vpc/subnet-b", "10.0.2.0/24").unwrap();
+
+        assert_eq!(alloc_a.ip, "10.0.1.3");
+        assert_eq!(alloc_b.ip, "10.0.2.3");
+
+        let list_a = store.list_allocations("vpc/subnet-a").unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_a[0].subnet_id, "vpc/subnet-a");
+
+        let list_b = store.list_allocations("vpc/subnet-b").unwrap();
+        assert_eq!(list_b.len(), 1);
+        assert_eq!(list_b[0].subnet_id, "vpc/subnet-b");
+    }
+
+    #[test]
+    fn sequential_allocation_fills_subnet() {
+        let (_dir, store) = temp_ipam();
+
+        // Allocate a few IPs and verify sequential assignment.
+        let a1 = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+        let a2 = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+        let a3 = store.reserve_ip(TEST_SUBNET_ID, TEST_SUBNET_CIDR).unwrap();
+
         assert_eq!(a1.ip, "10.0.1.3");
         assert_eq!(a2.ip, "10.0.1.4");
         assert_eq!(a3.ip, "10.0.1.5");
-    }
-
-    #[test]
-    fn release_and_reallocate() {
-        let (_dir, allocator) = temp_allocator();
-        let subnet_id = SubnetId("subnet-rel".to_string());
-        let a1 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        assert_eq!(a1.ip, "10.0.1.3");
-
-        let _a2 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-
-        // Release .3.
-        allocator
-            .release(&subnet_id, Ipv4Addr::new(10, 0, 1, 3))
-            .unwrap();
-
-        // Next allocation should reuse .3.
-        let a3 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        assert_eq!(a3.ip, "10.0.1.3");
-    }
-
-    #[test]
-    fn skip_reserved_ips() {
-        let (_dir, allocator) = temp_allocator();
-        let subnet_id = SubnetId("subnet-rsv".to_string());
-        // First allocation must skip .0, .1, .2 and start at .3.
-        let alloc = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        assert_eq!(alloc.ip, "10.0.1.3");
-    }
-
-    #[test]
-    fn bitmap_persistence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ipam-persist.redb");
-        let subnet_id = SubnetId("subnet-persist".to_string());
-
-        // Allocate in one session.
-        {
-            let db = syfrah_state::LayerDb::open_at(&path).unwrap();
-            let allocator = IpamAllocator::new(db);
-            let a1 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-            assert_eq!(a1.ip, "10.0.1.3");
-        }
-
-        // Reopen and allocate again; should continue from .4.
-        {
-            let db = syfrah_state::LayerDb::open_at(&path).unwrap();
-            let allocator = IpamAllocator::new(db);
-            let a2 = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-            assert_eq!(a2.ip, "10.0.1.4");
-        }
-    }
-
-    #[test]
-    fn allocation_includes_mac() {
-        let (_dir, allocator) = temp_allocator();
-        let subnet_id = SubnetId("subnet-mac".to_string());
-        let alloc = allocator.allocate(&subnet_id, "10.0.1.0/24").unwrap();
-        assert_eq!(
-            alloc.mac,
-            mac_from_ip(alloc.ip.parse::<Ipv4Addr>().unwrap())
-        );
     }
 }

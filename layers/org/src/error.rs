@@ -127,17 +127,14 @@ pub enum OrgError {
     #[error("already peered")]
     DuplicatePeering,
 
-    #[error("IPAM: subnet exhausted, no free IPs in {0}")]
-    IpamExhausted(String),
+    #[error("no available IP in subnet: {subnet}")]
+    IpExhausted { subnet: String },
 
-    #[error("IPAM: subnet not found in bitmap table: {0}")]
-    IpamSubnetNotFound(String),
+    #[error("IP allocation not found: {ip} in subnet {subnet}")]
+    IpNotFound { subnet: String, ip: String },
 
-    #[error("IPAM: cannot release reserved address: {0}")]
-    IpamReservedAddress(String),
-
-    #[error("IPAM: unsupported prefix length /{0}, only /24 is supported")]
-    IpamUnsupportedPrefix(u8),
+    #[error("IP already assigned: {ip} in subnet {subnet}")]
+    IpAlreadyAssigned { subnet: String, ip: String },
 
     #[error("store error: {0}")]
     StoreError(String),

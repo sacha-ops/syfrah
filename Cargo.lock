@@ -2457,7 +2457,6 @@ dependencies = [
  "clap",
  "console",
  "ipnet",
- "regex",
  "serde",
  "serde_json",
  "syfrah-api",
