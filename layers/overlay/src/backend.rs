@@ -1,90 +1,73 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use crate::error::Result;
 
-use ipnet::Ipv4Net;
-
-/// MAC address represented as 6 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MacAddr(pub [u8; 6]);
-
-impl std::fmt::Display for MacAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let b = &self.0;
-        write!(
-            f,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5]
-        )
-    }
-}
-
-/// All networking primitives needed by the overlay layer.
+/// Abstraction over Linux networking primitives (VXLAN, bridge, TAP, nftables).
 ///
-/// Implemented by `LinuxBackend` for production and `MockNetworkBackend` for
-/// unit tests. Every method is idempotent — calling it twice with the same
-/// arguments must succeed without error.
+/// All operations are idempotent. The real implementation shells out to
+/// `ip`, `bridge`, and `nft`; the mock records calls for testing.
+#[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
-    // ── VXLAN ───────────────────────────────────────────────────────────
-    fn create_vxlan(
-        &self,
-        name: &str,
-        vni: u32,
-        local_ip: Ipv6Addr,
-        port: u16,
-    ) -> Result<(), BackendError>;
+    // ── VXLAN ──────────────────────────────────────────────────────────
 
-    fn delete_vxlan(&self, name: &str) -> Result<(), BackendError>;
+    /// Create a VXLAN interface with the given VNI, bound to `local_ip` on `port`.
+    async fn create_vxlan(&self, name: &str, vni: u32, local_ip: &str, port: u16) -> Result<()>;
 
-    fn add_fdb_entry(&self, bridge: &str, mac: MacAddr, vtep: Ipv6Addr)
-        -> Result<(), BackendError>;
+    /// Delete a VXLAN interface.
+    async fn delete_vxlan(&self, name: &str) -> Result<()>;
 
-    fn remove_fdb_entry(&self, bridge: &str, mac: MacAddr) -> Result<(), BackendError>;
+    /// Add a static FDB entry so the bridge knows which VTEP hosts a given MAC.
+    async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()>;
 
-    fn add_arp_proxy(&self, vxlan: &str, ip: Ipv4Addr, mac: MacAddr) -> Result<(), BackendError>;
+    /// Remove a static FDB entry.
+    async fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()>;
 
-    // ── Bridge ──────────────────────────────────────────────────────────
-    fn create_bridge(&self, name: &str) -> Result<(), BackendError>;
+    /// Populate the ARP proxy table on a VXLAN interface.
+    async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()>;
 
-    fn add_bridge_ip(
-        &self,
-        bridge: &str,
-        gateway: Ipv4Addr,
-        prefix_len: u8,
-    ) -> Result<(), BackendError>;
+    // ── Bridge ─────────────────────────────────────────────────────────
 
-    fn remove_bridge_ip(&self, bridge: &str, gateway: Ipv4Addr) -> Result<(), BackendError>;
+    /// Create a Linux bridge.
+    async fn create_bridge(&self, name: &str) -> Result<()>;
 
-    fn delete_bridge(&self, name: &str) -> Result<(), BackendError>;
+    /// Add a gateway IP to a bridge (e.g. subnet gateway).
+    async fn add_bridge_ip(&self, bridge: &str, ip: &str, prefix_len: u8) -> Result<()>;
 
-    fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<(), BackendError>;
+    /// Remove an IP from a bridge.
+    async fn remove_bridge_ip(&self, bridge: &str, ip: &str) -> Result<()>;
 
-    // ── TAP / veth ──────────────────────────────────────────────────────
-    fn create_tap(&self, name: &str) -> Result<(), BackendError>;
+    /// Delete a Linux bridge.
+    async fn delete_bridge(&self, name: &str) -> Result<()>;
 
-    fn delete_tap(&self, name: &str) -> Result<(), BackendError>;
+    /// Attach a network interface to a bridge.
+    async fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<()>;
 
-    fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<(), BackendError>;
+    // ── TAP / veth ─────────────────────────────────────────────────────
 
-    // ── Firewall (nftables) ─────────────────────────────────────────────
-    fn apply_vm_rules(&self, tap: &str, mac: MacAddr, ip: Ipv4Addr) -> Result<(), BackendError>;
+    /// Create a TAP device (used by Cloud Hypervisor VMs).
+    async fn create_tap(&self, name: &str) -> Result<()>;
 
-    fn remove_vm_rules(&self, tap: &str) -> Result<(), BackendError>;
+    /// Delete a TAP device.
+    async fn delete_tap(&self, name: &str) -> Result<()>;
 
-    fn apply_nat(&self, bridge: &str, subnet: Ipv4Net) -> Result<(), BackendError>;
+    /// Create a veth pair (used by containers).
+    async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
 
-    /// Allow FORWARD between two peered VPC bridges (both directions).
-    fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<(), BackendError>;
+    // ── Firewall ───────────────────────────────────────────────────────
 
-    /// Remove FORWARD rules between two previously-peered VPC bridges.
-    fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<(), BackendError>;
-}
+    /// Apply anti-spoofing + default ingress/egress rules for a VM.
+    async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
 
-/// Errors produced by backend operations.
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    #[error("command failed: {0}")]
-    CommandFailed(String),
-    #[error("interface not found: {0}")]
-    InterfaceNotFound(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    /// Remove all firewall rules for a VM.
+    async fn remove_vm_rules(&self, tap: &str) -> Result<()>;
+
+    /// Enable SNAT/masquerade for a subnet behind a bridge.
+    async fn apply_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
+
+    /// Remove NAT rules for a subnet.
+    async fn remove_nat(&self, bridge: &str, subnet_cidr: &str) -> Result<()>;
+
+    /// Allow forwarding between two peered VPC bridges.
+    async fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
+
+    /// Remove peering forwarding rules.
+    async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
 }

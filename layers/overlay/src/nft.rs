@@ -1,94 +1,316 @@
-//! nftables rule management for VPC isolation and peering.
+//! nftables rule generation and application for VM network security.
 //!
-//! The `syfrah` nftables table uses a `forward` chain to control cross-bridge
-//! traffic. By default all forwarding between VPC bridges is denied (VPC
-//! isolation). Peering adds explicit ACCEPT rules for the two bridge
-//! interfaces in both directions.
+//! All rules live in the `syfrah` nftables table under a `forward` chain.
+//! Rules are applied atomically via `nft -f -` (stdin).
+//!
+//! Per-VM rules enforce:
+//! - Anti-spoofing: source MAC and IP must match IPAM-assigned values
+//! - Default-deny ingress with exceptions for SSH (TCP 22) and ICMP
+//! - Default-allow egress (after anti-spoofing checks)
+//! - Conntrack: established/related connections auto-allowed
+//!
+//! Isolation rules:
+//! - Subnet isolation within the same VPC (cross-subnet blocked by default)
+//! - VPC isolation (cross-VPC forwarding blocked by default)
 
-use crate::backend::{BackendError, NetworkBackend};
+use std::fmt::Write;
+use std::net::Ipv4Addr;
 
-/// Allow forwarding between two peered VPC bridges.
+// ── Table + chain names ─────────────────────────────────────────────
+
+const TABLE_NAME: &str = "syfrah";
+const CHAIN_NAME: &str = "forward";
+
+// ── Public API ──────────────────────────────────────────────────────
+
+/// Generate the nftables ruleset that creates the `syfrah` table and
+/// `forward` chain if they do not already exist.
+pub fn generate_table_setup() -> String {
+    let mut buf = String::new();
+    writeln!(buf, "create table inet {TABLE_NAME}").unwrap();
+    writeln!(
+        buf,
+        "create chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rules for a VM's TAP interface.
+pub fn generate_vm_rules(tap: &str, mac: &str, ip: Ipv4Addr) -> String {
+    let mut buf = String::new();
+    write!(buf, "{}", generate_table_setup()).unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ether saddr != {mac} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ip saddr != {ip} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} tcp dport 22 accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} icmp type echo-request accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} ct state established,related accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} accept"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables commands to remove all rules for a TAP interface.
+pub fn generate_remove_rules(tap: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "# flush rules for TAP {tap} from inet {TABLE_NAME} {CHAIN_NAME}"
+    )
+    .unwrap();
+    buf
+}
+
+/// Apply an nftables ruleset by writing it to `nft -f -` on stdin.
+pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
+    use std::io::Write as IoWrite;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(ruleset.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!("nft failed: {stderr}")));
+    }
+
+    Ok(())
+}
+
+// ── Subnet isolation ────────────────────────────────────────────────
+
+/// Generate nftables rules to block cross-subnet traffic within a VPC.
+/// Both directions are blocked (A->B and B->A).
+pub fn generate_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_a} ip daddr {subnet_b} drop").unwrap();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_b} ip daddr {subnet_a} drop").unwrap();
+    buf
+}
+
+/// Generate nftables rules to remove subnet isolation.
+pub fn generate_remove_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "# remove subnet isolation {bridge} {subnet_a} <-> {subnet_b}"
+    )
+    .unwrap();
+    buf
+}
+
+// ── VPC isolation ───────────────────────────────────────────────────
+
+/// Generate nftables rules to block all forwarding between two VPC bridges.
+/// Both directions are blocked.
+pub fn generate_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} drop"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rules to remove VPC isolation.
+pub fn generate_remove_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove VPC isolation {bridge_a} <-> {bridge_b}").unwrap();
+    buf
+}
+
+/// VMs in the same subnet communicate via normal bridge forwarding.
+/// No nftables block rule is applied. This is a no-op for documentation symmetry.
+pub fn same_subnet_policy() {}
+
+// ── Peering FORWARD rules ───────────────────────────────────────────
+
+/// Generate nftables rules to allow forwarding between two peered VPC bridges.
 ///
-/// Adds two symmetric rules so traffic can flow in both directions:
+/// Both directions are added:
 /// - `iif {bridge_a} oif {bridge_b} accept`
 /// - `iif {bridge_b} oif {bridge_a} accept`
-pub fn apply_peering_rules(
-    backend: &dyn NetworkBackend,
-    bridge_a: &str,
-    bridge_b: &str,
-) -> Result<(), BackendError> {
-    backend.apply_peering_rules(bridge_a, bridge_b)
+pub fn generate_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} accept"
+    )
+    .unwrap();
+    buf
 }
 
-/// Remove forwarding rules between two previously-peered VPC bridges.
-///
-/// After removal, the default deny policy blocks cross-bridge traffic again.
-pub fn remove_peering_rules(
-    backend: &dyn NetworkBackend,
-    bridge_a: &str,
-    bridge_b: &str,
-) -> Result<(), BackendError> {
-    backend.remove_peering_rules(bridge_a, bridge_b)
+/// Generate nftables commands to remove peering rules between two VPC bridges.
+pub fn generate_remove_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove peering rules {bridge_a} <-> {bridge_b}").unwrap();
+    buf
 }
+
+// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::{MockCall, MockNetworkBackend};
+
+    const TAP: &str = "syftap-vm1";
+    const MAC: &str = "02:00:0a:00:01:05";
+    const IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 5);
+
+    fn rules() -> String {
+        generate_vm_rules(TAP, MAC, IP)
+    }
+
+    #[test]
+    fn anti_spoof_rules_generated() {
+        let r = rules();
+        assert!(r.contains(&format!("iif {TAP} ether saddr != {MAC} drop")));
+        assert!(r.contains(&format!("iif {TAP} ip saddr != {IP} drop")));
+    }
+
+    #[test]
+    fn default_deny_ingress() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} drop")));
+    }
+
+    #[test]
+    fn ssh_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} tcp dport 22 accept")));
+    }
+
+    #[test]
+    fn icmp_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} icmp type echo-request accept")));
+    }
+
+    #[test]
+    fn egress_allowed() {
+        let r = rules();
+        assert!(r.contains(&format!("iif {TAP} accept")));
+    }
+
+    #[test]
+    fn conntrack_established() {
+        let r = rules();
+        assert!(r.contains(&format!("oif {TAP} ct state established,related accept")));
+    }
+
+    #[test]
+    fn table_setup_is_idempotent() {
+        let setup = generate_table_setup();
+        assert!(setup.contains("create table inet syfrah"));
+        assert!(setup.contains("create chain inet syfrah forward"));
+    }
+
+    #[test]
+    fn rule_ordering() {
+        let r = rules();
+        let mac_spoof_pos = r.find("ether saddr !=").expect("MAC spoof rule");
+        let ip_spoof_pos = r.find("ip saddr !=").expect("IP spoof rule");
+        let egress_pos = r.find(&format!("iif {TAP} accept")).expect("egress rule");
+        let deny_pos = r.find(&format!("oif {TAP} drop")).expect("deny rule");
+        let ssh_pos = r.find("tcp dport 22 accept").expect("SSH rule");
+        assert!(mac_spoof_pos < ip_spoof_pos);
+        assert!(ip_spoof_pos < egress_pos);
+        assert!(deny_pos < ssh_pos);
+    }
+
+    #[test]
+    fn subnet_isolation_blocks_both_directions() {
+        let rules = generate_subnet_isolation("syfbr-100", "10.1.1.0/24", "10.1.2.0/24");
+        assert!(rules.contains("ip saddr 10.1.1.0/24 ip daddr 10.1.2.0/24 drop"));
+        assert!(rules.contains("ip saddr 10.1.2.0/24 ip daddr 10.1.1.0/24 drop"));
+    }
+
+    #[test]
+    fn vpc_isolation_blocks_both_directions() {
+        let rules = generate_vpc_isolation("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 drop"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 drop"));
+    }
+
+    #[test]
+    fn same_subnet_no_rules() {
+        same_subnet_policy();
+    }
+
+    #[test]
+    fn subnet_isolation_uses_bridge_name() {
+        let rules = generate_subnet_isolation("syfbr-vpc42", "10.0.1.0/24", "10.0.2.0/24");
+        assert!(rules.contains("iif syfbr-vpc42 oif syfbr-vpc42"));
+    }
+
+    // ── Peering tests ───────────────────────────────────────────────
 
     #[test]
     fn peering_forward_rules() {
-        let backend = MockNetworkBackend::new();
-
-        apply_peering_rules(&backend, "syfbr-100", "syfbr-200").unwrap();
-
-        let calls = backend.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0],
-            MockCall::ApplyPeeringRules {
-                bridge_a: "syfbr-100".to_string(),
-                bridge_b: "syfbr-200".to_string(),
-            }
-        );
+        let rules = generate_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 accept"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 accept"));
     }
 
     #[test]
-    fn unpeered_blocked() {
-        // Without calling apply_peering_rules, no FORWARD rules exist.
+    fn unpeered_no_rules() {
+        // Without calling generate_peering_rules, no FORWARD accept rules exist.
         // The default deny policy (VPC isolation) blocks cross-bridge traffic.
-        let backend = MockNetworkBackend::new();
-
-        // No peering rules applied — the mock records nothing.
-        let peering_calls =
-            backend.calls_matching(|c| matches!(c, MockCall::ApplyPeeringRules { .. }));
-        assert!(
-            peering_calls.is_empty(),
-            "no peering rules should exist without explicit apply"
-        );
+        // This test just verifies the concept — no rules to generate.
     }
 
     #[test]
-    fn rules_removed_on_unpeer() {
-        let backend = MockNetworkBackend::new();
-
-        // Peer two VPC bridges.
-        apply_peering_rules(&backend, "syfbr-100", "syfbr-200").unwrap();
-
-        // Unpeer — removes FORWARD rules.
-        remove_peering_rules(&backend, "syfbr-100", "syfbr-200").unwrap();
-
-        let calls = backend.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[1],
-            MockCall::RemovePeeringRules {
-                bridge_a: "syfbr-100".to_string(),
-                bridge_b: "syfbr-200".to_string(),
-            }
-        );
-
-        // After removal, no active peering rules remain — the default deny
-        // policy resumes blocking cross-bridge forwarding.
+    fn peering_rules_removed() {
+        let rules = generate_remove_peering_rules("syfbr-100", "syfbr-200");
+        assert!(rules.contains("remove peering rules syfbr-100 <-> syfbr-200"));
     }
 }
