@@ -64,12 +64,6 @@ pub enum OrgError {
     #[error("cannot delete subnet '{name}': has {count} active VM(s)")]
     SubnetHasVms { name: String, count: usize },
 
-    #[error("subnet already exists: {0}")]
-    SubnetAlreadyExists(String),
-
-    #[error("subnet not found: {0}")]
-    SubnetNotFound(String),
-
     #[error("vpc is not shared: {0}")]
     VpcNotShared(String),
 

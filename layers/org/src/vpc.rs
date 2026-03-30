@@ -430,7 +430,10 @@ impl VpcStore {
         let subnet = self
             .db
             .get::<Subnet>(SUBNETS_TABLE, &subnet_id.0)?
-            .ok_or_else(|| OrgError::SubnetNotFound(subnet_id.0.clone()))?;
+            .ok_or_else(|| OrgError::SubnetNotFound {
+                vpc: String::new(),
+                subnet: subnet_id.0.clone(),
+            })?;
 
         // Guard: check VMs
         let vm_count = self.count_vms_in_subnet(subnet_id);
@@ -958,7 +961,7 @@ mod tests {
             )
             .unwrap();
 
-        let subnet = make_subnet(&vpc.id, "frontend");
+        let subnet = make_subnet(&vpc.id, "frontend", "10.1.1.0/24", "10.1.1.1");
         store.create_subnet(&subnet).unwrap();
 
         // No VMs → delete should succeed
@@ -978,7 +981,7 @@ mod tests {
             )
             .unwrap();
 
-        let subnet = make_subnet(&vpc.id, "frontend");
+        let subnet = make_subnet(&vpc.id, "frontend", "10.1.1.0/24", "10.1.1.1");
         store.create_subnet(&subnet).unwrap();
 
         // Create a wrapper that overrides count_vms_in_subnet to return non-zero.
@@ -1010,7 +1013,7 @@ mod tests {
         let err = store
             .delete_subnet(&SubnetId("subnet-ghost".to_string()))
             .unwrap_err();
-        assert!(matches!(err, OrgError::SubnetNotFound(_)));
+        assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
     #[test]
