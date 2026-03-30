@@ -22,6 +22,13 @@ impl OrgStore {
         Self { db }
     }
 
+    /// Access the underlying database handle.
+    ///
+    /// Used by extension modules (e.g. `vpc`) that add methods to `OrgStore`.
+    pub(crate) fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
     // ── Org operations ───────────────────────────────────────────────
 
     /// Create a new organization. Validates the name, checks for duplicates.
