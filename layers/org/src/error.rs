@@ -73,6 +73,15 @@ pub enum OrgError {
     #[error("project '{project}' is not attached to vpc '{vpc}'")]
     VpcNotAttached { vpc: String, project: String },
 
+    #[error("peering already exists between '{vpc_a}' and '{vpc_b}'")]
+    PeeringAlreadyExists { vpc_a: String, vpc_b: String },
+
+    #[error("peering not found between '{vpc_a}' and '{vpc_b}'")]
+    PeeringNotFound { vpc_a: String, vpc_b: String },
+
+    #[error("cannot peer a VPC with itself: {0}")]
+    SelfPeeringRejected(String),
+
     #[error("subnet already exists: {vpc}/{subnet}")]
     SubnetAlreadyExists { vpc: String, subnet: String },
 
@@ -112,8 +121,11 @@ pub enum OrgError {
     #[error("VPCs '{vpc_a}' and '{vpc_b}' are already peered")]
     AlreadyPeered { vpc_a: String, vpc_b: String },
 
-    #[error("no active peering between '{vpc_a}' and '{vpc_b}'")]
-    PeeringNotFound { vpc_a: String, vpc_b: String },
+    #[error("cannot peer a VPC with itself")]
+    SelfPeering,
+
+    #[error("already peered")]
+    DuplicatePeering,
 
     #[error("store error: {0}")]
     StoreError(String),

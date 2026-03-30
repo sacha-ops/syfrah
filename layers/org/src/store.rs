@@ -18,10 +18,10 @@ const ENVIRONMENTS_TABLE: &str = "environments";
 const VPCS_TABLE: &str = "vpcs";
 const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
 const SUBNETS_TABLE: &str = "subnets";
+const PEERINGS_TABLE: &str = "vpc_peerings";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
-const PEERINGS_TABLE: &str = "vpc_peerings";
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -471,10 +471,19 @@ impl OrgStore {
             .collect())
     }
 
-    /// Delete a VPC by name.
+    /// Delete a VPC by name. Fails if it has active peerings.
     pub fn delete_vpc(&self, name: &str) -> Result<()> {
         if !self.db.exists(VPCS_TABLE, name)? {
             return Err(OrgError::VpcNotFound(name.to_string()));
+        }
+
+        // Check for active peerings
+        let peerings = self.list_peerings_by_vpc(name)?;
+        if !peerings.is_empty() {
+            return Err(OrgError::VpcHasPeerings {
+                name: name.to_string(),
+                count: peerings.len(),
+            });
         }
 
         self.db.delete(VPCS_TABLE, name)?;
@@ -801,35 +810,44 @@ impl OrgStore {
         Ok(())
     }
 
-    // ── Peering operations ──────────────────────────────────────────
+    // ── VPC Peering operations ──────────────────────────────────────
 
-    /// Create a VPC peering between two VPCs.
+    /// Normalize a peering key by sorting the two VPC names alphabetically.
+    /// This ensures "A/B" and "B/A" resolve to the same peering.
+    fn peering_key(vpc_a: &str, vpc_b: &str) -> (String, String, String) {
+        let (a, b) = if vpc_a <= vpc_b {
+            (vpc_a.to_string(), vpc_b.to_string())
+        } else {
+            (vpc_b.to_string(), vpc_a.to_string())
+        };
+        let key = format!("{a}/{b}");
+        (key, a, b)
+    }
+
+    /// Create a peering between two VPCs.
     ///
-    /// Validates both VPCs exist, are distinct, and are not already peered.
-    pub fn create_peering(&self, vpc_a_name: &str, vpc_b_name: &str) -> Result<VpcPeering> {
-        if vpc_a_name == vpc_b_name {
-            return Err(OrgError::SelfPeer(vpc_a_name.to_string()));
+    /// Both VPCs must exist, self-peering is rejected, and duplicate
+    /// peerings are rejected. The key is normalized so that order of
+    /// vpc_a/vpc_b does not matter.
+    pub fn create_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<VpcPeering> {
+        // Reject self-peering
+        if vpc_a == vpc_b {
+            return Err(OrgError::SelfPeeringRejected(vpc_a.to_string()));
         }
 
-        let vpc_a = self
-            .get_vpc(vpc_a_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_a_name.to_string()))?;
-        let vpc_b = self
-            .get_vpc(vpc_b_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_b_name.to_string()))?;
+        // Verify both VPCs exist
+        if !self.db.exists(VPCS_TABLE, vpc_a)? {
+            return Err(OrgError::VpcNotFound(vpc_a.to_string()));
+        }
+        if !self.db.exists(VPCS_TABLE, vpc_b)? {
+            return Err(OrgError::VpcNotFound(vpc_b.to_string()));
+        }
 
-        // Check for existing active peering
-        let existing = self.list_peerings()?;
-        let already = existing.iter().any(|p| {
-            p.status == PeeringStatus::Active
-                && ((p.vpc_a == vpc_a.id && p.vpc_b == vpc_b.id)
-                    || (p.vpc_a == vpc_b.id && p.vpc_b == vpc_a.id))
-        });
-        if already {
-            return Err(OrgError::AlreadyPeered {
-                vpc_a: vpc_a_name.to_string(),
-                vpc_b: vpc_b_name.to_string(),
-            });
+        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
+
+        // Reject duplicate
+        if self.db.exists(PEERINGS_TABLE, &key)? {
+            return Err(OrgError::PeeringAlreadyExists { vpc_a: a, vpc_b: b });
         }
 
         let now = SystemTime::now()
@@ -838,71 +856,59 @@ impl OrgStore {
             .as_secs();
 
         let peering = VpcPeering {
-            id: PeeringId(format!("peer-{}-{}", vpc_a.id, vpc_b.id)),
-            vpc_a: vpc_a.id,
-            vpc_b: vpc_b.id,
+            id: PeeringId(format!("peer-{key}")),
+            vpc_a: a,
+            vpc_b: b,
             status: PeeringStatus::Active,
             created_at: now,
         };
 
-        self.db.set(PEERINGS_TABLE, &peering.id.0, &peering)?;
+        self.db.set(PEERINGS_TABLE, &key, &peering)?;
         Ok(peering)
     }
 
-    /// Delete a peering between two VPCs.
-    pub fn delete_peering(&self, vpc_a_name: &str, vpc_b_name: &str) -> Result<()> {
-        let vpc_a = self
-            .get_vpc(vpc_a_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_a_name.to_string()))?;
-        let vpc_b = self
-            .get_vpc(vpc_b_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_b_name.to_string()))?;
+    /// Delete (remove) a peering between two VPCs.
+    pub fn delete_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<()> {
+        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
 
-        let all = self.list_peerings()?;
-        let peering = all.into_iter().find(|p| {
-            p.status == PeeringStatus::Active
-                && ((p.vpc_a == vpc_a.id && p.vpc_b == vpc_b.id)
-                    || (p.vpc_a == vpc_b.id && p.vpc_b == vpc_a.id))
-        });
-
-        match peering {
-            Some(p) => {
-                self.db.delete(PEERINGS_TABLE, &p.id.0)?;
-                Ok(())
-            }
-            None => Err(OrgError::PeeringNotFound {
-                vpc_a: vpc_a_name.to_string(),
-                vpc_b: vpc_b_name.to_string(),
-            }),
+        if !self.db.exists(PEERINGS_TABLE, &key)? {
+            return Err(OrgError::PeeringNotFound { vpc_a: a, vpc_b: b });
         }
+
+        self.db.delete(PEERINGS_TABLE, &key)?;
+        Ok(())
     }
 
-    /// List all active peerings, optionally filtered by VPC name.
+    /// List all peerings.
     pub fn list_peerings(&self) -> Result<Vec<VpcPeering>> {
         let entries: Vec<(String, VpcPeering)> = self.db.list(PEERINGS_TABLE)?;
         Ok(entries.into_iter().map(|(_, p)| p).collect())
     }
 
-    /// List active peerings filtered by a specific VPC name.
-    pub fn list_peerings_for_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
-        let vpc = self
-            .get_vpc(vpc_name)?
-            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+    /// List peerings that involve a specific VPC.
+    pub fn list_peerings_by_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
         let all = self.list_peerings()?;
         Ok(all
             .into_iter()
-            .filter(|p| {
-                (p.vpc_a == vpc.id || p.vpc_b == vpc.id) && p.status == PeeringStatus::Active
-            })
+            .filter(|p| p.vpc_a == vpc_name || p.vpc_b == vpc_name)
             .collect())
     }
 
-    /// Resolve a VPC ID to its name. Returns the ID string if not found.
-    pub fn resolve_vpc_name(&self, vpc_id: &VpcId) -> String {
-        match self.get_vpc_by_id(vpc_id) {
-            Ok(Some(vpc)) => vpc.name,
-            _ => vpc_id.0.clone(),
-        }
+    /// List active peerings filtered by a specific VPC name (alias for CLI).
+    pub fn list_peerings_for_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
+        self.list_peerings_by_vpc(vpc_name)
+    }
+
+    /// Resolve a VPC name from its stored string. Since peerings now store
+    /// VPC names directly, this is an identity function.
+    pub fn resolve_vpc_name(&self, vpc_name: &str) -> String {
+        vpc_name.to_string()
+    }
+
+    /// Get a specific peering between two VPCs, if it exists.
+    pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
+        let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
+        Ok(self.db.get(PEERINGS_TABLE, &key)?)
     }
 }
 
@@ -2134,5 +2140,201 @@ mod tests {
             .create_subnet(&vpc_name, &env_id, "second", None)
             .unwrap();
         assert_eq!(subnet.cidr, "10.1.1.0/24");
+    }
+
+    // ── Peering tests ───────────────────────────────────────────────
+
+    /// Helper: create an org with two VPCs for peering tests.
+    fn setup_for_peering(store: &OrgStore) -> (String, String) {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        store
+            .create_vpc("vpc-alpha", "10.1.0.0/16", owner.clone(), false)
+            .unwrap();
+        store
+            .create_vpc("vpc-beta", "10.2.0.0/16", owner, false)
+            .unwrap();
+        ("vpc-alpha".to_string(), "vpc-beta".to_string())
+    }
+
+    #[test]
+    fn create_peering_succeeds() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        let peering = store.create_peering(&a, &b).unwrap();
+        assert_eq!(peering.vpc_a, "vpc-alpha");
+        assert_eq!(peering.vpc_b, "vpc-beta");
+        assert_eq!(peering.status, PeeringStatus::Active);
+        assert!(peering.created_at > 0);
+    }
+
+    #[test]
+    fn create_peering_reverse_order_normalizes() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        // Create with reversed order
+        let peering = store.create_peering(&b, &a).unwrap();
+        // Key is normalized alphabetically
+        assert_eq!(peering.vpc_a, "vpc-alpha");
+        assert_eq!(peering.vpc_b, "vpc-beta");
+    }
+
+    #[test]
+    fn create_peering_duplicate_rejected() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+        let err = store.create_peering(&a, &b).unwrap_err();
+        assert!(matches!(err, OrgError::PeeringAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn create_peering_duplicate_reversed_rejected() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+        // Reversed order should also be rejected
+        let err = store.create_peering(&b, &a).unwrap_err();
+        assert!(matches!(err, OrgError::PeeringAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn create_peering_self_rejected() {
+        let (_dir, store) = temp_store();
+        let (a, _) = setup_for_peering(&store);
+
+        let err = store.create_peering(&a, &a).unwrap_err();
+        assert!(matches!(err, OrgError::SelfPeeringRejected(_)));
+    }
+
+    #[test]
+    fn create_peering_vpc_not_found() {
+        let (_dir, store) = temp_store();
+        let (a, _) = setup_for_peering(&store);
+
+        let err = store.create_peering(&a, "ghost-vpc").unwrap_err();
+        assert!(matches!(err, OrgError::VpcNotFound(_)));
+    }
+
+    #[test]
+    fn delete_peering_succeeds() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+        store.delete_peering(&a, &b).unwrap();
+
+        let result = store.get_peering(&a, &b).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_peering_not_found() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        let err = store.delete_peering(&a, &b).unwrap_err();
+        assert!(matches!(err, OrgError::PeeringNotFound { .. }));
+    }
+
+    #[test]
+    fn list_peerings_returns_all() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        // Add a third VPC
+        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        store
+            .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
+            .unwrap();
+
+        store.create_peering(&a, &b).unwrap();
+        store.create_peering(&a, "vpc-gamma").unwrap();
+
+        let peerings = store.list_peerings().unwrap();
+        assert_eq!(peerings.len(), 2);
+    }
+
+    #[test]
+    fn list_peerings_by_vpc_filters() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        store
+            .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
+            .unwrap();
+
+        store.create_peering(&a, &b).unwrap();
+        store.create_peering(&a, "vpc-gamma").unwrap();
+
+        // vpc-alpha is in both peerings
+        let alpha_peerings = store.list_peerings_by_vpc(&a).unwrap();
+        assert_eq!(alpha_peerings.len(), 2);
+
+        // vpc-beta is in one peering
+        let beta_peerings = store.list_peerings_by_vpc(&b).unwrap();
+        assert_eq!(beta_peerings.len(), 1);
+
+        // vpc-gamma is in one peering
+        let gamma_peerings = store.list_peerings_by_vpc("vpc-gamma").unwrap();
+        assert_eq!(gamma_peerings.len(), 1);
+    }
+
+    #[test]
+    fn peering_status_lifecycle() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        // Create -> Active
+        let peering = store.create_peering(&a, &b).unwrap();
+        assert_eq!(peering.status, PeeringStatus::Active);
+
+        // Delete -> gone
+        store.delete_peering(&a, &b).unwrap();
+        let result = store.get_peering(&a, &b).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_peering_succeeds() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+
+        let peering = store.get_peering(&a, &b).unwrap();
+        assert!(peering.is_some());
+        let p = peering.unwrap();
+        assert_eq!(p.vpc_a, "vpc-alpha");
+        assert_eq!(p.vpc_b, "vpc-beta");
+    }
+
+    #[test]
+    fn get_peering_reversed_order() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+
+        // Reversed order should still find the peering
+        let peering = store.get_peering(&b, &a).unwrap();
+        assert!(peering.is_some());
+    }
+
+    #[test]
+    fn delete_vpc_blocked_by_peering() {
+        let (_dir, store) = temp_store();
+        let (a, b) = setup_for_peering(&store);
+
+        store.create_peering(&a, &b).unwrap();
+
+        let err = store.delete_vpc(&a).unwrap_err();
+        assert!(matches!(err, OrgError::VpcHasPeerings { .. }));
     }
 }
