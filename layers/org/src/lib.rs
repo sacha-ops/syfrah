@@ -9,7 +9,7 @@ pub mod validation;
 pub mod vpc;
 
 pub use api::OrgHandler;
-pub use cli::{EnvCommand, OrgCommand, ProjectCommand};
+pub use cli::{EnvCommand, OrgCommand, ProjectCommand, VpcCommand};
 pub use error::OrgError;
 pub use store::OrgStore;
 pub use types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Vpc, VpcId, VpcOwner};

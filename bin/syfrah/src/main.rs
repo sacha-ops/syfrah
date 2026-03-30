@@ -57,6 +57,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::EnvCommand,
     },
+    /// Manage Virtual Private Clouds (VPCs)
+    Vpc {
+        #[command(subcommand)]
+        command: syfrah_org::VpcCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -932,6 +937,7 @@ async fn run() -> Result<()> {
         Commands::Org { command } => syfrah_org::cli::run(command),
         Commands::Project { command } => syfrah_org::cli::run_project(command),
         Commands::Env { command } => syfrah_org::cli::run_env(command),
+        Commands::Vpc { command } => syfrah_org::cli::run_vpc(command),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
