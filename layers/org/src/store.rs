@@ -73,19 +73,14 @@ impl OrgStore {
             return Err(OrgError::NotFound(name.to_string()));
         }
 
-        // Check for child VPCs (org-owned or project-owned)
+        // Check for child VPCs (org-owned or project-owned).
+        // list_vpcs_by_org already includes project-scoped VPCs.
         let org_id = OrgId(name.to_string());
-        let org_vpcs = self.list_vpcs_by_org(&org_id)?;
-        let project_vpcs: Vec<Vpc> = self
-            .list_projects(name)?
-            .iter()
-            .flat_map(|p| self.list_vpcs_by_project(&p.id).unwrap_or_default())
-            .collect();
-        let vpc_count = org_vpcs.len() + project_vpcs.len();
-        if vpc_count > 0 {
+        let all_vpcs = self.list_vpcs_by_org(&org_id)?;
+        if !all_vpcs.is_empty() {
             return Err(OrgError::OrgHasVpcs {
                 org: name.to_string(),
-                count: vpc_count,
+                count: all_vpcs.len(),
             });
         }
 
