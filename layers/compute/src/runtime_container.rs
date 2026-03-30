@@ -925,11 +925,25 @@ impl ComputeRuntime for ContainerRuntime {
             serde_json::to_string_pretty(&meta).map_err(|e| ProcessError::SpawnFailed {
                 reason: format!("failed to serialize meta.json: {e}"),
             })?;
+        let meta_tmp = runtime_dir.join(".meta.json.tmp");
         let meta_path = runtime_dir.join("meta.json");
-        tokio::fs::write(&meta_path, meta_json)
+        tokio::fs::write(&meta_tmp, meta_json)
             .await
             .map_err(|e| ProcessError::SpawnFailed {
-                reason: format!("failed to write meta.json: {e}"),
+                reason: format!("failed to write meta.json tmp: {e}"),
+            })?;
+        {
+            let f = std::fs::File::open(&meta_tmp).map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to open meta.json tmp for sync: {e}"),
+            })?;
+            f.sync_all().map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to sync meta.json tmp: {e}"),
+            })?;
+        }
+        tokio::fs::rename(&meta_tmp, &meta_path)
+            .await
+            .map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to rename meta.json tmp: {e}"),
             })?;
 
         info!(
@@ -981,8 +995,9 @@ impl ComputeRuntime for ContainerRuntime {
                     reason: "runtime state missing valid pid".to_string(),
                 })? as u32;
 
-        // Update meta.json with new timestamp and PID.
+        // Update meta.json with new timestamp and PID (atomic: tmp + sync + rename).
         let now = chrono_now_iso8601();
+        let meta_tmp = handle.runtime_dir.join(".meta.json.tmp");
         let meta_path = handle.runtime_dir.join("meta.json");
         let old_meta = read_container_meta(&handle.runtime_dir)?;
         let meta = ContainerMeta {
@@ -994,10 +1009,23 @@ impl ComputeRuntime for ContainerRuntime {
             serde_json::to_string_pretty(&meta).map_err(|e| ProcessError::SpawnFailed {
                 reason: format!("failed to serialize meta.json: {e}"),
             })?;
-        tokio::fs::write(&meta_path, meta_json)
+        tokio::fs::write(&meta_tmp, meta_json)
             .await
             .map_err(|e| ProcessError::SpawnFailed {
-                reason: format!("failed to write meta.json: {e}"),
+                reason: format!("failed to write meta.json tmp: {e}"),
+            })?;
+        {
+            let f = std::fs::File::open(&meta_tmp).map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to open meta.json tmp for sync: {e}"),
+            })?;
+            f.sync_all().map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to sync meta.json tmp: {e}"),
+            })?;
+        }
+        tokio::fs::rename(&meta_tmp, &meta_path)
+            .await
+            .map_err(|e| ProcessError::SpawnFailed {
+                reason: format!("failed to rename meta.json tmp: {e}"),
             })?;
 
         info!(
