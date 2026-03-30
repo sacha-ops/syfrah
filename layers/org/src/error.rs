@@ -28,15 +28,26 @@ pub enum OrgError {
     #[error("environment is protected from deletion: {0}")]
     EnvProtected(String),
 
-    #[error("invalid {context} name: {reason}")]
-    InvalidName { context: String, reason: String },
-
-    // ── VPC errors ──────────────────────────────────────────────────
     #[error("vpc already exists: {0}")]
     VpcAlreadyExists(String),
 
     #[error("vpc not found: {0}")]
     VpcNotFound(String),
+
+    #[error("invalid {context} name: {reason}")]
+    InvalidName { context: String, reason: String },
+
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
+    #[error("CIDR overlap: {new_cidr} overlaps with existing {existing_cidr}")]
+    CidrOverlap {
+        new_cidr: String,
+        existing_cidr: String,
+    },
+
+    #[error("no available CIDR block in the auto-allocation range")]
+    CidrExhausted,
 
     #[error("vpc is not shared: {0}")]
     VpcNotShared(String),
@@ -46,9 +57,6 @@ pub enum OrgError {
 
     #[error("project '{project}' is not attached to vpc '{vpc}'")]
     VpcNotAttached { vpc: String, project: String },
-
-    #[error("invalid CIDR: {0}")]
-    InvalidCidr(String),
 
     #[error("store error: {0}")]
     StoreError(String),

@@ -2,7 +2,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-// ── VPC types ───────────────────────────────────────────────────────
+/// Unique identifier for a VPC.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VpcId(pub String);
+
+impl fmt::Display for VpcId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The owner of a VPC — either a project or an org (for shared VPCs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VpcOwner {
+    Project(ProjectId),
+    Org(OrgId),
+}
+
+/// A Virtual Private Cloud — one VPC = one VXLAN VNI = one isolated L2 domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vpc {
+    pub id: VpcId,
+    pub name: String,
+    pub cidr: String,
+    pub vni: u32,
+    pub owner: VpcOwner,
+    pub shared: bool,
+    pub created_at: u64,
+}
 
 /// Unique identifier for an organization.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +78,14 @@ pub struct Project {
     pub created_at: u64,
 }
 
+/// A record of a shared VPC being attached to a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpcAttachment {
+    pub vpc_name: String,
+    pub project_id: ProjectId,
+    pub attached_at: u64,
+}
+
 /// An environment — a runtime context within a project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
@@ -62,45 +97,4 @@ pub struct Environment {
     pub labels: HashMap<String, String>,
     pub created_at: u64,
     pub expires_at: Option<u64>,
-}
-
-// ── VPC types ───────────────────────────────────────────────────────
-
-/// Unique identifier for a VPC.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VpcId(pub String);
-
-impl fmt::Display for VpcId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Who owns a VPC — either a project or an org.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VpcOwner {
-    /// Project-scoped VPC.
-    Project(ProjectId),
-    /// Org-scoped VPC (can be shared).
-    Org(OrgId),
-}
-
-/// A Virtual Private Cloud — one VPC = one VXLAN VNI = one isolated L2 domain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Vpc {
-    pub id: VpcId,
-    pub name: String,
-    pub cidr: String,
-    pub vni: u32,
-    pub owner: VpcOwner,
-    pub shared: bool,
-    pub created_at: u64,
-}
-
-/// Record of a project attached to a shared VPC.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VpcAttachment {
-    pub vpc_name: String,
-    pub project_id: ProjectId,
-    pub attached_at: u64,
 }

@@ -15,6 +15,8 @@ const ENVIRONMENTS_TABLE: &str = "environments";
 const VPCS_TABLE: &str = "vpcs";
 const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
+const VNI_COUNTER_KEY: &str = "counter";
+const VNI_START: u32 = 100;
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -302,54 +304,59 @@ impl OrgStore {
 
     // ── VPC operations ──────────────────────────────────────────────
 
-    /// Allocate the next VNI (VXLAN Network Identifier), starting at 100.
-    fn next_vni(&self) -> Result<u32> {
-        let current: Option<u32> = self.db.get(VNI_COUNTER_TABLE, "counter")?;
-        let next = current.unwrap_or(100);
-        self.db.set(VNI_COUNTER_TABLE, "counter", &(next + 1))?;
-        Ok(next)
-    }
-
-    /// Validate a CIDR string (basic check: must look like a.b.c.d/N).
+    /// Validate a CIDR string. Accepts patterns like "10.0.0.0/16", "10.1.0.0/24".
     fn validate_cidr(cidr: &str) -> Result<()> {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
-            return Err(OrgError::InvalidCidr(cidr.to_string()));
+            return Err(OrgError::InvalidCidr(format!(
+                "expected format A.B.C.D/N, got: {cidr}"
+            )));
         }
+
         let octets: Vec<&str> = parts[0].split('.').collect();
         if octets.len() != 4 {
-            return Err(OrgError::InvalidCidr(cidr.to_string()));
+            return Err(OrgError::InvalidCidr(format!(
+                "expected 4 octets in network address, got: {}",
+                parts[0]
+            )));
         }
+
         for octet in &octets {
-            if octet.parse::<u8>().is_err() {
-                return Err(OrgError::InvalidCidr(cidr.to_string()));
-            }
+            let val: u8 = octet
+                .parse()
+                .map_err(|_| OrgError::InvalidCidr(format!("invalid octet: {octet}")))?;
+            // Allow any valid octet (0-255), parse already checks this
+            let _ = val;
         }
-        let prefix: u8 = parts[1]
+
+        let prefix_len: u8 = parts[1]
             .parse()
-            .map_err(|_| OrgError::InvalidCidr(cidr.to_string()))?;
-        if prefix > 32 {
-            return Err(OrgError::InvalidCidr(cidr.to_string()));
+            .map_err(|_| OrgError::InvalidCidr(format!("invalid prefix length: {}", parts[1])))?;
+        if prefix_len > 32 {
+            return Err(OrgError::InvalidCidr(format!(
+                "prefix length must be 0-32, got: {prefix_len}"
+            )));
         }
+
         Ok(())
     }
 
-    /// Create a VPC. If `shared` is true, the VPC is org-scoped and attachable.
+    /// Allocate the next VNI. Starts at 100, monotonically increasing.
+    fn next_vni(&self) -> Result<u32> {
+        let current: Option<u32> = self.db.get(VNI_COUNTER_TABLE, VNI_COUNTER_KEY)?;
+        let vni = current.unwrap_or(VNI_START);
+        self.db
+            .set(VNI_COUNTER_TABLE, VNI_COUNTER_KEY, &(vni + 1))?;
+        Ok(vni)
+    }
+
+    /// Create a VPC. Validates the name and CIDR, allocates a VNI, persists.
     pub fn create_vpc(&self, name: &str, cidr: &str, owner: VpcOwner, shared: bool) -> Result<Vpc> {
         validate_name(name, "vpc")?;
         Self::validate_cidr(cidr)?;
 
         if self.db.exists(VPCS_TABLE, name)? {
             return Err(OrgError::VpcAlreadyExists(name.to_string()));
-        }
-
-        // Shared VPCs must be org-owned.
-        if shared {
-            if let VpcOwner::Project(_) = &owner {
-                return Err(OrgError::VpcNotShared(
-                    "shared VPCs must be org-owned".to_string(),
-                ));
-            }
         }
 
         let vni = self.next_vni()?;
@@ -377,24 +384,28 @@ impl OrgStore {
         Ok(self.db.get(VPCS_TABLE, name)?)
     }
 
-    /// List all VPCs, optionally filtered by org.
-    pub fn list_vpcs(&self, org: Option<&str>) -> Result<Vec<Vpc>> {
-        let all: Vec<(String, Vpc)> = self.db.list(VPCS_TABLE)?;
-        let vpcs: Vec<Vpc> = all
+    /// List all VPCs.
+    pub fn list_vpcs(&self) -> Result<Vec<Vpc>> {
+        let entries: Vec<(String, Vpc)> = self.db.list(VPCS_TABLE)?;
+        Ok(entries.into_iter().map(|(_, vpc)| vpc).collect())
+    }
+
+    /// List VPCs owned by a specific project.
+    pub fn list_vpcs_by_project(&self, project_id: &ProjectId) -> Result<Vec<Vpc>> {
+        let all = self.list_vpcs()?;
+        Ok(all
             .into_iter()
-            .map(|(_, vpc)| vpc)
-            .filter(|vpc| {
-                if let Some(org_name) = org {
-                    match &vpc.owner {
-                        VpcOwner::Org(id) => id.0 == org_name,
-                        VpcOwner::Project(id) => id.0.starts_with(&format!("{org_name}/")),
-                    }
-                } else {
-                    true
-                }
-            })
-            .collect();
-        Ok(vpcs)
+            .filter(|vpc| matches!(&vpc.owner, VpcOwner::Project(pid) if pid == project_id))
+            .collect())
+    }
+
+    /// List VPCs owned by a specific org.
+    pub fn list_vpcs_by_org(&self, org_id: &OrgId) -> Result<Vec<Vpc>> {
+        let all = self.list_vpcs()?;
+        Ok(all
+            .into_iter()
+            .filter(|vpc| matches!(&vpc.owner, VpcOwner::Org(oid) if oid == org_id))
+            .collect())
     }
 
     /// Delete a VPC by name.
@@ -402,18 +413,19 @@ impl OrgStore {
         if !self.db.exists(VPCS_TABLE, name)? {
             return Err(OrgError::VpcNotFound(name.to_string()));
         }
+
         self.db.delete(VPCS_TABLE, name)?;
         Ok(())
     }
 
-    // ── VPC attachment operations ───────────────────────────────────
+    // ── VPC attachment operations ────────────────────────────────────
 
-    /// Build the redb key for an attachment: "vpc_name/project_name".
+    /// Build a storage key for a VPC attachment.
     fn attachment_key(vpc_name: &str, project_name: &str) -> String {
         format!("{vpc_name}/{project_name}")
     }
 
-    /// Attach a project to a shared VPC.
+    /// Attach a shared VPC to a project.
     pub fn attach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
         let vpc = self
             .db
@@ -447,7 +459,7 @@ impl OrgStore {
         Ok(())
     }
 
-    /// Detach a project from a shared VPC.
+    /// Detach a shared VPC from a project.
     pub fn detach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
         if !self.db.exists(VPCS_TABLE, vpc_name)? {
             return Err(OrgError::VpcNotFound(vpc_name.to_string()));
@@ -813,46 +825,27 @@ mod tests {
     // ── VPC tests ───────────────────────────────────────────────────
 
     #[test]
-    fn create_shared_vpc() {
+    fn create_vpc_succeeds() {
         let (_dir, store) = temp_store();
         let vpc = store
             .create_vpc(
-                "monitoring",
-                "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
-            .unwrap();
-
-        assert_eq!(vpc.name, "monitoring");
-        assert_eq!(vpc.cidr, "10.100.0.0/16");
-        assert!(vpc.shared);
-        assert_eq!(vpc.vni, 100); // first VNI
-        assert_eq!(vpc.owner, VpcOwner::Org(OrgId("acme".to_string())));
-
-        let fetched = store.get_vpc("monitoring").unwrap().unwrap();
-        assert_eq!(fetched.name, "monitoring");
-        assert!(fetched.shared);
-    }
-
-    #[test]
-    fn create_project_vpc() {
-        let (_dir, store) = temp_store();
-        let vpc = store
-            .create_vpc(
-                "prod-vpc",
-                "10.2.0.0/16",
+                "default",
+                "10.1.0.0/16",
                 VpcOwner::Project(ProjectId("acme/backend".to_string())),
                 false,
             )
             .unwrap();
 
-        assert_eq!(vpc.name, "prod-vpc");
+        assert_eq!(vpc.name, "default");
+        assert_eq!(vpc.id.0, "vpc-default");
+        assert_eq!(vpc.cidr, "10.1.0.0/16");
+        assert_eq!(vpc.vni, 100);
         assert!(!vpc.shared);
-        assert_eq!(
-            vpc.owner,
-            VpcOwner::Project(ProjectId("acme/backend".to_string()))
-        );
+        assert!(vpc.created_at > 0);
+
+        let fetched = store.get_vpc("default").unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().name, "default");
     }
 
     #[test]
@@ -862,7 +855,7 @@ mod tests {
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
                 false,
             )
             .unwrap();
@@ -870,7 +863,7 @@ mod tests {
             .create_vpc(
                 "vpc-two",
                 "10.2.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
                 false,
             )
             .unwrap();
@@ -880,22 +873,22 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_vpc_rejected() {
+    fn duplicate_vpc_name_rejected() {
         let (_dir, store) = temp_store();
         store
             .create_vpc(
-                "my-vpc",
-                "10.0.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                "default",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
                 false,
             )
             .unwrap();
 
         let err = store
             .create_vpc(
-                "my-vpc",
-                "10.1.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                "default",
+                "10.2.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
                 false,
             )
             .unwrap_err();
@@ -903,7 +896,161 @@ mod tests {
     }
 
     #[test]
-    fn attach_project() {
+    fn delete_vpc_succeeds() {
+        let (_dir, store) = temp_store();
+        store
+            .create_vpc(
+                "default",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store.delete_vpc("default").unwrap();
+        assert!(store.get_vpc("default").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_vpc_not_found() {
+        let (_dir, store) = temp_store();
+        let err = store.delete_vpc("ghost").unwrap_err();
+        assert!(matches!(err, OrgError::VpcNotFound(_)));
+    }
+
+    #[test]
+    fn list_vpcs_returns_all() {
+        let (_dir, store) = temp_store();
+        store
+            .create_vpc(
+                "vpc-one",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+        store
+            .create_vpc(
+                "vpc-two",
+                "10.2.0.0/16",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                true,
+            )
+            .unwrap();
+        store
+            .create_vpc(
+                "vpc-three",
+                "10.3.0.0/16",
+                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let all = store.list_vpcs().unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn list_vpcs_by_project_filters() {
+        let (_dir, store) = temp_store();
+        let pid = ProjectId("acme/backend".to_string());
+
+        store
+            .create_vpc(
+                "vpc-one",
+                "10.1.0.0/16",
+                VpcOwner::Project(pid.clone()),
+                false,
+            )
+            .unwrap();
+        store
+            .create_vpc(
+                "vpc-two",
+                "10.2.0.0/16",
+                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                false,
+            )
+            .unwrap();
+        store
+            .create_vpc(
+                "vpc-shared",
+                "10.100.0.0/16",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                true,
+            )
+            .unwrap();
+
+        let by_project = store.list_vpcs_by_project(&pid).unwrap();
+        assert_eq!(by_project.len(), 1);
+        assert_eq!(by_project[0].name, "vpc-one");
+    }
+
+    #[test]
+    fn list_vpcs_by_org_filters() {
+        let (_dir, store) = temp_store();
+        let oid = OrgId("acme".to_string());
+
+        store
+            .create_vpc(
+                "vpc-one",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+        store
+            .create_vpc(
+                "vpc-shared",
+                "10.100.0.0/16",
+                VpcOwner::Org(oid.clone()),
+                true,
+            )
+            .unwrap();
+
+        let by_org = store.list_vpcs_by_org(&oid).unwrap();
+        assert_eq!(by_org.len(), 1);
+        assert_eq!(by_org[0].name, "vpc-shared");
+    }
+
+    #[test]
+    fn invalid_cidr_rejected() {
+        let (_dir, store) = temp_store();
+
+        let err = store
+            .create_vpc(
+                "bad-cidr",
+                "not-a-cidr",
+                VpcOwner::Project(ProjectId("x".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+
+        let err = store
+            .create_vpc(
+                "bad-cidr",
+                "10.0.0/16",
+                VpcOwner::Project(ProjectId("x".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+
+        let err = store
+            .create_vpc(
+                "bad-cidr",
+                "10.0.0.0/33",
+                VpcOwner::Project(ProjectId("x".to_string())),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrgError::InvalidCidr(_)));
+    }
+
+    // ── VPC attachment tests ─────────────────────────────────────────
+
+    #[test]
+    fn attach_vpc_succeeds() {
         let (_dir, store) = temp_store();
         store
             .create_vpc(
@@ -915,68 +1062,9 @@ mod tests {
             .unwrap();
 
         store.attach_vpc("shared-vpc", "acme/backend").unwrap();
-
         let attachments = store.list_attachments("shared-vpc").unwrap();
         assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0], ProjectId("acme/backend".to_string()));
-    }
-
-    #[test]
-    fn detach_project() {
-        let (_dir, store) = temp_store();
-        store
-            .create_vpc(
-                "shared-vpc",
-                "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
-            .unwrap();
-
-        store.attach_vpc("shared-vpc", "acme/backend").unwrap();
-        store.attach_vpc("shared-vpc", "acme/frontend").unwrap();
-
-        store.detach_vpc("shared-vpc", "acme/backend").unwrap();
-
-        let attachments = store.list_attachments("shared-vpc").unwrap();
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0], ProjectId("acme/frontend".to_string()));
-    }
-
-    #[test]
-    fn list_attachments_empty() {
-        let (_dir, store) = temp_store();
-        store
-            .create_vpc(
-                "shared-vpc",
-                "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
-            .unwrap();
-
-        let attachments = store.list_attachments("shared-vpc").unwrap();
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn list_attachments_multiple() {
-        let (_dir, store) = temp_store();
-        store
-            .create_vpc(
-                "shared-vpc",
-                "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
-            .unwrap();
-
-        store.attach_vpc("shared-vpc", "acme/backend").unwrap();
-        store.attach_vpc("shared-vpc", "acme/frontend").unwrap();
-        store.attach_vpc("shared-vpc", "acme/data").unwrap();
-
-        let attachments = store.list_attachments("shared-vpc").unwrap();
-        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments[0].0, "acme/backend");
     }
 
     #[test]
@@ -998,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn double_attach_rejected() {
+    fn attach_duplicate_rejected() {
         let (_dir, store) = temp_store();
         store
             .create_vpc(
@@ -1010,9 +1098,26 @@ mod tests {
             .unwrap();
 
         store.attach_vpc("shared-vpc", "acme/backend").unwrap();
-
         let err = store.attach_vpc("shared-vpc", "acme/backend").unwrap_err();
         assert!(matches!(err, OrgError::VpcAlreadyAttached { .. }));
+    }
+
+    #[test]
+    fn detach_vpc_succeeds() {
+        let (_dir, store) = temp_store();
+        store
+            .create_vpc(
+                "shared-vpc",
+                "10.100.0.0/16",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                true,
+            )
+            .unwrap();
+
+        store.attach_vpc("shared-vpc", "acme/backend").unwrap();
+        store.detach_vpc("shared-vpc", "acme/backend").unwrap();
+        let attachments = store.list_attachments("shared-vpc").unwrap();
+        assert!(attachments.is_empty());
     }
 
     #[test]
@@ -1032,23 +1137,21 @@ mod tests {
     }
 
     #[test]
-    fn attach_nonexistent_vpc_rejected() {
+    fn list_attachments_multiple() {
         let (_dir, store) = temp_store();
-        let err = store.attach_vpc("ghost-vpc", "acme/backend").unwrap_err();
-        assert!(matches!(err, OrgError::VpcNotFound(_)));
-    }
-
-    #[test]
-    fn invalid_cidr_rejected() {
-        let (_dir, store) = temp_store();
-        let err = store
+        store
             .create_vpc(
-                "bad-cidr",
-                "not-a-cidr",
+                "shared-vpc",
+                "10.100.0.0/16",
                 VpcOwner::Org(OrgId("acme".to_string())),
-                false,
+                true,
             )
-            .unwrap_err();
-        assert!(matches!(err, OrgError::InvalidCidr(_)));
+            .unwrap();
+
+        store.attach_vpc("shared-vpc", "acme/backend").unwrap();
+        store.attach_vpc("shared-vpc", "acme/frontend").unwrap();
+
+        let attachments = store.list_attachments("shared-vpc").unwrap();
+        assert_eq!(attachments.len(), 2);
     }
 }

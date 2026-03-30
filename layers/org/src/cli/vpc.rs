@@ -1,108 +1,136 @@
-//! Implementation of `syfrah vpc` subcommands.
+//! `syfrah vpc create|list|delete` handlers.
 
-use anyhow::bail;
+use anyhow::{bail, Context, Result};
 use syfrah_state::LayerDb;
 
 use crate::store::OrgStore;
-use crate::types::VpcOwner;
-use crate::validation::validate_name;
+use crate::types::{OrgId, ProjectId, VpcOwner};
 
-/// Create a VPC.
+const DEFAULT_PROJECT_CIDR: &str = "10.1.0.0/16";
+const DEFAULT_SHARED_CIDR: &str = "10.100.0.0/16";
+
+fn open_store() -> Result<OrgStore> {
+    let db = LayerDb::open("org").context("failed to open org database")?;
+    Ok(OrgStore::new(db))
+}
+
 pub fn run_create(
     name: &str,
     org: &str,
     project: Option<&str>,
-    cidr: &str,
     shared: bool,
-) -> anyhow::Result<()> {
-    if let Err(e) = validate_name(name, "vpc") {
-        bail!("{e}");
+    cidr: Option<&str>,
+) -> Result<()> {
+    if !shared && project.is_none() {
+        bail!(
+            "--project is required for non-shared VPCs.\n\n\
+             Usage:\n  \
+             syfrah vpc create <name> --project <project> --org <org>\n  \
+             syfrah vpc create <name> --org <org> --shared"
+        );
     }
 
-    let db = LayerDb::open("org").map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
+    let store = open_store()?;
 
-    let owner = if let Some(proj) = project {
-        if shared {
-            bail!("shared VPCs must be org-owned, do not pass --project");
-        }
-        let key = format!("{org}/{proj}");
-        VpcOwner::Project(crate::types::ProjectId(key))
+    let (owner, cidr_str) = if shared {
+        let owner = VpcOwner::Org(OrgId(org.to_string()));
+        let cidr_str = cidr.unwrap_or(DEFAULT_SHARED_CIDR);
+        (owner, cidr_str)
     } else {
-        VpcOwner::Org(crate::types::OrgId(org.to_string()))
+        let project = project.unwrap();
+        let owner = VpcOwner::Project(ProjectId(format!("{org}/{project}")));
+        let cidr_str = cidr.unwrap_or(DEFAULT_PROJECT_CIDR);
+        (owner, cidr_str)
     };
 
-    match store.create_vpc(name, cidr, owner, shared) {
-        Ok(vpc) => {
-            println!(
-                "VPC '{}' created (VNI {}, CIDR {}, shared: {}).",
-                vpc.name, vpc.vni, vpc.cidr, vpc.shared
-            );
-            Ok(())
+    let vpc = store
+        .create_vpc(name, cidr_str, owner, shared)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("VPC created: {}", vpc.name);
+    match &vpc.owner {
+        VpcOwner::Org(org_id) => {
+            println!("  Org:      {}", org_id.0);
+            println!("  Shared:   yes");
         }
-        Err(crate::error::OrgError::VpcAlreadyExists(_)) => {
-            bail!("vpc '{name}' already exists");
-        }
-        Err(e) => {
-            bail!("failed to create vpc: {e}");
+        VpcOwner::Project(proj_id) => {
+            println!("  Org:      {org}");
+            if let Some(p) = proj_id.0.split('/').nth(1) {
+                println!("  Project:  {p}");
+            }
         }
     }
+    println!("  CIDR:     {}", vpc.cidr);
+    println!("  VNI:      {}", vpc.vni);
+    println!("  Created:  {}", format_timestamp(vpc.created_at));
+
+    Ok(())
 }
 
-/// List VPCs.
-pub fn run_list(org: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let db = LayerDb::open("org").map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
+pub fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<()> {
+    let store = open_store()?;
 
-    let vpcs = store
-        .list_vpcs(org)
-        .map_err(|e| anyhow::anyhow!("failed to list vpcs: {e}"))?;
+    let vpcs = match (org, project) {
+        (Some(org_name), Some(proj_name)) => {
+            let project_id = ProjectId(format!("{org_name}/{proj_name}"));
+            store
+                .list_vpcs_by_project(&project_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        (Some(org_name), None) => {
+            let org_id = OrgId(org_name.to_string());
+            store
+                .list_vpcs_by_org(&org_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        _ => store.list_vpcs().map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
 
     if json {
-        let json_str = serde_json::to_string_pretty(&vpcs)?;
-        println!("{json_str}");
+        println!("{}", serde_json::to_string_pretty(&vpcs)?);
         return Ok(());
     }
 
     if vpcs.is_empty() {
-        println!("(no VPCs)");
+        println!("No VPCs found.");
+        if let Some(org_name) = org {
+            println!(
+                "\nCreate one with: syfrah vpc create <name> --project <project> --org {org_name}"
+            );
+        }
         return Ok(());
     }
 
-    let tw = term_width();
-    let header = format!(
-        "{:<20} {:<18} {:<8} {:<8} {:<20}",
-        "NAME", "CIDR", "VNI", "SHARED", "OWNER"
+    println!(
+        "{:<20} {:<18} {:<6} {:<25} {:<8} CREATED",
+        "NAME", "CIDR", "VNI", "OWNER", "SHARED"
     );
-    if console::Term::stdout().is_term() {
-        let truncated = &header[..header.len().min(tw)];
-        println!("{}", console::Style::new().bold().apply_to(truncated));
-    } else {
-        println!("{}", &header[..header.len().min(tw)]);
-    }
-    println!("{}", "-".repeat(74.min(tw)));
+    println!("{}", "-".repeat(95));
 
     for vpc in &vpcs {
-        let owner_str = match &vpc.owner {
-            VpcOwner::Project(id) => format!("project:{}", id.0),
-            VpcOwner::Org(id) => format!("org:{}", id.0),
+        let owner = match &vpc.owner {
+            VpcOwner::Project(pid) => pid.0.clone(),
+            VpcOwner::Org(oid) => oid.0.clone(),
         };
-        let shared_str = if vpc.shared { "yes" } else { "no" };
-        let row = format!(
-            "{:<20} {:<18} {:<8} {:<8} {:<20}",
-            vpc.name, vpc.cidr, vpc.vni, shared_str, owner_str
+        let shared = if vpc.shared { "yes" } else { "no" };
+        println!(
+            "{:<20} {:<18} {:<6} {:<25} {:<8} {}",
+            vpc.name,
+            vpc.cidr,
+            vpc.vni,
+            owner,
+            shared,
+            format_timestamp(vpc.created_at),
         );
-        println!("{}", &row[..row.len().min(tw)]);
     }
 
     Ok(())
 }
 
-/// Delete a VPC.
-pub fn run_delete(name: &str, yes: bool) -> anyhow::Result<()> {
-    let db = LayerDb::open("org").map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
+pub fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
+    let store = open_store()?;
 
+    // Check it exists first
     match store.get_vpc(name) {
         Ok(Some(_)) => {}
         Ok(None) => bail!("vpc '{name}' not found"),
@@ -120,60 +148,219 @@ pub fn run_delete(name: &str, yes: bool) -> anyhow::Result<()> {
         }
     }
 
-    match store.delete_vpc(name) {
-        Ok(()) => {
-            println!("VPC '{name}' deleted.");
-            Ok(())
-        }
-        Err(e) => bail!("failed to delete vpc: {e}"),
-    }
+    store.delete_vpc(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("VPC '{name}' deleted.");
+    Ok(())
 }
 
-/// Attach a project to a shared VPC.
-pub fn run_attach(vpc_name: &str, project: &str) -> anyhow::Result<()> {
-    let db = LayerDb::open("org").map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-
-    match store.attach_vpc(vpc_name, project) {
-        Ok(()) => {
-            println!("Project '{project}' attached to VPC '{vpc_name}'.");
-            Ok(())
-        }
-        Err(crate::error::OrgError::VpcNotFound(_)) => {
-            bail!("vpc '{vpc_name}' not found");
-        }
-        Err(crate::error::OrgError::VpcNotShared(_)) => {
-            bail!("vpc '{vpc_name}' is not shared; only shared VPCs can be attached");
-        }
-        Err(crate::error::OrgError::VpcAlreadyAttached { .. }) => {
-            bail!("project '{project}' is already attached to vpc '{vpc_name}'");
-        }
-        Err(e) => bail!("failed to attach: {e}"),
-    }
+pub fn run_attach(vpc_name: &str, project: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .attach_vpc(vpc_name, project)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Project '{project}' attached to VPC '{vpc_name}'.");
+    Ok(())
 }
 
-/// Detach a project from a shared VPC.
-pub fn run_detach(vpc_name: &str, project: &str) -> anyhow::Result<()> {
-    let db = LayerDb::open("org").map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-
-    match store.detach_vpc(vpc_name, project) {
-        Ok(()) => {
-            println!("Project '{project}' detached from VPC '{vpc_name}'.");
-            Ok(())
-        }
-        Err(crate::error::OrgError::VpcNotFound(_)) => {
-            bail!("vpc '{vpc_name}' not found");
-        }
-        Err(crate::error::OrgError::VpcNotAttached { .. }) => {
-            bail!("project '{project}' is not attached to vpc '{vpc_name}'");
-        }
-        Err(e) => bail!("failed to detach: {e}"),
-    }
+pub fn run_detach(vpc_name: &str, project: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .detach_vpc(vpc_name, project)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Project '{project}' detached from VPC '{vpc_name}'.");
+    Ok(())
 }
 
-fn term_width() -> usize {
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(120)
+fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return "-".to_string();
+    }
+    let days = ts / 86400;
+    let remaining = ts % 86400;
+    let hours = remaining / 3600;
+    let mins = (remaining % 3600) / 60;
+    let (year, month, day) = epoch_days_to_date(days);
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{mins:02}")
+}
+
+fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u64, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::super::VpcCommand;
+
+    /// Helper to parse VPC commands from an arg list.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: VpcCommand,
+    }
+
+    fn parse(args: &[&str]) -> VpcCommand {
+        let full_args = std::iter::once("test").chain(args.iter().copied());
+        TestCli::parse_from(full_args).cmd
+    }
+
+    #[test]
+    fn vpc_create_parse() {
+        // Project-scoped VPC with all flags
+        let cmd = parse(&[
+            "create",
+            "my-vpc",
+            "--project",
+            "backend",
+            "--org",
+            "acme",
+            "--cidr",
+            "10.2.0.0/16",
+        ]);
+        match cmd {
+            VpcCommand::Create {
+                name,
+                org,
+                project,
+                shared,
+                cidr,
+            } => {
+                assert_eq!(name, "my-vpc");
+                assert_eq!(org, "acme");
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert!(!shared);
+                assert_eq!(cidr.as_deref(), Some("10.2.0.0/16"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+
+        // Shared VPC
+        let cmd = parse(&[
+            "create",
+            "shared-net",
+            "--org",
+            "acme",
+            "--shared",
+            "--cidr",
+            "10.100.0.0/16",
+        ]);
+        match cmd {
+            VpcCommand::Create {
+                name,
+                org,
+                project,
+                shared,
+                cidr,
+            } => {
+                assert_eq!(name, "shared-net");
+                assert_eq!(org, "acme");
+                assert!(project.is_none());
+                assert!(shared);
+                assert_eq!(cidr.as_deref(), Some("10.100.0.0/16"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+
+        // Project-scoped without explicit CIDR
+        let cmd = parse(&[
+            "create",
+            "default-vpc",
+            "--project",
+            "backend",
+            "--org",
+            "acme",
+        ]);
+        match cmd {
+            VpcCommand::Create {
+                name,
+                project,
+                cidr,
+                shared,
+                ..
+            } => {
+                assert_eq!(name, "default-vpc");
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert!(cidr.is_none());
+                assert!(!shared);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vpc_list_parse() {
+        let cmd = parse(&["list", "--project", "backend", "--org", "acme", "--json"]);
+        match cmd {
+            VpcCommand::List { project, org, json } => {
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert!(json);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+
+        let cmd = parse(&["list"]);
+        match cmd {
+            VpcCommand::List { project, org, json } => {
+                assert!(project.is_none());
+                assert!(org.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+
+        let cmd = parse(&["list", "--org", "acme"]);
+        match cmd {
+            VpcCommand::List { project, org, json } => {
+                assert!(project.is_none());
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert!(!json);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vpc_delete_parse() {
+        let cmd = parse(&["delete", "my-vpc", "--org", "acme", "--yes"]);
+        match cmd {
+            VpcCommand::Delete { name, org, yes } => {
+                assert_eq!(name, "my-vpc");
+                assert_eq!(org, "acme");
+                assert!(yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+
+        let cmd = parse(&["delete", "my-vpc", "--org", "acme"]);
+        match cmd {
+            VpcCommand::Delete { name, org, yes } => {
+                assert_eq!(name, "my-vpc");
+                assert_eq!(org, "acme");
+                assert!(!yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+
+        let cmd = parse(&["delete", "-y", "my-vpc", "--org", "acme"]);
+        match cmd {
+            VpcCommand::Delete { name, org, yes } => {
+                assert_eq!(name, "my-vpc");
+                assert_eq!(org, "acme");
+                assert!(yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
 }

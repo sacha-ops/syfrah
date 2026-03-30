@@ -57,7 +57,7 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::EnvCommand,
     },
-    /// Manage Virtual Private Clouds
+    /// Manage Virtual Private Clouds (VPCs)
     Vpc {
         #[command(subcommand)]
         command: syfrah_org::VpcCommand,
