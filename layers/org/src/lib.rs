@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli;
 pub mod daemon;
 pub mod error;
+pub mod ipam;
 pub mod store;
 pub mod ttl;
 pub mod types;

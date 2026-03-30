@@ -127,6 +127,18 @@ pub enum OrgError {
     #[error("already peered")]
     DuplicatePeering,
 
+    #[error("IPAM: subnet exhausted, no free IPs in {0}")]
+    IpamExhausted(String),
+
+    #[error("IPAM: subnet not found in bitmap table: {0}")]
+    IpamSubnetNotFound(String),
+
+    #[error("IPAM: cannot release reserved address: {0}")]
+    IpamReservedAddress(String),
+
+    #[error("IPAM: unsupported prefix length /{0}, only /24 is supported")]
+    IpamUnsupportedPrefix(u8),
+
     #[error("store error: {0}")]
     StoreError(String),
 }
