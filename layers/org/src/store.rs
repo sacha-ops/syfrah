@@ -770,6 +770,23 @@ impl OrgStore {
             .collect())
     }
 
+    /// Find all subnets with a given name across all VPCs.
+    ///
+    /// Returns a list of `(vpc_name, Subnet)` pairs. Useful for resolving a
+    /// subnet name when the VPC is not specified.
+    pub fn find_subnets_by_name(&self, subnet_name: &str) -> Result<Vec<(String, Subnet)>> {
+        let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
+        let mut matches = Vec::new();
+        for (key, subnet) in all {
+            if subnet.name == subnet_name {
+                // key is "vpc_name/subnet_name"; extract vpc_name
+                let vpc_name = key.split('/').next().unwrap_or(&key).to_string();
+                matches.push((vpc_name, subnet));
+            }
+        }
+        Ok(matches)
+    }
+
     /// Delete a subnet by VPC name and subnet name.
     pub fn delete_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<()> {
         let key = Self::subnet_key(vpc_name, subnet_name);

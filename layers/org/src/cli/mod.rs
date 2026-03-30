@@ -274,14 +274,14 @@ pub enum SubnetCommand {
     },
     /// Delete a subnet
     #[command(
-        after_help = "Examples:\n  syfrah subnet delete frontend --vpc my-vpc\n  syfrah subnet delete frontend --vpc my-vpc --yes"
+        after_help = "Examples:\n  syfrah subnet delete frontend --yes\n  syfrah subnet delete frontend --vpc my-vpc --yes"
     )]
     Delete {
         /// Subnet name
         name: String,
-        /// VPC the subnet belongs to
+        /// VPC the subnet belongs to (auto-detected if omitted and name is unique)
         #[arg(long)]
-        vpc: String,
+        vpc: Option<String>,
         /// Skip confirmation prompt
         #[arg(long, short)]
         yes: bool,
@@ -398,6 +398,6 @@ pub fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
             org.as_deref(),
             json,
         ),
-        SubnetCommand::Delete { name, vpc, yes } => subnet::run_delete(&name, &vpc, yes),
+        SubnetCommand::Delete { name, vpc, yes } => subnet::run_delete(&name, vpc.as_deref(), yes),
     }
 }
