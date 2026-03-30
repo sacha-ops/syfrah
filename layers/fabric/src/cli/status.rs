@@ -118,7 +118,7 @@ pub async fn run(opts: StatusOpts) -> Result<()> {
         .count();
 
     ui::box_top(&format!("Peers ({total})"));
-    if ui::is_tty() {
+    if ui::use_color() {
         let green = console::Style::new().green();
         let red = console::Style::new().red();
         ui::box_row(&format!("{} {} active", green.apply_to("\u{25cf}"), active));
@@ -187,7 +187,7 @@ pub async fn run(opts: StatusOpts) -> Result<()> {
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 for (zone_name, status) in &sorted {
                     let label = status.to_string();
-                    if ui::is_tty() {
+                    if ui::use_color() {
                         let styled = match status {
                             crate::events::ZoneHealthStatus::Healthy => {
                                 let s = console::Style::new().green();

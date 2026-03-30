@@ -20,6 +20,12 @@ mod update;
                   Run 'syfrah completions --help' for setup instructions."
 )]
 struct Cli {
+    /// Control colored output: always, auto, or never.
+    ///
+    /// Overrides NO_COLOR and FORCE_COLOR env vars.
+    #[arg(long, global = true, default_value = "auto", value_parser = ["always", "auto", "never"])]
+    color: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -666,6 +672,9 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = Cli::parse();
+
+    // Apply color mode before any output
+    syfrah_fabric::ui::set_color_mode(&args.color);
 
     match args.command {
         Commands::Fabric { command } => match command {
