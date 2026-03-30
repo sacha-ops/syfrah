@@ -47,15 +47,22 @@ create_network() {
 preflight_check() {
     local probe1="preflight-probe-1"
     local probe2="preflight-probe-2"
-    docker rm -f "$probe1" "$probe2" 2>/dev/null || true
-    docker run -d --name "$probe1" --network "$E2E_NETWORK" --ip 172.20.0.253 "$E2E_IMAGE" sleep 10 2>/dev/null
-    docker run -d --name "$probe2" --network "$E2E_NETWORK" --ip 172.20.0.254 "$E2E_IMAGE" sleep 10 2>/dev/null
+    # Always clean up probe containers, even on unexpected failure
+    _preflight_cleanup() { docker rm -f "$probe1" "$probe2" >/dev/null 2>&1 || true; }
+    trap '_preflight_cleanup' RETURN
+    _preflight_cleanup
+    docker run -d --name "$probe1" --network "$E2E_NETWORK" --ip 172.20.0.253 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container $probe1 (image=$E2E_IMAGE)"
+        return 1
+    }
+    docker run -d --name "$probe2" --network "$E2E_NETWORK" --ip 172.20.0.254 "$E2E_IMAGE" sleep 10 || {
+        fail "PREFLIGHT: Failed to start probe container $probe2 (image=$E2E_IMAGE)"
+        return 1
+    }
     if ! docker exec "$probe1" ping -c1 -W2 172.20.0.254 >/dev/null 2>&1; then
-        docker rm -f "$probe1" "$probe2" 2>/dev/null
         fail "PREFLIGHT: Docker container networking is broken — containers cannot ping each other"
         return 1
     fi
-    docker rm -f "$probe1" "$probe2" 2>/dev/null
     debug "preflight: Docker networking OK"
 }
 
@@ -131,7 +138,8 @@ wait_for_wg_interface() {
     local i=0
     debug "waiting for WireGuard interface on $container"
     while [ $i -lt "$max_wait" ]; do
-        if docker exec "$container" ip link show syfrah0 >/dev/null 2>&1; then
+        if docker exec "$container" ip link show syfrah0 >/dev/null 2>&1 \
+           && docker exec "$container" wg show syfrah0 >/dev/null 2>&1; then
             debug "WireGuard interface up on $container after ${i}s"
             return 0
         fi
@@ -140,6 +148,7 @@ wait_for_wg_interface() {
     done
     info "WireGuard interface not found on $container after ${max_wait}s"
     docker exec "$container" ip link 2>/dev/null || true
+    docker exec "$container" wg show syfrah0 2>/dev/null || true
     return 1
 }
 
@@ -159,7 +168,9 @@ init_mesh() {
         --endpoint "${ip}:51820"
 
     wait_daemon "$container"
-    wait_for_wg_interface "$container" || true
+    if ! wait_for_wg_interface "$container"; then
+        info "WARNING: WireGuard interface not ready on $container after init_mesh"
+    fi
     debug "init_mesh: $container done"
 }
 
@@ -194,7 +205,9 @@ join_mesh() {
         --pin "$E2E_PIN"
 
     wait_daemon "$container"
-    wait_for_wg_interface "$container" || true
+    if ! wait_for_wg_interface "$container"; then
+        info "WARNING: WireGuard interface not ready on $container after join_mesh"
+    fi
     debug "join_mesh: $container done"
 }
 
