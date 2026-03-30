@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use syfrah_state::LayerDb;
 
 use crate::store::OrgStore;
-use crate::types::EnvironmentId;
+use crate::types::{EnvironmentId, ProjectId};
 use crate::vpc::VpcStore;
 
 fn open_store() -> Result<OrgStore> {
@@ -85,6 +85,19 @@ pub fn run_list(
         store
             .list_subnets_by_env(&env_id)
             .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else if let (Some(proj), Some(org_name)) = (project, org) {
+        let project_id = ProjectId(format!("{org_name}/{proj}"));
+        let vpcs = store
+            .list_vpcs_by_project(&project_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut all_subnets = Vec::new();
+        for vpc in &vpcs {
+            let mut subs = store
+                .list_subnets(&vpc.name)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            all_subnets.append(&mut subs);
+        }
+        all_subnets
     } else {
         anyhow::bail!("specify --vpc or --env/--project/--org to list subnets");
     };
