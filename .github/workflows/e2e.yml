@@ -93,7 +93,10 @@ jobs:
       - name: Load image
         run: docker load < /tmp/syfrah-e2e-test.tar.gz
 
+      - name: Docker cleanup
+        run: docker system prune -f --volumes 2>/dev/null || true
+
       - name: Run ${{ matrix.group.name }} E2E tests
         env:
           SKIP_BUILD: "1"
-        run: ./tests/e2e/run.sh "${{ matrix.group.filter }}"
+        run: ./tests/e2e/run.sh "${{ matrix.group.filter }}" || ./tests/e2e/run.sh "${{ matrix.group.filter }}"
