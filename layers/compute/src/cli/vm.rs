@@ -247,10 +247,15 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                 let json_str = serde_json::to_string_pretty(&vms)?;
                 println!("{json_str}");
             } else {
-                println!(
+                let header = format!(
                     "{:<20} {:<20} {:<12} {:<12} {:<6} {:<10} {:<10}",
                     "NAME", "IMAGE", "PHASE", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
                 );
+                if console::Term::stdout().is_term() {
+                    println!("{}", console::Style::new().bold().apply_to(&header));
+                } else {
+                    println!("{header}");
+                }
                 println!("{}", "-".repeat(90));
                 if vms.is_empty() {
                     println!("(no VMs)");

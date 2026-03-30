@@ -92,7 +92,7 @@ pub async fn run(opts: StatusOpts) -> Result<()> {
             ));
         }
     } else {
-        println!("  Gateway: disabled");
+        ui::info_line("Gateway", "disabled");
     }
     println!();
 

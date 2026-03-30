@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+console = "0.15"
 dirs = "6"
 flate2 = "1"
 fs2 = "0.4"
