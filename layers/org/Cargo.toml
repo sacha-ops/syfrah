@@ -11,7 +11,9 @@ categories.workspace = true
 [dependencies]
 syfrah-api = { path = "../api" }
 syfrah-state = { path = "../state" }
+anyhow.workspace = true
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
