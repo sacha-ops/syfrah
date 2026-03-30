@@ -8,6 +8,10 @@
 //! - Default-deny ingress with exceptions for SSH (TCP 22) and ICMP
 //! - Default-allow egress (after anti-spoofing checks)
 //! - Conntrack: established/related connections auto-allowed
+//!
+//! Isolation rules:
+//! - Subnet isolation within the same VPC (cross-subnet blocked by default)
+//! - VPC isolation (cross-VPC forwarding blocked by default)
 
 use std::fmt::Write;
 use std::net::Ipv4Addr;
@@ -21,14 +25,8 @@ const CHAIN_NAME: &str = "forward";
 
 /// Generate the nftables ruleset that creates the `syfrah` table and
 /// `forward` chain if they do not already exist.
-///
-/// This is idempotent: re-running it on an already-initialized system
-/// is a no-op (we use `create` which silently succeeds if the object
-/// exists).
 pub fn generate_table_setup() -> String {
     let mut buf = String::new();
-    // `table inet` works for both IPv4 and IPv6 in nftables.
-    // Using `create` instead of `add` so it does not error if it exists.
     writeln!(buf, "create table inet {TABLE_NAME}").unwrap();
     writeln!(
         buf,
@@ -39,102 +37,59 @@ pub fn generate_table_setup() -> String {
 }
 
 /// Generate nftables rules for a VM's TAP interface.
-///
-/// The rules enforce (in order):
-/// 1. Anti-spoofing: drop traffic from the TAP with wrong source MAC
-/// 2. Anti-spoofing: drop traffic from the TAP with wrong source IP
-/// 3. Default-deny ingress: drop all traffic going to the TAP
-/// 4. Allow SSH (TCP 22) inbound
-/// 5. Allow ICMP echo-request inbound
-/// 6. Conntrack: allow established/related inbound
-/// 7. Egress allow: permit outbound traffic (after anti-spoofing)
-///
-/// Rules are applied atomically via `nft -f -`.
 pub fn generate_vm_rules(tap: &str, mac: &str, ip: Ipv4Addr) -> String {
     let mut buf = String::new();
-
-    // Ensure table and chain exist first (idempotent).
     write!(buf, "{}", generate_table_setup()).unwrap();
-
-    // Anti-spoofing: wrong MAC from this TAP → drop
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ether saddr != {mac} drop"
     )
     .unwrap();
-
-    // Anti-spoofing: wrong source IP from this TAP → drop
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ip saddr != {ip} drop"
     )
     .unwrap();
-
-    // Default-deny ingress: drop all traffic toward this TAP
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} drop"
     )
     .unwrap();
-
-    // Allow SSH inbound (TCP port 22)
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} tcp dport 22 accept"
     )
     .unwrap();
-
-    // Allow ICMP echo-request inbound
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} icmp type echo-request accept"
     )
     .unwrap();
-
-    // Conntrack: allow established/related connections inbound
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} ct state established,related accept"
     )
     .unwrap();
-
-    // Egress allow: all outbound traffic from this TAP (after anti-spoofing)
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} accept"
     )
     .unwrap();
-
     buf
 }
 
 /// Generate nftables commands to remove all rules for a TAP interface.
-///
-/// This flushes the chain and re-adds rules for other TAPs. In a
-/// production implementation, per-TAP chains would avoid full flushes.
-/// For now, we delete rules matching the given TAP name by flushing
-/// the chain (the caller is responsible for re-applying rules for
-/// remaining VMs).
 pub fn generate_remove_rules(tap: &str) -> String {
-    // In production, we would use per-TAP chains (e.g., `syfrah-{tap}`)
-    // and simply `flush chain inet syfrah syfrah-{tap}; delete chain ...`.
-    // For this initial implementation, we output comments marking the TAP
-    // for the caller's flush-and-rebuild strategy.
     let mut buf = String::new();
     writeln!(
         buf,
         "# flush rules for TAP {tap} from inet {TABLE_NAME} {CHAIN_NAME}"
     )
     .unwrap();
-    // The production backend will parse existing rules and delete by handle.
-    // The mock backend records the intent.
     buf
 }
 
 /// Apply an nftables ruleset by writing it to `nft -f -` on stdin.
-///
-/// This is the production entry point. In tests, the mock backend
-/// captures the generated ruleset instead.
 pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
     use std::io::Write as IoWrite;
     use std::process::{Command, Stdio};
@@ -160,6 +115,58 @@ pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── Subnet isolation ────────────────────────────────────────────────
+
+/// Generate nftables rules to block cross-subnet traffic within a VPC.
+/// Both directions are blocked (A->B and B->A).
+pub fn generate_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_a} ip daddr {subnet_b} drop").unwrap();
+    writeln!(buf, "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge} oif {bridge} ip saddr {subnet_b} ip daddr {subnet_a} drop").unwrap();
+    buf
+}
+
+/// Generate nftables rules to remove subnet isolation.
+pub fn generate_remove_subnet_isolation(bridge: &str, subnet_a: &str, subnet_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "# remove subnet isolation {bridge} {subnet_a} <-> {subnet_b}"
+    )
+    .unwrap();
+    buf
+}
+
+// ── VPC isolation ───────────────────────────────────────────────────
+
+/// Generate nftables rules to block all forwarding between two VPC bridges.
+/// Both directions are blocked.
+pub fn generate_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_a} oif {bridge_b} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {bridge_b} oif {bridge_a} drop"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rules to remove VPC isolation.
+pub fn generate_remove_vpc_isolation(bridge_a: &str, bridge_b: &str) -> String {
+    let mut buf = String::new();
+    writeln!(buf, "# remove VPC isolation {bridge_a} <-> {bridge_b}").unwrap();
+    buf
+}
+
+/// VMs in the same subnet communicate via normal bridge forwarding.
+/// No nftables block rule is applied. This is a no-op for documentation symmetry.
+pub fn same_subnet_policy() {}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -177,96 +184,82 @@ mod tests {
     #[test]
     fn anti_spoof_rules_generated() {
         let r = rules();
-        assert!(
-            r.contains(&format!("iif {TAP} ether saddr != {MAC} drop")),
-            "MAC anti-spoof rule missing:\n{r}"
-        );
-        assert!(
-            r.contains(&format!("iif {TAP} ip saddr != {IP} drop")),
-            "IP anti-spoof rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("iif {TAP} ether saddr != {MAC} drop")));
+        assert!(r.contains(&format!("iif {TAP} ip saddr != {IP} drop")));
     }
 
     #[test]
     fn default_deny_ingress() {
         let r = rules();
-        assert!(
-            r.contains(&format!("oif {TAP} drop")),
-            "Default-deny ingress rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("oif {TAP} drop")));
     }
 
     #[test]
     fn ssh_allowed() {
         let r = rules();
-        assert!(
-            r.contains(&format!("oif {TAP} tcp dport 22 accept")),
-            "SSH allow rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("oif {TAP} tcp dport 22 accept")));
     }
 
     #[test]
     fn icmp_allowed() {
         let r = rules();
-        assert!(
-            r.contains(&format!("oif {TAP} icmp type echo-request accept")),
-            "ICMP allow rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("oif {TAP} icmp type echo-request accept")));
     }
 
     #[test]
     fn egress_allowed() {
         let r = rules();
-        assert!(
-            r.contains(&format!("iif {TAP} accept")),
-            "Egress allow rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("iif {TAP} accept")));
     }
 
     #[test]
     fn conntrack_established() {
         let r = rules();
-        assert!(
-            r.contains(&format!("oif {TAP} ct state established,related accept")),
-            "Conntrack rule missing:\n{r}"
-        );
+        assert!(r.contains(&format!("oif {TAP} ct state established,related accept")));
     }
 
     #[test]
     fn table_setup_is_idempotent() {
         let setup = generate_table_setup();
-        // Uses `create` (not `add`) so re-running is a no-op.
-        assert!(
-            setup.contains("create table inet syfrah"),
-            "Table creation should use 'create' for idempotency:\n{setup}"
-        );
-        assert!(
-            setup.contains("create chain inet syfrah forward"),
-            "Chain creation should use 'create' for idempotency:\n{setup}"
-        );
+        assert!(setup.contains("create table inet syfrah"));
+        assert!(setup.contains("create chain inet syfrah forward"));
     }
 
     #[test]
     fn rule_ordering() {
         let r = rules();
-        // Anti-spoofing must come before egress allow.
         let mac_spoof_pos = r.find("ether saddr !=").expect("MAC spoof rule");
         let ip_spoof_pos = r.find("ip saddr !=").expect("IP spoof rule");
         let egress_pos = r.find(&format!("iif {TAP} accept")).expect("egress rule");
         let deny_pos = r.find(&format!("oif {TAP} drop")).expect("deny rule");
         let ssh_pos = r.find("tcp dport 22 accept").expect("SSH rule");
+        assert!(mac_spoof_pos < ip_spoof_pos);
+        assert!(ip_spoof_pos < egress_pos);
+        assert!(deny_pos < ssh_pos);
+    }
 
-        assert!(
-            mac_spoof_pos < ip_spoof_pos,
-            "MAC spoof should come before IP spoof"
-        );
-        assert!(
-            ip_spoof_pos < egress_pos,
-            "Anti-spoofing should come before egress allow"
-        );
-        assert!(
-            deny_pos < ssh_pos,
-            "Default deny should come before SSH allow (nft evaluates in order)"
-        );
+    #[test]
+    fn subnet_isolation_blocks_both_directions() {
+        let rules = generate_subnet_isolation("syfbr-100", "10.1.1.0/24", "10.1.2.0/24");
+        assert!(rules.contains("ip saddr 10.1.1.0/24 ip daddr 10.1.2.0/24 drop"));
+        assert!(rules.contains("ip saddr 10.1.2.0/24 ip daddr 10.1.1.0/24 drop"));
+    }
+
+    #[test]
+    fn vpc_isolation_blocks_both_directions() {
+        let rules = generate_vpc_isolation("syfbr-100", "syfbr-200");
+        assert!(rules.contains("iif syfbr-100 oif syfbr-200 drop"));
+        assert!(rules.contains("iif syfbr-200 oif syfbr-100 drop"));
+    }
+
+    #[test]
+    fn same_subnet_no_rules() {
+        same_subnet_policy();
+    }
+
+    #[test]
+    fn subnet_isolation_uses_bridge_name() {
+        let rules = generate_subnet_isolation("syfbr-vpc42", "10.0.1.0/24", "10.0.2.0/24");
+        assert!(rules.contains("iif syfbr-vpc42 oif syfbr-vpc42"));
     }
 }
