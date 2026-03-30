@@ -31,6 +31,15 @@ pub enum OrgError {
     #[error("invalid {context} name: {reason}")]
     InvalidName { context: String, reason: String },
 
+    #[error("vpc already exists: {0}")]
+    VpcAlreadyExists(String),
+
+    #[error("vpc not found: {0}")]
+    VpcNotFound(String),
+
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }
