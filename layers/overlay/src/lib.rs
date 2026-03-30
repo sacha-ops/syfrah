@@ -4,6 +4,7 @@ pub mod error;
 pub mod fdb;
 pub mod linux;
 pub mod mock;
+pub mod nft;
 pub mod tap;
 pub mod vxlan;
 
