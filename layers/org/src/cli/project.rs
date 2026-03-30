@@ -2,25 +2,38 @@
 
 use anyhow::Result;
 
-use crate::store;
-use crate::types::validate_name;
+use crate::store::OrgStore;
+use crate::validation::validate_name;
 
 pub fn create(name: &str, org: &str) -> Result<()> {
     validate_name(name)?;
-    let db = store::open()?;
-    let project = store::create_project(&db, name, org)?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
+    let project = store.create_project(org, name)?;
     println!(
         "Project '{}' created in organization '{}'.",
-        project.name, project.org
+        project.name, project.org_id
     );
     Ok(())
 }
 
 pub fn list(org: Option<&str>, json: bool) -> Result<()> {
-    let db = store::open()?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
+
     let projects = match org {
-        Some(org_name) => store::list_projects_by_org(&db, org_name)?,
-        None => store::list_projects(&db)?,
+        Some(org_name) => store.list_projects(org_name)?,
+        None => {
+            // List all projects across all orgs
+            let orgs = store.list()?;
+            let mut all = Vec::new();
+            for o in &orgs {
+                all.extend(store.list_projects(&o.name)?);
+            }
+            all
+        }
     };
 
     if json {
@@ -44,7 +57,7 @@ pub fn list(org: Option<&str>, json: bool) -> Result<()> {
     println!("{:<30} {:<20} {:<20}", "NAME", "ORG", "CREATED");
     for p in &projects {
         let created = format_timestamp(p.created_at);
-        println!("{:<30} {:<20} {:<20}", p.name, p.org, created);
+        println!("{:<30} {:<20} {:<20}", p.name, p.org_id, created);
     }
     Ok(())
 }
@@ -59,8 +72,10 @@ pub fn delete(name: &str, org: &str, yes: bool) -> Result<()> {
             return Ok(());
         }
     }
-    let db = store::open()?;
-    store::delete_project(&db, name, org)?;
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
+    let store = OrgStore::new(db);
+    store.delete_project(org, name)?;
     println!("Project '{name}' deleted from org '{org}'.");
     Ok(())
 }

@@ -45,7 +45,7 @@ enum Commands {
     /// Manage organizations
     Org {
         #[command(subcommand)]
-        command: syfrah_org::OrgCommand,
+command: syfrah_org::OrgCommand,
     },
     /// Manage projects within organizations
     Project {
@@ -924,8 +924,8 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Compute { command } => syfrah_compute::cli::run(command).await,
-        Commands::Org { command } => syfrah_org::cli::run_org(command).await,
-        Commands::Project { command } => syfrah_org::cli::run_project(command).await,
+Commands::Org { command } => syfrah_org::cli::run(command),
+        Commands::Project { command } => syfrah_org::cli::run_project(command),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();

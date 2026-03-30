@@ -9,22 +9,25 @@ use clap::Subcommand;
 #[derive(Debug, Subcommand)]
 pub enum OrgCommand {
     /// Create a new organization
+    #[command(after_help = "Examples:\n  syfrah org create acme\n  syfrah org create my-company")]
     Create {
-        /// Organization name (lowercase alphanumeric + hyphens, 3-63 chars)
+        /// Organization name (lowercase alphanumeric and hyphens, 3-63 chars)
         name: String,
     },
     /// List all organizations
+    #[command(after_help = "Examples:\n  syfrah org list\n  syfrah org list --json")]
     List {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Delete an organization
+    #[command(after_help = "Examples:\n  syfrah org delete acme\n  syfrah org delete acme --yes")]
     Delete {
         /// Organization name
         name: String,
         /// Skip confirmation prompt
-        #[arg(long)]
+        #[arg(long, short)]
         yes: bool,
     },
 }
@@ -62,17 +65,17 @@ pub enum ProjectCommand {
     },
 }
 
-/// Run an org subcommand.
-pub async fn run_org(cmd: OrgCommand) -> anyhow::Result<()> {
+/// Execute an org CLI command.
+pub fn run(cmd: OrgCommand) -> anyhow::Result<()> {
     match cmd {
-        OrgCommand::Create { name } => org::create(&name),
-        OrgCommand::List { json } => org::list(json),
-        OrgCommand::Delete { name, yes } => org::delete(&name, yes),
+        OrgCommand::Create { name } => org::run_create(name),
+        OrgCommand::List { json } => org::run_list(json),
+        OrgCommand::Delete { name, yes } => org::run_delete(name, yes),
     }
 }
 
-/// Run a project subcommand.
-pub async fn run_project(cmd: ProjectCommand) -> anyhow::Result<()> {
+/// Execute a project CLI command.
+pub fn run_project(cmd: ProjectCommand) -> anyhow::Result<()> {
     match cmd {
         ProjectCommand::Create { name, org } => project::create(&name, &org),
         ProjectCommand::List { org, json } => project::list(org.as_deref(), json),
