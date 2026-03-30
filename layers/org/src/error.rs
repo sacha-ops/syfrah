@@ -61,6 +61,9 @@ pub enum OrgError {
     #[error("cannot delete vpc '{name}': has {count} vm(s) in its subnets")]
     VpcHasVms { name: String, count: usize },
 
+    #[error("cannot delete subnet '{name}': has {count} active VM(s)")]
+    SubnetHasVms { name: String, count: usize },
+
     #[error("vpc is not shared: {0}")]
     VpcNotShared(String),
 
