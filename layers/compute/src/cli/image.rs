@@ -112,10 +112,15 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&images)?);
             } else {
-                println!(
+                let header = format!(
                     "{:<25} {:<10} {:<10} {:<12} {:<10}",
                     "NAME", "ARCH", "SIZE MB", "CLOUD-INIT", "SOURCE"
                 );
+                if console::Term::stdout().is_term() {
+                    println!("{}", console::Style::new().bold().apply_to(&header));
+                } else {
+                    println!("{header}");
+                }
                 println!("{}", "-".repeat(67));
                 if images.is_empty() {
                     println!("(no images)");
@@ -413,10 +418,15 @@ async fn run_catalog(json: bool) -> anyhow::Result<()> {
             let images = v.get("images").and_then(|i| i.as_array());
             match images {
                 Some(images) => {
-                    println!(
+                    let header = format!(
                         "{:<25} {:<10} {:<10} {:<12}",
                         "NAME", "ARCH", "SIZE MB", "CLOUD-INIT"
                     );
+                    if console::Term::stdout().is_term() {
+                        println!("{}", console::Style::new().bold().apply_to(&header));
+                    } else {
+                        println!("{header}");
+                    }
                     println!("{}", "-".repeat(57));
                     if images.is_empty() {
                         println!("(no images in catalog)");
