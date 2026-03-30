@@ -71,6 +71,22 @@ impl OrgStore {
             return Err(OrgError::NotFound(name.to_string()));
         }
 
+        // Check for child VPCs (org-owned or project-owned)
+        let org_id = OrgId(name.to_string());
+        let org_vpcs = self.list_vpcs_by_org(&org_id)?;
+        let project_vpcs: Vec<Vpc> = self
+            .list_projects(name)?
+            .iter()
+            .flat_map(|p| self.list_vpcs_by_project(&p.id).unwrap_or_default())
+            .collect();
+        let vpc_count = org_vpcs.len() + project_vpcs.len();
+        if vpc_count > 0 {
+            return Err(OrgError::OrgHasVpcs {
+                org: name.to_string(),
+                count: vpc_count,
+            });
+        }
+
         // Check for child projects
         let projects = self.list_projects(name)?;
         if !projects.is_empty() {
@@ -561,6 +577,39 @@ mod tests {
         store.create("acme").unwrap();
         store.delete("acme").unwrap();
         assert!(store.get("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_org_with_org_vpc_fails() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store
+            .create_vpc(
+                "shared-net",
+                "10.0.0.0/16",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                true,
+            )
+            .unwrap();
+        let err = store.delete("acme").unwrap_err();
+        assert!(matches!(err, OrgError::OrgHasVpcs { count: 1, .. }));
+    }
+
+    #[test]
+    fn delete_org_with_project_vpc_fails() {
+        let (_dir, store) = temp_store();
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store
+            .create_vpc(
+                "proj-net",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+        let err = store.delete("acme").unwrap_err();
+        assert!(matches!(err, OrgError::OrgHasVpcs { count: 1, .. }));
     }
 
     #[test]

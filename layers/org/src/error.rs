@@ -10,6 +10,9 @@ pub enum OrgError {
     #[error("org has projects and cannot be deleted: {0}")]
     OrgHasProjects(String),
 
+    #[error("org has {count} VPC(s) — delete them first: {org}")]
+    OrgHasVpcs { org: String, count: usize },
+
     #[error("project already exists: {project} in org {org}")]
     ProjectAlreadyExists { org: String, project: String },
 
