@@ -25,23 +25,26 @@ pub fn run_create(
     vpc: Option<&str>,
     cidr: Option<&str>,
 ) -> Result<()> {
-    let store = open_store()?;
-    let vpc_store = open_vpc_store()?;
-
-    // Resolve VPC name: explicit or default for project
+    // Resolve VPC name: explicit or default for project.
+    // We must ensure the default VPC exists before creating the subnet.
+    // Since redb holds a file lock, we must close VpcStore before opening OrgStore.
     let vpc_name = match vpc {
         Some(v) => v.to_string(),
         None => {
+            let vpc_store = open_vpc_store()?;
             let default_vpc = vpc_store
                 .ensure_default_vpc(org, project)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            default_vpc.name
+            let name = default_vpc.name.clone();
+            drop(vpc_store);
+            name
         }
     };
 
     // Build environment ID
     let env_id = EnvironmentId(format!("{org}/{project}/{env}"));
 
+    let store = open_store()?;
     let subnet = store
         .create_subnet(&vpc_name, &env_id, name, cidr)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
