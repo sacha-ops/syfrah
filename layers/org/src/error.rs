@@ -31,6 +31,25 @@ pub enum OrgError {
     #[error("invalid {context} name: {reason}")]
     InvalidName { context: String, reason: String },
 
+    // ── VPC errors ──────────────────────────────────────────────────
+    #[error("vpc already exists: {0}")]
+    VpcAlreadyExists(String),
+
+    #[error("vpc not found: {0}")]
+    VpcNotFound(String),
+
+    #[error("vpc is not shared: {0}")]
+    VpcNotShared(String),
+
+    #[error("project '{project}' is already attached to vpc '{vpc}'")]
+    VpcAlreadyAttached { vpc: String, project: String },
+
+    #[error("project '{project}' is not attached to vpc '{vpc}'")]
+    VpcNotAttached { vpc: String, project: String },
+
+    #[error("invalid CIDR: {0}")]
+    InvalidCidr(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }

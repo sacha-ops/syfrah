@@ -1,8 +1,9 @@
-//! CLI commands for `syfrah org ...`, `syfrah project ...`, and `syfrah env ...`.
+//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, and `syfrah vpc ...`.
 
 pub mod env;
 pub mod org;
 pub mod project;
+pub mod vpc;
 
 use clap::Subcommand;
 
@@ -166,6 +167,79 @@ pub fn run_project(cmd: ProjectCommand) -> anyhow::Result<()> {
         ProjectCommand::Create { name, org } => project::create(&name, &org),
         ProjectCommand::List { org, json } => project::list(org.as_deref(), json),
         ProjectCommand::Delete { name, org, yes } => project::delete(&name, &org, yes),
+    }
+}
+
+/// Top-level vpc CLI command.
+#[derive(Debug, Subcommand)]
+pub enum VpcCommand {
+    /// Create a new VPC
+    Create {
+        /// VPC name (lowercase alphanumeric + hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Organization that owns this VPC
+        #[arg(long)]
+        org: String,
+        /// Project this VPC belongs to (omit for org-scoped VPCs)
+        #[arg(long)]
+        project: Option<String>,
+        /// CIDR block for the VPC (e.g. 10.1.0.0/16)
+        #[arg(long, default_value = "10.0.0.0/16")]
+        cidr: String,
+        /// Make this VPC shared (attachable to multiple projects)
+        #[arg(long)]
+        shared: bool,
+    },
+    /// List VPCs
+    List {
+        /// Filter by organization
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a VPC
+    Delete {
+        /// VPC name
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Attach a project to a shared VPC
+    Attach {
+        /// VPC name
+        vpc: String,
+        /// Project to attach
+        #[arg(long)]
+        project: String,
+    },
+    /// Detach a project from a shared VPC
+    Detach {
+        /// VPC name
+        vpc: String,
+        /// Project to detach
+        #[arg(long)]
+        project: String,
+    },
+}
+
+/// Execute a vpc CLI command.
+pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
+    match cmd {
+        VpcCommand::Create {
+            name,
+            org,
+            project,
+            cidr,
+            shared,
+        } => vpc::run_create(&name, &org, project.as_deref(), &cidr, shared),
+        VpcCommand::List { org, json } => vpc::run_list(org.as_deref(), json),
+        VpcCommand::Delete { name, yes } => vpc::run_delete(&name, yes),
+        VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
+        VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
     }
 }
 
