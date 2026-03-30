@@ -1710,4 +1710,199 @@ mod tests {
             peering.vpc_b
         );
     }
+
+    // ── Hub & spoke topology tests ─────────────────────────────────
+
+    /// Helper: create a named VPC with a given CIDR for hub/spoke tests.
+    fn create_vpc(store: &VpcStore, name: &str, cidr: &str) -> Vpc {
+        store
+            .create(
+                name,
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some(cidr),
+                false,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn hub_spoke_topology() {
+        let (_dir, store) = temp_store();
+
+        // Create hub + 2 spokes
+        let hub = create_vpc(&store, "hub", "10.0.0.0/16");
+        let spoke_a = create_vpc(&store, "spoke-a", "10.1.0.0/16");
+        let spoke_b = create_vpc(&store, "spoke-b", "10.2.0.0/16");
+
+        // Peer hub <-> spoke-a
+        let peering_a = make_peering(&hub.id, &spoke_a.id);
+        store.create_peering(&peering_a).unwrap();
+
+        // Peer hub <-> spoke-b
+        let peering_b = make_peering(&hub.id, &spoke_b.id);
+        store.create_peering(&peering_b).unwrap();
+
+        // Hub should have 2 active peerings
+        let hub_peerings = store.list_active_peerings_for_vpc(&hub.id).unwrap();
+        assert_eq!(hub_peerings.len(), 2, "hub must have 2 peerings");
+
+        // spoke-a should have 1 peering (with hub only)
+        let spoke_a_peerings = store.list_active_peerings_for_vpc(&spoke_a.id).unwrap();
+        assert_eq!(
+            spoke_a_peerings.len(),
+            1,
+            "spoke-a must have exactly 1 peering"
+        );
+        assert!(
+            spoke_a_peerings[0].vpc_a == hub.id.0 || spoke_a_peerings[0].vpc_b == hub.id.0,
+            "spoke-a's peering must be with hub"
+        );
+
+        // spoke-b should have 1 peering (with hub only)
+        let spoke_b_peerings = store.list_active_peerings_for_vpc(&spoke_b.id).unwrap();
+        assert_eq!(
+            spoke_b_peerings.len(),
+            1,
+            "spoke-b must have exactly 1 peering"
+        );
+        assert!(
+            spoke_b_peerings[0].vpc_a == hub.id.0 || spoke_b_peerings[0].vpc_b == hub.id.0,
+            "spoke-b's peering must be with hub"
+        );
+    }
+
+    #[test]
+    fn spokes_not_connected() {
+        let (_dir, store) = temp_store();
+
+        let hub = create_vpc(&store, "hub", "10.0.0.0/16");
+        let spoke_a = create_vpc(&store, "spoke-a", "10.1.0.0/16");
+        let spoke_b = create_vpc(&store, "spoke-b", "10.2.0.0/16");
+
+        // Peer hub <-> spoke-a and hub <-> spoke-b
+        store
+            .create_peering(&make_peering(&hub.id, &spoke_a.id))
+            .unwrap();
+        store
+            .create_peering(&make_peering(&hub.id, &spoke_b.id))
+            .unwrap();
+
+        // Verify no peering exists between spoke-a and spoke-b.
+        // Peering is NOT transitive: spoke-a <-> hub <-> spoke-b does NOT
+        // imply spoke-a <-> spoke-b.
+        let spoke_a_peerings = store.list_active_peerings_for_vpc(&spoke_a.id).unwrap();
+        for p in &spoke_a_peerings {
+            let peer_vpc = if p.vpc_a == spoke_a.id.0 {
+                &p.vpc_b
+            } else {
+                &p.vpc_a
+            };
+            assert_ne!(
+                *peer_vpc, spoke_b.id.0,
+                "spoke-a must NOT be peered with spoke-b (no transitive peering)"
+            );
+        }
+
+        let spoke_b_peerings = store.list_active_peerings_for_vpc(&spoke_b.id).unwrap();
+        for p in &spoke_b_peerings {
+            let peer_vpc = if p.vpc_a == spoke_b.id.0 {
+                &p.vpc_b
+            } else {
+                &p.vpc_a
+            };
+            assert_ne!(
+                *peer_vpc, spoke_a.id.0,
+                "spoke-b must NOT be peered with spoke-a (no transitive peering)"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_reaches_all_spokes() {
+        let (_dir, store) = temp_store();
+
+        let hub = create_vpc(&store, "hub", "10.0.0.0/16");
+        let spoke_a = create_vpc(&store, "spoke-a", "10.1.0.0/16");
+        let spoke_b = create_vpc(&store, "spoke-b", "10.2.0.0/16");
+
+        store
+            .create_peering(&make_peering(&hub.id, &spoke_a.id))
+            .unwrap();
+        store
+            .create_peering(&make_peering(&hub.id, &spoke_b.id))
+            .unwrap();
+
+        // Collect the VPC IDs that the hub is peered with
+        let hub_peerings = store.list_active_peerings_for_vpc(&hub.id).unwrap();
+        let hub_peers: Vec<String> = hub_peerings
+            .iter()
+            .map(|p| {
+                if p.vpc_a == hub.id.0 {
+                    p.vpc_b.clone()
+                } else {
+                    p.vpc_a.clone()
+                }
+            })
+            .collect();
+
+        assert!(
+            hub_peers.contains(&spoke_a.id.0),
+            "hub must be peered with spoke-a"
+        );
+        assert!(
+            hub_peers.contains(&spoke_b.id.0),
+            "hub must be peered with spoke-b"
+        );
+        assert_eq!(hub_peers.len(), 2, "hub must be peered with exactly 2 VPCs");
+    }
+
+    #[test]
+    fn delete_one_spoke_peering_preserves_other() {
+        let (_dir, store) = temp_store();
+
+        let hub = create_vpc(&store, "hub", "10.0.0.0/16");
+        let spoke_a = create_vpc(&store, "spoke-a", "10.1.0.0/16");
+        let spoke_b = create_vpc(&store, "spoke-b", "10.2.0.0/16");
+
+        let peering_a = make_peering(&hub.id, &spoke_a.id);
+        let peering_b = make_peering(&hub.id, &spoke_b.id);
+        store.create_peering(&peering_a).unwrap();
+        store.create_peering(&peering_b).unwrap();
+
+        // Delete hub <-> spoke-a peering
+        store.delete_peering(&peering_a.id).unwrap();
+
+        // Hub should now have only 1 peering (with spoke-b)
+        let hub_peerings = store.list_active_peerings_for_vpc(&hub.id).unwrap();
+        assert_eq!(
+            hub_peerings.len(),
+            1,
+            "hub must have 1 peering after removing spoke-a"
+        );
+        let remaining_peer = if hub_peerings[0].vpc_a == hub.id.0 {
+            &hub_peerings[0].vpc_b
+        } else {
+            &hub_peerings[0].vpc_a
+        };
+        assert_eq!(
+            *remaining_peer, spoke_b.id.0,
+            "remaining peering must be with spoke-b"
+        );
+
+        // spoke-a should have 0 peerings
+        let spoke_a_peerings = store.list_active_peerings_for_vpc(&spoke_a.id).unwrap();
+        assert_eq!(
+            spoke_a_peerings.len(),
+            0,
+            "spoke-a must have 0 peerings after unpeer"
+        );
+
+        // spoke-b should still have 1 peering
+        let spoke_b_peerings = store.list_active_peerings_for_vpc(&spoke_b.id).unwrap();
+        assert_eq!(
+            spoke_b_peerings.len(),
+            1,
+            "spoke-b must still have 1 peering"
+        );
+    }
 }
