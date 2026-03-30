@@ -155,6 +155,16 @@ impl VpcStore {
             .collect())
     }
 
+    /// List VPCs owned by a specific project.
+    pub fn list_for_project(&self, org: &str, project: &str) -> Result<Vec<Vpc>> {
+        let project_id = format!("{org}/{project}");
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|v| matches!(&v.owner, VpcOwner::Project(pid) if pid.0 == project_id))
+            .collect())
+    }
+
     /// Get a VPC by name.
     pub fn get(&self, name: &str) -> Result<Option<Vpc>> {
         Ok(self.db.get(VPCS_TABLE, name)?)
@@ -237,6 +247,25 @@ impl VpcStore {
         Ok(vpc)
     }
 
+    /// Ensure a default VPC exists for the given org/project.
+    ///
+    /// If a VPC named "{org}-{project}-default" already exists, returns it.
+    /// Otherwise, creates one with an auto-allocated /16 CIDR and a new VNI.
+    ///
+    /// This is the entry point for auto-creation when the first subnet is
+    /// created in a project that has no VPC.
+    pub fn ensure_default_vpc(&self, org: &str, project: &str) -> Result<Vpc> {
+        let default_name = format!("{org}-{project}-default");
+
+        // Idempotency: return existing default VPC if present.
+        if let Some(existing) = self.get(&default_name)? {
+            return Ok(existing);
+        }
+
+        let owner = VpcOwner::Project(crate::types::ProjectId(format!("{org}/{project}")));
+        self.create(&default_name, owner, None, false)
+    }
+
     /// Delete a VPC by name.
     pub fn delete(&self, name: &str) -> Result<()> {
         if !self.db.exists(VPCS_TABLE, name)? {
@@ -278,41 +307,30 @@ mod tests {
 
     #[test]
     fn invalid_cidr_rejected() {
-        // Not a CIDR at all
         assert!(parse_and_validate_cidr("not-a-cidr").is_err());
-        // Invalid octets
         assert!(parse_and_validate_cidr("256.0.0.0/16").is_err());
-        // Missing prefix
         assert!(parse_and_validate_cidr("10.0.0.0").is_err());
     }
 
     #[test]
     fn non_private_range_rejected() {
-        // Public IP range
         assert!(parse_and_validate_cidr("8.8.8.0/24").is_err());
-        // Another public range
         assert!(parse_and_validate_cidr("1.0.0.0/8").is_err());
     }
 
     #[test]
     fn prefix_too_small_rejected() {
-        // /7 is too small
-        let err = parse_and_validate_cidr("10.0.0.0/7");
-        assert!(err.is_err());
+        assert!(parse_and_validate_cidr("10.0.0.0/7").is_err());
     }
 
     #[test]
     fn prefix_too_large_rejected() {
-        // /29 is too large
-        let err = parse_and_validate_cidr("10.0.0.0/29");
-        assert!(err.is_err());
+        assert!(parse_and_validate_cidr("10.0.0.0/29").is_err());
     }
 
     #[test]
     fn host_bits_set_rejected() {
-        // 10.1.0.1/16 has host bits set — should be 10.1.0.0/16
-        let err = parse_and_validate_cidr("10.1.0.1/16");
-        assert!(err.is_err());
+        assert!(parse_and_validate_cidr("10.1.0.1/16").is_err());
     }
 
     // ── Overlap detection tests ─────────────────────────────────────
@@ -381,7 +399,6 @@ mod tests {
     #[test]
     fn auto_allocate_skips_used_cidrs() {
         let (_dir, store) = temp_store();
-        // Create first VPC — gets 10.0.0.0/16
         store
             .create(
                 "vpc-one",
@@ -391,7 +408,6 @@ mod tests {
             )
             .unwrap();
 
-        // Auto-allocate second — should skip 10.0.0.0/16 and get 10.1.0.0/16
         let vpc2 = store
             .create(
                 "vpc-two",
@@ -461,7 +477,6 @@ mod tests {
             )
             .unwrap();
 
-        // Same CIDR in a different org should be fine
         let vpc2 = store
             .create(
                 "vpc-org-b",
@@ -539,7 +554,6 @@ mod tests {
     #[test]
     fn project_vpc_overlap_detection() {
         let (_dir, store) = temp_store();
-        // Create a project VPC
         store
             .create(
                 "proj-vpc",
@@ -549,7 +563,6 @@ mod tests {
             )
             .unwrap();
 
-        // Try to create an org VPC with overlapping CIDR in the same org
         let err = store
             .create(
                 "org-vpc",
@@ -559,5 +572,37 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, OrgError::CidrOverlap { .. }));
+    }
+
+    // ── Auto-creation tests ─────────────────────────────────────────
+
+    #[test]
+    fn ensure_default_vpc_creates_new() {
+        let (_dir, store) = temp_store();
+        let vpc = store.ensure_default_vpc("acme", "backend").unwrap();
+        assert_eq!(vpc.name, "acme-backend-default");
+        assert!(!vpc.shared);
+        assert!(matches!(&vpc.owner, VpcOwner::Project(pid) if pid.0 == "acme/backend"));
+        assert!(vpc.vni >= 100);
+        assert!(vpc.cidr.ends_with("/16"));
+    }
+
+    #[test]
+    fn ensure_default_vpc_idempotent() {
+        let (_dir, store) = temp_store();
+        let vpc1 = store.ensure_default_vpc("acme", "backend").unwrap();
+        let vpc2 = store.ensure_default_vpc("acme", "backend").unwrap();
+        assert_eq!(vpc1.id, vpc2.id);
+        assert_eq!(vpc1.vni, vpc2.vni);
+        assert_eq!(vpc1.cidr, vpc2.cidr);
+    }
+
+    #[test]
+    fn ensure_default_vpc_unique_vnis() {
+        let (_dir, store) = temp_store();
+        let vpc1 = store.ensure_default_vpc("acme", "alpha").unwrap();
+        let vpc2 = store.ensure_default_vpc("acme", "bravo").unwrap();
+        assert_ne!(vpc1.vni, vpc2.vni);
+        assert!(vpc2.vni > vpc1.vni);
     }
 }
