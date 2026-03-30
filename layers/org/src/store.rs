@@ -247,7 +247,10 @@ impl OrgStore {
             .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
             .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
 
-        let now = now();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         env.ttl = Some(ttl);
         env.expires_at = Some(now + ttl);
 
