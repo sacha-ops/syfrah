@@ -48,25 +48,8 @@ pub trait NetworkBackend: Send + Sync {
     /// Delete a TAP device.
     async fn delete_tap(&self, name: &str) -> Result<()>;
 
-    /// Create a veth pair (used by containers or VPC peering).
+    /// Create a veth pair (used by containers).
     async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
-
-    /// Delete a veth pair (removing one end auto-removes the other).
-    async fn delete_veth_pair(&self, name: &str) -> Result<()>;
-
-    /// Bring a network interface up.
-    async fn set_link_up(&self, name: &str) -> Result<()>;
-
-    /// Check whether a network interface exists.
-    async fn link_exists(&self, name: &str) -> Result<bool>;
-
-    // ── Routing ────────────────────────────────────────────────────────
-
-    /// Add an IP route: `ip route add {cidr} dev {dev}`.
-    async fn add_route(&self, cidr: &str, dev: &str) -> Result<()>;
-
-    /// Delete an IP route: `ip route del {cidr} dev {dev}`.
-    async fn delete_route(&self, cidr: &str, dev: &str) -> Result<()>;
 
     // ── Firewall ───────────────────────────────────────────────────────
 
