@@ -286,7 +286,7 @@ fn validate_zone_exists(
 
 /// Format a zone status label with color when on a TTY.
 fn zone_status_label(label: &str) -> String {
-    if !ui::is_tty() {
+    if !ui::use_color() {
         return label.to_string();
     }
     match label {

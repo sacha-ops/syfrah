@@ -71,7 +71,7 @@ pub async fn watch(pin: Option<String>, continuous: bool) -> Result<()> {
                         .await
                         {
                             Ok(FabricResponse::PeeringAccepted { peer_name }) => {
-                                if ui::is_tty() {
+                                if ui::use_color() {
                                     let green = console::Style::new().green();
                                     println!(
                                         "     {} {} joined the mesh.\n",

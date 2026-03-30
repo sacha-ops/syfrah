@@ -2,14 +2,80 @@
 //!
 //! When stdout is not a terminal (piping, CI, docker exec), all output falls
 //! back to plain text with no ANSI escape codes and no spinners.
+//!
+//! Color output respects:
+//! - `--color=always|auto|never` CLI flag (via [`set_color_mode`])
+//! - `NO_COLOR` env var (disables color when set)
+//! - `FORCE_COLOR` env var (forces color when set)
+//! - TTY detection (auto mode, the default)
 
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+/// Color mode set by the `--color` CLI flag.
+///
+/// 0 = auto (default), 1 = always, 2 = never
+static COLOR_MODE: AtomicU8 = AtomicU8::new(0);
+
+const COLOR_AUTO: u8 = 0;
+const COLOR_ALWAYS: u8 = 1;
+const COLOR_NEVER: u8 = 2;
+
+/// Set the global color mode. Call once from CLI arg parsing.
+pub fn set_color_mode(mode: &str) {
+    let val = match mode {
+        "always" => COLOR_ALWAYS,
+        "never" => COLOR_NEVER,
+        _ => COLOR_AUTO,
+    };
+    COLOR_MODE.store(val, Ordering::Relaxed);
+    // Propagate to the `console` crate so Style::apply_to respects the setting.
+    match val {
+        COLOR_ALWAYS => {
+            console::set_colors_enabled(true);
+            console::set_colors_enabled_stderr(true);
+        }
+        COLOR_NEVER => {
+            console::set_colors_enabled(false);
+            console::set_colors_enabled_stderr(false);
+        }
+        _ => {} // auto: let console decide
+    }
+}
+
 /// Returns `true` when stdout is connected to a real terminal.
+///
+/// This is the raw TTY check — used for interactive features like spinners and
+/// confirmation prompts that depend on a real terminal regardless of color
+/// settings.
 pub fn is_tty() -> bool {
     console::Term::stdout().is_term()
+}
+
+/// Returns `true` when colored/styled output should be used.
+///
+/// Checks (in priority order):
+/// 1. `--color=always` / `--color=never` CLI flag
+/// 2. `FORCE_COLOR` env var (any non-empty value enables color)
+/// 3. `NO_COLOR` env var (any non-empty value disables color)
+/// 4. TTY detection (color if stdout is a terminal)
+pub fn use_color() -> bool {
+    match COLOR_MODE.load(Ordering::Relaxed) {
+        COLOR_ALWAYS => true,
+        COLOR_NEVER => false,
+        _ => {
+            // FORCE_COLOR takes priority over NO_COLOR
+            if std::env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty()) {
+                return true;
+            }
+            if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+                return false;
+            }
+            is_tty()
+        }
+    }
 }
 
 /// Create a cyan spinner with the given message.
@@ -34,7 +100,7 @@ pub fn spinner(msg: &str) -> ProgressBar {
 
 /// Finish a spinner with a green checkmark and success message.
 pub fn step_ok(pb: &ProgressBar, msg: &str) {
-    if is_tty() {
+    if use_color() {
         let green = Style::new().green();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -50,7 +116,7 @@ pub fn step_ok(pb: &ProgressBar, msg: &str) {
 
 /// Finish a spinner with a red cross and failure message.
 pub fn step_fail(pb: &ProgressBar, msg: &str) {
-    if is_tty() {
+    if use_color() {
         let red = Style::new().red();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -64,9 +130,9 @@ pub fn step_fail(pb: &ProgressBar, msg: &str) {
     }
 }
 
-/// Print a styled key-value line (bold key in TTY, plain otherwise).
+/// Print a styled key-value line (bold key when color is enabled, plain otherwise).
 pub fn info_line(key: &str, value: &str) {
-    if is_tty() {
+    if use_color() {
         let bold = Style::new().bold();
         println!("  {}: {value}", bold.apply_to(key));
     } else {
@@ -87,7 +153,7 @@ fn term_width() -> usize {
 /// doesn't wrap on narrow terminals (see issue #210).
 pub fn heading(text: &str) {
     let width = text.len().min(term_width());
-    if is_tty() {
+    if use_color() {
         let bold = Style::new().bold().underlined();
         println!("{}", bold.apply_to(text));
     } else {
@@ -98,7 +164,7 @@ pub fn heading(text: &str) {
 
 /// Print a green success line (used for final summaries).
 pub fn success(msg: &str) {
-    if is_tty() {
+    if use_color() {
         let green = Style::new().green().bold();
         println!("{}", green.apply_to(msg));
     } else {
@@ -128,7 +194,7 @@ pub fn confirm(prompt: &str) -> bool {
 
 /// Print a yellow warning line.
 pub fn warn(msg: &str) {
-    if is_tty() {
+    if use_color() {
         let yellow = Style::new().yellow();
         eprintln!("{}", yellow.apply_to(msg));
     } else {
@@ -142,7 +208,7 @@ const BOX_WIDTH: usize = 50;
 
 /// Print the top border of a section box with an optional title.
 pub fn box_top(title: &str) {
-    if is_tty() {
+    if use_color() {
         let bold = Style::new().bold();
         if title.is_empty() {
             println!("\u{256d}{}\u{256e}", "\u{2500}".repeat(BOX_WIDTH));
@@ -168,7 +234,7 @@ pub fn box_top(title: &str) {
 
 /// Print a line inside a box section.
 pub fn box_row(text: &str) {
-    if is_tty() {
+    if use_color() {
         let pad = BOX_WIDTH.saturating_sub(console::measure_text_width(text) + 1);
         println!("\u{2502} {text}{}\u{2502}", " ".repeat(pad));
     } else {
@@ -178,7 +244,7 @@ pub fn box_row(text: &str) {
 
 /// Print the bottom border of a section box.
 pub fn box_bottom() {
-    if is_tty() {
+    if use_color() {
         println!("\u{2570}{}\u{256f}", "\u{2500}".repeat(BOX_WIDTH));
     } else {
         println!("{}", "-".repeat(BOX_WIDTH + 2));
@@ -187,7 +253,7 @@ pub fn box_bottom() {
 
 /// Print a health status line (outside a box). Green check or red cross.
 pub fn health_ok(msg: &str) {
-    if is_tty() {
+    if use_color() {
         let green = Style::new().green().bold();
         println!("  {} {msg}", green.apply_to("\u{25cf}"));
     } else {
@@ -197,7 +263,7 @@ pub fn health_ok(msg: &str) {
 
 /// Print a health problem line. Red cross in TTY, plain in non-TTY.
 pub fn health_bad(msg: &str) {
-    if is_tty() {
+    if use_color() {
         let red = Style::new().red().bold();
         println!("  {} {msg}", red.apply_to("\u{2717}"));
     } else {
@@ -225,7 +291,7 @@ pub fn mask_secret(secret: &str) -> String {
 
 /// Print a styled pass/fail check line for diagnostics.
 pub fn check_pass(name: &str) {
-    if is_tty() {
+    if use_color() {
         let green = Style::new().green();
         println!("  {} {name}", green.apply_to("\u{2713}"));
     } else {
@@ -235,7 +301,7 @@ pub fn check_pass(name: &str) {
 
 /// Print a styled fail check line for diagnostics.
 pub fn check_fail(name: &str, detail: &str) {
-    if is_tty() {
+    if use_color() {
         let red = Style::new().red();
         println!("  {} {name}: {detail}", red.apply_to("\u{2717}"));
     } else {
@@ -245,7 +311,7 @@ pub fn check_fail(name: &str, detail: &str) {
 
 /// Print a styled join request card for peering watch.
 pub fn join_request_card(node_name: &str, endpoint: &str, wg_key_prefix: &str) {
-    if is_tty() {
+    if use_color() {
         let cyan = Style::new().cyan();
         let bold = Style::new().bold();
         println!(
@@ -269,7 +335,7 @@ pub fn join_request_card(node_name: &str, endpoint: &str, wg_key_prefix: &str) {
 /// In default mode, just says "Waiting for join request..." since it exits
 /// after the first accept/reject.
 pub fn peering_banner(port: u16, pin: Option<&str>, continuous: bool) {
-    if is_tty() {
+    if use_color() {
         let green = Style::new().green();
         println!(
             "  {} Peering active on port {port}",
@@ -360,5 +426,30 @@ mod tests {
     #[test]
     fn mask_secret_short_input() {
         assert_eq!(mask_secret("short"), "****");
+    }
+
+    #[test]
+    fn set_color_mode_always() {
+        set_color_mode("always");
+        assert!(use_color());
+        // Reset to auto for other tests
+        set_color_mode("auto");
+    }
+
+    #[test]
+    fn set_color_mode_never() {
+        set_color_mode("never");
+        assert!(!use_color());
+        // Reset to auto for other tests
+        set_color_mode("auto");
+    }
+
+    #[test]
+    fn set_color_mode_auto_non_tty() {
+        set_color_mode("auto");
+        // In tests we're not on a TTY, so use_color() returns false
+        // (unless FORCE_COLOR or NO_COLOR are set in the env)
+        // Just verify it doesn't panic
+        let _ = use_color();
     }
 }

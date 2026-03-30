@@ -308,7 +308,7 @@ fn run_json(mesh_name: &str, view: &TopologyView, opts: &TopologyOpts) -> Result
 
 fn format_zone_health(status: ZoneHealthStatus) -> String {
     let label = status.to_string();
-    if !ui::is_tty() {
+    if !ui::use_color() {
         return label;
     }
     match status {
@@ -334,7 +334,7 @@ fn format_zone_health(status: ZoneHealthStatus) -> String {
 fn format_status(status: PeerStatus) -> String {
     match status {
         PeerStatus::Active => {
-            if ui::is_tty() {
+            if ui::use_color() {
                 let green = console::Style::new().green();
                 format!("{}", green.apply_to("active"))
             } else {
@@ -342,7 +342,7 @@ fn format_status(status: PeerStatus) -> String {
             }
         }
         PeerStatus::Unreachable => {
-            if ui::is_tty() {
+            if ui::use_color() {
                 let red = console::Style::new().red();
                 format!("{}", red.apply_to("unreachable"))
             } else {
