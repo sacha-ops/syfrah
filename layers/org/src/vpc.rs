@@ -587,7 +587,97 @@ impl VpcStore {
 
     // ── Peering operations ──────────────────────────────────────────
 
-    /// Create a VPC peering.
+    /// Normalize a peering key so that "A/B" and "B/A" produce the same key.
+    /// The two VPC IDs are sorted lexicographically and joined with "/".
+    fn normalize_peering_key(vpc_a: &VpcId, vpc_b: &VpcId) -> String {
+        let (lo, hi) = if vpc_a.0 <= vpc_b.0 {
+            (&vpc_a.0, &vpc_b.0)
+        } else {
+            (&vpc_b.0, &vpc_a.0)
+        };
+        format!("{lo}/{hi}")
+    }
+
+    /// Create a VPC peering with full validation:
+    ///
+    /// 1. **No self-peering**: vpc_a == vpc_b is rejected.
+    /// 2. **Both VPCs must exist**: validated before creating.
+    /// 3. **No duplicate peering**: if an active peering already exists between the
+    ///    two VPCs (in either direction), the request is rejected.
+    /// 4. **CIDR overlap warning**: if the two VPCs have overlapping CIDRs, a warning
+    ///    is logged but the peering succeeds (overlap is valid but may cause routing
+    ///    confusion).
+    /// 5. **Key normalization**: "A/B" and "B/A" are the same peering.
+    pub fn create_peering_validated(
+        &self,
+        vpc_a_name: &str,
+        vpc_b_name: &str,
+    ) -> Result<VpcPeering> {
+        // Look up both VPCs — must exist
+        let vpc_a = self
+            .get(vpc_a_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a_name.to_string()))?;
+        let vpc_b = self
+            .get(vpc_b_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b_name.to_string()))?;
+
+        // No self-peering
+        if vpc_a.id == vpc_b.id {
+            return Err(OrgError::SelfPeering);
+        }
+
+        // Normalize key — ensures A/B == B/A
+        let key = Self::normalize_peering_key(&vpc_a.id, &vpc_b.id);
+
+        // Check for duplicate active peering
+        let existing: Option<VpcPeering> = self.db.get(PEERINGS_TABLE, &key)?;
+        if let Some(ref p) = existing {
+            if p.status == PeeringStatus::Active {
+                return Err(OrgError::DuplicatePeering);
+            }
+        }
+
+        // CIDR overlap warning (log but don't block)
+        if let (Ok(cidr_a), Ok(cidr_b)) = (
+            vpc_a.cidr.parse::<ipnet::Ipv4Net>(),
+            vpc_b.cidr.parse::<ipnet::Ipv4Net>(),
+        ) {
+            if cidrs_overlap(&cidr_a, &cidr_b) {
+                tracing::warn!(
+                    vpc_a = %vpc_a.name,
+                    vpc_b = %vpc_b.name,
+                    cidr_a = %cidr_a,
+                    cidr_b = %cidr_b,
+                    "peering VPCs have overlapping CIDRs — this may cause routing confusion"
+                );
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Normalize vpc_a/vpc_b order to match the key
+        let (norm_a, norm_b) = if vpc_a.id.0 <= vpc_b.id.0 {
+            (vpc_a.id.0.clone(), vpc_b.id.0.clone())
+        } else {
+            (vpc_b.id.0.clone(), vpc_a.id.0.clone())
+        };
+
+        let peering = VpcPeering {
+            id: PeeringId(key.clone()),
+            vpc_a: norm_a,
+            vpc_b: norm_b,
+            status: PeeringStatus::Active,
+            created_at: now,
+        };
+
+        self.db.set(PEERINGS_TABLE, &key, &peering)?;
+        Ok(peering)
+    }
+
+    /// Create a VPC peering (low-level, no validation — for internal/migration use).
     pub fn create_peering(&self, peering: &VpcPeering) -> Result<()> {
         let key = peering.id.0.clone();
         self.db.set(PEERINGS_TABLE, &key, peering)?;
@@ -1459,5 +1549,165 @@ mod tests {
         //   "environment has 2 subnets -- specify --subnet <name>"
         // This is enforced in the compute layer, not here. This test
         // documents the expected behavior for when compute is wired.
+    }
+
+    // ── Peering validation tests ───────────────────────────────────
+
+    #[test]
+    fn self_peer_rejected() {
+        let (_dir, store) = temp_store();
+        store
+            .create(
+                "vpc-solo",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        let err = store
+            .create_peering_validated("vpc-solo", "vpc-solo")
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::SelfPeering),
+            "expected SelfPeering, got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_peer_rejected() {
+        let (_dir, store) = temp_store();
+        store
+            .create(
+                "vpc-alpha",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        store
+            .create(
+                "vpc-beta",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.2.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // First peering succeeds
+        store
+            .create_peering_validated("vpc-alpha", "vpc-beta")
+            .unwrap();
+
+        // Second attempt (same direction) is rejected
+        let err = store
+            .create_peering_validated("vpc-alpha", "vpc-beta")
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::DuplicatePeering),
+            "expected DuplicatePeering, got: {err}"
+        );
+
+        // Reversed direction is also rejected (key normalization)
+        let err = store
+            .create_peering_validated("vpc-beta", "vpc-alpha")
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::DuplicatePeering),
+            "expected DuplicatePeering on reverse, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cidr_overlap_warned() {
+        let (_dir, store) = temp_store();
+        // Create two VPCs in different orgs so their CIDRs can overlap
+        store
+            .create(
+                "vpc-over-a",
+                VpcOwner::Org(OrgId("org-a".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        store
+            .create(
+                "vpc-over-b",
+                VpcOwner::Org(OrgId("org-b".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // Peering succeeds despite CIDR overlap (warning logged, not blocking)
+        let peering = store
+            .create_peering_validated("vpc-over-a", "vpc-over-b")
+            .unwrap();
+        assert_eq!(peering.status, PeeringStatus::Active);
+    }
+
+    #[test]
+    fn peering_nonexistent_vpc_rejected() {
+        let (_dir, store) = temp_store();
+        store
+            .create(
+                "vpc-real",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // One VPC missing
+        let err = store
+            .create_peering_validated("vpc-real", "vpc-ghost")
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::VpcNotFound(_)),
+            "expected VpcNotFound, got: {err}"
+        );
+
+        // Both VPCs missing
+        let err = store
+            .create_peering_validated("vpc-nope", "vpc-also-nope")
+            .unwrap_err();
+        assert!(
+            matches!(err, OrgError::VpcNotFound(_)),
+            "expected VpcNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn peering_key_normalization() {
+        let (_dir, store) = temp_store();
+        store
+            .create(
+                "vpc-zzz",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.1.0.0/16"),
+                false,
+            )
+            .unwrap();
+        store
+            .create(
+                "vpc-aaa",
+                VpcOwner::Org(OrgId("acme".to_string())),
+                Some("10.2.0.0/16"),
+                false,
+            )
+            .unwrap();
+
+        // Create peering with "zzz" first — key should still normalize
+        let peering = store
+            .create_peering_validated("vpc-zzz", "vpc-aaa")
+            .unwrap();
+
+        // vpc_a should be the lexicographically smaller ID
+        assert!(
+            peering.vpc_a < peering.vpc_b,
+            "vpc_a ({}) should be < vpc_b ({})",
+            peering.vpc_a,
+            peering.vpc_b
+        );
     }
 }
