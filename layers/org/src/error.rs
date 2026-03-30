@@ -7,6 +7,18 @@ pub enum OrgError {
     #[error("org not found: {0}")]
     NotFound(String),
 
+    #[error("org has projects and cannot be deleted: {0}")]
+    OrgHasProjects(String),
+
+    #[error("project already exists: {project} in org {org}")]
+    ProjectAlreadyExists { org: String, project: String },
+
+    #[error("project not found: {project} in org {org}")]
+    ProjectNotFound { org: String, project: String },
+
+    #[error("project has environments and cannot be deleted: {project} in org {org}")]
+    ProjectHasEnvironments { org: String, project: String },
+
     #[error("invalid org name: {0}")]
     InvalidName(String),
 
