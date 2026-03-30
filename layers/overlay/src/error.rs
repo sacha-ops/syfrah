@@ -1,21 +1,19 @@
-//! Overlay error types.
-
 use thiserror::Error;
 
+/// Errors returned by overlay networking operations.
 #[derive(Debug, Error)]
 pub enum OverlayError {
-    #[error("invalid MAC address: {0}")]
-    InvalidMac(String),
+    /// A shell/system command failed.
+    #[error("command failed: {0}")]
+    CommandFailed(String),
 
-    #[error("command failed: {cmd} — {detail}")]
-    CommandFailed { cmd: String, detail: String },
-
+    /// The requested network interface does not exist.
     #[error("interface not found: {0}")]
     InterfaceNotFound(String),
 
-    #[error("VXLAN device not found for bridge: {0}")]
-    VxlanNotFound(String),
+    /// A firewall / nftables rule could not be applied.
+    #[error("rule application failed: {0}")]
+    RuleApplicationFailed(String),
 }
 
-/// Overlay result alias.
 pub type Result<T> = std::result::Result<T, OverlayError>;
