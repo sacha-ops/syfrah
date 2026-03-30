@@ -4,12 +4,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
-use crate::types::{Environment, EnvironmentId, Org, OrgId, Project, ProjectId};
+use crate::types::{
+    Environment, EnvironmentId, Org, OrgId, Project, ProjectId, Vpc, VpcId, VpcOwner,
+};
 use crate::validation::validate_name;
 
 const TABLE: &str = "orgs";
 const PROJECTS_TABLE: &str = "projects";
 const ENVIRONMENTS_TABLE: &str = "environments";
+const VPCS_TABLE: &str = "vpcs";
+const VNI_COUNTER_TABLE: &str = "vni_counter";
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -292,6 +296,154 @@ impl OrgStore {
         }
 
         self.db.delete(ENVIRONMENTS_TABLE, &key)?;
+        Ok(())
+    }
+
+    // ── VPC operations ──────────────────────────────────────────────
+
+    /// Allocate the next VNI (monotonically increasing, starting at 100).
+    fn next_vni(&self) -> Result<u32> {
+        let current: Option<u32> = self.db.get(VNI_COUNTER_TABLE, "counter")?;
+        let next = current.unwrap_or(100);
+        self.db.set(VNI_COUNTER_TABLE, "counter", &(next + 1))?;
+        Ok(next)
+    }
+
+    /// Create a project-scoped VPC.
+    pub fn create_vpc(&self, name: &str, org: &str, project: &str, cidr: &str) -> Result<Vpc> {
+        validate_name(name, "vpc")?;
+
+        // Verify org exists
+        if !self.db.exists(TABLE, org)? {
+            return Err(OrgError::NotFound(org.to_string()));
+        }
+
+        // Verify project exists
+        let project_key = Self::project_key(org, project);
+        if !self.db.exists(PROJECTS_TABLE, &project_key)? {
+            return Err(OrgError::ProjectNotFound {
+                org: org.to_string(),
+                project: project.to_string(),
+            });
+        }
+
+        // Check for duplicate VPC name within the org
+        let vpc_key = format!("{org}/{name}");
+        if self.db.exists(VPCS_TABLE, &vpc_key)? {
+            return Err(OrgError::VpcAlreadyExists(name.to_string()));
+        }
+
+        let vni = self.next_vni()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let vpc = Vpc {
+            id: VpcId(vpc_key.clone()),
+            name: name.to_string(),
+            cidr: cidr.to_string(),
+            vni,
+            owner: VpcOwner::Project {
+                org: org.to_string(),
+                project: project.to_string(),
+            },
+            shared: false,
+            created_at: now,
+        };
+
+        self.db.set(VPCS_TABLE, &vpc_key, &vpc)?;
+        Ok(vpc)
+    }
+
+    /// Create a shared (org-level) VPC.
+    pub fn create_shared_vpc(&self, name: &str, org: &str, cidr: &str) -> Result<Vpc> {
+        validate_name(name, "vpc")?;
+
+        if !self.db.exists(TABLE, org)? {
+            return Err(OrgError::NotFound(org.to_string()));
+        }
+
+        let vpc_key = format!("{org}/{name}");
+        if self.db.exists(VPCS_TABLE, &vpc_key)? {
+            return Err(OrgError::VpcAlreadyExists(name.to_string()));
+        }
+
+        let vni = self.next_vni()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let vpc = Vpc {
+            id: VpcId(vpc_key.clone()),
+            name: name.to_string(),
+            cidr: cidr.to_string(),
+            vni,
+            owner: VpcOwner::Org(org.to_string()),
+            shared: true,
+            created_at: now,
+        };
+
+        self.db.set(VPCS_TABLE, &vpc_key, &vpc)?;
+        Ok(vpc)
+    }
+
+    /// List VPCs, optionally filtered by org and/or project.
+    pub fn list_vpcs(&self, org: Option<&str>, project: Option<&str>) -> Result<Vec<Vpc>> {
+        let all: Vec<(String, Vpc)> = self.db.list(VPCS_TABLE)?;
+
+        let vpcs: Vec<Vpc> = all
+            .into_iter()
+            .map(|(_, vpc)| vpc)
+            .filter(|vpc| {
+                if let Some(org_filter) = org {
+                    match &vpc.owner {
+                        VpcOwner::Project { org: o, .. } => {
+                            if o != org_filter {
+                                return false;
+                            }
+                        }
+                        VpcOwner::Org(o) => {
+                            if o != org_filter {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if let Some(project_filter) = project {
+                    match &vpc.owner {
+                        VpcOwner::Project { project: p, .. } => {
+                            if p != project_filter {
+                                return false;
+                            }
+                        }
+                        VpcOwner::Org(_) => {
+                            // Shared VPCs are org-level, not filtered by project
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
+
+        Ok(vpcs)
+    }
+
+    /// Get a VPC by org and name.
+    pub fn get_vpc(&self, org: &str, name: &str) -> Result<Option<Vpc>> {
+        let key = format!("{org}/{name}");
+        Ok(self.db.get(VPCS_TABLE, &key)?)
+    }
+
+    /// Delete a VPC by org and name.
+    pub fn delete_vpc(&self, org: &str, name: &str) -> Result<()> {
+        let key = format!("{org}/{name}");
+        if !self.db.exists(VPCS_TABLE, &key)? {
+            return Err(OrgError::VpcNotFound(name.to_string()));
+        }
+        self.db.delete(VPCS_TABLE, &key)?;
         Ok(())
     }
 }
