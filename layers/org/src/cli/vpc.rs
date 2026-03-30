@@ -171,6 +171,70 @@ pub fn run_detach(vpc_name: &str, project: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn run_peer(from: &str, to: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .create_peering(from, to)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("VPCs peered: {from} <-> {to}");
+    Ok(())
+}
+
+pub fn run_unpeer(from: &str, to: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .delete_peering(from, to)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("VPCs unpeered: {from} <-> {to}");
+    Ok(())
+}
+
+pub fn run_peerings(vpc: Option<&str>, json: bool) -> Result<()> {
+    let store = open_store()?;
+
+    let peerings = match vpc {
+        Some(name) => store
+            .list_peerings_for_vpc(name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => {
+            let all = store.list_peerings().map_err(|e| anyhow::anyhow!("{e}"))?;
+            all.into_iter()
+                .filter(|p| p.status == crate::types::PeeringStatus::Active)
+                .collect()
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&peerings)?);
+        return Ok(());
+    }
+
+    if peerings.is_empty() {
+        println!("No peerings found.");
+        if vpc.is_some() {
+            println!("\nCreate one with: syfrah vpc peer --from <vpc-a> --to <vpc-b>");
+        }
+        return Ok(());
+    }
+
+    println!("{:<20} {:<20} {:<10} CREATED", "VPC_A", "VPC_B", "STATUS");
+    println!("{}", "-".repeat(70));
+
+    for p in &peerings {
+        let vpc_a_name = store.resolve_vpc_name(&p.vpc_a);
+        let vpc_b_name = store.resolve_vpc_name(&p.vpc_b);
+        println!(
+            "{:<20} {:<20} {:<10} {}",
+            vpc_a_name,
+            vpc_b_name,
+            p.status,
+            format_timestamp(p.created_at),
+        );
+    }
+
+    Ok(())
+}
+
 fn format_timestamp(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -328,6 +392,63 @@ mod tests {
                 assert!(!json);
             }
             other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vpc_peer_parse() {
+        let cmd = parse(&["peer", "--from", "hub-vpc", "--to", "spoke-a"]);
+        match cmd {
+            VpcCommand::Peer { from, to } => {
+                assert_eq!(from, "hub-vpc");
+                assert_eq!(to, "spoke-a");
+            }
+            other => panic!("expected Peer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vpc_unpeer_parse() {
+        let cmd = parse(&["unpeer", "--from", "hub-vpc", "--to", "spoke-a"]);
+        match cmd {
+            VpcCommand::Unpeer { from, to } => {
+                assert_eq!(from, "hub-vpc");
+                assert_eq!(to, "spoke-a");
+            }
+            other => panic!("expected Unpeer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vpc_peerings_parse() {
+        // With --vpc filter and --json
+        let cmd = parse(&["peerings", "--vpc", "hub-vpc", "--json"]);
+        match cmd {
+            VpcCommand::Peerings { vpc, json } => {
+                assert_eq!(vpc.as_deref(), Some("hub-vpc"));
+                assert!(json);
+            }
+            other => panic!("expected Peerings, got {other:?}"),
+        }
+
+        // Without filters
+        let cmd = parse(&["peerings"]);
+        match cmd {
+            VpcCommand::Peerings { vpc, json } => {
+                assert!(vpc.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected Peerings, got {other:?}"),
+        }
+
+        // With only --vpc
+        let cmd = parse(&["peerings", "--vpc", "my-vpc"]);
+        match cmd {
+            VpcCommand::Peerings { vpc, json } => {
+                assert_eq!(vpc.as_deref(), Some("my-vpc"));
+                assert!(!json);
+            }
+            other => panic!("expected Peerings, got {other:?}"),
         }
     }
 

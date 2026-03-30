@@ -115,6 +115,12 @@ pub enum OrgError {
     #[error("invalid subnet prefix length: expected /{min} to /{max}, got /{actual}")]
     SubnetPrefixLength { min: u8, max: u8, actual: u8 },
 
+    #[error("cannot peer a VPC with itself: '{0}'")]
+    SelfPeer(String),
+
+    #[error("VPCs '{vpc_a}' and '{vpc_b}' are already peered")]
+    AlreadyPeered { vpc_a: String, vpc_b: String },
+
     #[error("cannot peer a VPC with itself")]
     SelfPeering,
 

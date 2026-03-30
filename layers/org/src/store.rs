@@ -894,6 +894,17 @@ impl OrgStore {
             .collect())
     }
 
+    /// List active peerings filtered by a specific VPC name (alias for CLI).
+    pub fn list_peerings_for_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
+        self.list_peerings_by_vpc(vpc_name)
+    }
+
+    /// Resolve a VPC name from its stored string. Since peerings now store
+    /// VPC names directly, this is an identity function.
+    pub fn resolve_vpc_name(&self, vpc_name: &str) -> String {
+        vpc_name.to_string()
+    }
+
     /// Get a specific peering between two VPCs, if it exists.
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
         let (key, _, _) = Self::peering_key(vpc_a, vpc_b);

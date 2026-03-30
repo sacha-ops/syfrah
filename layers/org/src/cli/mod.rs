@@ -222,6 +222,38 @@ pub enum VpcCommand {
         #[arg(long)]
         project: String,
     },
+    /// Create a peering between two VPCs
+    #[command(after_help = "Examples:\n  syfrah vpc peer --from hub-vpc --to spoke-a-vpc")]
+    Peer {
+        /// Source VPC name
+        #[arg(long)]
+        from: String,
+        /// Destination VPC name
+        #[arg(long)]
+        to: String,
+    },
+    /// Remove a peering between two VPCs
+    #[command(after_help = "Examples:\n  syfrah vpc unpeer --from hub-vpc --to spoke-a-vpc")]
+    Unpeer {
+        /// Source VPC name
+        #[arg(long)]
+        from: String,
+        /// Destination VPC name
+        #[arg(long)]
+        to: String,
+    },
+    /// List VPC peerings
+    #[command(
+        after_help = "Examples:\n  syfrah vpc peerings\n  syfrah vpc peerings --vpc hub-vpc\n  syfrah vpc peerings --json"
+    )]
+    Peerings {
+        /// Filter by VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Top-level subnet CLI command.
@@ -371,6 +403,9 @@ pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
         VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes),
         VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
         VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
+        VpcCommand::Peer { from, to } => vpc::run_peer(&from, &to),
+        VpcCommand::Unpeer { from, to } => vpc::run_unpeer(&from, &to),
+        VpcCommand::Peerings { vpc, json } => vpc::run_peerings(vpc.as_deref(), json),
     }
 }
 
