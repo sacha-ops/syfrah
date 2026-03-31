@@ -154,6 +154,15 @@ pub enum OrgError {
     #[error("invalid port range: {reason}")]
     InvalidPortRange { reason: String },
 
+    #[error("nic already exists: {0}")]
+    NicAlreadyExists(String),
+
+    #[error("nic not found: {0}")]
+    NicNotFound(String),
+
+    #[error("security group '{sg}' is not attached to nic '{nic}'")]
+    SgNotAttached { nic: String, sg: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }

@@ -1,16 +1,17 @@
 //! Full hierarchy integration test: Org -> Project -> Environment lifecycle.
-//! VM placement persistence tests.
-//! Security group rule persistence tests.
+//! VM placement persistence tests. Security group rule persistence tests.
+//! NIC store tests.
 
 use std::collections::HashMap;
 
 use crate::error::OrgError;
+use crate::nic::NicStore;
 use crate::placement::PlacementStore;
 use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
-    Direction, PlacementAction, PortRange, Protocol, RuleId, RuleSource, SecurityGroupId,
-    SecurityGroupRule, VmPlacement,
+    Direction, NetworkInterface, NicId, PlacementAction, PortRange, Protocol, ResourceState,
+    RuleId, RuleSource, SecurityGroupId, SecurityGroupRule, VmPlacement,
 };
 
 fn temp_store() -> (tempfile::TempDir, OrgStore) {
@@ -392,5 +393,163 @@ fn duplicate_rule_handling() {
         rules.len(),
         1,
         "should have exactly 1 rule, not a duplicate"
+    );
+}
+
+// ── NIC tests ──────────────────────────────────────────────────────
+
+fn temp_nic_store() -> (tempfile::TempDir, NicStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nic-test.redb");
+    let db = syfrah_state::LayerDb::open_at(&path).unwrap();
+    (dir, NicStore::new(db))
+}
+
+fn make_nic(id: &str, vm_id: Option<&str>, subnet: &str, vpc: &str) -> NetworkInterface {
+    NetworkInterface {
+        id: NicId(id.to_string()),
+        name: format!("nic-{id}"),
+        vm_id: vm_id.map(|s| s.to_string()),
+        subnet_id: subnet.to_string(),
+        vpc_id: vpc.to_string(),
+        private_ip: "10.0.1.10".to_string(),
+        mac: "02:00:0a:00:01:0a".to_string(),
+        security_groups: vec![],
+        state: ResourceState::Active,
+        created_at: 1700000000,
+    }
+}
+
+#[test]
+fn create_and_get_nic() {
+    let (_dir, store) = temp_nic_store();
+
+    let nic = make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1");
+    store.create_nic(&nic).unwrap();
+
+    let got = store.get_nic("nic-1").unwrap();
+    assert_eq!(got, Some(nic));
+}
+
+#[test]
+fn create_nic_duplicate_rejected() {
+    let (_dir, store) = temp_nic_store();
+
+    let nic = make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1");
+    store.create_nic(&nic).unwrap();
+
+    let err = store.create_nic(&nic).unwrap_err();
+    assert!(
+        matches!(err, OrgError::NicAlreadyExists(_)),
+        "expected NicAlreadyExists, got: {err}"
+    );
+}
+
+#[test]
+fn list_nics_by_vm() {
+    let (_dir, store) = temp_nic_store();
+
+    store
+        .create_nic(&make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1"))
+        .unwrap();
+    store
+        .create_nic(&make_nic("nic-2", Some("vm-1"), "subnet-2", "vpc-1"))
+        .unwrap();
+    store
+        .create_nic(&make_nic("nic-3", Some("vm-2"), "subnet-1", "vpc-1"))
+        .unwrap();
+
+    let vm1_nics = store.list_nics_by_vm("vm-1").unwrap();
+    assert_eq!(vm1_nics.len(), 2, "expected 2 NICs for vm-1");
+    assert!(vm1_nics.iter().all(|n| n.vm_id.as_deref() == Some("vm-1")));
+
+    let vm2_nics = store.list_nics_by_vm("vm-2").unwrap();
+    assert_eq!(vm2_nics.len(), 1, "expected 1 NIC for vm-2");
+
+    let vm3_nics = store.list_nics_by_vm("vm-99").unwrap();
+    assert_eq!(vm3_nics.len(), 0, "expected 0 NICs for vm-99");
+}
+
+#[test]
+fn list_nics_by_subnet() {
+    let (_dir, store) = temp_nic_store();
+
+    store
+        .create_nic(&make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1"))
+        .unwrap();
+    store
+        .create_nic(&make_nic("nic-2", Some("vm-2"), "subnet-1", "vpc-1"))
+        .unwrap();
+    store
+        .create_nic(&make_nic("nic-3", Some("vm-3"), "subnet-2", "vpc-1"))
+        .unwrap();
+
+    let s1 = store.list_nics_by_subnet("subnet-1").unwrap();
+    assert_eq!(s1.len(), 2, "expected 2 NICs in subnet-1");
+
+    let s2 = store.list_nics_by_subnet("subnet-2").unwrap();
+    assert_eq!(s2.len(), 1, "expected 1 NIC in subnet-2");
+}
+
+#[test]
+fn attach_sg_to_nic() {
+    let (_dir, store) = temp_nic_store();
+
+    store
+        .create_nic(&make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1"))
+        .unwrap();
+
+    let sg = SecurityGroupId("sg-default".to_string());
+    store.attach_sg_to_nic("nic-1", &sg).unwrap();
+
+    let nic = store.get_nic("nic-1").unwrap().unwrap();
+    assert_eq!(nic.security_groups, vec![sg.clone()]);
+
+    // Attaching the same SG again is a no-op.
+    store.attach_sg_to_nic("nic-1", &sg).unwrap();
+    let nic = store.get_nic("nic-1").unwrap().unwrap();
+    assert_eq!(nic.security_groups.len(), 1, "SG should not be duplicated");
+}
+
+#[test]
+fn detach_sg_from_nic() {
+    let (_dir, store) = temp_nic_store();
+
+    let mut nic = make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1");
+    let sg = SecurityGroupId("sg-default".to_string());
+    nic.security_groups.push(sg.clone());
+    store.create_nic(&nic).unwrap();
+
+    store.detach_sg_from_nic("nic-1", &sg).unwrap();
+
+    let nic = store.get_nic("nic-1").unwrap().unwrap();
+    assert!(nic.security_groups.is_empty(), "SG should be detached");
+
+    // Detaching again should error.
+    let err = store.detach_sg_from_nic("nic-1", &sg).unwrap_err();
+    assert!(
+        matches!(err, OrgError::SgNotAttached { .. }),
+        "expected SgNotAttached, got: {err}"
+    );
+}
+
+#[test]
+fn delete_nic() {
+    let (_dir, store) = temp_nic_store();
+
+    store
+        .create_nic(&make_nic("nic-1", Some("vm-1"), "subnet-1", "vpc-1"))
+        .unwrap();
+
+    store.delete_nic("nic-1").unwrap();
+
+    let nic = store.get_nic("nic-1").unwrap().unwrap();
+    assert_eq!(nic.state, ResourceState::Deleted, "NIC should be Deleted");
+
+    // Deleting a non-existent NIC should error.
+    let err = store.delete_nic("nic-999").unwrap_err();
+    assert!(
+        matches!(err, OrgError::NicNotFound(_)),
+        "expected NicNotFound, got: {err}"
     );
 }
