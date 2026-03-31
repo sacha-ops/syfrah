@@ -71,6 +71,27 @@ pub enum SgCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Check if traffic would be allowed or denied by a VM's security groups
+    #[command(
+        name = "check",
+        after_help = "Examples:\n  \
+            syfrah sg check --vm web-1 --port 443 --protocol tcp\n  \
+            syfrah sg check --vm web-1 --port 22 --protocol tcp --source 10.0.0.1"
+    )]
+    Check {
+        /// VM name to evaluate
+        #[arg(long)]
+        vm: String,
+        /// Port to check
+        #[arg(long)]
+        port: u16,
+        /// Protocol: tcp, udp, icmp
+        #[arg(long, default_value = "tcp")]
+        protocol: String,
+        /// Source IP address to check (default: 0.0.0.0 = any)
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 fn control_socket_path() -> PathBuf {
@@ -167,6 +188,12 @@ pub async fn run(cmd: SgCommand) -> Result<()> {
         }
         SgCommand::RemoveRule { sg, rule_id } => run_remove_rule(&sg, &rule_id).await,
         SgCommand::Rules { sg, json } => run_rules(&sg, json).await,
+        SgCommand::Check {
+            vm,
+            port,
+            protocol,
+            source,
+        } => run_check(&vm, port, &protocol, source.as_deref()).await,
     }
 }
 
@@ -350,6 +377,141 @@ fn print_rules_table(sg: &str, rules: &[SecurityGroupRule]) {
     }
 }
 
+async fn run_check(vm: &str, port: u16, protocol: &str, source: Option<&str>) -> Result<()> {
+    let proto: Protocol = protocol
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+
+    let source_ip = source.unwrap_or("0.0.0.0");
+
+    // Query the daemon for the VM's security group rules.
+    let req = serde_json::json!({
+        "type": "sg_check",
+        "vm": vm,
+        "port": port,
+        "protocol": proto,
+        "source": source_ip,
+    });
+
+    let socket = control_socket_path();
+    let resp = send_overlay_request(&socket, &req)
+        .await
+        .map_err(daemon_err)?;
+
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        bail!("{err}");
+    }
+
+    let verdict = resp
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+    let reason = resp
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no reason provided");
+
+    println!("{verdict}: {reason}");
+    Ok(())
+}
+
+/// Evaluate security group rules to determine if traffic is allowed.
+///
+/// Returns `(verdict, reason)` where verdict is "ALLOWED" or "DENIED".
+/// This is a pure function for testability -- no daemon required.
+pub fn evaluate_rules(
+    rules: &[SecurityGroupRule],
+    port: u16,
+    protocol: Protocol,
+    source_ip: &str,
+) -> (String, String) {
+    // Filter to ingress rules only, sort by priority.
+    let mut ingress: Vec<&SecurityGroupRule> = rules
+        .iter()
+        .filter(|r| r.direction == Direction::Ingress)
+        .collect();
+    ingress.sort_by_key(|r| r.priority);
+
+    for rule in &ingress {
+        if rule_matches(rule, port, protocol, source_ip) {
+            let reason = format!(
+                "rule {} (priority {}, {} port {} from {})",
+                rule.id, rule.priority, rule.protocol, port, rule.source
+            );
+            return ("ALLOWED".to_string(), reason);
+        }
+    }
+
+    ("DENIED".to_string(), "no matching ingress rule".to_string())
+}
+
+/// Check if a single rule matches the given traffic.
+fn rule_matches(rule: &SecurityGroupRule, port: u16, protocol: Protocol, source_ip: &str) -> bool {
+    // Protocol match.
+    if rule.protocol != Protocol::All && rule.protocol != protocol {
+        return false;
+    }
+
+    // Port match.
+    if let Some(ref pr) = rule.port_range {
+        if port < pr.from || port > pr.to {
+            return false;
+        }
+    }
+    // No port_range = all ports match.
+
+    // Source match.
+    match &rule.source {
+        TrafficSource::Cidr(cidr) if cidr == "0.0.0.0/0" => {
+            // Matches any source.
+        }
+        TrafficSource::Cidr(cidr) => {
+            if !cidr_contains(cidr, source_ip) {
+                return false;
+            }
+        }
+        TrafficSource::SecurityGroup(_) => {
+            // SG-ref source requires IP membership check -- for CLI check
+            // we cannot resolve this without the daemon, so we skip.
+            // The daemon-side check should resolve SG members.
+        }
+    }
+
+    true
+}
+
+/// Simple CIDR containment check.
+fn cidr_contains(cidr: &str, ip: &str) -> bool {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let net: std::net::Ipv4Addr = match parts[0].parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let prefix_len: u32 = match parts[1].parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let check: std::net::Ipv4Addr = match ip.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 32 {
+        return false;
+    }
+
+    let mask = !0u32 << (32 - prefix_len);
+    let net_bits = u32::from(net) & mask;
+    let check_bits = u32::from(check) & mask;
+    net_bits == check_bits
+}
+
 /// Send a request to the overlay layer via the daemon's control socket.
 async fn send_overlay_request(
     socket_path: &std::path::Path,
@@ -379,4 +541,134 @@ async fn send_overlay_request(
 
     serde_json::from_slice(&resp_buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sg::{PortRange, RuleId, SecurityGroupId};
+
+    fn make_rule(
+        protocol: Protocol,
+        port_range: Option<PortRange>,
+        source: TrafficSource,
+        priority: u32,
+    ) -> SecurityGroupRule {
+        SecurityGroupRule {
+            id: RuleId(format!("rule-{priority}")),
+            sg_id: SecurityGroupId("sg-default".to_string()),
+            direction: Direction::Ingress,
+            protocol,
+            port_range,
+            source,
+            priority,
+            description: String::new(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_evaluate_tcp_allowed() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 443, to: 443 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let (verdict, _reason) = evaluate_rules(&rules, 443, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "ALLOWED");
+    }
+
+    #[test]
+    fn test_evaluate_tcp_denied_wrong_port() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 443, to: 443 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let (verdict, _reason) = evaluate_rules(&rules, 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+    }
+
+    #[test]
+    fn test_evaluate_denied_wrong_protocol() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 443, to: 443 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let (verdict, _) = evaluate_rules(&rules, 443, Protocol::Udp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+    }
+
+    #[test]
+    fn test_evaluate_cidr_source_match() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 22, to: 22 }),
+            TrafficSource::Cidr("10.0.0.0/8".to_string()),
+            100,
+        )];
+        let (verdict, _) = evaluate_rules(&rules, 22, Protocol::Tcp, "10.1.2.3");
+        assert_eq!(verdict, "ALLOWED");
+    }
+
+    #[test]
+    fn test_evaluate_cidr_source_no_match() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 22, to: 22 }),
+            TrafficSource::Cidr("10.0.0.0/8".to_string()),
+            100,
+        )];
+        let (verdict, _) = evaluate_rules(&rules, 22, Protocol::Tcp, "192.168.1.1");
+        assert_eq!(verdict, "DENIED");
+    }
+
+    #[test]
+    fn test_evaluate_no_rules() {
+        let (verdict, reason) = evaluate_rules(&[], 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+        assert!(reason.contains("no matching"));
+    }
+
+    #[test]
+    fn test_evaluate_protocol_all() {
+        let rules = vec![make_rule(
+            Protocol::All,
+            None,
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let (verdict, _) = evaluate_rules(&rules, 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "ALLOWED");
+    }
+
+    #[test]
+    fn test_cidr_contains_basic() {
+        assert!(cidr_contains("10.0.0.0/8", "10.1.2.3"));
+        assert!(!cidr_contains("10.0.0.0/8", "192.168.1.1"));
+        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4"));
+        assert!(cidr_contains("192.168.1.0/24", "192.168.1.100"));
+        assert!(!cidr_contains("192.168.1.0/24", "192.168.2.1"));
+    }
+
+    #[test]
+    fn test_evaluate_port_range() {
+        let rules = vec![make_rule(
+            Protocol::Tcp,
+            Some(PortRange {
+                from: 8000,
+                to: 9000,
+            }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let (v1, _) = evaluate_rules(&rules, 8500, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(v1, "ALLOWED");
+        let (v2, _) = evaluate_rules(&rules, 7999, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(v2, "DENIED");
+    }
 }
