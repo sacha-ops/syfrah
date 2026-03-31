@@ -136,6 +136,12 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
+    #[error("{0}")]
+    Ambiguous(String),
+
+    #[error("{0}")]
+    CannotDelete(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }

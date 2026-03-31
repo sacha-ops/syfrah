@@ -159,6 +159,131 @@ pub struct Environment {
     pub expires_at: Option<u64>,
 }
 
+/// Lifecycle state for mutable network resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceState {
+    Pending,
+    Active,
+    Failed,
+    Deleting,
+    Deleted,
+}
+
+impl fmt::Display for ResourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceState::Pending => f.write_str("Pending"),
+            ResourceState::Active => f.write_str("Active"),
+            ResourceState::Failed => f.write_str("Failed"),
+            ResourceState::Deleting => f.write_str("Deleting"),
+            ResourceState::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
+/// Unique identifier for a security group.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecurityGroupId(pub String);
+
+impl fmt::Display for SecurityGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A security group — a stateful firewall rule-set scoped to a VPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroup {
+    pub id: SecurityGroupId,
+    pub name: String,
+    pub description: String,
+    pub vpc_id: VpcId,
+    pub is_default: bool,
+    pub state: ResourceState,
+    pub rules: Vec<SecurityGroupRule>,
+    pub attached_vms: Vec<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Unique identifier for a security group rule.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuleId(pub String);
+
+impl fmt::Display for RuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A single allow rule within a security group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroupRule {
+    pub id: RuleId,
+    pub sg_id: SecurityGroupId,
+    pub direction: Direction,
+    pub protocol: Protocol,
+    pub port_range: Option<PortRange>,
+    pub source: String,
+    pub destination: String,
+    pub priority: u32,
+    pub description: String,
+    pub created_at: u64,
+}
+
+/// Traffic direction for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Ingress,
+    Egress,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Ingress => f.write_str("ingress"),
+            Direction::Egress => f.write_str("egress"),
+        }
+    }
+}
+
+/// Protocol for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+    All,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Tcp => f.write_str("tcp"),
+            Protocol::Udp => f.write_str("udp"),
+            Protocol::Icmp => f.write_str("icmp"),
+            Protocol::All => f.write_str("all"),
+        }
+    }
+}
+
+/// A port range for a security group rule (inclusive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub from: u16,
+    pub to: u16,
+}
+
+impl fmt::Display for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.from == self.to {
+            write!(f, "{}", self.from)
+        } else {
+            write!(f, "{}-{}", self.from, self.to)
+        }
+    }
+}
+
 /// Whether a VM placement is being added or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementAction {

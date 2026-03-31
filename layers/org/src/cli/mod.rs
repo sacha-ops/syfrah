@@ -3,6 +3,7 @@
 pub mod env;
 pub mod org;
 pub mod project;
+pub mod sg;
 pub mod subnet;
 pub mod vpc;
 
@@ -320,6 +321,63 @@ pub enum SubnetCommand {
     },
 }
 
+/// Top-level SG CLI command.
+#[derive(Debug, Subcommand)]
+pub enum SgCommand {
+    /// Create a new security group
+    #[command(
+        after_help = "Examples:\n  syfrah sg create web-sg --vpc my-vpc\n  syfrah sg create db-sg --vpc my-vpc --description \"Database tier\""
+    )]
+    Create {
+        /// Security group name (lowercase alphanumeric and hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// VPC the security group belongs to
+        #[arg(long)]
+        vpc: String,
+        /// Description of the security group
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List security groups
+    #[command(
+        after_help = "Examples:\n  syfrah sg list --vpc my-vpc\n  syfrah sg list --vpc my-vpc --json"
+    )]
+    List {
+        /// Filter by VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show security group details (rules + attached VMs)
+    #[command(
+        after_help = "Examples:\n  syfrah sg show web-sg\n  syfrah sg show web-sg --vpc my-vpc"
+    )]
+    Show {
+        /// Security group name
+        name: String,
+        /// VPC the security group belongs to (auto-detected if name is unique)
+        #[arg(long)]
+        vpc: Option<String>,
+    },
+    /// Delete a security group
+    #[command(
+        after_help = "Examples:\n  syfrah sg delete web-sg --yes\n  syfrah sg delete web-sg --vpc my-vpc --yes"
+    )]
+    Delete {
+        /// Security group name
+        name: String,
+        /// VPC the security group belongs to (auto-detected if name is unique)
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
 /// Execute an org CLI command.
 pub async fn run(cmd: OrgCommand) -> anyhow::Result<()> {
     match cmd {
@@ -445,5 +503,19 @@ pub async fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
         SubnetCommand::Delete { name, vpc, yes } => {
             subnet::run_delete(&name, vpc.as_deref(), yes).await
         }
+    }
+}
+
+/// Execute a security group CLI command.
+pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
+    match cmd {
+        SgCommand::Create {
+            name,
+            vpc,
+            description,
+        } => sg::run_create(&name, &vpc, description.as_deref().unwrap_or("")).await,
+        SgCommand::List { vpc, json } => sg::run_list(vpc.as_deref(), json).await,
+        SgCommand::Show { name, vpc } => sg::run_show(&name, vpc.as_deref()).await,
+        SgCommand::Delete { name, vpc, yes } => sg::run_delete(&name, vpc.as_deref(), yes).await,
     }
 }

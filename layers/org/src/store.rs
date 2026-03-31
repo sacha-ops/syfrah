@@ -6,8 +6,9 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
-    SubnetId, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId,
+    ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment, VpcId,
+    VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -22,6 +23,7 @@ const PEERINGS_TABLE: &str = "vpc_peerings";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
+const SECURITY_GROUPS_TABLE: &str = "security_groups";
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -909,6 +911,133 @@ impl OrgStore {
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
         let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
         Ok(self.db.get(PEERINGS_TABLE, &key)?)
+    }
+
+    // ── Security Group operations ───────────────────────────────────
+
+    /// Create a security group in a VPC.
+    pub fn create_security_group(
+        &self,
+        name: &str,
+        vpc_name: &str,
+        description: &str,
+    ) -> Result<SecurityGroup> {
+        validate_name(name, "security group")?;
+
+        // Verify the VPC exists.
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Err(OrgError::NotFound(format!("VPC '{vpc_name}'"))),
+        };
+
+        // Check for duplicate SG name within the VPC.
+        let key = format!("{}/{}", vpc.id, name);
+        if self.db.exists(SECURITY_GROUPS_TABLE, &key)? {
+            return Err(OrgError::AlreadyExists(format!(
+                "security group '{name}' in VPC '{vpc_name}'"
+            )));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sg = SecurityGroup {
+            id: SecurityGroupId(format!("sg-{}", &key)),
+            name: name.to_string(),
+            description: description.to_string(),
+            vpc_id: vpc.id,
+            is_default: false,
+            state: ResourceState::Active,
+            rules: Vec::new(),
+            attached_vms: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        Ok(sg)
+    }
+
+    /// List security groups, optionally filtered by VPC name.
+    pub fn list_security_groups(&self, vpc_name: Option<&str>) -> Result<Vec<SecurityGroup>> {
+        let entries: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+
+        let sgs: Vec<SecurityGroup> = if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            entries
+                .into_iter()
+                .filter(|(_, sg)| sg.vpc_id == vpc.id)
+                .map(|(_, sg)| sg)
+                .collect()
+        } else {
+            entries.into_iter().map(|(_, sg)| sg).collect()
+        };
+
+        Ok(sgs)
+    }
+
+    /// Get a security group by name. Searches all VPCs or a specific one.
+    pub fn get_security_group(
+        &self,
+        name: &str,
+        vpc_name: Option<&str>,
+    ) -> Result<Option<SecurityGroup>> {
+        if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            let key = format!("{}/{}", vpc.id, name);
+            Ok(self.db.get(SECURITY_GROUPS_TABLE, &key)?)
+        } else {
+            // Search across all VPCs for a matching name.
+            let entries: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+            let matches: Vec<SecurityGroup> = entries
+                .into_iter()
+                .filter(|(_, sg)| sg.name == name)
+                .map(|(_, sg)| sg)
+                .collect();
+            match matches.len() {
+                0 => Ok(None),
+                1 => Ok(Some(matches.into_iter().next().unwrap())),
+                _ => Err(OrgError::Ambiguous(format!(
+                    "security group '{name}' exists in multiple VPCs — specify --vpc"
+                ))),
+            }
+        }
+    }
+
+    /// Delete a security group by name.
+    pub fn delete_security_group(&self, name: &str, vpc_name: Option<&str>) -> Result<()> {
+        let sg = match self.get_security_group(name, vpc_name)? {
+            Some(sg) => sg,
+            None => {
+                return Err(OrgError::NotFound(format!("security group '{name}'")));
+            }
+        };
+
+        if sg.is_default {
+            return Err(OrgError::CannotDelete(
+                "cannot delete the default security group".to_string(),
+            ));
+        }
+
+        if !sg.attached_vms.is_empty() {
+            return Err(OrgError::CannotDelete(format!(
+                "security group '{}' is attached to {} network interface(s)",
+                name,
+                sg.attached_vms.len()
+            )));
+        }
+
+        let key = format!("{}/{}", sg.vpc_id, name);
+        self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
+        Ok(())
     }
 }
 

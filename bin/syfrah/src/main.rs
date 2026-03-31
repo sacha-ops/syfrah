@@ -67,6 +67,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::SubnetCommand,
     },
+    /// Manage security groups
+    Sg {
+        #[command(subcommand)]
+        command: syfrah_org::SgCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -944,6 +949,7 @@ async fn run() -> Result<()> {
         Commands::Env { command } => syfrah_org::cli::run_env(command).await,
         Commands::Vpc { command } => syfrah_org::cli::run_vpc(command).await,
         Commands::Subnet { command } => syfrah_org::cli::run_subnet(command).await,
+        Commands::Sg { command } => syfrah_org::cli::run_sg(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
