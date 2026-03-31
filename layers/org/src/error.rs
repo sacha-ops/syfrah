@@ -218,6 +218,9 @@ pub enum OrgError {
     #[error("{0}")]
     CannotDelete(String),
 
+    #[error("invalid state transition: {from} → {to}")]
+    InvalidStateTransition { from: String, to: String },
+
     #[error("VM not found: {0}")]
     VmNotFound(String),
 

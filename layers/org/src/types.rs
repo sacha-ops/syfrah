@@ -477,3 +477,206 @@ pub struct VmPlacement {
     pub action: PlacementAction,
     pub created_at: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Hypervisor model (ADR-004)
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a hypervisor. Format: `hv-{ulid}`.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HypervisorId(pub String);
+
+impl fmt::Display for HypervisorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Lifecycle state for a hypervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HypervisorState {
+    /// Hardware detection in progress.
+    Registering,
+    /// Registered but not schedulable.
+    NotReady,
+    /// Healthy and schedulable.
+    Available,
+    /// Draining — no new VMs, existing VMs being evacuated.
+    Draining,
+    /// Offline for planned work.
+    Maintenance,
+    /// Permanently removed. Terminal state.
+    Decommissioned,
+}
+
+impl fmt::Display for HypervisorState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HypervisorState::Registering => f.write_str("Registering"),
+            HypervisorState::NotReady => f.write_str("NotReady"),
+            HypervisorState::Available => f.write_str("Available"),
+            HypervisorState::Draining => f.write_str("Draining"),
+            HypervisorState::Maintenance => f.write_str("Maintenance"),
+            HypervisorState::Decommissioned => f.write_str("Decommissioned"),
+        }
+    }
+}
+
+/// Disk type detected on the hypervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiskType {
+    NVMe,
+    SSD,
+    HDD,
+}
+
+impl fmt::Display for DiskType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiskType::NVMe => f.write_str("NVMe"),
+            DiskType::SSD => f.write_str("SSD"),
+            DiskType::HDD => f.write_str("HDD"),
+        }
+    }
+}
+
+/// CPU architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CpuArchitecture {
+    X86_64,
+    Aarch64,
+}
+
+impl fmt::Display for CpuArchitecture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CpuArchitecture::X86_64 => f.write_str("x86_64"),
+            CpuArchitecture::Aarch64 => f.write_str("aarch64"),
+        }
+    }
+}
+
+/// GPU specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuSpec {
+    pub model: String,
+    pub vram_mb: u32,
+    pub count: u32,
+}
+
+/// Detected hardware specifications of a hypervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareSpec {
+    pub cpu_model: String,
+    pub cpu_cores_physical: u32,
+    pub cpu_threads_logical: u32,
+    pub memory_gb: u32,
+    pub local_disk_type: DiskType,
+    pub local_disk_gb: u32,
+    pub gpu: Option<GpuSpec>,
+    pub network_bandwidth_gbps: u32,
+    pub architecture: CpuArchitecture,
+}
+
+/// Allocatable capacity on a hypervisor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocatableCapacity {
+    pub physical_vcpus: u32,
+    pub physical_memory_mb: u64,
+    pub allocatable_vcpus: u32,
+    pub allocatable_memory_mb: u64,
+    pub used_vcpus: u32,
+    pub used_memory_mb: u64,
+    pub available_vcpus: u32,
+    pub available_memory_mb: u64,
+    pub reserved_vcpus: u32,
+    pub reserved_memory_mb: u64,
+    pub overcommit_cpu: f32,
+    pub overcommit_memory: f32,
+    pub local_total_gb: u32,
+    pub local_used_gb: u32,
+    pub local_allocatable_gb: u32,
+}
+
+impl Default for AllocatableCapacity {
+    fn default() -> Self {
+        Self {
+            physical_vcpus: 0,
+            physical_memory_mb: 0,
+            allocatable_vcpus: 0,
+            allocatable_memory_mb: 0,
+            used_vcpus: 0,
+            used_memory_mb: 0,
+            available_vcpus: 0,
+            available_memory_mb: 0,
+            reserved_vcpus: 1,
+            reserved_memory_mb: 1024,
+            overcommit_cpu: 2.0,
+            overcommit_memory: 1.0,
+            local_total_gb: 0,
+            local_used_gb: 0,
+            local_allocatable_gb: 0,
+        }
+    }
+}
+
+/// Taint effect — what happens to VMs that don't tolerate this taint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaintEffect {
+    NoSchedule,
+    NoExecute,
+}
+
+impl fmt::Display for TaintEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaintEffect::NoSchedule => f.write_str("NoSchedule"),
+            TaintEffect::NoExecute => f.write_str("NoExecute"),
+        }
+    }
+}
+
+/// A scheduling taint on a hypervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Taint {
+    pub key: String,
+    pub value: Option<String>,
+    pub effect: TaintEffect,
+}
+
+impl fmt::Display for Taint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.value {
+            Some(v) => write!(f, "{}={}:{}", self.key, v, self.effect),
+            None => write!(f, "{}:{}", self.key, self.effect),
+        }
+    }
+}
+
+/// Runtime status of a hypervisor (observed, not persisted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HypervisorStatus {
+    pub hypervisor_id: HypervisorId,
+    pub last_heartbeat: u64,
+    pub reachable: bool,
+    pub forge_version: String,
+    pub uptime_seconds: u64,
+}
+
+/// A hypervisor — a compute host that can run VMs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hypervisor {
+    pub id: HypervisorId,
+    pub name: String,
+    pub region: String,
+    pub zone: String,
+    pub state: HypervisorState,
+    pub fabric_node_id: String,
+    pub public_ip: String,
+    pub fabric_ipv6: String,
+    pub hardware: HardwareSpec,
+    pub capacity: AllocatableCapacity,
+    pub labels: HashMap<String, String>,
+    pub taints: Vec<Taint>,
+    pub created_at: u64,
+}
