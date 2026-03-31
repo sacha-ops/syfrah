@@ -11,6 +11,7 @@ pub mod reconcile;
 pub mod recovery;
 pub mod rollback;
 pub mod sg;
+pub mod sg_nft;
 pub mod sysctl;
 pub mod tap;
 pub mod veth_peer;
