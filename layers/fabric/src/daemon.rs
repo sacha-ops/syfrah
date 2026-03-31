@@ -1002,7 +1002,90 @@ pub async fn run_daemon(
     {
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
-            Ok(vm_manager) => {
+            Ok(mut vm_manager) => {
+                // Wire networking into VmManager: open org/ipam/placement stores
+                // and create the LinuxBackend for overlay operations.
+                let net_ok = match (
+                    syfrah_state::LayerDb::open("org"),
+                    syfrah_state::LayerDb::open("ipam"),
+                    syfrah_state::LayerDb::open("placement"),
+                ) {
+                    (Ok(org_db), Ok(ipam_db), Ok(placement_db)) => {
+                        let org_store = Arc::new(syfrah_org::store::OrgStore::new(org_db));
+                        let ipam_store = Arc::new(syfrah_org::ipam::IpamStore::new(ipam_db));
+                        let placement_store =
+                            Arc::new(syfrah_org::PlacementStore::new(placement_db));
+                        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                            Arc::new(syfrah_overlay::LinuxBackend::new());
+                        let local_node = my_record.mesh_ipv6.to_string();
+
+                        // Set up network cleanup callbacks for VM delete.
+                        let ipam_for_release = Arc::clone(&ipam_store);
+                        let placement_for_remove = Arc::clone(&placement_store);
+                        let placement_for_counter = Arc::clone(&placement_store);
+
+                        #[allow(clippy::type_complexity)]
+                        let bridge_counter: Arc<
+                            dyn Fn(&str, &str) -> usize + Send + Sync,
+                        > = {
+                            Arc::new(move |vpc_id, vm_id| {
+                                placement_for_counter
+                                    .list_by_vpc(vpc_id)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .filter(|p| p.vm_id != vm_id)
+                                    .count()
+                            })
+                        };
+                        #[allow(clippy::type_complexity)]
+                        let ipam_releaser: Arc<
+                            dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync,
+                        > = Arc::new(move |subnet_id, subnet_cidr, ip| {
+                            ipam_for_release
+                                .release_ip(subnet_id, subnet_cidr, ip)
+                                .map_err(|e| e.to_string())
+                        });
+                        #[allow(clippy::type_complexity)]
+                        let placement_remover: Arc<
+                            dyn Fn(&str, &str) -> Result<(), String> + Send + Sync,
+                        > = Arc::new(move |vpc_id, vm_id| {
+                            placement_for_remove
+                                .remove_placement(vpc_id, vm_id)
+                                .map_err(|e| e.to_string())
+                        });
+
+                        vm_manager.set_network(
+                            Arc::clone(&backend),
+                            bridge_counter,
+                            ipam_releaser,
+                            placement_remover,
+                        );
+                        vm_manager.set_network_setup(
+                            org_store,
+                            ipam_store,
+                            placement_store,
+                            local_node,
+                        );
+
+                        info!("compute: networking wired (IPAM, bridge, VXLAN, TAP, nftables)");
+                        true
+                    }
+                    (org_res, ipam_res, placement_res) => {
+                        if let Err(e) = org_res {
+                            warn!("compute: failed to open org store: {e}");
+                        }
+                        if let Err(e) = ipam_res {
+                            warn!("compute: failed to open ipam store: {e}");
+                        }
+                        if let Err(e) = placement_res {
+                            warn!("compute: failed to open placement store: {e}");
+                        }
+                        warn!("compute: networking not available (store init failed)");
+                        false
+                    }
+                };
+                let _ = net_ok;
+
                 let vm_manager = Arc::new(vm_manager);
 
                 // Reconnect VMs that survived a daemon restart.

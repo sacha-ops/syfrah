@@ -11,12 +11,16 @@ use crate::events;
 use crate::image::store::ImageStore;
 use crate::image::types::{ImageCatalog, PullPolicy};
 use crate::network::{NetworkCleanup, NetworkInfo};
+use crate::network_setup::NetworkSetup;
 use crate::process;
 use crate::runtime::VmRuntimeState;
 use crate::runtime_backend::{ComputeRuntime, RuntimeSpec};
 use crate::runtime_ch;
 use crate::types::{VmEvent, VmId, VmSpec, VmStatus};
 
+use syfrah_org::ipam::IpamStore;
+use syfrah_org::store::OrgStore;
+use syfrah_org::PlacementStore;
 use syfrah_overlay::NetworkBackend;
 
 // ---------------------------------------------------------------------------
@@ -222,6 +226,14 @@ pub struct VmManager {
     /// Callback to remove a VmPlacement from the placement store. Args: (vpc_id, vm_id).
     /// If None, placement removal is skipped.
     placement_remover: Option<PlacementRemover>,
+    /// Org store for subnet/VPC resolution (shared with NetworkSetup).
+    org_store: Option<Arc<OrgStore>>,
+    /// IPAM store for IP allocation (shared with NetworkSetup).
+    ipam_store: Option<Arc<IpamStore>>,
+    /// Placement store for VM placement tracking (shared with NetworkSetup).
+    placement_store: Option<Arc<PlacementStore>>,
+    /// This node's fabric IPv6 address (for VXLAN local IP and placement).
+    local_node: Option<String>,
 }
 
 impl VmManager {
@@ -288,6 +300,10 @@ impl VmManager {
             bridge_vm_counter: None,
             ipam_releaser: None,
             placement_remover: None,
+            org_store: None,
+            ipam_store: None,
+            placement_store: None,
+            local_node: None,
         })
     }
 
@@ -309,6 +325,24 @@ impl VmManager {
         self.bridge_vm_counter = Some(bridge_vm_counter);
         self.ipam_releaser = Some(ipam_releaser);
         self.placement_remover = Some(placement_remover);
+    }
+
+    /// Set the network setup dependencies for VM creation.
+    ///
+    /// When these are set, `create_vm()` will run the full network setup
+    /// (IPAM allocation, bridge/VXLAN/TAP creation, nftables, NAT) for VMs
+    /// that have a `subnet` in their spec.
+    pub fn set_network_setup(
+        &mut self,
+        org_store: Arc<OrgStore>,
+        ipam_store: Arc<IpamStore>,
+        placement_store: Arc<PlacementStore>,
+        local_node: String,
+    ) {
+        self.org_store = Some(org_store);
+        self.ipam_store = Some(ipam_store);
+        self.placement_store = Some(placement_store);
+        self.local_node = Some(local_node);
     }
 
     /// Set the image catalog (e.g., after fetching from a remote endpoint).
@@ -428,6 +462,53 @@ impl VmManager {
                     .expect("at least one config error"),
             )
         })?;
+
+        // -- Network setup (IPAM, bridge, VXLAN, TAP, nftables, NAT) ----------
+        // Run before image management so cloud-init can include network config.
+        let mut network_result: Option<crate::network_setup::NetworkSetupResult> = None;
+        if let Some(ref subnet_info) = spec.subnet {
+            if let (
+                Some(ref org_store),
+                Some(ref ipam_store),
+                Some(ref placement_store),
+                Some(ref backend),
+                Some(ref local_node),
+            ) = (
+                &self.org_store,
+                &self.ipam_store,
+                &self.placement_store,
+                &self.network_backend,
+                &self.local_node,
+            ) {
+                let subnet_name = subnet_info.name.clone();
+                let ns = NetworkSetup::new(
+                    Arc::clone(org_store),
+                    Arc::clone(ipam_store),
+                    Arc::clone(placement_store),
+                    Arc::clone(backend),
+                    local_node.clone(),
+                );
+                match ns.setup(&vm_id_str, &subnet_name).await {
+                    Ok(result) => {
+                        info!(
+                            vm_id = %vm_id_str,
+                            ip = %result.ip,
+                            tap = %result.tap_name,
+                            "network setup complete"
+                        );
+                        network_result = Some(result);
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            } else {
+                warn!(
+                    vm_id = %vm_id_str,
+                    "subnet specified but network setup dependencies not configured"
+                );
+            }
+        }
 
         // -- Image management (pull, clone, cloud-init) -----------------------
         // These steps stay in the manager; only the final spawn goes through
@@ -563,16 +644,21 @@ impl VmManager {
                 };
 
                 // Generate cloud-init (if applicable)
-                if image_meta.cloud_init && spec.ssh_key.is_some() {
+                let has_ssh = spec.ssh_key.is_some();
+                let has_network = network_result.is_some();
+                if image_meta.cloud_init && (has_ssh || has_network) {
+                    let ci_network = network_result
+                        .as_ref()
+                        .map(|nr| nr.cloud_init_network.clone());
                     let cloud_config = CloudInitConfig {
                         hostname: vm_id_str.clone(),
-                        ssh_authorized_keys: vec![spec.ssh_key.clone().unwrap()],
+                        ssh_authorized_keys: spec.ssh_key.clone().into_iter().collect(),
                         default_user: image_meta
                             .default_username
                             .clone()
                             .unwrap_or_else(|| "ubuntu".to_string()),
                         users: vec![],
-                        network_config: None,
+                        network_config: ci_network,
                         user_data_extra: None,
                     };
                     match disk::generate_cloud_init(&cloud_config, &inst_dir, &instance_id) {
@@ -622,12 +708,22 @@ impl VmManager {
             self.config.image_dir.join(format!("{}.raw", spec.image))
         };
 
+        // If network setup produced a TAP, use it as the network config.
+        let network = if let Some(ref nr) = network_result {
+            Some(crate::types::NetworkConfig {
+                tap_name: nr.tap_name.clone(),
+                mac: Some(nr.mac.clone()),
+            })
+        } else {
+            spec.network.clone()
+        };
+
         let runtime_spec = RuntimeSpec {
             vcpus: spec.vcpus,
             memory_mb: spec.memory_mb,
             rootfs_path,
             cloud_init_path,
-            network: spec.network.clone(),
+            network,
             gpu: spec.gpu.clone(),
             image_name: Some(spec.image.clone()),
         };
@@ -639,12 +735,80 @@ impl VmManager {
                 if let Some(ref p) = instance_dir_path {
                     let _ = std::fs::remove_dir_all(p);
                 }
+                // Rollback network setup on runtime failure.
+                if let Some(ref nr) = network_result {
+                    if let (
+                        Some(ref org_store),
+                        Some(ref ipam_store),
+                        Some(ref placement_store),
+                        Some(ref backend),
+                        Some(ref local_node),
+                    ) = (
+                        &self.org_store,
+                        &self.ipam_store,
+                        &self.placement_store,
+                        &self.network_backend,
+                        &self.local_node,
+                    ) {
+                        let ns = NetworkSetup::new(
+                            Arc::clone(org_store),
+                            Arc::clone(ipam_store),
+                            Arc::clone(placement_store),
+                            Arc::clone(backend),
+                            local_node.clone(),
+                        );
+                        if let Err(te) = ns
+                            .teardown(
+                                &vm_id_str,
+                                &nr.placement.vpc_id,
+                                &nr.placement.subnet_id,
+                                &nr.subnet_cidr,
+                                &nr.ip,
+                                &nr.tap_name,
+                            )
+                            .await
+                        {
+                            warn!(
+                                vm_id = %vm_id_str,
+                                error = %te,
+                                "failed to rollback network setup after runtime failure"
+                            );
+                        }
+                    }
+                }
                 return Err(e);
             }
         };
 
         // -- Build VmRuntimeState from the RuntimeHandle ----------------------
         let now = now_unix();
+
+        // Extract network metadata from setup result for runtime state.
+        let (vm_ip, vm_subnet, vm_vpc, net_info) = if let Some(ref nr) = network_result {
+            let info = NetworkInfo {
+                vpc_id: nr.placement.vpc_id.clone(),
+                subnet_id: nr.placement.subnet_id.clone(),
+                subnet_cidr: nr.subnet_cidr.clone(),
+                ip: nr.ip.clone(),
+                mac: nr.mac.clone(),
+                tap_name: nr.tap_name.clone(),
+                hosting_node: nr.placement.hosting_node.clone(),
+            };
+            (
+                Some(nr.ip.clone()),
+                Some(
+                    spec.subnet
+                        .as_ref()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default(),
+                ),
+                Some(nr.placement.vpc_id.clone()),
+                Some(info),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
         let state = crate::runtime::VmRuntimeState {
             vm_id: spec.id.clone(),
             pid: handle.pid,
@@ -663,10 +827,10 @@ impl VmManager {
             image_name: Some(spec.image.clone()),
             instance_dir_path,
             runtime_handle: Some(handle),
-            ip: None,
-            subnet: None,
-            vpc: None,
-            network_info: None,
+            ip: vm_ip,
+            subnet: vm_subnet,
+            vpc: vm_vpc,
+            network_info: net_info,
         };
 
         let status = state.to_status(now);
@@ -676,6 +840,38 @@ impl VmManager {
         {
             let mut map = self.vms.write().await;
             map.insert(vm_id_str.clone(), Arc::new(Mutex::new(state)));
+        }
+
+        // Mark IPAM allocation as assigned now that the VM is booted.
+        if let Some(ref nr) = network_result {
+            if let (
+                Some(ref org_store),
+                Some(ref ipam_store),
+                Some(ref placement_store),
+                Some(ref backend),
+                Some(ref local_node),
+            ) = (
+                &self.org_store,
+                &self.ipam_store,
+                &self.placement_store,
+                &self.network_backend,
+                &self.local_node,
+            ) {
+                let ns = NetworkSetup::new(
+                    Arc::clone(org_store),
+                    Arc::clone(ipam_store),
+                    Arc::clone(placement_store),
+                    Arc::clone(backend),
+                    local_node.clone(),
+                );
+                if let Err(e) = ns.mark_assigned(&nr.placement.subnet_id, &nr.ip, &vm_id_str) {
+                    warn!(
+                        vm_id = %vm_id_str,
+                        error = %e,
+                        "failed to mark IPAM allocation as assigned (non-fatal)"
+                    );
+                }
+            }
         }
 
         // Increment image refcount.

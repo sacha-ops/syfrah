@@ -11,6 +11,8 @@ categories.workspace = true
 [dependencies]
 syfrah-core = { path = "../core" }
 syfrah-compute = { path = "../compute" }
+syfrah-org = { path = "../org" }
+syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
 syfrah-api = { path = "../api" }
 wireguard-control = "1.7"
