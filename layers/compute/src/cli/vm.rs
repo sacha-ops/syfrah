@@ -368,8 +368,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             } else {
                 let tw = super::term_width();
                 let header = format!(
-                    "{:<20} {:<20} {:<12} {:<12} {:<6} {:<10} {:<10}",
-                    "NAME", "IMAGE", "PHASE", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
+                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10}",
+                    "NAME", "IMAGE", "PHASE", "IP", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
                 );
                 if console::Term::stdout().is_term() {
                     let truncated = &header[..header.len().min(tw)];
@@ -377,7 +377,7 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                 } else {
                     println!("{}", &header[..header.len().min(tw)]);
                 }
-                println!("{}", "-".repeat(90.min(tw)));
+                println!("{}", "-".repeat(106.min(tw)));
                 if vms.is_empty() {
                     println!("(no VMs)");
                 } else {
@@ -385,6 +385,7 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                         let name = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
                         let image = vm.get("image").and_then(|i| i.as_str()).unwrap_or("");
                         let phase = vm.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
+                        let ip = vm.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
                         let runtime = vm.get("runtime").and_then(|r| r.as_str()).unwrap_or("-");
                         let vcpus = vm.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(0);
                         let memory = vm.get("memory_mb").and_then(|m| m.as_u64()).unwrap_or(0);
@@ -395,7 +396,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .unwrap_or_else(|| "-".to_string());
                         let name = super::truncate(name, 19);
                         let image = super::truncate(image, 19);
-                        let row = format!("{name:<20} {image:<20} {phase:<12} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10}");
+                        let ip = super::truncate(ip, 15);
+                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10}");
                         println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
@@ -446,6 +448,9 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                     .and_then(|u| u.as_u64())
                     .map(format_uptime)
                     .unwrap_or_else(|| "-".to_string());
+                let ip = v.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
+                let subnet_val = v.get("subnet").and_then(|s| s.as_str()).unwrap_or("-");
+                let vpc_val = v.get("vpc").and_then(|s| s.as_str()).unwrap_or("-");
                 println!("VM Details");
                 println!("  Name:      {name}");
                 println!("  Image:     {image}");
@@ -454,6 +459,9 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 println!("  vCPUs:     {vcpus}");
                 println!("  Memory:    {memory} MB");
                 println!("  Uptime:    {uptime}");
+                println!("  IP:        {ip}");
+                println!("  Subnet:    {subnet_val}");
+                println!("  VPC:       {vpc_val}");
             }
             Ok(())
         }

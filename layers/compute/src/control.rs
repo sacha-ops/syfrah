@@ -125,6 +125,9 @@ fn vm_status_to_json(s: &crate::types::VmStatus) -> serde_json::Value {
         "runtime": runtime,
         "created_at": s.created_at,
         "uptime_secs": s.uptime_secs,
+        "ip": s.ip,
+        "subnet": s.subnet,
+        "vpc": s.vpc,
     })
 }
 
