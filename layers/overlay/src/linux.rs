@@ -253,33 +253,35 @@ impl NetworkBackend for LinuxBackend {
         prefix_len: u8,
         gateway: &str,
     ) -> Result<()> {
-        let ns = format!("/proc/{pid}/ns/net");
+        // Use --net=<path> (not --net <path>) for compatibility with
+        // util-linux nsenter which requires the = form.
+        let ns_flag = format!("--net=/proc/{pid}/ns/net");
         let cidr = format!("{ip}/{prefix_len}");
 
         // Rename the veth endpoint to eth0 inside the namespace.
         Self::run(
             "nsenter",
-            &["--net", &ns, "ip", "link", "set", iface, "name", "eth0"],
+            &[&ns_flag, "ip", "link", "set", iface, "name", "eth0"],
         )
         .await?;
         // Assign the allocated IP.
         Self::run(
             "nsenter",
-            &["--net", &ns, "ip", "addr", "add", &cidr, "dev", "eth0"],
+            &[&ns_flag, "ip", "addr", "add", &cidr, "dev", "eth0"],
         )
         .await?;
         // Bring up eth0 and loopback.
         Self::run(
             "nsenter",
-            &["--net", &ns, "ip", "link", "set", "eth0", "up"],
+            &[&ns_flag, "ip", "link", "set", "eth0", "up"],
         )
         .await?;
-        Self::run("nsenter", &["--net", &ns, "ip", "link", "set", "lo", "up"]).await?;
+        Self::run("nsenter", &[&ns_flag, "ip", "link", "set", "lo", "up"]).await?;
         // Default route through the bridge gateway.
         Self::run(
             "nsenter",
             &[
-                "--net", &ns, "ip", "route", "add", "default", "via", gateway,
+                &ns_flag, "ip", "route", "add", "default", "via", gateway,
             ],
         )
         .await?;
