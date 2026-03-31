@@ -73,4 +73,13 @@ pub trait NetworkBackend: Send + Sync {
 
     /// Remove peering forwarding rules.
     async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
+
+    // ── Query / Discovery ──────────────────────────────────────────────
+
+    /// List kernel network interfaces matching a given prefix.
+    ///
+    /// Used by the reconciliation loop and daemon restart recovery to
+    /// discover existing `syfbr-*`, `syfvx-*`, `syftap-*`, and
+    /// `syfpeer-*` interfaces.
+    async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>>;
 }

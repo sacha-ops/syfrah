@@ -116,6 +116,12 @@ pub struct VmResponse {
     pub created_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +156,9 @@ fn vm_status_to_response(s: &VmStatus) -> VmResponse {
         runtime: s.runtime.map(|r| r.to_string()),
         created_at: s.created_at,
         uptime_secs: s.uptime_secs,
+        ip: s.ip.clone(),
+        subnet: s.subnet.clone(),
+        vpc: s.vpc.clone(),
     }
 }
 
@@ -242,6 +251,7 @@ async fn create_vm(
         gpu: parse_gpu_mode(body.gpu),
         ssh_key: None,
         disk_size_mb: None,
+        subnet: None,
     };
 
     match mgr.create_vm(spec).await {
@@ -323,6 +333,9 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(id): Path<String>) -> im
                     runtime: None,
                     created_at: None,
                     uptime_secs: None,
+                    ip: None,
+                    subnet: None,
+                    vpc: None,
                 }),
             )
                 .into_response(),
@@ -652,6 +665,9 @@ mod tests {
             runtime: Some(crate::runtime_backend::RuntimeType::Vm),
             created_at: Some(1700000000),
             uptime_secs: Some(3600),
+            ip: Some("10.1.1.3".to_string()),
+            subnet: Some("frontend".to_string()),
+            vpc: Some("default".to_string()),
         };
         let resp = vm_status_to_response(&status);
         assert_eq!(resp.id, "test-vm");
@@ -660,6 +676,9 @@ mod tests {
         assert_eq!(resp.memory_mb, 8192);
         assert_eq!(resp.created_at, Some(1700000000));
         assert_eq!(resp.uptime_secs, Some(3600));
+        assert_eq!(resp.ip.as_deref(), Some("10.1.1.3"));
+        assert_eq!(resp.subnet.as_deref(), Some("frontend"));
+        assert_eq!(resp.vpc.as_deref(), Some("default"));
     }
 
     #[test]
@@ -673,6 +692,9 @@ mod tests {
             runtime: None,
             created_at: None,
             uptime_secs: None,
+            ip: None,
+            subnet: None,
+            vpc: None,
         };
         let resp = vm_status_to_response(&status);
         let json = serde_json::to_string(&resp).unwrap();

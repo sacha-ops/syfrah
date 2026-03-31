@@ -103,6 +103,7 @@ impl ComputeRuntime for ChRuntime {
             gpu: spec.gpu.clone(),
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
 
         // Step 1: validate
