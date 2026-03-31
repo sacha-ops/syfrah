@@ -21,6 +21,7 @@ use std::path::PathBuf as StdPathBuf;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ComputeRequest {
     CreateVm {
         name: String,

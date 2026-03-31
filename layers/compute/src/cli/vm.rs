@@ -12,6 +12,7 @@ use crate::types::SubnetInfo;
 
 /// VM management subcommands.
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum VmCommand {
     /// Create a new virtual machine
     #[command(
