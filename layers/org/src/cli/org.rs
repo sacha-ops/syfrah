@@ -1,87 +1,93 @@
 //! Org subcommand handlers.
 //!
-//! All operations are local (redb), no daemon needed.
+//! All operations go through the daemon's control socket to avoid redb lock
+//! contention (the daemon holds the exclusive lock on org.redb).
 
-use crate::store::OrgStore;
-use crate::validation::validate_name;
+use std::path::PathBuf;
+
+use crate::api::{send_org_request, OrgRequest, OrgResponse};
+
+fn control_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("control.sock")
+}
 
 /// Create a new organization.
-pub fn run_create(name: String) -> anyhow::Result<()> {
-    if let Err(e) = validate_name(&name, "org") {
-        anyhow::bail!("{e}");
-    }
+pub async fn run_create(name: String) -> anyhow::Result<()> {
+    let req = OrgRequest::OrgCreate { name: name.clone() };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the syfrah daemon — is it running?\n\
+                 Start it with: syfrah fabric init ...\n\n\
+                 Error: {e}"
+            )
+        })?;
 
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-
-    match store.create(&name) {
-        Ok(org) => {
+    match resp {
+        OrgResponse::Org(org) => {
             println!("Organization '{}' created.", org.name);
             Ok(())
         }
-        Err(crate::error::OrgError::AlreadyExists(_)) => {
-            anyhow::bail!("org '{name}' already exists");
-        }
-        Err(e) => {
-            anyhow::bail!("failed to create org: {e}");
-        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
 
 /// List all organizations.
-pub fn run_list(json: bool) -> anyhow::Result<()> {
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
+pub async fn run_list(json: bool) -> anyhow::Result<()> {
+    let req = OrgRequest::OrgList;
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the syfrah daemon — is it running?\n\
+                 Start it with: syfrah fabric init ...\n\n\
+                 Error: {e}"
+            )
+        })?;
 
-    let orgs = store
-        .list()
-        .map_err(|e| anyhow::anyhow!("failed to list orgs: {e}"))?;
+    match resp {
+        OrgResponse::OrgList(orgs) => {
+            if json {
+                let json_str = serde_json::to_string_pretty(&orgs)?;
+                println!("{json_str}");
+                return Ok(());
+            }
 
-    if json {
-        let json_str = serde_json::to_string_pretty(&orgs)?;
-        println!("{json_str}");
-        return Ok(());
+            if orgs.is_empty() {
+                println!("(no organizations)");
+                return Ok(());
+            }
+
+            let tw = term_width();
+            let header = format!("{:<30} {:<20}", "NAME", "CREATED");
+            if console::Term::stdout().is_term() {
+                let truncated = &header[..header.len().min(tw)];
+                println!("{}", console::Style::new().bold().apply_to(truncated));
+            } else {
+                println!("{}", &header[..header.len().min(tw)]);
+            }
+            println!("{}", "-".repeat(50.min(tw)));
+
+            for org in &orgs {
+                let created = format_timestamp(org.created_at);
+                let row = format!("{:<30} {:<20}", org.name, created);
+                println!("{}", &row[..row.len().min(tw)]);
+            }
+
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    if orgs.is_empty() {
-        println!("(no organizations)");
-        return Ok(());
-    }
-
-    let tw = term_width();
-    let header = format!("{:<30} {:<20}", "NAME", "CREATED");
-    if console::Term::stdout().is_term() {
-        let truncated = &header[..header.len().min(tw)];
-        println!("{}", console::Style::new().bold().apply_to(truncated));
-    } else {
-        println!("{}", &header[..header.len().min(tw)]);
-    }
-    println!("{}", "-".repeat(50.min(tw)));
-
-    for org in &orgs {
-        let created = format_timestamp(org.created_at);
-        let row = format!("{:<30} {:<20}", org.name, created);
-        println!("{}", &row[..row.len().min(tw)]);
-    }
-
-    Ok(())
 }
 
 /// Delete an organization.
-pub fn run_delete(name: String, yes: bool) -> anyhow::Result<()> {
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-
-    // Check it exists before prompting
-    match store.get(&name) {
-        Ok(Some(_)) => {}
-        Ok(None) => anyhow::bail!("org '{name}' not found"),
-        Err(e) => anyhow::bail!("failed to look up org: {e}"),
-    }
-
+pub async fn run_delete(name: String, yes: bool) -> anyhow::Result<()> {
     if !yes {
         eprint!("Delete organization '{name}'? This cannot be undone. [y/N] ");
         let mut answer = String::new();
@@ -93,17 +99,23 @@ pub fn run_delete(name: String, yes: bool) -> anyhow::Result<()> {
         }
     }
 
-    match store.delete(&name) {
-        Ok(()) => {
+    let req = OrgRequest::OrgDelete { name: name.clone() };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the syfrah daemon — is it running?\n\n\
+                 Error: {e}"
+            )
+        })?;
+
+    match resp {
+        OrgResponse::Ok => {
             println!("Organization '{name}' deleted.");
             Ok(())
         }
-        Err(crate::error::OrgError::NotFound(_)) => {
-            anyhow::bail!("org '{name}' not found");
-        }
-        Err(e) => {
-            anyhow::bail!("failed to delete org: {e}");
-        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
 

@@ -184,21 +184,20 @@ pub(crate) fn normalize_disk_size(disk_size: Option<u32>) -> Option<u32> {
     }
 }
 
-/// Resolve a subnet for VM placement.
+/// Resolve a subnet for VM placement via the daemon's control socket.
 ///
 /// - If `--subnet` is given, look up that specific subnet in the environment.
 /// - If `--subnet` is NOT given but `--env/--project/--org` are, look up all
 ///   subnets in the environment. If exactly 1, use it. If 0 or 2+, error.
 /// - If none of the org context flags are given, returns `None` (no subnet).
-fn resolve_subnet(
+async fn resolve_subnet(
     subnet_name: Option<String>,
     env: Option<String>,
     project: Option<String>,
     org: Option<String>,
 ) -> anyhow::Result<Option<SubnetInfo>> {
-    // If no org context flags at all, skip subnet resolution
-    let (env_name, project_name, org_name) = match (&env, &project, &org) {
-        (Some(e), Some(p), Some(o)) => (e.as_str(), p.as_str(), o.as_str()),
+    // Validate argument completeness locally (no daemon needed)
+    match (&env, &project, &org) {
         (None, None, None) => {
             if subnet_name.is_some() {
                 anyhow::bail!(
@@ -207,69 +206,38 @@ fn resolve_subnet(
             }
             return Ok(None);
         }
+        (Some(_), Some(_), Some(_)) => { /* ok, proceed to daemon */ }
         _ => {
             anyhow::bail!("--env, --project, and --org must all be specified together");
         }
+    }
+
+    let req = syfrah_org::OrgRequest::SubnetResolve {
+        subnet_name,
+        env,
+        project,
+        org,
     };
+    let resp = syfrah_org::send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the syfrah daemon — is it running?\n\n\
+                 Error: {e}"
+            )
+        })?;
 
-    let env_id = syfrah_org::EnvironmentId(format!("{org_name}/{project_name}/{env_name}"));
-
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org database: {e}"))?;
-    let store = syfrah_org::OrgStore::new(db);
-
-    let subnets = store
-        .list_subnets_by_env(&env_id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    match subnet_name {
-        Some(name) => {
-            // Look for the specific subnet by name
-            let subnet = subnets
-                .into_iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "subnet '{name}' not found in environment '{env_name}'. \
-                         Create one with: syfrah subnet create {name} --env {env_name} --project {project_name} --org {org_name}"
-                    )
-                })?;
-            Ok(Some(SubnetInfo {
-                name: subnet.name,
-                cidr: subnet.cidr,
-                gateway: subnet.gateway,
-                vpc_id: subnet.vpc_id.0,
-                env_id: subnet.env_id.0,
-            }))
-        }
-        None => {
-            // Auto-select: must have exactly 1 subnet
-            match subnets.len() {
-                0 => {
-                    anyhow::bail!(
-                        "no subnet found for environment '{env_name}'. \
-                         Create one with: syfrah subnet create <name> --env {env_name} --project {project_name} --org {org_name}"
-                    );
-                }
-                1 => {
-                    let subnet = subnets.into_iter().next().unwrap();
-                    Ok(Some(SubnetInfo {
-                        name: subnet.name,
-                        cidr: subnet.cidr,
-                        gateway: subnet.gateway,
-                        vpc_id: subnet.vpc_id.0,
-                        env_id: subnet.env_id.0,
-                    }))
-                }
-                _ => {
-                    let names: Vec<&str> = subnets.iter().map(|s| s.name.as_str()).collect();
-                    anyhow::bail!(
-                        "environment '{env_name}' has multiple subnets: {}. Specify --subnet",
-                        names.join(", ")
-                    );
-                }
-            }
-        }
+    match resp {
+        syfrah_org::OrgResponse::SubnetResolved(None) => Ok(None),
+        syfrah_org::OrgResponse::SubnetResolved(Some(resolved)) => Ok(Some(SubnetInfo {
+            name: resolved.name,
+            cidr: resolved.cidr,
+            gateway: resolved.gateway,
+            vpc_id: resolved.vpc_id,
+            env_id: resolved.env_id,
+        })),
+        syfrah_org::OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
 
@@ -295,7 +263,7 @@ async fn run_create(
     let disk_size_mb = normalize_disk_size(disk_size);
 
     // Resolve subnet if org/project/env context is provided
-    let subnet = resolve_subnet(subnet_name, env, project, org)?;
+    let subnet = resolve_subnet(subnet_name, env, project, org).await?;
 
     let req = ComputeRequest::CreateVm {
         name,
@@ -1060,10 +1028,10 @@ mod tests {
 
     // -- Subnet resolution tests ---------------------------------------------
 
-    #[test]
-    fn subnet_requires_org_context() {
+    #[tokio::test]
+    async fn subnet_requires_org_context() {
         // --subnet without --env/--project/--org should error
-        let result = resolve_subnet(Some("frontend".to_string()), None, None, None);
+        let result = resolve_subnet(Some("frontend".to_string()), None, None, None).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1072,10 +1040,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subnet_partial_org_context_errors() {
+    #[tokio::test]
+    async fn subnet_partial_org_context_errors() {
         // Only --env without --project/--org should error
-        let result = resolve_subnet(None, Some("production".to_string()), None, None);
+        let result = resolve_subnet(None, Some("production".to_string()), None, None).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1084,10 +1052,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subnet_none_when_no_context() {
+    #[tokio::test]
+    async fn subnet_none_when_no_context() {
         // No flags at all should return Ok(None)
-        let result = resolve_subnet(None, None, None, None);
+        let result = resolve_subnet(None, None, None, None).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }

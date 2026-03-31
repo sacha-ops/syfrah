@@ -939,11 +939,11 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Compute { command } => syfrah_compute::cli::run(command).await,
-        Commands::Org { command } => syfrah_org::cli::run(command),
-        Commands::Project { command } => syfrah_org::cli::run_project(command),
-        Commands::Env { command } => syfrah_org::cli::run_env(command),
-        Commands::Vpc { command } => syfrah_org::cli::run_vpc(command),
-        Commands::Subnet { command } => syfrah_org::cli::run_subnet(command),
+        Commands::Org { command } => syfrah_org::cli::run(command).await,
+        Commands::Project { command } => syfrah_org::cli::run_project(command).await,
+        Commands::Env { command } => syfrah_org::cli::run_env(command).await,
+        Commands::Vpc { command } => syfrah_org::cli::run_vpc(command).await,
+        Commands::Subnet { command } => syfrah_org::cli::run_subnet(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();

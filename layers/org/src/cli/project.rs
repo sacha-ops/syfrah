@@ -1,68 +1,91 @@
 //! `syfrah project create|list|delete` handlers.
+//!
+//! All operations go through the daemon's control socket.
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::store::OrgStore;
-use crate::validation::validate_name;
+use crate::api::{send_org_request, OrgRequest, OrgResponse};
 
-pub fn create(name: &str, org: &str) -> Result<()> {
-    validate_name(name, "project")?;
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-    let project = store.create_project(org, name)?;
-    println!(
-        "Project '{}' created in organization '{}'.",
-        project.name, project.org_id
-    );
-    Ok(())
+fn control_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("control.sock")
 }
 
-pub fn list(org: Option<&str>, json: bool) -> Result<()> {
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
+fn daemon_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot reach the syfrah daemon — is it running?\n\
+         Start it with: syfrah fabric init ...\n\n\
+         Error: {e}"
+    )
+}
 
-    let projects = match org {
-        Some(org_name) => store.list_projects(org_name)?,
-        None => {
-            // List all projects across all orgs
-            let orgs = store.list()?;
-            let mut all = Vec::new();
-            for o in &orgs {
-                all.extend(store.list_projects(&o.name)?);
-            }
-            all
-        }
+pub async fn create(name: &str, org: &str) -> Result<()> {
+    let req = OrgRequest::ProjectCreate {
+        name: name.to_string(),
+        org: org.to_string(),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&projects)?);
-        return Ok(());
-    }
-
-    if projects.is_empty() {
-        if let Some(org_name) = org {
+    match resp {
+        OrgResponse::Project(project) => {
             println!(
-                "No projects found in org '{org_name}'. Create one with: syfrah project create <name> --org {org_name}"
+                "Project '{}' created in organization '{}'.",
+                project.name, project.org_id
             );
-        } else {
-            println!(
-                "No projects found. Create one with: syfrah project create <name> --org <org>"
-            );
+            Ok(())
         }
-        return Ok(());
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    println!("{:<30} {:<20} {:<20}", "NAME", "ORG", "CREATED");
-    for p in &projects {
-        let created = format_timestamp(p.created_at);
-        println!("{:<30} {:<20} {:<20}", p.name, p.org_id, created);
-    }
-    Ok(())
 }
 
-pub fn delete(name: &str, org: &str, yes: bool) -> Result<()> {
+pub async fn list(org: Option<&str>, json: bool) -> Result<()> {
+    let req = OrgRequest::ProjectList {
+        org: org.map(String::from),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::ProjectList(projects) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&projects)?);
+                return Ok(());
+            }
+
+            if projects.is_empty() {
+                if let Some(org_name) = org {
+                    println!(
+                        "No projects found in org '{org_name}'. Create one with: syfrah project create <name> --org {org_name}"
+                    );
+                } else {
+                    println!(
+                        "No projects found. Create one with: syfrah project create <name> --org <org>"
+                    );
+                }
+                return Ok(());
+            }
+
+            println!("{:<30} {:<20} {:<20}", "NAME", "ORG", "CREATED");
+            for p in &projects {
+                let created = format_timestamp(p.created_at);
+                println!("{:<30} {:<20} {:<20}", p.name, p.org_id, created);
+            }
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn delete(name: &str, org: &str, yes: bool) -> Result<()> {
     if !yes {
         eprint!("Delete project '{name}' from org '{org}'? This cannot be undone. [y/N] ");
         let mut input = String::new();
@@ -72,12 +95,23 @@ pub fn delete(name: &str, org: &str, yes: bool) -> Result<()> {
             return Ok(());
         }
     }
-    let db = syfrah_state::LayerDb::open("org")
-        .map_err(|e| anyhow::anyhow!("failed to open org store: {e}"))?;
-    let store = OrgStore::new(db);
-    store.delete_project(org, name)?;
-    println!("Project '{name}' deleted from org '{org}'.");
-    Ok(())
+
+    let req = OrgRequest::ProjectDelete {
+        name: name.to_string(),
+        org: org.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Ok => {
+            println!("Project '{name}' deleted from org '{org}'.");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
 fn format_timestamp(ts: u64) -> String {

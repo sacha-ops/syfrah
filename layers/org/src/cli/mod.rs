@@ -321,25 +321,25 @@ pub enum SubnetCommand {
 }
 
 /// Execute an org CLI command.
-pub fn run(cmd: OrgCommand) -> anyhow::Result<()> {
+pub async fn run(cmd: OrgCommand) -> anyhow::Result<()> {
     match cmd {
-        OrgCommand::Create { name } => org::run_create(name),
-        OrgCommand::List { json } => org::run_list(json),
-        OrgCommand::Delete { name, yes } => org::run_delete(name, yes),
+        OrgCommand::Create { name } => org::run_create(name).await,
+        OrgCommand::List { json } => org::run_list(json).await,
+        OrgCommand::Delete { name, yes } => org::run_delete(name, yes).await,
     }
 }
 
 /// Execute a project CLI command.
-pub fn run_project(cmd: ProjectCommand) -> anyhow::Result<()> {
+pub async fn run_project(cmd: ProjectCommand) -> anyhow::Result<()> {
     match cmd {
-        ProjectCommand::Create { name, org } => project::create(&name, &org),
-        ProjectCommand::List { org, json } => project::list(org.as_deref(), json),
-        ProjectCommand::Delete { name, org, yes } => project::delete(&name, &org, yes),
+        ProjectCommand::Create { name, org } => project::create(&name, &org).await,
+        ProjectCommand::List { org, json } => project::list(org.as_deref(), json).await,
+        ProjectCommand::Delete { name, org, yes } => project::delete(&name, &org, yes).await,
     }
 }
 
 /// Execute an env CLI command.
-pub fn run_env(cmd: EnvCommand) -> anyhow::Result<()> {
+pub async fn run_env(cmd: EnvCommand) -> anyhow::Result<()> {
     match cmd {
         EnvCommand::Create {
             name,
@@ -348,47 +348,53 @@ pub fn run_env(cmd: EnvCommand) -> anyhow::Result<()> {
             ttl,
             deletion_protection,
             labels,
-        } => env::run_create(
-            &name,
-            &project,
-            &org,
-            ttl.as_deref(),
-            deletion_protection,
-            &labels,
-        ),
+        } => {
+            env::run_create(
+                &name,
+                &project,
+                &org,
+                ttl.as_deref(),
+                deletion_protection,
+                &labels,
+            )
+            .await
+        }
         EnvCommand::List { project, org, json } => {
-            env::run_list(project.as_deref(), org.as_deref(), json)
+            env::run_list(project.as_deref(), org.as_deref(), json).await
         }
         EnvCommand::Destroy {
             name,
             project,
             org,
             yes,
-        } => env::run_destroy(&name, &project, &org, yes),
+        } => env::run_destroy(&name, &project, &org, yes).await,
         EnvCommand::Extend {
             name,
             project,
             org,
             ttl,
-        } => env::run_extend(&name, &project, &org, &ttl),
+        } => env::run_extend(&name, &project, &org, &ttl).await,
         EnvCommand::Update {
             name,
             project,
             org,
             deletion_protection,
             no_deletion_protection,
-        } => env::run_update(
-            &name,
-            &project,
-            &org,
-            deletion_protection,
-            no_deletion_protection,
-        ),
+        } => {
+            env::run_update(
+                &name,
+                &project,
+                &org,
+                deletion_protection,
+                no_deletion_protection,
+            )
+            .await
+        }
     }
 }
 
 /// Execute a VPC CLI command.
-pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
+pub async fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
     match cmd {
         VpcCommand::Create {
             name,
@@ -396,21 +402,21 @@ pub fn run_vpc(cmd: VpcCommand) -> anyhow::Result<()> {
             project,
             shared,
             cidr,
-        } => vpc::run_create(&name, &org, project.as_deref(), shared, cidr.as_deref()),
+        } => vpc::run_create(&name, &org, project.as_deref(), shared, cidr.as_deref()).await,
         VpcCommand::List { project, org, json } => {
-            vpc::run_list(org.as_deref(), project.as_deref(), json)
+            vpc::run_list(org.as_deref(), project.as_deref(), json).await
         }
-        VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes),
-        VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project),
-        VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project),
-        VpcCommand::Peer { from, to } => vpc::run_peer(&from, &to),
-        VpcCommand::Unpeer { from, to } => vpc::run_unpeer(&from, &to),
-        VpcCommand::Peerings { vpc, json } => vpc::run_peerings(vpc.as_deref(), json),
+        VpcCommand::Delete { name, org, yes } => vpc::run_delete(&name, &org, yes).await,
+        VpcCommand::Attach { vpc: v, project } => vpc::run_attach(&v, &project).await,
+        VpcCommand::Detach { vpc: v, project } => vpc::run_detach(&v, &project).await,
+        VpcCommand::Peer { from, to } => vpc::run_peer(&from, &to).await,
+        VpcCommand::Unpeer { from, to } => vpc::run_unpeer(&from, &to).await,
+        VpcCommand::Peerings { vpc, json } => vpc::run_peerings(vpc.as_deref(), json).await,
     }
 }
 
 /// Execute a subnet CLI command.
-pub fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
+pub async fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
     match cmd {
         SubnetCommand::Create {
             name,
@@ -419,20 +425,25 @@ pub fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
             org,
             vpc,
             cidr,
-        } => subnet::run_create(&name, &env, &project, &org, vpc.as_deref(), cidr.as_deref()),
+        } => subnet::run_create(&name, &env, &project, &org, vpc.as_deref(), cidr.as_deref()).await,
         SubnetCommand::List {
             env,
             vpc,
             project,
             org,
             json,
-        } => subnet::run_list(
-            env.as_deref(),
-            vpc.as_deref(),
-            project.as_deref(),
-            org.as_deref(),
-            json,
-        ),
-        SubnetCommand::Delete { name, vpc, yes } => subnet::run_delete(&name, vpc.as_deref(), yes),
+        } => {
+            subnet::run_list(
+                env.as_deref(),
+                vpc.as_deref(),
+                project.as_deref(),
+                org.as_deref(),
+                json,
+            )
+            .await
+        }
+        SubnetCommand::Delete { name, vpc, yes } => {
+            subnet::run_delete(&name, vpc.as_deref(), yes).await
+        }
     }
 }

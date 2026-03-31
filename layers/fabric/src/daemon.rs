@@ -995,6 +995,31 @@ pub async fn run_daemon(
     let mut router = LayerRouter::new();
     router.register("fabric", Arc::new(fabric_layer_handler));
 
+    // -- Org layer integration -----------------------------------------------
+    //
+    // Open the org database once and share it between the org control handler
+    // and the compute layer. This avoids the redb exclusive-lock contention
+    // that previously prevented CLI commands from accessing org.redb while the
+    // daemon was running.
+    let shared_org_store: Option<Arc<syfrah_org::OrgStore>> =
+        match syfrah_state::LayerDb::open("org") {
+            Ok(org_db) => {
+                let store = Arc::new(syfrah_org::OrgStore::new(org_db));
+
+                // Register the org layer handler so CLI org/project/env/vpc/subnet
+                // commands are routed through the daemon's control socket.
+                let org_handler = syfrah_org::OrgLayerHandler::new(Arc::clone(&store));
+                router.register("org", Arc::new(org_handler));
+
+                info!("org layer initialised");
+                Some(store)
+            }
+            Err(e) => {
+                warn!("org layer init failed (non-fatal): {e}");
+                None
+            }
+        };
+
     // -- Compute layer integration ------------------------------------------
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
@@ -1003,15 +1028,14 @@ pub async fn run_daemon(
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
             Ok(mut vm_manager) => {
-                // Wire networking into VmManager: open org/ipam/placement stores
-                // and create the LinuxBackend for overlay operations.
+                // Wire networking into VmManager: reuse the shared org store
+                // and open ipam/placement stores.
                 let net_ok = match (
-                    syfrah_state::LayerDb::open("org"),
+                    shared_org_store.clone(),
                     syfrah_state::LayerDb::open("ipam"),
                     syfrah_state::LayerDb::open("placement"),
                 ) {
-                    (Ok(org_db), Ok(ipam_db), Ok(placement_db)) => {
-                        let org_store = Arc::new(syfrah_org::store::OrgStore::new(org_db));
+                    (Some(org_store), Ok(ipam_db), Ok(placement_db)) => {
                         let ipam_store = Arc::new(syfrah_org::ipam::IpamStore::new(ipam_db));
                         let placement_store =
                             Arc::new(syfrah_org::PlacementStore::new(placement_db));
@@ -1071,8 +1095,8 @@ pub async fn run_daemon(
                         true
                     }
                     (org_res, ipam_res, placement_res) => {
-                        if let Err(e) = org_res {
-                            warn!("compute: failed to open org store: {e}");
+                        if org_res.is_none() {
+                            warn!("compute: org store not available");
                         }
                         if let Err(e) = ipam_res {
                             warn!("compute: failed to open ipam store: {e}");

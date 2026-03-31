@@ -10,7 +10,7 @@ pub mod types;
 pub mod validation;
 pub mod vpc;
 
-pub use api::OrgHandler;
+pub use api::{send_org_request, OrgLayerHandler, OrgRequest, OrgResponse, ResolvedSubnet};
 pub use cli::{EnvCommand, OrgCommand, ProjectCommand, SubnetCommand, VpcCommand};
 pub use error::OrgError;
 pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
