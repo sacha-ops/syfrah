@@ -291,6 +291,13 @@ impl NetworkBackend for LinuxBackend {
 
     // ── Firewall ───────────────────────────────────────────────────
 
+    async fn apply_infra_protection(&self) -> Result<()> {
+        let ruleset = crate::nft::generate_infra_protection();
+        crate::nft::apply_ruleset(&ruleset)
+            .map_err(|e| OverlayError::CommandFailed(e.to_string()))?;
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         // Ensure table and chain exist (ignore errors if already present)
         Self::run("nft", &["add", "table", "inet", "syfrah"])

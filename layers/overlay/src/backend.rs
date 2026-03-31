@@ -73,6 +73,12 @@ pub trait NetworkBackend: Send + Sync {
 
     // ── Firewall ───────────────────────────────────────────────────────
 
+    /// Apply infrastructure protection rules that block VMs from reaching
+    /// host overlay/fabric ports (VXLAN 4789, WireGuard 51820, peering 51821).
+    ///
+    /// Must be called once during init, before any per-VM rules are applied.
+    async fn apply_infra_protection(&self) -> Result<()>;
+
     /// Apply anti-spoofing + default ingress/egress rules for a VM.
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
 
