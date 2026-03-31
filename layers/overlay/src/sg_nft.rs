@@ -227,20 +227,20 @@ pub fn build_sg_ruleset(
         write!(buf, "{}", generate_named_set_in_table(sg_name, ips)).unwrap();
     }
 
-    // Ingress chain.
+    // Ingress chain: create (idempotent) then flush then populate.
     let ingress_rules = generate_ingress_chain(nic, rules);
     let in_chain = ingress_chain_name(&nic.vm_id);
-    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
     writeln!(buf, "add chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
     for rule in &ingress_rules {
         writeln!(buf, "add rule inet {SG_TABLE} {in_chain} {}", rule.text).unwrap();
     }
 
-    // Egress chain.
+    // Egress chain: create (idempotent) then flush then populate.
     let egress_rules = generate_egress_chain(nic, rules);
     let out_chain = egress_chain_name(&nic.vm_id);
-    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
     writeln!(buf, "add chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
     for rule in &egress_rules {
         writeln!(buf, "add rule inet {SG_TABLE} {out_chain} {}", rule.text).unwrap();
     }

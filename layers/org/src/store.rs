@@ -1212,21 +1212,21 @@ impl OrgStore {
     }
 
     /// List security groups attached to a NIC.
+    ///
+    /// The NIC stores `SecurityGroupId` values (e.g. `"sg-web-sg"`), but the
+    /// SECURITY_GROUPS_TABLE is keyed by `"vpc_id/sg_name"`. We therefore scan
+    /// all SGs and match by ID rather than using `sg_id.0` as a DB key.
     pub fn list_sgs_for_nic(&self, nic_id: &str) -> Result<Vec<SecurityGroup>> {
         let nic: NetworkInterface = self
             .db
             .get(NICS_TABLE, nic_id)?
             .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
 
-        let mut sgs = Vec::new();
-        for sg_id in &nic.security_groups {
-            if let Some(sg) = self
-                .db
-                .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, &sg_id.0)?
-            {
-                sgs.push(sg);
-            }
-        }
+        let all_sgs = self.list_sgs()?;
+        let sgs: Vec<SecurityGroup> = all_sgs
+            .into_iter()
+            .filter(|sg| nic.security_groups.contains(&sg.id))
+            .collect();
         Ok(sgs)
     }
 }

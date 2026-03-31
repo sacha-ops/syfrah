@@ -234,6 +234,8 @@ pub struct VmManager {
     placement_store: Option<Arc<PlacementStore>>,
     /// This node's fabric IPv6 address (for VXLAN local IP and placement).
     local_node: Option<String>,
+    /// SG rule store for applying SG-based nftables rules during network setup.
+    sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
 }
 
 impl VmManager {
@@ -304,6 +306,7 @@ impl VmManager {
             ipam_store: None,
             placement_store: None,
             local_node: None,
+            sg_rule_store: None,
         })
     }
 
@@ -343,6 +346,12 @@ impl VmManager {
         self.ipam_store = Some(ipam_store);
         self.placement_store = Some(placement_store);
         self.local_node = Some(local_node);
+    }
+
+    /// Set the SG rule store so that SG-based nftables rules are applied
+    /// during VM network setup.
+    pub fn set_sg_rule_store(&mut self, store: Arc<syfrah_org::SgRuleStore>) {
+        self.sg_rule_store = Some(store);
     }
 
     /// Set the image catalog (e.g., after fetching from a remote endpoint).
@@ -481,15 +490,26 @@ impl VmManager {
                 &self.local_node,
             ) {
                 let subnet_name = subnet_info.name.clone();
-                let ns = NetworkSetup::new(
+                let mut ns = NetworkSetup::new(
                     Arc::clone(org_store),
                     Arc::clone(ipam_store),
                     Arc::clone(placement_store),
                     Arc::clone(backend),
                     local_node.clone(),
                 );
+                if let Some(ref rs) = self.sg_rule_store {
+                    ns = ns.with_sg_rule_store(Arc::clone(rs));
+                }
                 let is_container = self.runtime.name().starts_with("container");
-                match ns.setup(&vm_id_str, &subnet_name, is_container).await {
+                match ns
+                    .setup_with_sg(
+                        &vm_id_str,
+                        &subnet_name,
+                        is_container,
+                        &spec.security_groups,
+                    )
+                    .await
+                {
                     Ok(result) => {
                         info!(
                             vm_id = %vm_id_str,

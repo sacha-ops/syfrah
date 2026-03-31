@@ -16,7 +16,9 @@ use syfrah_org::types::{
     Vpc,
 };
 use syfrah_org::PlacementStore;
+use syfrah_org::SgRuleStore;
 use syfrah_overlay::backend::NetworkBackend;
+use syfrah_overlay::sg_nft;
 
 use crate::error::ComputeError;
 use crate::image::types::CloudInitNetworkConfig;
@@ -73,6 +75,8 @@ pub struct NetworkSetup<B: NetworkBackend + ?Sized> {
     backend: Arc<B>,
     /// This node's fabric IPv6 address (for VXLAN local IP and placement).
     local_node: String,
+    /// SG rule store — when present, SG-based nftables rules are applied.
+    sg_rule_store: Option<Arc<SgRuleStore>>,
 }
 
 impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
@@ -90,7 +94,15 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             placement_store,
             backend,
             local_node,
+            sg_rule_store: None,
         }
+    }
+
+    /// Attach an SG rule store so that SG-based nftables rules are applied
+    /// for VMs with security groups.
+    pub fn with_sg_rule_store(mut self, store: Arc<SgRuleStore>) -> Self {
+        self.sg_rule_store = Some(store);
+        self
     }
 
     /// Run the full network setup sequence for a VM.
@@ -271,22 +283,71 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             })?;
 
         // -- 6. Apply nftables rules ------------------------------------------
-        // Use SG-based rules when security groups are specified;
-        // otherwise fall back to legacy hardcoded rules for migration.
-        if !security_groups.is_empty() {
-            info!(
-                vm_id,
-                sgs = ?security_groups,
-                "applying SG-based nftables rules"
-            );
+        // Use SG-based rules when security groups are specified and a rule
+        // store is available; otherwise fall back to legacy hardcoded rules.
+        let sg_applied = if !security_groups.is_empty() {
+            if let Some(ref rule_store) = self.sg_rule_store {
+                info!(
+                    vm_id,
+                    sgs = ?security_groups,
+                    "applying SG-based nftables rules"
+                );
+
+                // Collect all rules for the VM's security groups.
+                let sg_ids: Vec<syfrah_org::types::SecurityGroupId> = security_groups
+                    .iter()
+                    .filter_map(|name| {
+                        self.org_store
+                            .find_sg_by_name(name)
+                            .ok()
+                            .flatten()
+                            .map(|sg| sg.id)
+                    })
+                    .collect();
+
+                let mut overlay_rules = Vec::new();
+                for sg_id in &sg_ids {
+                    if let Ok(rules) = rule_store.list_rules_by_sg(sg_id) {
+                        for r in rules {
+                            overlay_rules.push(convert_org_rule_to_overlay(&r));
+                        }
+                    }
+                }
+
+                // Build the NIC for sg_nft (overlay type).
+                let nft_nic = sg_nft::NetworkInterface {
+                    id: sg_nft::NicId(format!("nic-{vm_id}")),
+                    vm_id: vm_id.to_string(),
+                    private_ip: ip
+                        .parse()
+                        .map_err(|e| ComputeError::NetworkSetup(format!("bad IP: {e}")))?,
+                    mac: mac.to_string(),
+                    security_groups: sg_ids
+                        .iter()
+                        .map(|id| syfrah_overlay::sg::SecurityGroupId(id.0.clone()))
+                        .collect(),
+                };
+
+                let sg_ip_map = std::collections::HashMap::new();
+                sg_nft::apply_sg_for_vm(&nft_nic, &overlay_rules, &sg_ip_map).map_err(|e| {
+                    ComputeError::NetworkSetup(format!("SG nftables rules failed: {e}"))
+                })?;
+
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Fall back to legacy hardcoded rules when SG rules were not applied.
+        if !sg_applied {
+            self.backend
+                .apply_vm_rules(&host_iface, mac, ip)
+                .await
+                .map_err(|e| ComputeError::NetworkSetup(format!("nftables rules failed: {e}")))?;
         }
-        // Both paths currently use the legacy apply_vm_rules backend call.
-        // TODO(#877): once SG rule store is wired, replace this with
-        // sg_nft::apply_sg_for_vm() when security_groups is non-empty.
-        self.backend
-            .apply_vm_rules(&host_iface, mac, ip)
-            .await
-            .map_err(|e| ComputeError::NetworkSetup(format!("nftables rules failed: {e}")))?;
 
         // -- 7. Apply NAT -----------------------------------------------------
         self.backend
@@ -498,6 +559,50 @@ fn parse_prefix_len(cidr: &str) -> Result<u8, ComputeError> {
     parts[1]
         .parse::<u8>()
         .map_err(|_| ComputeError::NetworkSetup(format!("invalid prefix length in CIDR: {cidr}")))
+}
+
+/// Convert an org-layer `SecurityGroupRule` into the overlay-layer type
+/// used by `sg_nft`.
+fn convert_org_rule_to_overlay(
+    r: &syfrah_org::types::SecurityGroupRule,
+) -> syfrah_overlay::sg::SecurityGroupRule {
+    use syfrah_overlay::sg as ov;
+
+    let direction = match r.direction {
+        syfrah_org::types::Direction::Ingress => ov::Direction::Ingress,
+        syfrah_org::types::Direction::Egress => ov::Direction::Egress,
+    };
+
+    let protocol = match r.protocol {
+        syfrah_org::types::Protocol::Tcp => ov::Protocol::Tcp,
+        syfrah_org::types::Protocol::Udp => ov::Protocol::Udp,
+        syfrah_org::types::Protocol::Icmp => ov::Protocol::Icmp,
+        syfrah_org::types::Protocol::All => ov::Protocol::All,
+    };
+
+    let port_range = r.port_range.as_ref().map(|pr| ov::PortRange {
+        from: pr.from,
+        to: pr.to,
+    });
+
+    let source = match &r.source {
+        syfrah_org::types::RuleSource::Cidr(cidr) => ov::TrafficSource::Cidr(cidr.clone()),
+        syfrah_org::types::RuleSource::SecurityGroup(sg_id) => {
+            ov::TrafficSource::SecurityGroup(sg_id.0.clone())
+        }
+    };
+
+    ov::SecurityGroupRule {
+        id: ov::RuleId(r.id.0.clone()),
+        sg_id: ov::SecurityGroupId(r.sg_id.0.clone()),
+        direction,
+        protocol,
+        port_range,
+        source,
+        priority: r.priority,
+        description: r.description.clone().unwrap_or_default(),
+        created_at: 0,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

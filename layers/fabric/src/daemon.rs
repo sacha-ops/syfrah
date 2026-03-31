@@ -1001,6 +1001,7 @@ pub async fn run_daemon(
     // and the compute layer. This avoids the redb exclusive-lock contention
     // that previously prevented CLI commands from accessing org.redb while the
     // daemon was running.
+    let mut shared_sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>> = None;
     let shared_org_store: Option<Arc<syfrah_org::OrgStore>> =
         match syfrah_state::LayerDb::open("org") {
             Ok(org_db) => {
@@ -1013,7 +1014,8 @@ pub async fn run_daemon(
                 // Open the SG rule store for rule management CLI commands.
                 if let Ok(sg_rules_db) = syfrah_state::LayerDb::open("sg_rules") {
                     let sg_rule_store = Arc::new(syfrah_org::SgRuleStore::new(sg_rules_db));
-                    org_handler = org_handler.with_sg_rule_store(sg_rule_store);
+                    org_handler = org_handler.with_sg_rule_store(Arc::clone(&sg_rule_store));
+                    shared_sg_rule_store = Some(sg_rule_store);
                     info!("sg_rules store initialised");
                 }
 
@@ -1098,6 +1100,12 @@ pub async fn run_daemon(
                             placement_store,
                             local_node,
                         );
+
+                        // Wire SG rule store so nftables rules are generated
+                        // from actual SG rules instead of hardcoded defaults.
+                        if let Some(ref sg_rs) = shared_sg_rule_store {
+                            vm_manager.set_sg_rule_store(Arc::clone(sg_rs));
+                        }
 
                         info!("compute: networking wired (IPAM, bridge, VXLAN, TAP, nftables)");
                         true
