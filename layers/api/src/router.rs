@@ -19,6 +19,8 @@ pub enum LayerRequest {
     Compute(Vec<u8>),
     /// Request destined for the Org layer.
     Org(Vec<u8>),
+    /// Request destined for the Hypervisor layer.
+    Hypervisor(Vec<u8>),
 }
 
 /// Top-level response envelope returned to the client.
@@ -30,6 +32,8 @@ pub enum LayerResponse {
     Compute(Vec<u8>),
     /// Response originating from the Org layer.
     Org(Vec<u8>),
+    /// Response originating from the Hypervisor layer.
+    Hypervisor(Vec<u8>),
     /// The requested layer is not registered in the router.
     UnknownLayer(String),
 }
@@ -81,6 +85,13 @@ impl LayerRouter {
                     LayerResponse::Org(handler.handle(payload, caller_uid).await)
                 } else {
                     LayerResponse::UnknownLayer("org".into())
+                }
+            }
+            LayerRequest::Hypervisor(payload) => {
+                if let Some(handler) = self.handlers.get("hypervisor") {
+                    LayerResponse::Hypervisor(handler.handle(payload, caller_uid).await)
+                } else {
+                    LayerResponse::UnknownLayer("hypervisor".into())
                 }
             }
         }

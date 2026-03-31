@@ -1197,6 +1197,14 @@ pub async fn run_daemon(
                     &public_ip,
                     &fabric_ipv6,
                 );
+                // Register the hypervisor layer handler for CLI commands.
+                let hv_handler = syfrah_org::HypervisorLayerHandler::new(
+                    Arc::clone(&store),
+                    my_record.name.clone(),
+                );
+                router.register("hypervisor", Arc::new(hv_handler));
+                info!("hypervisor layer initialised");
+
                 Some(store)
             }
             Err(e) => {
@@ -1204,7 +1212,7 @@ pub async fn run_daemon(
                 None
             }
         };
-    let _ = &shared_hypervisor_store; // suppress unused warning for now
+    let _ = &shared_hypervisor_store;
 
     // Register the forge layer handler on the control socket so future
     // `syfrah forge` CLI commands can be routed through the daemon.
