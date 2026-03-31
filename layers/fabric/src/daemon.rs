@@ -1174,6 +1174,11 @@ pub async fn run_daemon(
         }
     }
 
+    // Register the forge layer handler on the control socket so future
+    // `syfrah forge` CLI commands can be routed through the daemon.
+    // Currently returns "not implemented" — real Forge operations use HTTP.
+    router.register("forge", Arc::new(syfrah_forge::ForgeHandler));
+
     let router = Arc::new(router);
 
     let control_path = store::control_socket_path();
@@ -1183,9 +1188,10 @@ pub async fn run_daemon(
 
     // -- Forge HTTP API server -----------------------------------------------
     //
-    // Start the Forge HTTP API on the fabric IPv6 address, port 7100.
-    // This coexists with the control socket — CLI uses the socket, API
-    // consumers use HTTP.
+    // Migration: daemon.rs starts the Forge HTTP server alongside the control
+    // socket. Both coexist — CLI commands still go through the control socket
+    // (fabric/org/compute handlers), while new API consumers use HTTP on
+    // syfrah0:7100. The daemon is Forge's process entry point.
     let (forge_shutdown_tx, forge_shutdown_rx) = tokio::sync::watch::channel(false);
     let forge_task = {
         // Open the task store for Forge operations.
