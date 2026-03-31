@@ -58,6 +58,11 @@ pub fn ingress_chain_name(vm_id: &str) -> String {
     format!("vm_{}_in", short_hash(vm_id))
 }
 
+/// Compute the per-VM egress chain name: `vm_{hash}_out`.
+pub fn egress_chain_name(vm_id: &str) -> String {
+    format!("vm_{}_out", short_hash(vm_id))
+}
+
 /// Generate the nftables ingress chain rules for a NIC.
 ///
 /// Collects all ingress rules from the provided list, sorts by priority
@@ -103,6 +108,56 @@ pub fn generate_ingress_chain(
 /// ```
 pub fn render_ingress_chain(vm_id: &str, rules: &[NftRule]) -> String {
     let chain = ingress_chain_name(vm_id);
+    let mut buf = String::new();
+    writeln!(buf, "chain {chain} {{").unwrap();
+    for rule in rules {
+        writeln!(buf, "    {}", rule.text).unwrap();
+    }
+    writeln!(buf, "}}").unwrap();
+    buf
+}
+
+/// Generate the nftables egress chain rules for a NIC.
+///
+/// Collects all egress rules from the provided list, sorts by priority
+/// (ascending -- lower number evaluated first), translates each to an nft
+/// rule statement.
+///
+/// If no egress rules exist, returns a single `accept` rule (default allow).
+/// If egress rules exist, appends an implicit `drop` at the end.
+pub fn generate_egress_chain(_nic: &NetworkInterface, rules: &[SecurityGroupRule]) -> Vec<NftRule> {
+    let mut egress: Vec<&SecurityGroupRule> = rules
+        .iter()
+        .filter(|r| r.direction == Direction::Egress)
+        .collect();
+    egress.sort_by_key(|r| r.priority);
+
+    // No egress rules → default accept (allow all outbound).
+    if egress.is_empty() {
+        return vec![NftRule {
+            text: "accept".to_string(),
+        }];
+    }
+
+    let mut nft_rules: Vec<NftRule> = Vec::with_capacity(egress.len() + 1);
+
+    for rule in &egress {
+        if let Some(text) = translate_egress_rule(rule) {
+            nft_rules.push(NftRule { text });
+        }
+    }
+
+    // Implicit deny at end of chain.
+    nft_rules.push(NftRule {
+        text: "drop".to_string(),
+    });
+
+    nft_rules
+}
+
+/// Render a full nftables egress chain definition as a string.
+pub fn render_egress_chain(vm_id: &str, rules: &[NftRule]) -> String {
+    let chain = egress_chain_name(vm_id);
     let mut buf = String::new();
     writeln!(buf, "chain {chain} {{").unwrap();
     for rule in rules {
@@ -167,6 +222,64 @@ fn translate_rule(rule: &SecurityGroupRule) -> Option<String> {
         Protocol::All => {
             // No protocol filter -- accept all protocols.
         }
+    }
+
+    parts.push("accept".to_string());
+    Some(parts.join(" "))
+}
+
+/// Translate a single egress `SecurityGroupRule` into an nft rule statement.
+///
+/// For egress rules the `source` field is re-interpreted as **destination**:
+/// - `Cidr` → `ip daddr <cidr>`
+/// - `SecurityGroup` → `ip daddr @sg_{hash}_ips`
+fn translate_egress_rule(rule: &SecurityGroupRule) -> Option<String> {
+    if rule.direction != Direction::Egress {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    // Destination filter (source field re-interpreted for egress).
+    match &rule.source {
+        TrafficSource::Cidr(cidr) if cidr != "0.0.0.0/0" => {
+            parts.push(format!("ip daddr {cidr}"));
+        }
+        TrafficSource::SecurityGroup(sg_name) => {
+            let set_name = format!("sg_{}_ips", short_hash(sg_name));
+            parts.push(format!("ip daddr @{set_name}"));
+        }
+        _ => {}
+    }
+
+    // Protocol + port.
+    match rule.protocol {
+        Protocol::Tcp => {
+            if let Some(ref pr) = rule.port_range {
+                if pr.from == pr.to {
+                    parts.push(format!("tcp dport {}", pr.from));
+                } else {
+                    parts.push(format!("tcp dport {}-{}", pr.from, pr.to));
+                }
+            } else {
+                parts.push("tcp dport 0-65535".to_string());
+            }
+        }
+        Protocol::Udp => {
+            if let Some(ref pr) = rule.port_range {
+                if pr.from == pr.to {
+                    parts.push(format!("udp dport {}", pr.from));
+                } else {
+                    parts.push(format!("udp dport {}-{}", pr.from, pr.to));
+                }
+            } else {
+                parts.push("udp dport 0-65535".to_string());
+            }
+        }
+        Protocol::Icmp => {
+            parts.push("icmp type echo-request".to_string());
+        }
+        Protocol::All => {}
     }
 
     parts.push("accept".to_string());
@@ -414,5 +527,187 @@ mod tests {
         // Single port should not produce a range.
         assert_eq!(chain[0].text, "tcp dport 80 accept");
         assert!(!chain[0].text.contains('-'));
+    }
+
+    // ── Egress tests ──────────────────────────────────────────────
+
+    fn egress_rule(
+        protocol: Protocol,
+        port_range: Option<PortRange>,
+        source: TrafficSource,
+        priority: u32,
+    ) -> SecurityGroupRule {
+        SecurityGroupRule {
+            id: RuleId(format!("rule-e-{priority}")),
+            sg_id: SecurityGroupId("sg-default".to_string()),
+            direction: Direction::Egress,
+            protocol,
+            port_range,
+            source,
+            priority,
+            description: String::new(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_egress_no_rules_default_accept() {
+        let nic = test_nic();
+        let chain = generate_egress_chain(&nic, &[]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].text, "accept");
+    }
+
+    #[test]
+    fn test_egress_tcp_with_implicit_drop() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 443, to: 443 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].text, "tcp dport 443 accept");
+        assert_eq!(chain[1].text, "drop");
+    }
+
+    #[test]
+    fn test_egress_cidr_destination() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 80, to: 80 }),
+            TrafficSource::Cidr("10.0.0.0/8".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain[0].text, "ip daddr 10.0.0.0/8 tcp dport 80 accept");
+    }
+
+    #[test]
+    fn test_egress_sg_destination() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::Tcp,
+            Some(PortRange {
+                from: 5432,
+                to: 5432,
+            }),
+            TrafficSource::SecurityGroup("db-sg".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        let expected_set = format!("sg_{}_ips", short_hash("db-sg"));
+        assert_eq!(
+            chain[0].text,
+            format!("ip daddr @{expected_set} tcp dport 5432 accept")
+        );
+    }
+
+    #[test]
+    fn test_egress_priority_sorting() {
+        let nic = test_nic();
+        let rules = vec![
+            egress_rule(
+                Protocol::Tcp,
+                Some(PortRange { from: 443, to: 443 }),
+                TrafficSource::Cidr("0.0.0.0/0".to_string()),
+                200,
+            ),
+            egress_rule(
+                Protocol::Tcp,
+                Some(PortRange { from: 80, to: 80 }),
+                TrafficSource::Cidr("0.0.0.0/0".to_string()),
+                100,
+            ),
+        ];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].text, "tcp dport 80 accept");
+        assert_eq!(chain[1].text, "tcp dport 443 accept");
+        assert_eq!(chain[2].text, "drop");
+    }
+
+    #[test]
+    fn test_egress_ingress_rules_filtered_out() {
+        let nic = test_nic();
+        let rules = vec![ingress_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 22, to: 22 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        // No egress rules → default accept.
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].text, "accept");
+    }
+
+    #[test]
+    fn test_egress_chain_name_deterministic() {
+        assert_eq!(egress_chain_name("vm-1"), egress_chain_name("vm-1"));
+        assert_ne!(egress_chain_name("vm-1"), egress_chain_name("vm-2"));
+    }
+
+    #[test]
+    fn test_render_egress_chain() {
+        let rules = vec![
+            NftRule {
+                text: "tcp dport 443 accept".to_string(),
+            },
+            NftRule {
+                text: "drop".to_string(),
+            },
+        ];
+        let rendered = render_egress_chain("vm-1", &rules);
+        let chain_name = egress_chain_name("vm-1");
+        assert!(rendered.contains(&format!("chain {chain_name} {{")));
+        assert!(rendered.contains("    tcp dport 443 accept"));
+        assert!(rendered.contains("    drop"));
+    }
+
+    #[test]
+    fn test_egress_udp_range() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::Udp,
+            Some(PortRange {
+                from: 8000,
+                to: 9000,
+            }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain[0].text, "udp dport 8000-9000 accept");
+    }
+
+    #[test]
+    fn test_egress_icmp() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::Icmp,
+            None,
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain[0].text, "icmp type echo-request accept");
+    }
+
+    #[test]
+    fn test_egress_protocol_all() {
+        let nic = test_nic();
+        let rules = vec![egress_rule(
+            Protocol::All,
+            None,
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let chain = generate_egress_chain(&nic, &rules);
+        assert_eq!(chain[0].text, "accept");
+        assert_eq!(chain[1].text, "drop");
     }
 }
