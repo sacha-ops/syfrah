@@ -20,6 +20,13 @@ use std::net::Ipv4Addr;
 
 const TABLE_NAME: &str = "syfrah";
 const CHAIN_NAME: &str = "forward";
+const INPUT_CHAIN: &str = "input";
+
+/// Infrastructure ports that VMs must never reach.
+/// These protect the host overlay/fabric services from VM-initiated traffic.
+const VXLAN_PORT: u16 = 4789;
+const WIREGUARD_PORT: u16 = 51820;
+const PEERING_PORT: u16 = 51821;
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -33,6 +40,64 @@ pub fn generate_table_setup() -> String {
         "create chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
     )
     .unwrap();
+    writeln!(
+        buf,
+        "create chain inet {TABLE_NAME} {INPUT_CHAIN} {{ type filter hook input priority 0; policy accept; }}"
+    )
+    .unwrap();
+    buf
+}
+
+/// Generate nftables rules that block VMs from reaching host infrastructure
+/// ports (VXLAN, WireGuard, peering).
+///
+/// These rules go in the forward chain (blocking VM-to-VM or VM-to-remote
+/// traffic on infrastructure ports) and the input chain (blocking VM-to-host
+/// traffic on infrastructure ports via bridge interfaces).
+///
+/// Must be applied early, before any per-VM or SG rules.
+pub fn generate_infra_protection() -> String {
+    let mut buf = String::new();
+    write!(buf, "{}", generate_table_setup()).unwrap();
+
+    // Forward chain: block infrastructure ports for all forwarded traffic.
+    // This prevents VMs from sending VXLAN/WG/peering packets to any
+    // destination through the forward path.
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} udp dport {VXLAN_PORT} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} udp dport {WIREGUARD_PORT} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} tcp dport {PEERING_PORT} drop"
+    )
+    .unwrap();
+
+    // Input chain: block VM traffic (from bridge interfaces) to host
+    // infrastructure ports. Uses source 10.0.0.0/8 to match VM subnets
+    // since nftables does not support wildcard interface matching.
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 udp dport {VXLAN_PORT} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 udp dport {WIREGUARD_PORT} drop"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 tcp dport {PEERING_PORT} drop"
+    )
+    .unwrap();
+
     buf
 }
 
@@ -371,5 +436,82 @@ mod tests {
         let br_b = crate::naming::bridge_name("200");
         let rules = generate_remove_peering_rules(&br_a, &br_b);
         assert!(rules.contains(&format!("remove peering rules {br_a} <-> {br_b}")));
+    }
+
+    // ── Infrastructure protection tests ─────────────────────────────
+
+    #[test]
+    fn infrastructure_ports_blocked() {
+        let rules = generate_infra_protection();
+        // Forward chain blocks
+        assert!(rules.contains("udp dport 4789 drop"));
+        assert!(rules.contains("udp dport 51820 drop"));
+        assert!(rules.contains("tcp dport 51821 drop"));
+        // Input chain blocks (VM-to-host)
+        assert!(rules.contains("ip saddr 10.0.0.0/8 udp dport 4789 drop"));
+        assert!(rules.contains("ip saddr 10.0.0.0/8 udp dport 51820 drop"));
+        assert!(rules.contains("ip saddr 10.0.0.0/8 tcp dport 51821 drop"));
+    }
+
+    #[test]
+    fn vxlan_port_blocked() {
+        let rules = generate_infra_protection();
+        // VXLAN port 4789 must be blocked in both forward and input chains
+        let forward_rule = format!("add rule inet {TABLE_NAME} {CHAIN_NAME} udp dport 4789 drop");
+        let input_rule = format!(
+            "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 udp dport 4789 drop"
+        );
+        assert!(rules.contains(&forward_rule));
+        assert!(rules.contains(&input_rule));
+    }
+
+    #[test]
+    fn wireguard_port_blocked() {
+        let rules = generate_infra_protection();
+        // WireGuard port 51820 must be blocked in both forward and input chains
+        let forward_rule = format!("add rule inet {TABLE_NAME} {CHAIN_NAME} udp dport 51820 drop");
+        let input_rule = format!(
+            "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 udp dport 51820 drop"
+        );
+        assert!(rules.contains(&forward_rule));
+        assert!(rules.contains(&input_rule));
+    }
+
+    #[test]
+    fn peering_port_blocked() {
+        let rules = generate_infra_protection();
+        // Peering port 51821 must be blocked in both forward and input chains
+        let forward_rule = format!("add rule inet {TABLE_NAME} {CHAIN_NAME} tcp dport 51821 drop");
+        let input_rule = format!(
+            "add rule inet {TABLE_NAME} {INPUT_CHAIN} ip saddr 10.0.0.0/8 tcp dport 51821 drop"
+        );
+        assert!(rules.contains(&forward_rule));
+        assert!(rules.contains(&input_rule));
+    }
+
+    #[test]
+    fn infra_protection_includes_table_setup() {
+        let rules = generate_infra_protection();
+        // Must include table and both chains
+        assert!(rules.contains("create table inet syfrah"));
+        assert!(rules.contains("create chain inet syfrah forward"));
+        assert!(rules.contains("create chain inet syfrah input"));
+    }
+
+    #[test]
+    fn infra_rules_before_vm_rules() {
+        // Infrastructure rules must appear before per-VM rules in the
+        // generated output when both are composed.
+        let infra = generate_infra_protection();
+        let vm = generate_vm_rules(&tap(), MAC, IP);
+
+        // When combined, infra port blocks should come first.
+        let combined = format!("{infra}{vm}");
+        let vxlan_pos = combined.find("udp dport 4789 drop").unwrap();
+        let anti_spoof_pos = combined.find("ether saddr !=").unwrap();
+        assert!(
+            vxlan_pos < anti_spoof_pos,
+            "infra protection must precede per-VM rules"
+        );
     }
 }

@@ -138,7 +138,14 @@ pub async fn reconcile_network(
     // 2. Check expected TAPs exist — warn if missing
     check_taps(backend, expected_state, &mut report).await;
 
-    // 3. Re-apply nftables rules (they don't survive reboot)
+    // 3a. Re-apply infrastructure protection rules (they don't survive reboot)
+    if let Err(e) = backend.apply_infra_protection().await {
+        report
+            .warnings
+            .push(format!("infra protection re-apply failed: {e}"));
+    }
+
+    // 3b. Re-apply nftables rules (they don't survive reboot)
     reapply_rules(backend, expected_state, &mut report).await;
 
     // 4. Detect orphaned IP allocations

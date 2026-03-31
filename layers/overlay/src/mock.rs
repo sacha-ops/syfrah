@@ -192,6 +192,11 @@ impl NetworkBackend for MockBackend {
 
     // ── Firewall ───────────────────────────────────────────────────────
 
+    async fn apply_infra_protection(&self) -> Result<()> {
+        self.record("apply_infra_protection()".to_string());
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         self.record(format!("apply_vm_rules({tap}, {mac}, {ip})"));
         Ok(())
