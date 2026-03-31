@@ -133,106 +133,368 @@ impl NetworkBackend for LinuxBackend {
         Ok(())
     }
 
-    // ── VXLAN (placeholder — implemented by future PRs) ────────────
+    // ── VXLAN ───────────────────────────────────────────────────────
 
-    async fn create_vxlan(
-        &self,
-        _name: &str,
-        _vni: u32,
-        _local_ip: &str,
-        _port: u16,
-    ) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "vxlan: not yet implemented".into(),
-        ))
+    async fn create_vxlan(&self, name: &str, vni: u32, local_ip: &str, port: u16) -> Result<()> {
+        if Self::interface_exists(name).await {
+            return Ok(());
+        }
+        Self::run(
+            "ip",
+            &[
+                "link",
+                "add",
+                name,
+                "type",
+                "vxlan",
+                "id",
+                &vni.to_string(),
+                "local",
+                local_ip,
+                "dstport",
+                &port.to_string(),
+                "nolearning",
+            ],
+        )
+        .await?;
+        Self::run("ip", &["link", "set", name, "up"]).await?;
+        Ok(())
     }
 
-    async fn delete_vxlan(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "vxlan: not yet implemented".into(),
-        ))
+    async fn delete_vxlan(&self, name: &str) -> Result<()> {
+        if !Self::interface_exists(name).await {
+            return Ok(());
+        }
+        Self::run("ip", &["link", "del", name]).await?;
+        Ok(())
     }
 
-    async fn add_fdb_entry(&self, _bridge: &str, _mac: &str, _vtep: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "fdb: not yet implemented".into(),
-        ))
+    async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()> {
+        let vxlan = bridge.replace("syfbr-", "syfvx-");
+        Self::run("bridge", &["fdb", "add", mac, "dev", &vxlan, "dst", vtep]).await?;
+        Ok(())
     }
 
-    async fn remove_fdb_entry(&self, _bridge: &str, _mac: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "fdb: not yet implemented".into(),
-        ))
+    async fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()> {
+        let vxlan = bridge.replace("syfbr-", "syfvx-");
+        Self::run("bridge", &["fdb", "del", mac, "dev", &vxlan]).await?;
+        Ok(())
     }
 
-    async fn add_arp_proxy(&self, _vxlan: &str, _ip: &str, _mac: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "arp_proxy: not yet implemented".into(),
-        ))
+    async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()> {
+        Self::run(
+            "ip",
+            &[
+                "neigh",
+                "replace",
+                ip,
+                "lladdr",
+                mac,
+                "dev",
+                vxlan,
+                "nud",
+                "permanent",
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn remove_arp_proxy(&self, _vxlan: &str, _ip: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "arp_proxy: not yet implemented".into(),
-        ))
+    async fn remove_arp_proxy(&self, vxlan: &str, ip: &str) -> Result<()> {
+        Self::run("ip", &["neigh", "del", ip, "dev", vxlan]).await?;
+        Ok(())
     }
 
-    // ── TAP / veth (placeholder) ───────────────────────────────────
+    // ── TAP / veth ─────────────────────────────────────────────────
 
-    async fn create_tap(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "tap: not yet implemented".into(),
-        ))
+    async fn create_tap(&self, name: &str) -> Result<()> {
+        if Self::interface_exists(name).await {
+            return Ok(());
+        }
+        Self::run("ip", &["tuntap", "add", "dev", name, "mode", "tap"]).await?;
+        Self::run("ip", &["link", "set", name, "up"]).await?;
+        Ok(())
     }
 
-    async fn delete_tap(&self, _name: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "tap: not yet implemented".into(),
-        ))
+    async fn delete_tap(&self, name: &str) -> Result<()> {
+        if !Self::interface_exists(name).await {
+            return Ok(());
+        }
+        Self::run("ip", &["link", "del", name]).await?;
+        Ok(())
     }
 
-    async fn create_veth_pair(&self, _name_a: &str, _name_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "veth: not yet implemented".into(),
-        ))
+    async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()> {
+        if Self::interface_exists(name_a).await {
+            return Ok(());
+        }
+        Self::run(
+            "ip",
+            &[
+                "link", "add", name_a, "type", "veth", "peer", "name", name_b,
+            ],
+        )
+        .await?;
+        Self::run("ip", &["link", "set", name_a, "up"]).await?;
+        Self::run("ip", &["link", "set", name_b, "up"]).await?;
+        Ok(())
     }
 
-    // ── Firewall (placeholder) ─────────────────────────────────────
+    // ── Firewall ───────────────────────────────────────────────────
 
-    async fn apply_vm_rules(&self, _tap: &str, _mac: &str, _ip: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
+        // Ensure table and chain exist (ignore errors if already present)
+        Self::run("nft", &["add", "table", "inet", "syfrah"])
+            .await
+            .ok();
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                "syfrah",
+                "forward",
+                "{ type filter hook forward priority 0; policy accept; }",
+            ],
+        )
+        .await
+        .ok();
+
+        // Anti-spoofing: drop packets from this TAP with wrong MAC or IP
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "iif", tap, "ether", "saddr", "!=",
+                mac, "drop",
+            ],
+        )
+        .await?;
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "iif", tap, "ip", "saddr", "!=", ip,
+                "drop",
+            ],
+        )
+        .await?;
+
+        // Ingress rules: conntrack, SSH, ICMP, default deny
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "syfrah",
+                "forward",
+                "oif",
+                tap,
+                "ct",
+                "state",
+                "established,related",
+                "accept",
+            ],
+        )
+        .await?;
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "oif", tap, "tcp", "dport", "22",
+                "accept",
+            ],
+        )
+        .await?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "syfrah",
+                "forward",
+                "oif",
+                tap,
+                "icmp",
+                "type",
+                "echo-request",
+                "accept",
+            ],
+        )
+        .await?;
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "oif", tap, "drop",
+            ],
+        )
+        .await?;
+
+        Ok(())
     }
 
-    async fn remove_vm_rules(&self, _tap: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn remove_vm_rules(&self, tap: &str) -> Result<()> {
+        // List all rules with handles, then delete those matching this TAP
+        let output = Self::run("nft", &["-a", "list", "chain", "inet", "syfrah", "forward"])
+            .await
+            .unwrap_or_default();
+
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.contains(tap) {
+                continue;
+            }
+            // Lines look like: "iif "syftap-xxx" ... # handle 42"
+            if let Some(handle_pos) = trimmed.rfind("# handle ") {
+                let handle = trimmed[handle_pos + 9..].trim();
+                Self::run(
+                    "nft",
+                    &[
+                        "delete", "rule", "inet", "syfrah", "forward", "handle", handle,
+                    ],
+                )
+                .await
+                .ok();
+            }
+        }
+        Ok(())
     }
 
-    async fn apply_nat(&self, _bridge: &str, _subnet_cidr: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn apply_nat(&self, _bridge: &str, subnet_cidr: &str) -> Result<()> {
+        Self::run("nft", &["add", "table", "ip", "syfrah_nat"])
+            .await
+            .ok();
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                "syfrah_nat",
+                "postrouting",
+                "{ type nat hook postrouting priority 100; }",
+            ],
+        )
+        .await
+        .ok();
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                "syfrah_nat",
+                "postrouting",
+                "ip",
+                "saddr",
+                subnet_cidr,
+                "masquerade",
+            ],
+        )
+        .await?;
+        // Enable IP forwarding
+        Self::run("sysctl", &["-w", "net.ipv4.ip_forward=1"])
+            .await
+            .ok();
+        Ok(())
     }
 
-    async fn remove_nat(&self, _bridge: &str, _subnet_cidr: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn remove_nat(&self, _bridge: &str, subnet_cidr: &str) -> Result<()> {
+        let output = Self::run(
+            "nft",
+            &["-a", "list", "chain", "ip", "syfrah_nat", "postrouting"],
+        )
+        .await
+        .unwrap_or_default();
+
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.contains(subnet_cidr) {
+                continue;
+            }
+            if let Some(handle_pos) = trimmed.rfind("# handle ") {
+                let handle = trimmed[handle_pos + 9..].trim();
+                Self::run(
+                    "nft",
+                    &[
+                        "delete",
+                        "rule",
+                        "ip",
+                        "syfrah_nat",
+                        "postrouting",
+                        "handle",
+                        handle,
+                    ],
+                )
+                .await
+                .ok();
+            }
+        }
+        Ok(())
     }
 
-    async fn apply_peering_rules(&self, _bridge_a: &str, _bridge_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn apply_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()> {
+        Self::run("nft", &["add", "table", "inet", "syfrah"])
+            .await
+            .ok();
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                "syfrah",
+                "forward",
+                "{ type filter hook forward priority 0; policy accept; }",
+            ],
+        )
+        .await
+        .ok();
+
+        // Allow forwarding in both directions between the peered bridges
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "iif", bridge_a, "oif", bridge_b,
+                "accept",
+            ],
+        )
+        .await?;
+        Self::run(
+            "nft",
+            &[
+                "add", "rule", "inet", "syfrah", "forward", "iif", bridge_b, "oif", bridge_a,
+                "accept",
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn remove_peering_rules(&self, _bridge_a: &str, _bridge_b: &str) -> Result<()> {
-        Err(OverlayError::CommandFailed(
-            "nft: not yet implemented".into(),
-        ))
+    async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()> {
+        let output = Self::run("nft", &["-a", "list", "chain", "inet", "syfrah", "forward"])
+            .await
+            .unwrap_or_default();
+
+        for line in output.lines() {
+            let trimmed = line.trim();
+            // Match rules that reference both bridges (peering rules)
+            if !(trimmed.contains(bridge_a) && trimmed.contains(bridge_b)) {
+                continue;
+            }
+            if let Some(handle_pos) = trimmed.rfind("# handle ") {
+                let handle = trimmed[handle_pos + 9..].trim();
+                Self::run(
+                    "nft",
+                    &[
+                        "delete", "rule", "inet", "syfrah", "forward", "handle", handle,
+                    ],
+                )
+                .await
+                .ok();
+            }
+        }
+        Ok(())
     }
 
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
