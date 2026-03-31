@@ -23,6 +23,9 @@ pub trait NetworkBackend: Send + Sync {
     /// Populate the ARP proxy table on a VXLAN interface.
     async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()>;
 
+    /// Remove an ARP proxy entry from a VXLAN interface.
+    async fn remove_arp_proxy(&self, vxlan: &str, ip: &str) -> Result<()>;
+
     // ── Bridge ─────────────────────────────────────────────────────────
 
     /// Create a Linux bridge.

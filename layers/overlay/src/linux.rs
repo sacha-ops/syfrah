@@ -171,6 +171,12 @@ impl NetworkBackend for LinuxBackend {
         ))
     }
 
+    async fn remove_arp_proxy(&self, _vxlan: &str, _ip: &str) -> Result<()> {
+        Err(OverlayError::CommandFailed(
+            "arp_proxy: not yet implemented".into(),
+        ))
+    }
+
     // ── TAP / veth (placeholder) ───────────────────────────────────
 
     async fn create_tap(&self, _name: &str) -> Result<()> {
