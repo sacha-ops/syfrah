@@ -1,23 +1,29 @@
 //! `syfrah subnet create|list|delete` handlers.
+//!
+//! All operations go through the daemon's control socket.
 
-use anyhow::{Context, Result};
-use syfrah_state::LayerDb;
+use std::path::PathBuf;
 
-use crate::store::OrgStore;
-use crate::types::{EnvironmentId, ProjectId};
-use crate::vpc::VpcStore;
+use anyhow::Result;
 
-fn open_store() -> Result<OrgStore> {
-    let db = LayerDb::open("org").context("failed to open org database")?;
-    Ok(OrgStore::new(db))
+use crate::api::{send_org_request, OrgRequest, OrgResponse};
+
+fn control_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("control.sock")
 }
 
-fn open_vpc_store() -> Result<VpcStore> {
-    let db = LayerDb::open("org").context("failed to open org database")?;
-    Ok(VpcStore::new(db))
+fn daemon_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot reach the syfrah daemon — is it running?\n\
+         Start it with: syfrah fabric init ...\n\n\
+         Error: {e}"
+    )
 }
 
-pub fn run_create(
+pub async fn run_create(
     name: &str,
     env: &str,
     project: &str,
@@ -25,155 +31,99 @@ pub fn run_create(
     vpc: Option<&str>,
     cidr: Option<&str>,
 ) -> Result<()> {
-    // Resolve VPC name: explicit or default for project.
-    // We must ensure the default VPC exists before creating the subnet.
-    // Since redb holds a file lock, we must close VpcStore before opening OrgStore.
-    let vpc_name = match vpc {
-        Some(v) => v.to_string(),
-        None => {
-            let vpc_store = open_vpc_store()?;
-            let default_vpc = vpc_store
-                .ensure_default_vpc(org, project)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let name = default_vpc.name.clone();
-            drop(vpc_store);
-            name
-        }
+    let req = OrgRequest::SubnetCreate {
+        name: name.to_string(),
+        env: env.to_string(),
+        project: project.to_string(),
+        org: org.to_string(),
+        vpc: vpc.map(String::from),
+        cidr: cidr.map(String::from),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    // Build environment ID
-    let env_id = EnvironmentId(format!("{org}/{project}/{env}"));
-
-    let store = open_store()?;
-    let subnet = store
-        .create_subnet(&vpc_name, &env_id, name, cidr)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Resolve VPC name for display
-    let display_vpc = store
-        .get_vpc_by_id(&subnet.vpc_id)
-        .ok()
-        .flatten()
-        .map(|v| v.name)
-        .unwrap_or_else(|| vpc_name.clone());
-
-    println!("Subnet created: {}", subnet.name);
-    println!("  VPC:      {display_vpc}");
-    println!("  Env:      {env}");
-    println!("  CIDR:     {}", subnet.cidr);
-    println!("  Gateway:  {}", subnet.gateway);
-    println!("  Created:  {}", format_timestamp(subnet.created_at));
-
-    Ok(())
+    match resp {
+        OrgResponse::Subnet(subnet) => {
+            println!("Subnet created: {}", subnet.name);
+            println!("  VPC:      {}", subnet.vpc_id);
+            println!("  Env:      {env}");
+            println!("  CIDR:     {}", subnet.cidr);
+            println!("  Gateway:  {}", subnet.gateway);
+            println!("  Created:  {}", format_timestamp(subnet.created_at));
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
-pub fn run_list(
+pub async fn run_list(
     env: Option<&str>,
     vpc: Option<&str>,
     project: Option<&str>,
     org: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let store = open_store()?;
-
-    let subnets = if let Some(vpc_name) = vpc {
-        store
-            .list_subnets(vpc_name)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    } else if let (Some(env_name), Some(proj), Some(org_name)) = (env, project, org) {
-        let env_id = EnvironmentId(format!("{org_name}/{proj}/{env_name}"));
-        store
-            .list_subnets_by_env(&env_id)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    } else if let (Some(proj), Some(org_name)) = (project, org) {
-        let project_id = ProjectId(format!("{org_name}/{proj}"));
-        let vpcs = store
-            .list_vpcs_by_project(&project_id)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut all_subnets = Vec::new();
-        for vpc in &vpcs {
-            let mut subs = store
-                .list_subnets(&vpc.name)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            all_subnets.append(&mut subs);
-        }
-        all_subnets
-    } else {
-        anyhow::bail!("specify --vpc or --env/--project/--org to list subnets");
+    let req = OrgRequest::SubnetList {
+        env: env.map(String::from),
+        vpc: vpc.map(String::from),
+        project: project.map(String::from),
+        org: org.map(String::from),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&subnets)?);
-        return Ok(());
+    match resp {
+        OrgResponse::SubnetList(subnets) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&subnets)?);
+                return Ok(());
+            }
+
+            if subnets.is_empty() {
+                println!("No subnets found.");
+                println!("\nCreate one with: syfrah subnet create <name> --env <env> --project <project> --org <org>");
+                return Ok(());
+            }
+
+            println!(
+                "{:<20} {:<25} {:<15} {:<18} {:<16} CREATED",
+                "NAME", "VPC", "ENV", "CIDR", "GATEWAY"
+            );
+            println!("{}", "-".repeat(110));
+
+            for subnet in &subnets {
+                let env_name = subnet
+                    .env_id
+                    .0
+                    .split('/')
+                    .nth(2)
+                    .unwrap_or(&subnet.env_id.0);
+
+                println!(
+                    "{:<20} {:<25} {:<15} {:<18} {:<16} {}",
+                    subnet.name,
+                    subnet.vpc_id,
+                    env_name,
+                    subnet.cidr,
+                    subnet.gateway,
+                    format_timestamp(subnet.created_at),
+                );
+            }
+
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    if subnets.is_empty() {
-        println!("No subnets found.");
-        println!("\nCreate one with: syfrah subnet create <name> --env <env> --project <project> --org <org>");
-        return Ok(());
-    }
-
-    println!(
-        "{:<20} {:<25} {:<15} {:<18} {:<16} CREATED",
-        "NAME", "VPC", "ENV", "CIDR", "GATEWAY"
-    );
-    println!("{}", "-".repeat(110));
-
-    for subnet in &subnets {
-        let vpc_name = store
-            .get_vpc_by_id(&subnet.vpc_id)
-            .ok()
-            .flatten()
-            .map(|v| v.name)
-            .unwrap_or_else(|| subnet.vpc_id.0.clone());
-
-        let env_name = subnet
-            .env_id
-            .0
-            .split('/')
-            .nth(2)
-            .unwrap_or(&subnet.env_id.0);
-
-        println!(
-            "{:<20} {:<25} {:<15} {:<18} {:<16} {}",
-            subnet.name,
-            vpc_name,
-            env_name,
-            subnet.cidr,
-            subnet.gateway,
-            format_timestamp(subnet.created_at),
-        );
-    }
-
-    Ok(())
 }
 
-pub fn run_delete(name: &str, vpc: Option<&str>, yes: bool) -> Result<()> {
-    let store = open_store()?;
-
-    // Resolve VPC: if provided use it directly, otherwise search all VPCs.
-    let vpc_name = match vpc {
-        Some(v) => v.to_string(),
-        None => {
-            let matches = store
-                .find_subnets_by_name(name)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            match matches.len() {
-                0 => anyhow::bail!("subnet '{name}' not found"),
-                1 => matches.into_iter().next().unwrap().0,
-                _ => {
-                    let vpc_names: Vec<String> = matches.into_iter().map(|(v, _)| v).collect();
-                    anyhow::bail!(
-                        "subnet '{name}' exists in multiple VPCs: {}. Specify --vpc",
-                        vpc_names.join(", ")
-                    );
-                }
-            }
-        }
-    };
-
+pub async fn run_delete(name: &str, vpc: Option<&str>, yes: bool) -> Result<()> {
     if !yes {
-        eprint!("Delete subnet '{name}' from VPC '{vpc_name}'? This cannot be undone. [y/N] ");
+        let vpc_display = vpc.unwrap_or("(auto-detect)");
+        eprint!("Delete subnet '{name}' from VPC '{vpc_display}'? This cannot be undone. [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim();
@@ -183,12 +133,22 @@ pub fn run_delete(name: &str, vpc: Option<&str>, yes: bool) -> Result<()> {
         }
     }
 
-    store
-        .delete_subnet(&vpc_name, name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = OrgRequest::SubnetDelete {
+        name: name.to_string(),
+        vpc: vpc.map(String::from),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    println!("Subnet '{name}' deleted from VPC '{vpc_name}'.");
-    Ok(())
+    match resp {
+        OrgResponse::Ok => {
+            println!("Subnet '{name}' deleted.");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
 fn format_timestamp(ts: u64) -> String {
@@ -237,7 +197,6 @@ mod tests {
 
     #[test]
     fn subnet_create_parse() {
-        // All flags
         let cmd = parse(&[
             "create",
             "frontend",
@@ -271,7 +230,6 @@ mod tests {
             other => panic!("expected Create, got {other:?}"),
         }
 
-        // Without optional flags (vpc and cidr omitted)
         let cmd = parse(&[
             "create",
             "database",
@@ -304,7 +262,6 @@ mod tests {
 
     #[test]
     fn subnet_list_parse() {
-        // With all filters
         let cmd = parse(&[
             "list",
             "--env",
@@ -334,7 +291,6 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
 
-        // No filters
         let cmd = parse(&["list"]);
         match cmd {
             SubnetCommand::List {
@@ -353,7 +309,6 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
 
-        // Partial filters
         let cmd = parse(&["list", "--env", "staging"]);
         match cmd {
             SubnetCommand::List { env, vpc, .. } => {
@@ -366,7 +321,6 @@ mod tests {
 
     #[test]
     fn subnet_delete_parse() {
-        // With --vpc and --yes
         let cmd = parse(&["delete", "frontend", "--vpc", "my-vpc", "--yes"]);
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
@@ -377,7 +331,6 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
 
-        // Without --yes
         let cmd = parse(&["delete", "frontend", "--vpc", "my-vpc"]);
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
@@ -388,7 +341,6 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
 
-        // Short -y flag
         let cmd = parse(&["delete", "-y", "frontend", "--vpc", "my-vpc"]);
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {
@@ -399,7 +351,6 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
 
-        // Without --vpc (auto-resolve mode)
         let cmd = parse(&["delete", "frontend", "--yes"]);
         match cmd {
             SubnetCommand::Delete { name, vpc, yes } => {

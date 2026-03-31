@@ -1,20 +1,30 @@
-//! `syfrah vpc create|list|delete` handlers.
+//! `syfrah vpc create|list|delete|attach|detach|peer|unpeer|peerings` handlers.
+//!
+//! All operations go through the daemon's control socket.
 
-use anyhow::{bail, Context, Result};
-use syfrah_state::LayerDb;
+use std::path::PathBuf;
 
-use crate::store::OrgStore;
-use crate::types::{OrgId, ProjectId, VpcOwner};
+use anyhow::{bail, Result};
 
-const DEFAULT_PROJECT_CIDR: &str = "10.1.0.0/16";
-const DEFAULT_SHARED_CIDR: &str = "10.100.0.0/16";
+use crate::api::{send_org_request, OrgRequest, OrgResponse};
+use crate::types::VpcOwner;
 
-fn open_store() -> Result<OrgStore> {
-    let db = LayerDb::open("org").context("failed to open org database")?;
-    Ok(OrgStore::new(db))
+fn control_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("control.sock")
 }
 
-pub fn run_create(
+fn daemon_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot reach the syfrah daemon — is it running?\n\
+         Start it with: syfrah fabric init ...\n\n\
+         Error: {e}"
+    )
+}
+
+pub async fn run_create(
     name: &str,
     org: &str,
     project: Option<&str>,
@@ -30,113 +40,99 @@ pub fn run_create(
         );
     }
 
-    let store = open_store()?;
-
-    let (owner, cidr_str) = if shared {
-        let owner = VpcOwner::Org(OrgId(org.to_string()));
-        let cidr_str = cidr.unwrap_or(DEFAULT_SHARED_CIDR);
-        (owner, cidr_str)
-    } else {
-        let project = project.unwrap();
-        let owner = VpcOwner::Project(ProjectId(format!("{org}/{project}")));
-        let cidr_str = cidr.unwrap_or(DEFAULT_PROJECT_CIDR);
-        (owner, cidr_str)
+    let req = OrgRequest::VpcCreate {
+        name: name.to_string(),
+        org: org.to_string(),
+        project: project.map(String::from),
+        shared,
+        cidr: cidr.map(String::from),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    let vpc = store
-        .create_vpc(name, cidr_str, owner, shared)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    println!("VPC created: {}", vpc.name);
-    match &vpc.owner {
-        VpcOwner::Org(org_id) => {
-            println!("  Org:      {}", org_id.0);
-            println!("  Shared:   yes");
-        }
-        VpcOwner::Project(proj_id) => {
-            println!("  Org:      {org}");
-            if let Some(p) = proj_id.0.split('/').nth(1) {
-                println!("  Project:  {p}");
+    match resp {
+        OrgResponse::Vpc(vpc) => {
+            println!("VPC created: {}", vpc.name);
+            match &vpc.owner {
+                VpcOwner::Org(org_id) => {
+                    println!("  Org:      {}", org_id.0);
+                    println!("  Shared:   yes");
+                }
+                VpcOwner::Project(proj_id) => {
+                    println!("  Org:      {org}");
+                    if let Some(p) = proj_id.0.split('/').nth(1) {
+                        println!("  Project:  {p}");
+                    }
+                }
             }
+            println!("  CIDR:     {}", vpc.cidr);
+            println!("  VNI:      {}", vpc.vni);
+            println!("  Created:  {}", format_timestamp(vpc.created_at));
+            Ok(())
         }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-    println!("  CIDR:     {}", vpc.cidr);
-    println!("  VNI:      {}", vpc.vni);
-    println!("  Created:  {}", format_timestamp(vpc.created_at));
-
-    Ok(())
 }
 
-pub fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<()> {
-    let store = open_store()?;
-
-    let vpcs = match (org, project) {
-        (Some(org_name), Some(proj_name)) => {
-            let project_id = ProjectId(format!("{org_name}/{proj_name}"));
-            store
-                .list_vpcs_by_project(&project_id)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        (Some(org_name), None) => {
-            let org_id = OrgId(org_name.to_string());
-            store
-                .list_vpcs_by_org(&org_id)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        _ => store.list_vpcs().map_err(|e| anyhow::anyhow!("{e}"))?,
+pub async fn run_list(org: Option<&str>, project: Option<&str>, json: bool) -> Result<()> {
+    let req = OrgRequest::VpcList {
+        org: org.map(String::from),
+        project: project.map(String::from),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&vpcs)?);
-        return Ok(());
-    }
+    match resp {
+        OrgResponse::VpcList(vpcs) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&vpcs)?);
+                return Ok(());
+            }
 
-    if vpcs.is_empty() {
-        println!("No VPCs found.");
-        if let Some(org_name) = org {
+            if vpcs.is_empty() {
+                println!("No VPCs found.");
+                if let Some(org_name) = org {
+                    println!(
+                        "\nCreate one with: syfrah vpc create <name> --project <project> --org {org_name}"
+                    );
+                }
+                return Ok(());
+            }
+
             println!(
-                "\nCreate one with: syfrah vpc create <name> --project <project> --org {org_name}"
+                "{:<20} {:<18} {:<6} {:<25} {:<8} CREATED",
+                "NAME", "CIDR", "VNI", "OWNER", "SHARED"
             );
+            println!("{}", "-".repeat(95));
+
+            for vpc in &vpcs {
+                let owner = match &vpc.owner {
+                    VpcOwner::Project(pid) => pid.0.clone(),
+                    VpcOwner::Org(oid) => oid.0.clone(),
+                };
+                let shared = if vpc.shared { "yes" } else { "no" };
+                println!(
+                    "{:<20} {:<18} {:<6} {:<25} {:<8} {}",
+                    vpc.name,
+                    vpc.cidr,
+                    vpc.vni,
+                    owner,
+                    shared,
+                    format_timestamp(vpc.created_at),
+                );
+            }
+
+            Ok(())
         }
-        return Ok(());
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    println!(
-        "{:<20} {:<18} {:<6} {:<25} {:<8} CREATED",
-        "NAME", "CIDR", "VNI", "OWNER", "SHARED"
-    );
-    println!("{}", "-".repeat(95));
-
-    for vpc in &vpcs {
-        let owner = match &vpc.owner {
-            VpcOwner::Project(pid) => pid.0.clone(),
-            VpcOwner::Org(oid) => oid.0.clone(),
-        };
-        let shared = if vpc.shared { "yes" } else { "no" };
-        println!(
-            "{:<20} {:<18} {:<6} {:<25} {:<8} {}",
-            vpc.name,
-            vpc.cidr,
-            vpc.vni,
-            owner,
-            shared,
-            format_timestamp(vpc.created_at),
-        );
-    }
-
-    Ok(())
 }
 
-pub fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
-    let store = open_store()?;
-
-    // Check it exists first
-    match store.get_vpc(name) {
-        Ok(Some(_)) => {}
-        Ok(None) => bail!("vpc '{name}' not found"),
-        Err(e) => bail!("failed to look up vpc: {e}"),
-    }
-
+pub async fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
     if !yes {
         eprint!("Delete VPC '{name}'? This cannot be undone. [y/N] ");
         let mut answer = String::new();
@@ -148,91 +144,140 @@ pub fn run_delete(name: &str, _org: &str, yes: bool) -> Result<()> {
         }
     }
 
-    store.delete_vpc(name).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("VPC '{name}' deleted.");
-    Ok(())
-}
-
-pub fn run_attach(vpc_name: &str, project: &str) -> Result<()> {
-    let store = open_store()?;
-    store
-        .attach_vpc(vpc_name, project)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("Project '{project}' attached to VPC '{vpc_name}'.");
-    Ok(())
-}
-
-pub fn run_detach(vpc_name: &str, project: &str) -> Result<()> {
-    let store = open_store()?;
-    store
-        .detach_vpc(vpc_name, project)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("Project '{project}' detached from VPC '{vpc_name}'.");
-    Ok(())
-}
-
-pub fn run_peer(from: &str, to: &str) -> Result<()> {
-    let store = open_store()?;
-    store
-        .create_peering(from, to)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("VPCs peered: {from} <-> {to}");
-    Ok(())
-}
-
-pub fn run_unpeer(from: &str, to: &str) -> Result<()> {
-    let store = open_store()?;
-    store
-        .delete_peering(from, to)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("VPCs unpeered: {from} <-> {to}");
-    Ok(())
-}
-
-pub fn run_peerings(vpc: Option<&str>, json: bool) -> Result<()> {
-    let store = open_store()?;
-
-    let peerings = match vpc {
-        Some(name) => store
-            .list_peerings_for_vpc(name)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => {
-            let all = store.list_peerings().map_err(|e| anyhow::anyhow!("{e}"))?;
-            all.into_iter()
-                .filter(|p| p.status == crate::types::PeeringStatus::Active)
-                .collect()
-        }
+    let req = OrgRequest::VpcDelete {
+        name: name.to_string(),
     };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&peerings)?);
-        return Ok(());
-    }
-
-    if peerings.is_empty() {
-        println!("No peerings found.");
-        if vpc.is_some() {
-            println!("\nCreate one with: syfrah vpc peer --from <vpc-a> --to <vpc-b>");
+    match resp {
+        OrgResponse::Ok => {
+            println!("VPC '{name}' deleted.");
+            Ok(())
         }
-        return Ok(());
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
+}
 
-    println!("{:<20} {:<20} {:<10} CREATED", "VPC_A", "VPC_B", "STATUS");
-    println!("{}", "-".repeat(70));
+pub async fn run_attach(vpc_name: &str, project: &str) -> Result<()> {
+    let req = OrgRequest::VpcAttach {
+        vpc: vpc_name.to_string(),
+        project: project.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    for p in &peerings {
-        let vpc_a_name = store.resolve_vpc_name(&p.vpc_a);
-        let vpc_b_name = store.resolve_vpc_name(&p.vpc_b);
-        println!(
-            "{:<20} {:<20} {:<10} {}",
-            vpc_a_name,
-            vpc_b_name,
-            p.status,
-            format_timestamp(p.created_at),
-        );
+    match resp {
+        OrgResponse::Ok => {
+            println!("Project '{project}' attached to VPC '{vpc_name}'.");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
+}
 
-    Ok(())
+pub async fn run_detach(vpc_name: &str, project: &str) -> Result<()> {
+    let req = OrgRequest::VpcDetach {
+        vpc: vpc_name.to_string(),
+        project: project.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Ok => {
+            println!("Project '{project}' detached from VPC '{vpc_name}'.");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_peer(from: &str, to: &str) -> Result<()> {
+    let req = OrgRequest::VpcPeer {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Ok => {
+            println!("VPCs peered: {from} <-> {to}");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_unpeer(from: &str, to: &str) -> Result<()> {
+    let req = OrgRequest::VpcUnpeer {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Ok => {
+            println!("VPCs unpeered: {from} <-> {to}");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_peerings(vpc: Option<&str>, json: bool) -> Result<()> {
+    let req = OrgRequest::VpcPeeringsList {
+        vpc: vpc.map(String::from),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::PeeringList(peerings) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&peerings)?);
+                return Ok(());
+            }
+
+            if peerings.is_empty() {
+                println!("No peerings found.");
+                if vpc.is_some() {
+                    println!("\nCreate one with: syfrah vpc peer --from <vpc-a> --to <vpc-b>");
+                }
+                return Ok(());
+            }
+
+            println!("{:<20} {:<20} {:<10} CREATED", "VPC_A", "VPC_B", "STATUS");
+            println!("{}", "-".repeat(70));
+
+            for p in &peerings {
+                println!(
+                    "{:<20} {:<20} {:<10} {}",
+                    p.vpc_a,
+                    p.vpc_b,
+                    p.status,
+                    format_timestamp(p.created_at),
+                );
+            }
+
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
 fn format_timestamp(ts: u64) -> String {
@@ -281,7 +326,6 @@ mod tests {
 
     #[test]
     fn vpc_create_parse() {
-        // Project-scoped VPC with all flags
         let cmd = parse(&[
             "create",
             "my-vpc",
@@ -309,7 +353,6 @@ mod tests {
             other => panic!("expected Create, got {other:?}"),
         }
 
-        // Shared VPC
         let cmd = parse(&[
             "create",
             "shared-net",
@@ -336,7 +379,6 @@ mod tests {
             other => panic!("expected Create, got {other:?}"),
         }
 
-        // Project-scoped without explicit CIDR
         let cmd = parse(&[
             "create",
             "default-vpc",
@@ -421,7 +463,6 @@ mod tests {
 
     #[test]
     fn vpc_peerings_parse() {
-        // With --vpc filter and --json
         let cmd = parse(&["peerings", "--vpc", "hub-vpc", "--json"]);
         match cmd {
             VpcCommand::Peerings { vpc, json } => {
@@ -431,7 +472,6 @@ mod tests {
             other => panic!("expected Peerings, got {other:?}"),
         }
 
-        // Without filters
         let cmd = parse(&["peerings"]);
         match cmd {
             VpcCommand::Peerings { vpc, json } => {
@@ -441,7 +481,6 @@ mod tests {
             other => panic!("expected Peerings, got {other:?}"),
         }
 
-        // With only --vpc
         let cmd = parse(&["peerings", "--vpc", "my-vpc"]);
         match cmd {
             VpcCommand::Peerings { vpc, json } => {

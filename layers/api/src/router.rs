@@ -17,6 +17,8 @@ pub enum LayerRequest {
     Fabric(Vec<u8>),
     /// Request destined for the Compute layer.
     Compute(Vec<u8>),
+    /// Request destined for the Org layer.
+    Org(Vec<u8>),
 }
 
 /// Top-level response envelope returned to the client.
@@ -26,6 +28,8 @@ pub enum LayerResponse {
     Fabric(Vec<u8>),
     /// Response originating from the Compute layer.
     Compute(Vec<u8>),
+    /// Response originating from the Org layer.
+    Org(Vec<u8>),
     /// The requested layer is not registered in the router.
     UnknownLayer(String),
 }
@@ -70,6 +74,13 @@ impl LayerRouter {
                     LayerResponse::Compute(handler.handle(payload, caller_uid).await)
                 } else {
                     LayerResponse::UnknownLayer("compute".into())
+                }
+            }
+            LayerRequest::Org(payload) => {
+                if let Some(handler) = self.handlers.get("org") {
+                    LayerResponse::Org(handler.handle(payload, caller_uid).await)
+                } else {
+                    LayerResponse::UnknownLayer("org".into())
                 }
             }
         }

@@ -13,6 +13,7 @@ syfrah-api = { path = "../api" }
 syfrah-state = { path = "../state" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
 console = "0.15"
 serde.workspace = true
 serde_json.workspace = true

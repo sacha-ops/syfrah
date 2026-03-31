@@ -1,11 +1,28 @@
 //! Implementation of `syfrah env` subcommands.
+//!
+//! All operations go through the daemon's control socket.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use anyhow::{bail, Context};
-use syfrah_state::LayerDb;
+use anyhow::bail;
 
-use crate::store::OrgStore;
+use crate::api::{send_org_request, OrgRequest, OrgResponse};
+
+fn control_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("control.sock")
+}
+
+fn daemon_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot reach the syfrah daemon — is it running?\n\
+         Start it with: syfrah fabric init ...\n\n\
+         Error: {e}"
+    )
+}
 
 // ── Duration parsing ────────────────────────────────────────────────
 
@@ -24,7 +41,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
     if s.chars().all(|c| c.is_ascii_digit()) {
         let value: u64 = s
             .parse()
-            .with_context(|| format!("invalid duration: '{s}'"))?;
+            .map_err(|_| anyhow::anyhow!("invalid duration: '{s}'"))?;
         if value == 0 {
             bail!("duration must be greater than zero");
         }
@@ -32,8 +49,8 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
     }
 
     let (digits, suffix) = s.split_at(s.len() - 1);
-    let value: u64 = digits.parse().with_context(|| {
-        format!("invalid duration: '{s}' (expected a number followed by s, m, h, or d)")
+    let value: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!("invalid duration: '{s}' (expected a number followed by s, m, h, or d)")
     })?;
 
     if value == 0 {
@@ -55,7 +72,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
 fn parse_label(s: &str) -> anyhow::Result<(String, String)> {
     let (key, value) = s
         .split_once('=')
-        .with_context(|| format!("invalid label '{s}': expected KEY=VALUE format"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid label '{s}': expected KEY=VALUE format"))?;
     if key.is_empty() {
         bail!("label key cannot be empty in '{s}'");
     }
@@ -63,11 +80,6 @@ fn parse_label(s: &str) -> anyhow::Result<(String, String)> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-fn open_store() -> anyhow::Result<OrgStore> {
-    let db = LayerDb::open("org").context("failed to open org database")?;
-    Ok(OrgStore::new(db))
-}
 
 fn format_ttl(seconds: Option<u64>) -> String {
     match seconds {
@@ -89,17 +101,12 @@ fn format_labels(labels: &HashMap<String, String>) -> String {
 }
 
 fn format_timestamp(epoch_secs: u64) -> String {
-    // Simple human-readable UTC timestamp.
     let secs = epoch_secs;
-    // Break into date components manually (avoid chrono dependency).
-    // For a CLI display, we show seconds-since-epoch if we don't have
-    // a lightweight formatter. Let's do a basic calculation.
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
 
-    // Compute year/month/day from days since epoch (1970-01-01).
     let (year, month, day) = days_to_ymd(days_since_epoch);
     format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02} UTC")
 }
@@ -149,7 +156,7 @@ fn is_leap(y: u64) -> bool {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-pub fn run_create(
+pub async fn run_create(
     name: &str,
     project: &str,
     org: &str,
@@ -168,31 +175,42 @@ pub fn run_create(
         labels.insert(k, v);
     }
 
-    let store = open_store()?;
-    let env = store
-        .create_env(org, project, name, ttl_seconds, deletion_protection, labels)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = OrgRequest::EnvCreate {
+        name: name.to_string(),
+        project: project.to_string(),
+        org: org.to_string(),
+        ttl: ttl_seconds,
+        deletion_protection,
+        labels,
+    };
 
-    println!("Environment created: {}", env.name);
-    println!("  Project:    {project}");
-    println!("  Org:        {org}");
-    if let Some(ttl) = env.ttl {
-        println!("  TTL:        {}", format_ttl(Some(ttl)));
-    }
-    if env.deletion_protection {
-        println!("  Protected:  yes");
-    }
-    if !env.labels.is_empty() {
-        println!("  Labels:     {}", format_labels(&env.labels));
-    }
-    println!("  Created:    {}", format_timestamp(env.created_at));
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    Ok(())
+    match resp {
+        OrgResponse::Env(env) => {
+            println!("Environment created: {}", env.name);
+            println!("  Project:    {project}");
+            println!("  Org:        {org}");
+            if let Some(ttl) = env.ttl {
+                println!("  TTL:        {}", format_ttl(Some(ttl)));
+            }
+            if env.deletion_protection {
+                println!("  Protected:  yes");
+            }
+            if !env.labels.is_empty() {
+                println!("  Labels:     {}", format_labels(&env.labels));
+            }
+            println!("  Created:    {}", format_timestamp(env.created_at));
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
-pub fn run_list(project: Option<&str>, org: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let store = open_store()?;
-
+pub async fn run_list(project: Option<&str>, org: Option<&str>, json: bool) -> anyhow::Result<()> {
     let (org_name, project_name) = match (org, project) {
         (Some(o), Some(p)) => (o, p),
         (None, None) => {
@@ -206,47 +224,56 @@ pub fn run_list(project: Option<&str>, org: Option<&str>, json: bool) -> anyhow:
         }
     };
 
-    let envs = store
-        .list_envs(org_name, project_name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = OrgRequest::EnvList {
+        project: Some(project_name.to_string()),
+        org: Some(org_name.to_string()),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&envs)?);
-        return Ok(());
+    match resp {
+        OrgResponse::EnvList(envs) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&envs)?);
+                return Ok(());
+            }
+
+            if envs.is_empty() {
+                println!("No environments found in project '{project_name}' (org: {org_name}).");
+                println!(
+                    "\nCreate one with: syfrah env create <name> --project {project_name} --org {org_name}"
+                );
+                return Ok(());
+            }
+
+            println!(
+                "{:<20} {:<15} {:<8} {:<10} {:<30} CREATED",
+                "NAME", "PROJECT", "TTL", "PROTECTED", "LABELS"
+            );
+            println!("{}", "-".repeat(100));
+
+            for env in &envs {
+                let protected = if env.deletion_protection { "yes" } else { "no" };
+                println!(
+                    "{:<20} {:<15} {:<8} {:<10} {:<30} {}",
+                    env.name,
+                    project_name,
+                    format_ttl(env.ttl),
+                    protected,
+                    format_labels(&env.labels),
+                    format_timestamp(env.created_at),
+                );
+            }
+
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    if envs.is_empty() {
-        println!("No environments found in project '{project_name}' (org: {org_name}).");
-        println!(
-            "\nCreate one with: syfrah env create <name> --project {project_name} --org {org_name}"
-        );
-        return Ok(());
-    }
-
-    // Table output: NAME, PROJECT, TTL, PROTECTED, LABELS, CREATED
-    println!(
-        "{:<20} {:<15} {:<8} {:<10} {:<30} CREATED",
-        "NAME", "PROJECT", "TTL", "PROTECTED", "LABELS"
-    );
-    println!("{}", "-".repeat(100));
-
-    for env in &envs {
-        let protected = if env.deletion_protection { "yes" } else { "no" };
-        println!(
-            "{:<20} {:<15} {:<8} {:<10} {:<30} {}",
-            env.name,
-            project_name,
-            format_ttl(env.ttl),
-            protected,
-            format_labels(&env.labels),
-            format_timestamp(env.created_at),
-        );
-    }
-
-    Ok(())
 }
 
-pub fn run_destroy(name: &str, project: &str, org: &str, yes: bool) -> anyhow::Result<()> {
+pub async fn run_destroy(name: &str, project: &str, org: &str, yes: bool) -> anyhow::Result<()> {
     if !yes {
         eprintln!(
             "This will permanently destroy environment '{name}' in project '{project}' (org: {org})."
@@ -255,64 +282,97 @@ pub fn run_destroy(name: &str, project: &str, org: &str, yes: bool) -> anyhow::R
         std::process::exit(1);
     }
 
-    let store = open_store()?;
-    store
-        .delete_env(org, project, name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = OrgRequest::EnvDestroy {
+        name: name.to_string(),
+        project: project.to_string(),
+        org: org.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    println!("Environment destroyed: {name}");
-    Ok(())
+    match resp {
+        OrgResponse::Ok => {
+            println!("Environment destroyed: {name}");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
-pub fn run_extend(name: &str, project: &str, org: &str, ttl_str: &str) -> anyhow::Result<()> {
+pub async fn run_extend(name: &str, project: &str, org: &str, ttl_str: &str) -> anyhow::Result<()> {
     let ttl_seconds = parse_duration(ttl_str)?;
 
-    let store = open_store()?;
-    let env = store
-        .extend_env(org, project, name, ttl_seconds)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = OrgRequest::EnvExtend {
+        name: name.to_string(),
+        project: project.to_string(),
+        org: org.to_string(),
+        ttl_seconds,
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
 
-    println!("Environment extended: {name}");
-    println!("  New TTL:    {}", format_ttl(env.ttl));
-    if let Some(expires) = env.expires_at {
-        println!("  Expires:    {}", format_timestamp(expires));
+    match resp {
+        OrgResponse::Env(env) => {
+            println!("Environment extended: {name}");
+            println!("  New TTL:    {}", format_ttl(env.ttl));
+            if let Some(expires) = env.expires_at {
+                println!("  Expires:    {}", format_timestamp(expires));
+            }
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
-
-    Ok(())
 }
 
-pub fn run_update(
+pub async fn run_update(
     name: &str,
     project: &str,
     org: &str,
     deletion_protection: bool,
     no_deletion_protection: bool,
 ) -> anyhow::Result<()> {
-    let store = open_store()?;
-
-    if deletion_protection {
-        let env = store
-            .update_env_protection(org, project, name, true)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!(
-            "Deletion protection enabled for environment '{}'.",
-            env.name
-        );
+    let dp = if deletion_protection {
+        Some(true)
     } else if no_deletion_protection {
-        let env = store
-            .update_env_protection(org, project, name, false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!(
-            "Deletion protection disabled for environment '{}'.",
-            env.name
-        );
+        Some(false)
     } else {
         anyhow::bail!(
             "specify --deletion-protection or --no-deletion-protection to update the environment"
         );
-    }
+    };
 
-    Ok(())
+    let req = OrgRequest::EnvUpdate {
+        name: name.to_string(),
+        project: project.to_string(),
+        org: org.to_string(),
+        deletion_protection: dp,
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Env(env) => {
+            if deletion_protection {
+                println!(
+                    "Deletion protection enabled for environment '{}'.",
+                    env.name
+                );
+            } else {
+                println!(
+                    "Deletion protection disabled for environment '{}'.",
+                    env.name
+                );
+            }
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -348,8 +408,6 @@ mod tests {
 
     #[test]
     fn env_destroy_parse() {
-        // With --yes the command should proceed; without it, it exits.
-        // We test the flag parsing via clap derive.
         use clap::Parser;
 
         #[derive(Parser)]
@@ -358,7 +416,6 @@ mod tests {
             cmd: crate::cli::EnvCommand,
         }
 
-        // Parse with --yes
         let cli = TestCli::parse_from([
             "test",
             "destroy",
@@ -385,7 +442,6 @@ mod tests {
             _ => panic!("expected Destroy command"),
         }
 
-        // Parse without --yes
         let cli = TestCli::parse_from([
             "test",
             "destroy",
@@ -437,7 +493,6 @@ mod tests {
                 assert_eq!(project, "backend");
                 assert_eq!(org, "acme");
                 assert_eq!(ttl, "24h");
-                // Verify the duration parses correctly
                 assert_eq!(parse_duration(&ttl).unwrap(), 86400);
             }
             _ => panic!("expected Extend command"),
