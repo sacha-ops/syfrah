@@ -6,6 +6,7 @@ pub mod linux;
 pub mod mock;
 pub mod nft;
 pub mod reconcile;
+pub mod rollback;
 pub mod sysctl;
 pub mod tap;
 pub mod veth_peer;
@@ -24,6 +25,7 @@ pub use reconcile::{
     reconcile_network, AllocationState, ExpectedBridge, ExpectedVm, IpAllocation, NetworkState,
     ReconcileReport,
 };
+pub use rollback::NetworkRollback;
 pub use sysctl::ensure_ip_forwarding;
 
 #[cfg(test)]
