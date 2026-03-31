@@ -166,6 +166,25 @@ pub enum OrgError {
     #[error("target resource '{name}' is not active (current state: {state})")]
     RouteTargetNotActive { name: String, state: String },
 
+    #[error("nat-gw already exists: {0}")]
+    NatGwAlreadyExists(String),
+
+    #[error("nat-gw not found: {0}")]
+    NatGwNotFound(String),
+
+    #[error("cannot delete nat-gw '{name}': referenced by route {route} in route table '{table}'")]
+    NatGwHasRoutes {
+        name: String,
+        route: String,
+        table: String,
+    },
+
+    #[error("cannot delete nat-gw '{name}': {count} VM(s) in subnet are actively using it")]
+    NatGwInUse { name: String, count: usize },
+
+    #[error("nat-gw '{name}' is not active (current state: {state})")]
+    NatGwNotActive { name: String, state: String },
+
     #[error("security group already exists: {0}")]
     SgAlreadyExists(String),
 
