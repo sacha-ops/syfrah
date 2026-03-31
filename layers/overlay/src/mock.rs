@@ -128,11 +128,13 @@ impl NetworkBackend for MockBackend {
     // ── TAP / veth ─────────────────────────────────────────────────────
 
     async fn create_tap(&self, name: &str) -> Result<()> {
+        self.should_fail("create_tap")?;
         self.record(format!("create_tap({name})"));
         Ok(())
     }
 
     async fn delete_tap(&self, name: &str) -> Result<()> {
+        self.should_fail("delete_tap")?;
         self.record(format!("delete_tap({name})"));
         Ok(())
     }
