@@ -21,6 +21,7 @@ use std::path::PathBuf as StdPathBuf;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ComputeRequest {
     CreateVm {
         name: String,
@@ -35,6 +36,9 @@ pub enum ComputeRequest {
         disk_size_mb: Option<u32>,
         #[serde(default)]
         subnet: Option<crate::types::SubnetInfo>,
+        /// Security group names to attach. Defaults to `["default"]`.
+        #[serde(default)]
+        security_groups: Vec<String>,
     },
     ListVms,
     GetVm {
@@ -172,6 +176,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
             ssh_key,
             disk_size_mb,
             subnet,
+            security_groups,
         } => {
             let gpu = match gpu_bdf {
                 Some(bdf) => GpuMode::Passthrough { bdf },
@@ -193,6 +198,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 ssh_key,
                 disk_size_mb,
                 subnet,
+                security_groups,
             };
             match mgr.create_vm(spec).await {
                 Ok(status) => ComputeResponse::Vm(vm_status_to_json(&status)),

@@ -1661,6 +1661,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let h1 = compute_spec_hash(&spec);
         let h2 = compute_spec_hash(&spec);
