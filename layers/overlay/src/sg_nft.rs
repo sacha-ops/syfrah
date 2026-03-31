@@ -1,11 +1,10 @@
-//! Security Group nftables rule generation.
+//! Security Group nftables rule generation and atomic application.
 //!
 //! Converts `SecurityGroupRule` objects into nftables chain rules for
-//! per-VM ingress chains. Rules from all SGs attached to a NIC are
-//! merged and sorted by priority before generation.
+//! per-VM ingress and egress chains. Rules from all SGs attached to a NIC
+//! are merged and sorted by priority before generation.
 //!
-//! This module handles ingress only. Egress, named sets, and atomic
-//! apply are in separate modules.
+//! Provides atomic apply/remove via `nft -f -` for transactional updates.
 
 use std::fmt::Write;
 use std::net::Ipv4Addr;
@@ -196,6 +195,113 @@ pub fn render_egress_chain(vm_id: &str, rules: &[NftRule]) -> String {
         writeln!(buf, "    {}", rule.text).unwrap();
     }
     writeln!(buf, "}}").unwrap();
+    buf
+}
+
+// ── Atomic apply / remove ─────────────────────────────────────────
+
+/// The nftables table name used for SG chains.
+const SG_TABLE: &str = "syfrah_sg";
+
+/// Build a complete nftables ruleset for a VM's security groups.
+///
+/// The ruleset includes:
+/// 1. Table creation (`create table inet syfrah_sg` -- idempotent)
+/// 2. Named sets for any SG references
+/// 3. Ingress chain (`vm_{hash}_in`)
+/// 4. Egress chain (`vm_{hash}_out`)
+///
+/// `sg_ip_map` provides the IP addresses for each referenced SG name.
+pub fn build_sg_ruleset(
+    nic: &NetworkInterface,
+    rules: &[SecurityGroupRule],
+    sg_ip_map: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let mut buf = String::new();
+
+    // Idempotent table creation.
+    writeln!(buf, "create table inet {SG_TABLE}").unwrap();
+
+    // Named sets for SG references.
+    for (sg_name, ips) in sg_ip_map {
+        write!(buf, "{}", generate_named_set_in_table(sg_name, ips)).unwrap();
+    }
+
+    // Ingress chain.
+    let ingress_rules = generate_ingress_chain(nic, rules);
+    let in_chain = ingress_chain_name(&nic.vm_id);
+    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "add chain inet {SG_TABLE} {in_chain}").unwrap();
+    for rule in &ingress_rules {
+        writeln!(buf, "add rule inet {SG_TABLE} {in_chain} {}", rule.text).unwrap();
+    }
+
+    // Egress chain.
+    let egress_rules = generate_egress_chain(nic, rules);
+    let out_chain = egress_chain_name(&nic.vm_id);
+    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "add chain inet {SG_TABLE} {out_chain}").unwrap();
+    for rule in &egress_rules {
+        writeln!(buf, "add rule inet {SG_TABLE} {out_chain} {}", rule.text).unwrap();
+    }
+
+    buf
+}
+
+/// Generate a named set definition inside the SG table.
+fn generate_named_set_in_table(sg_name: &str, ips: &[String]) -> String {
+    let name = sg_set_name(sg_name);
+    let mut buf = String::new();
+    writeln!(buf, "add set inet {SG_TABLE} {name} {{ type ipv4_addr; }}").unwrap();
+    if !ips.is_empty() {
+        writeln!(
+            buf,
+            "add element inet {SG_TABLE} {name} {{ {} }}",
+            ips.join(", ")
+        )
+        .unwrap();
+    }
+    buf
+}
+
+/// Apply SG rules for a VM atomically via `nft -f -`.
+///
+/// Builds the complete ruleset and pipes it to nft.
+pub fn apply_sg_for_vm(
+    nic: &NetworkInterface,
+    rules: &[SecurityGroupRule],
+    sg_ip_map: &std::collections::HashMap<String, Vec<String>>,
+) -> std::io::Result<()> {
+    let ruleset = build_sg_ruleset(nic, rules, sg_ip_map);
+    crate::nft::apply_ruleset(&ruleset)
+}
+
+/// Remove all SG chains for a VM by flushing and deleting them.
+///
+/// Produces an nftables script that flushes the ingress/egress chains
+/// and deletes them from the SG table.
+pub fn remove_sg_for_vm(vm_id: &str) -> std::io::Result<()> {
+    let in_chain = ingress_chain_name(vm_id);
+    let out_chain = egress_chain_name(vm_id);
+    let mut buf = String::new();
+    // Flush then delete — both are idempotent-safe with `delete` (nft
+    // returns success if chain does not exist when using -f batch).
+    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "delete chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "delete chain inet {SG_TABLE} {out_chain}").unwrap();
+    crate::nft::apply_ruleset(&buf)
+}
+
+/// Build the removal ruleset for a VM (for testing without executing).
+pub fn build_remove_ruleset(vm_id: &str) -> String {
+    let in_chain = ingress_chain_name(vm_id);
+    let out_chain = egress_chain_name(vm_id);
+    let mut buf = String::new();
+    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "delete chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "delete chain inet {SG_TABLE} {out_chain}").unwrap();
     buf
 }
 
@@ -783,5 +889,98 @@ mod tests {
         let set_name = sg_set_name("web-sg");
         let expected = format!("sg_{}_ips", short_hash("web-sg"));
         assert_eq!(set_name, expected);
+    }
+
+    // ── Atomic apply/remove tests ─────────────────────────────────
+
+    #[test]
+    fn test_build_sg_ruleset_contains_table() {
+        let nic = test_nic();
+        let rules = vec![ingress_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 22, to: 22 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let sg_map = std::collections::HashMap::new();
+        let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
+        assert!(ruleset.contains("create table inet syfrah_sg"));
+    }
+
+    #[test]
+    fn test_build_sg_ruleset_contains_chains() {
+        let nic = test_nic();
+        let rules = vec![ingress_rule(
+            Protocol::Tcp,
+            Some(PortRange { from: 22, to: 22 }),
+            TrafficSource::Cidr("0.0.0.0/0".to_string()),
+            100,
+        )];
+        let sg_map = std::collections::HashMap::new();
+        let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
+        let in_chain = ingress_chain_name(&nic.vm_id);
+        let out_chain = egress_chain_name(&nic.vm_id);
+        assert!(ruleset.contains(&format!("add chain inet syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("add chain inet syfrah_sg {out_chain}")));
+    }
+
+    #[test]
+    fn test_build_sg_ruleset_with_sg_ref() {
+        let nic = test_nic();
+        let rules = vec![ingress_rule(
+            Protocol::Tcp,
+            Some(PortRange {
+                from: 5432,
+                to: 5432,
+            }),
+            TrafficSource::SecurityGroup("web-sg".to_string()),
+            100,
+        )];
+        let mut sg_map = std::collections::HashMap::new();
+        sg_map.insert(
+            "web-sg".to_string(),
+            vec!["10.1.0.5".to_string(), "10.1.0.6".to_string()],
+        );
+        let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
+        let set_name = sg_set_name("web-sg");
+        assert!(ruleset.contains(&format!("add set inet syfrah_sg {set_name}")));
+        assert!(ruleset.contains("10.1.0.5, 10.1.0.6"));
+    }
+
+    #[test]
+    fn test_build_sg_ruleset_ingress_and_egress() {
+        let nic = test_nic();
+        let rules = vec![
+            ingress_rule(
+                Protocol::Tcp,
+                Some(PortRange { from: 22, to: 22 }),
+                TrafficSource::Cidr("0.0.0.0/0".to_string()),
+                100,
+            ),
+            egress_rule(
+                Protocol::Tcp,
+                Some(PortRange { from: 443, to: 443 }),
+                TrafficSource::Cidr("0.0.0.0/0".to_string()),
+                100,
+            ),
+        ];
+        let sg_map = std::collections::HashMap::new();
+        let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
+        // Ingress: TCP 22 + drop.
+        assert!(ruleset.contains("tcp dport 22 accept"));
+        assert!(ruleset.contains("drop"));
+        // Egress: TCP 443 + drop (since rules exist).
+        assert!(ruleset.contains("tcp dport 443 accept"));
+    }
+
+    #[test]
+    fn test_build_remove_ruleset() {
+        let ruleset = build_remove_ruleset("vm-1");
+        let in_chain = ingress_chain_name("vm-1");
+        let out_chain = egress_chain_name("vm-1");
+        assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {out_chain}")));
+        assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {out_chain}")));
     }
 }
