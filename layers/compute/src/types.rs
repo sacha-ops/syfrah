@@ -110,6 +110,15 @@ pub struct VmStatus {
     pub created_at: Option<u64>,
     /// Seconds the VM has been running. `None` if not in the `Running` phase.
     pub uptime_secs: Option<u64>,
+    /// IP address assigned to the VM (e.g. "10.1.1.3").
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// Subnet the VM belongs to (e.g. "frontend").
+    #[serde(default)]
+    pub subnet: Option<String>,
+    /// VPC the VM belongs to (e.g. "default").
+    #[serde(default)]
+    pub vpc: Option<String>,
 }
 
 /// Observable events emitted to forge via a broadcast channel.
@@ -280,6 +289,9 @@ mod tests {
             runtime: Some(RuntimeType::Vm),
             created_at: Some(1700000000),
             uptime_secs: Some(3600),
+            ip: None,
+            subnet: None,
+            vpc: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: VmStatus = serde_json::from_str(&json).unwrap();
@@ -369,5 +381,84 @@ mod tests {
         let spec: VmSpec = serde_json::from_str(json).unwrap();
         assert!(spec.ssh_key.is_none());
         assert!(spec.disk_size_mb.is_none());
+    }
+
+    #[test]
+    fn vm_list_shows_ip() {
+        let status = VmStatus {
+            vm_id: VmId("web-1".to_string()),
+            phase: VmPhase::Running,
+            vcpus: 2,
+            memory_mb: 2048,
+            image: Some("alpine-3.20".to_string()),
+            runtime: None,
+            created_at: Some(1700000000),
+            uptime_secs: Some(60),
+            ip: Some("10.1.1.3".to_string()),
+            subnet: Some("frontend".to_string()),
+            vpc: Some("default".to_string()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["ip"].as_str(), Some("10.1.1.3"));
+    }
+
+    #[test]
+    fn vm_get_shows_subnet() {
+        let status = VmStatus {
+            vm_id: VmId("db-1".to_string()),
+            phase: VmPhase::Running,
+            vcpus: 4,
+            memory_mb: 8192,
+            image: Some("ubuntu-24.04".to_string()),
+            runtime: None,
+            created_at: Some(1700000000),
+            uptime_secs: Some(3600),
+            ip: Some("10.1.2.3".to_string()),
+            subnet: Some("database".to_string()),
+            vpc: Some("default".to_string()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["subnet"].as_str(), Some("database"));
+    }
+
+    #[test]
+    fn vm_get_json_has_network_fields() {
+        let status = VmStatus {
+            vm_id: VmId("web-2".to_string()),
+            phase: VmPhase::Running,
+            vcpus: 2,
+            memory_mb: 2048,
+            image: Some("alpine-3.20".to_string()),
+            runtime: None,
+            created_at: Some(1700000000),
+            uptime_secs: Some(120),
+            ip: Some("10.1.1.4".to_string()),
+            subnet: Some("frontend".to_string()),
+            vpc: Some("prod-vpc".to_string()),
+        };
+        let json_str = serde_json::to_string(&status).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["ip"].as_str(), Some("10.1.1.4"));
+        assert_eq!(json["subnet"].as_str(), Some("frontend"));
+        assert_eq!(json["vpc"].as_str(), Some("prod-vpc"));
+    }
+
+    #[test]
+    fn vm_status_without_network_fields_deserializes() {
+        // Backward compatibility: JSON without ip/subnet/vpc should deserialize
+        let json = r#"{
+            "vm_id": "vm-old",
+            "phase": "Running",
+            "vcpus": 2,
+            "memory_mb": 1024,
+            "image": "alpine",
+            "runtime": null,
+            "created_at": 1700000000,
+            "uptime_secs": 60
+        }"#;
+        let status: VmStatus = serde_json::from_str(json).unwrap();
+        assert!(status.ip.is_none());
+        assert!(status.subnet.is_none());
+        assert!(status.vpc.is_none());
     }
 }

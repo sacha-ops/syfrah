@@ -616,6 +616,9 @@ impl VmManager {
             image_name: Some(spec.image.clone()),
             instance_dir_path,
             runtime_handle: Some(handle),
+            ip: None,
+            subnet: None,
+            vpc: None,
         };
 
         let status = state.to_status(now);
@@ -888,6 +891,9 @@ impl VmManager {
                     image_name: handle.image_name.clone(),
                     instance_dir_path: None,
                     runtime_handle: Some(handle),
+                    ip: None,
+                    subnet: None,
+                    vpc: None,
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;
