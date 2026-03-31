@@ -420,6 +420,84 @@ pub enum SgCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Add a firewall rule to a security group
+    #[command(
+        name = "add-rule",
+        after_help = "Examples:\n  \
+            syfrah sg add-rule web-sg --direction ingress --protocol tcp --port 443 --source 0.0.0.0/0\n  \
+            syfrah sg add-rule db-sg --direction ingress --protocol tcp --port 5432 --source-sg web-sg\n  \
+            syfrah sg add-rule app-sg --direction egress --protocol tcp --port 8000-9000 --source 10.0.0.0/8"
+    )]
+    AddRule {
+        /// Security group name
+        sg: String,
+        /// Rule direction: ingress or egress
+        #[arg(long)]
+        direction: String,
+        /// Protocol: tcp, udp, icmp, or all
+        #[arg(long)]
+        protocol: String,
+        /// Port number (e.g. 443) or range (e.g. 8000-9000)
+        #[arg(long)]
+        port: Option<String>,
+        /// Source/destination as CIDR (e.g. 0.0.0.0/0)
+        #[arg(long, conflicts_with = "source_sg")]
+        source: Option<String>,
+        /// Source/destination as security group name
+        #[arg(long, conflicts_with = "source")]
+        source_sg: Option<String>,
+        /// Rule description
+        #[arg(long)]
+        description: Option<String>,
+        /// Priority (lower = evaluated first, default: 100)
+        #[arg(long)]
+        priority: Option<u32>,
+    },
+    /// Remove a rule from a security group
+    #[command(
+        name = "remove-rule",
+        after_help = "Examples:\n  syfrah sg remove-rule web-sg --rule-id rule-abc123"
+    )]
+    RemoveRule {
+        /// Security group name
+        sg: String,
+        /// Rule ID to remove
+        #[arg(long)]
+        rule_id: String,
+    },
+    /// List rules in a security group
+    #[command(
+        name = "rules",
+        after_help = "Examples:\n  syfrah sg rules web-sg\n  syfrah sg rules web-sg --json"
+    )]
+    Rules {
+        /// Security group name
+        sg: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check if traffic would be allowed or denied by a VM's security groups
+    #[command(
+        name = "check",
+        after_help = "Examples:\n  \
+            syfrah sg check --vm web-1 --port 443 --protocol tcp\n  \
+            syfrah sg check --vm web-1 --port 22 --protocol tcp --source 10.0.0.1"
+    )]
+    Check {
+        /// VM name to evaluate
+        #[arg(long)]
+        vm: String,
+        /// Port to check
+        #[arg(long)]
+        port: u16,
+        /// Protocol: tcp, udp, icmp
+        #[arg(long, default_value = "tcp")]
+        protocol: String,
+        /// Source IP address to check (default: 0.0.0.0 = any)
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 /// Execute an org CLI command.
@@ -570,5 +648,35 @@ pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
         SgCommand::ListAttached { vm, nic, json } => {
             sg::run_list_attached(vm.as_deref(), nic.as_deref(), json).await
         }
+        SgCommand::AddRule {
+            sg,
+            direction,
+            protocol,
+            port,
+            source,
+            source_sg,
+            description,
+            priority,
+        } => {
+            sg::run_add_rule(
+                &sg,
+                &direction,
+                &protocol,
+                port.as_deref(),
+                source.as_deref(),
+                source_sg.as_deref(),
+                description.as_deref(),
+                priority,
+            )
+            .await
+        }
+        SgCommand::RemoveRule { sg, rule_id } => sg::run_remove_rule(&sg, &rule_id).await,
+        SgCommand::Rules { sg, json } => sg::run_rules(&sg, json).await,
+        SgCommand::Check {
+            vm,
+            port,
+            protocol,
+            source,
+        } => sg::run_check(&vm, port, &protocol, source.as_deref()).await,
     }
 }
