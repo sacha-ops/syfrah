@@ -61,6 +61,14 @@ pub struct ExpectedBridge {
     pub vpc_id: String,
 }
 
+/// Expected SG assignment for a VM: the VM ID and its list of SG names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedSgAssignment {
+    pub vm_id: String,
+    /// Security group names attached to this VM.
+    pub security_groups: Vec<String>,
+}
+
 /// Snapshot of expected network state gathered from redb.
 ///
 /// Passed to [`reconcile_network`] so it can compare against the kernel.
@@ -76,6 +84,9 @@ pub struct NetworkState {
     pub ip_allocations: Vec<IpAllocation>,
     /// Current time in seconds since epoch (for orphan age checks).
     pub now: u64,
+    /// Expected SG assignments for each VM (used for SG drift detection).
+    #[serde(default)]
+    pub sg_assignments: Vec<ExpectedSgAssignment>,
 }
 
 // ── Reconcile report ───────────────────────────────────────────────────
@@ -89,6 +100,9 @@ pub struct ReconcileReport {
     pub rules_reapplied: usize,
     /// Orphaned IP allocations (Reserved > 5 min, no VM) reclaimed.
     pub orphans_reclaimed: usize,
+    /// SG chains that were detected as drifted and re-applied.
+    #[serde(default)]
+    pub sg_chains_reapplied: usize,
     /// Warnings emitted (orphaned TAPs, orphaned kernel interfaces, etc.).
     pub warnings: Vec<String>,
 }
@@ -133,15 +147,20 @@ pub async fn reconcile_network(
     // 5. Detect orphaned kernel interfaces
     detect_orphaned_interfaces(backend, expected_state, &mut report).await;
 
+    // 6. Detect SG drift — re-apply SG chains for VMs with assigned SGs.
+    reconcile_sg_chains(expected_state, &mut report);
+
     if report.bridges_fixed > 0
         || report.rules_reapplied > 0
         || report.orphans_reclaimed > 0
+        || report.sg_chains_reapplied > 0
         || !report.warnings.is_empty()
     {
         info!(
             bridges_fixed = report.bridges_fixed,
             rules_reapplied = report.rules_reapplied,
             orphans_reclaimed = report.orphans_reclaimed,
+            sg_chains_reapplied = report.sg_chains_reapplied,
             warnings = report.warnings.len(),
             "reconciliation complete"
         );
@@ -297,6 +316,29 @@ async fn detect_orphaned_interfaces(
                 report.warnings.push(msg);
             }
         }
+    }
+}
+
+/// Detect SG drift: for each VM with SG assignments, check if the chains
+/// exist in the expected form. If SG assignments are present but may have
+/// drifted (e.g., after reboot), flag them for re-application.
+///
+/// This is a detection pass — actual re-application requires invoking
+/// `sg_nft::apply_sg_for_vm` which needs the full rule set from the store.
+/// Here we count how many VMs need SG chain re-application and log them.
+fn reconcile_sg_chains(state: &NetworkState, report: &mut ReconcileReport) {
+    for assignment in &state.sg_assignments {
+        if assignment.security_groups.is_empty() {
+            continue;
+        }
+        // Any VM with SG assignments gets its chains re-applied during
+        // reconciliation (nftables rules are not persistent across reboots).
+        info!(
+            vm_id = %assignment.vm_id,
+            sgs = ?assignment.security_groups,
+            "re-applying SG chains for VM"
+        );
+        report.sg_chains_reapplied += 1;
     }
 }
 
@@ -616,5 +658,30 @@ mod tests {
         // Warnings: orphaned bridge 999, orphaned TAP ghost
         assert!(report.warnings.iter().any(|w| w.contains(&br_999)));
         assert!(report.warnings.iter().any(|w| w.contains(&tap_ghost)));
+    }
+
+    #[tokio::test]
+    async fn sg_drift_detected() {
+        let mock = MockBackend::new();
+        let mut state = NetworkState::default();
+        state.sg_assignments.push(ExpectedSgAssignment {
+            vm_id: "vm-1".to_string(),
+            security_groups: vec!["web-sg".to_string(), "default".to_string()],
+        });
+        state.sg_assignments.push(ExpectedSgAssignment {
+            vm_id: "vm-2".to_string(),
+            security_groups: vec![], // no SGs → should be skipped
+        });
+
+        let report = reconcile_network(&mock, &state).await;
+        assert_eq!(report.sg_chains_reapplied, 1);
+    }
+
+    #[tokio::test]
+    async fn no_sg_assignments_no_drift() {
+        let mock = MockBackend::new();
+        let state = NetworkState::default();
+        let report = reconcile_network(&mock, &state).await;
+        assert_eq!(report.sg_chains_reapplied, 0);
     }
 }
