@@ -3,8 +3,96 @@
 //! All FDB entries are static — the control plane knows where every VM is.
 //! No flood-and-learn, no broadcast, no MAC learning races.
 
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
 use crate::backend::NetworkBackend;
 use crate::error::{OverlayError, Result};
+
+/// A persisted VM placement record.
+///
+/// Stored in the `vm_placements` redb table. Contains everything needed to
+/// reconstruct FDB + ARP proxy entries on daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmPlacement {
+    pub vpc_id: String,
+    pub vm_id: String,
+    pub vm_mac: String,
+    pub vm_ip: String,
+    pub subnet_id: String,
+    pub hosting_node: String,
+}
+
+/// Summary returned by [`rebuild_fdb`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildSummary {
+    /// Number of FDB + ARP entries successfully rebuilt.
+    pub rebuilt: usize,
+    /// Placements on the local node (no FDB needed).
+    pub skipped_local: usize,
+    /// Placements where the FDB/ARP add failed.
+    pub errors: usize,
+}
+
+/// Rebuild FDB tables from persisted `vm_placements`.
+///
+/// Called at daemon startup after reconnecting VMs. Iterates all placements
+/// and adds FDB + ARP proxy entries for every remote VM (where `hosting_node`
+/// differs from `local_node`). Local placements are skipped. Failures are
+/// counted but do not abort the rebuild — the function is best-effort so
+/// that a single stale placement does not block the entire daemon startup.
+pub async fn rebuild_fdb(
+    backend: &dyn NetworkBackend,
+    placements: &[VmPlacement],
+    local_node: &str,
+) -> Result<RebuildSummary> {
+    let mut summary = RebuildSummary::default();
+
+    for p in placements {
+        if p.hosting_node == local_node {
+            summary.skipped_local += 1;
+            continue;
+        }
+
+        let bridge = format!("syfbr-{}", p.vpc_id);
+        let vxlan = format!("syfvx-{}", p.vpc_id);
+
+        match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hosting_node).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    vm_id = %p.vm_id, vpc_id = %p.vpc_id,
+                    error = %e, "failed to rebuild FDB entry"
+                );
+                summary.errors += 1;
+                continue;
+            }
+        }
+
+        match add_arp_proxy(backend, &vxlan, &p.vm_ip, &p.vm_mac).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    vm_id = %p.vm_id, vpc_id = %p.vpc_id,
+                    error = %e, "failed to rebuild ARP proxy entry"
+                );
+                summary.errors += 1;
+                continue;
+            }
+        }
+
+        summary.rebuilt += 1;
+    }
+
+    info!(
+        rebuilt = summary.rebuilt,
+        skipped_local = summary.skipped_local,
+        errors = summary.errors,
+        "FDB rebuild complete"
+    );
+
+    Ok(summary)
+}
 
 /// Naming convention: VXLAN interface for a given bridge.
 ///
@@ -120,5 +208,85 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[0].starts_with("add_fdb_entry("));
         assert!(calls[1].starts_with("add_arp_proxy("));
+    }
+
+    // ── rebuild_fdb tests ─────────────────────────────────────────────
+
+    fn placement(vpc: &str, vm: &str, mac: &str, ip: &str, node: &str) -> VmPlacement {
+        VmPlacement {
+            vpc_id: vpc.to_string(),
+            vm_id: vm.to_string(),
+            vm_mac: mac.to_string(),
+            vm_ip: ip.to_string(),
+            subnet_id: "sub-1".to_string(),
+            hosting_node: node.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_fdb_from_table() {
+        let backend = MockBackend::new();
+        let placements = vec![
+            placement("100", "vm-1", "02:00:0a:01:01:03", "10.1.1.3", "node-2"),
+            placement("100", "vm-2", "02:00:0a:01:01:04", "10.1.1.4", "node-3"),
+            placement("200", "vm-3", "02:00:0a:02:01:03", "10.2.1.3", "node-2"),
+            // local — should be skipped
+            placement("100", "vm-local", "02:00:0a:01:01:05", "10.1.1.5", "node-1"),
+        ];
+
+        let summary = rebuild_fdb(&backend, &placements, "node-1").await.unwrap();
+
+        assert_eq!(summary.rebuilt, 3);
+        assert_eq!(summary.skipped_local, 1);
+        assert_eq!(summary.errors, 0);
+
+        let calls = backend.calls();
+        // 3 remote placements x 2 calls each (FDB + ARP)
+        assert_eq!(calls.len(), 6);
+        assert!(calls[0].contains("add_fdb_entry(syfbr-100"));
+        assert!(calls[1].contains("add_arp_proxy(syfvx-100"));
+    }
+
+    #[tokio::test]
+    async fn skip_dead_placements() {
+        let backend = MockBackend::new();
+        backend.set_fail("add_fdb_entry");
+
+        let placements = vec![
+            placement("100", "vm-1", "02:00:0a:01:01:03", "10.1.1.3", "node-2"),
+            placement("100", "vm-2", "02:00:0a:01:01:04", "10.1.1.4", "node-3"),
+        ];
+
+        let summary = rebuild_fdb(&backend, &placements, "node-1").await.unwrap();
+
+        // Both should be counted as errors, but the function continues
+        assert_eq!(summary.errors, 2);
+        assert_eq!(summary.rebuilt, 0);
+        assert_eq!(summary.skipped_local, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_kernel() {
+        // Calling rebuild_fdb twice should work identically (idempotent).
+        let backend = MockBackend::new();
+        let placements = vec![placement(
+            "100",
+            "vm-1",
+            "02:00:0a:01:01:03",
+            "10.1.1.3",
+            "node-2",
+        )];
+
+        let s1 = rebuild_fdb(&backend, &placements, "node-1").await.unwrap();
+        let s2 = rebuild_fdb(&backend, &placements, "node-1").await.unwrap();
+
+        assert_eq!(s1, s2);
+        assert_eq!(s1.rebuilt, 1);
+
+        // Backend should have 4 calls total (2 per rebuild)
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], calls[2], "identical FDB call on second rebuild");
+        assert_eq!(calls[1], calls[3], "identical ARP call on second rebuild");
     }
 }
