@@ -271,18 +271,12 @@ impl NetworkBackend for LinuxBackend {
         )
         .await?;
         // Bring up eth0 and loopback.
-        Self::run(
-            "nsenter",
-            &[&ns_flag, "ip", "link", "set", "eth0", "up"],
-        )
-        .await?;
+        Self::run("nsenter", &[&ns_flag, "ip", "link", "set", "eth0", "up"]).await?;
         Self::run("nsenter", &[&ns_flag, "ip", "link", "set", "lo", "up"]).await?;
         // Default route through the bridge gateway.
         Self::run(
             "nsenter",
-            &[
-                &ns_flag, "ip", "route", "add", "default", "via", gateway,
-            ],
+            &[&ns_flag, "ip", "route", "add", "default", "via", gateway],
         )
         .await?;
         Ok(())
