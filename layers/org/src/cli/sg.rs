@@ -108,7 +108,11 @@ pub async fn run_show(name: &str, vpc: Option<&str>) -> Result<()> {
         .map_err(daemon_err)?;
 
     match resp {
-        OrgResponse::Sg(sg) => {
+        OrgResponse::SgDetail {
+            sg,
+            rules,
+            attached_vms,
+        } => {
             println!("Security Group: {}", sg.name);
             println!("  ID:           {}", sg.id);
             println!("  VPC:          {}", sg.vpc_id);
@@ -120,6 +124,42 @@ pub async fn run_show(name: &str, vpc: Option<&str>) -> Result<()> {
             println!("  Default:      {default_str}");
             println!("  State:        {}", sg.state);
             println!("  Created:      {}", format_timestamp(sg.created_at));
+
+            // -- Rules section --
+            println!();
+            if rules.is_empty() {
+                println!("  Rules:        (none)");
+            } else {
+                println!("  Rules:");
+                println!(
+                    "    {:<20} {:<10} {:<8} {:<12} {:<20} DESCRIPTION",
+                    "ID", "DIRECTION", "PROTO", "PORTS", "SOURCE"
+                );
+                println!("    {}", "-".repeat(80));
+                for r in &rules {
+                    let ports = r
+                        .port_range
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let desc = r.description.as_deref().unwrap_or("");
+                    println!(
+                        "    {:<20} {:<10} {:<8} {:<12} {:<20} {}",
+                        r.id, r.direction, r.protocol, ports, r.source, desc,
+                    );
+                }
+            }
+
+            // -- Attached VMs section --
+            println!();
+            if attached_vms.is_empty() {
+                println!("  Attached VMs: (none)");
+            } else {
+                println!("  Attached VMs:");
+                for vm in &attached_vms {
+                    println!("    - {vm}");
+                }
+            }
 
             Ok(())
         }

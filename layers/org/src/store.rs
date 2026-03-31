@@ -1097,6 +1097,16 @@ impl OrgStore {
 
     // ── NIC operations (convenience wrappers for attach/detach) ────
 
+    /// List NICs that have a specific security group attached.
+    pub fn list_nics_by_sg(&self, sg_id: &SecurityGroupId) -> Result<Vec<NetworkInterface>> {
+        let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, nic)| nic.security_groups.contains(sg_id))
+            .map(|(_, nic)| nic)
+            .collect())
+    }
+
     /// Create a NIC in the store.
     pub fn create_nic(&self, nic: &NetworkInterface) -> Result<()> {
         if self.db.exists(NICS_TABLE, &nic.id.0)? {

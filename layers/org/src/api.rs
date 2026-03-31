@@ -220,6 +220,11 @@ pub enum OrgResponse {
     Nic(NetworkInterface),
     SgRule(SecurityGroupRule),
     SgRuleList(Vec<SecurityGroupRule>),
+    SgDetail {
+        sg: SecurityGroup,
+        rules: Vec<SecurityGroupRule>,
+        attached_vms: Vec<String>,
+    },
     SgCheckResult {
         verdict: String,
         reason: String,
@@ -595,7 +600,26 @@ fn handle_org_request(
             Err(e) => OrgResponse::Error(e.to_string()),
         },
         OrgRequest::SgShow { name, vpc } => match store.get_security_group(&name, vpc.as_deref()) {
-            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            Ok(Some(sg)) => {
+                // Fetch rules if the rule store is available.
+                let rules = sg_rule_store
+                    .and_then(|rs| rs.list_rules_by_sg(&sg.id).ok())
+                    .unwrap_or_default();
+
+                // Find attached VMs by scanning NICs with this SG.
+                let attached_vms = store
+                    .list_nics_by_sg(&sg.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|nic| nic.vm_id)
+                    .collect();
+
+                OrgResponse::SgDetail {
+                    sg,
+                    rules,
+                    attached_vms,
+                }
+            }
             Ok(None) => OrgResponse::Error(format!("security group '{name}' not found")),
             Err(e) => OrgResponse::Error(e.to_string()),
         },
