@@ -16,8 +16,8 @@ use tokio::net::UnixStream;
 
 use crate::store::OrgStore;
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringStatus, Project, ProjectId, SecurityGroup,
-    Subnet, Vpc, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, Project, ProjectId,
+    SecurityGroup, Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,20 @@ pub enum OrgRequest {
         name: String,
         vpc: Option<String>,
     },
+    SgAttach {
+        sg: String,
+        vm: Option<String>,
+        nic: Option<String>,
+    },
+    SgDetach {
+        sg: String,
+        vm: Option<String>,
+        nic: Option<String>,
+    },
+    SgListForNic {
+        vm: Option<String>,
+        nic: Option<String>,
+    },
 
     // -- Subnet resolution (used by compute layer) --
     SubnetResolve {
@@ -176,6 +190,7 @@ pub enum OrgResponse {
     SubnetList(Vec<Subnet>),
     Sg(SecurityGroup),
     SgList(Vec<SecurityGroup>),
+    Nic(NetworkInterface),
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
     Ok,
@@ -544,6 +559,52 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
                 Err(e) => OrgResponse::Error(e.to_string()),
             }
         }
+        OrgRequest::SgAttach { sg, vm, nic } => {
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            match store.attach_sg_to_nic(&sg_key, &nic_id) {
+                Ok(updated_nic) => OrgResponse::Nic(updated_nic),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::SgDetach { sg, vm, nic } => {
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            match store.detach_sg_from_nic(&sg_key, &nic_id) {
+                Ok(updated_nic) => OrgResponse::Nic(updated_nic),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::SgListForNic { vm, nic } => {
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+            match store.list_sgs_for_nic(&nic_id) {
+                Ok(sgs) => OrgResponse::SgList(sgs),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
 
         // -- Subnet resolution (for compute layer) --
         OrgRequest::SubnetResolve {
@@ -641,6 +702,26 @@ pub async fn send_org_request(
         }
         LayerResponse::UnknownLayer(name) => Err(format!("unknown layer: {name}").into()),
         other => Err(format!("unexpected response variant: {other:?}").into()),
+    }
+}
+
+/// Resolve a NIC ID from either a VM name or a direct NIC ID.
+fn resolve_nic(
+    store: &OrgStore,
+    vm: Option<&str>,
+    nic: Option<&str>,
+) -> std::result::Result<String, String> {
+    if let Some(nic_id) = nic {
+        return Ok(nic_id.to_string());
+    }
+    if let Some(vm_id) = vm {
+        match store.find_nic_by_vm(vm_id) {
+            Ok(Some(n)) => Ok(n.id.0),
+            Ok(None) => Err(format!("VM '{vm_id}' has no NIC")),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        Err("either --vm or --nic must be specified".to_string())
     }
 }
 

@@ -169,6 +169,25 @@ pub enum OrgError {
     #[error("{0}")]
     CannotDelete(String),
 
+    #[error("VM not found: {0}")]
+    VmNotFound(String),
+
+    #[error("VM '{vm}' has no NIC")]
+    VmHasNoNic { vm: String },
+
+    #[error("security group '{sg}' is already attached to NIC '{nic}'")]
+    SgAlreadyAttached { sg: String, nic: String },
+
+    #[error("security group '{sg}' is not in the same VPC as VM's subnet (sg vpc: {sg_vpc}, nic vpc: {nic_vpc})")]
+    SgVpcMismatch {
+        sg: String,
+        sg_vpc: String,
+        nic_vpc: String,
+    },
+
+    #[error("cannot detach the last security group from NIC '{nic}' — a NIC must always have at least one SG")]
+    LastSgDetach { nic: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }

@@ -6,9 +6,9 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId,
-    ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment, VpcId,
-    VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringId, PeeringStatus, Project,
+    ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment,
+    VpcId, VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -21,6 +21,7 @@ const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
 const SUBNETS_TABLE: &str = "subnets";
 const PEERINGS_TABLE: &str = "vpc_peerings";
 const SECURITY_GROUPS_TABLE: &str = "security_groups";
+const NICS_TABLE: &str = "network_interfaces";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
@@ -1092,6 +1093,122 @@ impl OrgStore {
         }
 
         self.delete_sg(&sg.vpc_id, name)
+    }
+
+    // ── NIC operations (convenience wrappers for attach/detach) ────
+
+    /// Create a NIC in the store.
+    pub fn create_nic(&self, nic: &NetworkInterface) -> Result<()> {
+        if self.db.exists(NICS_TABLE, &nic.id.0)? {
+            return Err(OrgError::NicAlreadyExists(nic.id.0.clone()));
+        }
+        self.db.set(NICS_TABLE, &nic.id.0, nic)?;
+        Ok(())
+    }
+
+    /// Get a NIC by its ID.
+    pub fn get_nic(&self, nic_id: &str) -> Result<Option<NetworkInterface>> {
+        Ok(self.db.get(NICS_TABLE, nic_id)?)
+    }
+
+    /// Find the primary NIC for a given VM.
+    pub fn find_nic_by_vm(&self, vm_id: &str) -> Result<Option<NetworkInterface>> {
+        let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        Ok(entries
+            .into_iter()
+            .find(|(_, nic)| nic.vm_id.as_deref() == Some(vm_id))
+            .map(|(_, nic)| nic))
+    }
+
+    /// Find a security group by name across all VPCs.
+    pub fn find_sg_by_name(&self, name: &str) -> Result<Option<SecurityGroup>> {
+        let all = self.list_sgs()?;
+        let matches: Vec<SecurityGroup> = all.into_iter().filter(|sg| sg.name == name).collect();
+        match matches.len() {
+            0 => Ok(None),
+            _ => Ok(Some(matches.into_iter().next().unwrap())),
+        }
+    }
+
+    /// Attach a security group to a NIC. Validates VPC match.
+    pub fn attach_sg_to_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, sg_key)?
+            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+
+        let mut nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        if sg.vpc_id.0 != nic.vpc_id {
+            return Err(OrgError::SgVpcMismatch {
+                sg: sg.name.clone(),
+                sg_vpc: sg.vpc_id.0.clone(),
+                nic_vpc: nic.vpc_id.clone(),
+            });
+        }
+
+        if nic.security_groups.contains(&sg.id) {
+            return Err(OrgError::SgAlreadyAttached {
+                sg: sg.name.clone(),
+                nic: nic.name.clone(),
+            });
+        }
+
+        nic.security_groups.push(sg.id);
+        self.db.set(NICS_TABLE, nic_id, &nic)?;
+        Ok(nic)
+    }
+
+    /// Detach a security group from a NIC.
+    pub fn detach_sg_from_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, sg_key)?
+            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+
+        let mut nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        if !nic.security_groups.contains(&sg.id) {
+            return Err(OrgError::SgNotAttached {
+                sg: sg.name.clone(),
+                nic: nic.name.clone(),
+            });
+        }
+
+        if nic.security_groups.len() <= 1 {
+            return Err(OrgError::LastSgDetach {
+                nic: nic.name.clone(),
+            });
+        }
+
+        nic.security_groups.retain(|id| id != &sg.id);
+        self.db.set(NICS_TABLE, nic_id, &nic)?;
+        Ok(nic)
+    }
+
+    /// List security groups attached to a NIC.
+    pub fn list_sgs_for_nic(&self, nic_id: &str) -> Result<Vec<SecurityGroup>> {
+        let nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        let mut sgs = Vec::new();
+        for sg_id in &nic.security_groups {
+            if let Some(sg) = self
+                .db
+                .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, &sg_id.0)?
+            {
+                sgs.push(sg);
+            }
+        }
+        Ok(sgs)
     }
 }
 

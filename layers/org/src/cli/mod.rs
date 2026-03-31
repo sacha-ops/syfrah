@@ -376,6 +376,50 @@ pub enum SgCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Attach a security group to a VM (via its primary NIC)
+    #[command(
+        after_help = "Examples:\n  syfrah sg attach web-sg --vm web-1\n  syfrah sg attach web-sg --nic nic-web-1"
+    )]
+    Attach {
+        /// Security group name
+        sg: String,
+        /// VM name (resolves to primary NIC)
+        #[arg(long, conflicts_with = "nic")]
+        vm: Option<String>,
+        /// NIC ID (direct)
+        #[arg(long, conflicts_with = "vm")]
+        nic: Option<String>,
+    },
+    /// Detach a security group from a VM (via its primary NIC)
+    #[command(
+        after_help = "Examples:\n  syfrah sg detach web-sg --vm web-1\n  syfrah sg detach web-sg --nic nic-web-1"
+    )]
+    Detach {
+        /// Security group name
+        sg: String,
+        /// VM name (resolves to primary NIC)
+        #[arg(long, conflicts_with = "nic")]
+        vm: Option<String>,
+        /// NIC ID (direct)
+        #[arg(long, conflicts_with = "vm")]
+        nic: Option<String>,
+    },
+    /// List security groups attached to a VM or NIC
+    #[command(
+        name = "list-attached",
+        after_help = "Examples:\n  syfrah sg list-attached --vm web-1\n  syfrah sg list-attached --nic nic-web-1"
+    )]
+    ListAttached {
+        /// VM name (resolves to primary NIC)
+        #[arg(long, conflicts_with = "nic")]
+        vm: Option<String>,
+        /// NIC ID (direct)
+        #[arg(long, conflicts_with = "vm")]
+        nic: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Execute an org CLI command.
@@ -517,5 +561,14 @@ pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
         SgCommand::List { vpc, json } => sg::run_list(vpc.as_deref(), json).await,
         SgCommand::Show { name, vpc } => sg::run_show(&name, vpc.as_deref()).await,
         SgCommand::Delete { name, vpc, yes } => sg::run_delete(&name, vpc.as_deref(), yes).await,
+        SgCommand::Attach { sg, vm, nic } => {
+            sg::run_attach(&sg, vm.as_deref(), nic.as_deref()).await
+        }
+        SgCommand::Detach { sg, vm, nic } => {
+            sg::run_detach(&sg, vm.as_deref(), nic.as_deref()).await
+        }
+        SgCommand::ListAttached { vm, nic, json } => {
+            sg::run_list_attached(vm.as_deref(), nic.as_deref(), json).await
+        }
     }
 }
