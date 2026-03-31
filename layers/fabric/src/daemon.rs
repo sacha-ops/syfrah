@@ -1174,6 +1174,38 @@ pub async fn run_daemon(
         }
     }
 
+    // -- Hypervisor auto-discovery ---------------------------------------------
+    //
+    // If this node has /dev/kvm, discover (or recover) a hypervisor record.
+    // The hypervisor store is opened from the org layer's database.
+    let shared_hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>> =
+        match syfrah_state::LayerDb::open("hypervisor") {
+            Ok(hv_db) => {
+                let store = Arc::new(syfrah_org::HypervisorStore::new(hv_db));
+                let region = my_record.region.as_deref().unwrap_or("default");
+                let zone = my_record.zone.as_deref().unwrap_or("default");
+                let fabric_ipv6 = my_record.mesh_ipv6.to_string();
+                let public_ip = my_record.endpoint.ip().to_string();
+                let fabric_node_id = wg_pubkey.to_base64();
+
+                let _hv_name = syfrah_org::discovery::discover_hypervisor(
+                    &store,
+                    &my_record.name,
+                    &fabric_node_id,
+                    region,
+                    zone,
+                    &public_ip,
+                    &fabric_ipv6,
+                );
+                Some(store)
+            }
+            Err(e) => {
+                warn!("hypervisor store init failed (non-fatal): {e}");
+                None
+            }
+        };
+    let _ = &shared_hypervisor_store; // suppress unused warning for now
+
     // Register the forge layer handler on the control socket so future
     // `syfrah forge` CLI commands can be routed through the daemon.
     // Currently returns "not implemented" — real Forge operations use HTTP.

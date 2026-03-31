@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cli;
 pub mod daemon;
+pub mod discovery;
 pub mod error;
 pub mod hypervisor;
 pub mod ipam;
