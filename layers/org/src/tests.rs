@@ -1,15 +1,25 @@
 //! Full hierarchy integration test: Org -> Project -> Environment lifecycle.
+//! VM placement persistence tests.
 
 use std::collections::HashMap;
 
 use crate::error::OrgError;
+use crate::placement::PlacementStore;
 use crate::store::OrgStore;
+use crate::types::{PlacementAction, VmPlacement};
 
 fn temp_store() -> (tempfile::TempDir, OrgStore) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("org-test.redb");
     let db = syfrah_state::LayerDb::open_at(&path).unwrap();
     (dir, OrgStore::new(db))
+}
+
+fn temp_placement_store() -> (tempfile::TempDir, PlacementStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("placement-test.redb");
+    let db = syfrah_state::LayerDb::open_at(&path).unwrap();
+    (dir, PlacementStore::new(db))
 }
 
 #[test]
@@ -121,4 +131,102 @@ fn org_project_env_lifecycle() {
         0,
         "projects should be empty"
     );
+}
+
+// ── VM Placement tests ──────────────────────────────────────────────
+
+fn make_placement(vpc: &str, vm: &str, node: &str, subnet: &str) -> VmPlacement {
+    VmPlacement {
+        vpc_id: vpc.to_string(),
+        vm_id: vm.to_string(),
+        vm_mac: format!("02:00:0a:00:01:{:02x}", vm.len()),
+        vm_ip: format!("10.0.1.{}", vm.len()),
+        subnet_id: subnet.to_string(),
+        hosting_node: node.to_string(),
+        action: PlacementAction::Add,
+        created_at: 1700000000,
+    }
+}
+
+#[test]
+fn create_placement() {
+    let (_dir, store) = temp_placement_store();
+
+    let p = make_placement("vpc-1", "vm-1", "fd00::1", "subnet-1");
+    store.add_placement(&p).unwrap();
+
+    let got = store.get_placement("vpc-1", "vm-1").unwrap();
+    assert_eq!(got, Some(p));
+}
+
+#[test]
+fn delete_placement() {
+    let (_dir, store) = temp_placement_store();
+
+    let p = make_placement("vpc-1", "vm-1", "fd00::1", "subnet-1");
+    store.add_placement(&p).unwrap();
+
+    store.remove_placement("vpc-1", "vm-1").unwrap();
+
+    let got = store.get_placement("vpc-1", "vm-1").unwrap();
+    assert!(got.is_none(), "placement should be gone after removal");
+
+    // Removing again should error.
+    let err = store.remove_placement("vpc-1", "vm-1").unwrap_err();
+    assert!(
+        matches!(err, OrgError::NotFound(_)),
+        "expected NotFound, got: {err}"
+    );
+}
+
+#[test]
+fn list_by_vpc() {
+    let (_dir, store) = temp_placement_store();
+
+    // Two VMs in vpc-1, one in vpc-2.
+    store
+        .add_placement(&make_placement("vpc-1", "vm-1", "fd00::1", "subnet-1"))
+        .unwrap();
+    store
+        .add_placement(&make_placement("vpc-1", "vm-2", "fd00::2", "subnet-1"))
+        .unwrap();
+    store
+        .add_placement(&make_placement("vpc-2", "vm-3", "fd00::1", "subnet-2"))
+        .unwrap();
+
+    let vpc1 = store.list_by_vpc("vpc-1").unwrap();
+    assert_eq!(vpc1.len(), 2, "expected 2 placements in vpc-1");
+    assert!(vpc1.iter().all(|p| p.vpc_id == "vpc-1"));
+
+    let vpc2 = store.list_by_vpc("vpc-2").unwrap();
+    assert_eq!(vpc2.len(), 1, "expected 1 placement in vpc-2");
+
+    let vpc3 = store.list_by_vpc("vpc-3").unwrap();
+    assert_eq!(vpc3.len(), 0, "expected 0 placements in vpc-3");
+}
+
+#[test]
+fn list_by_node() {
+    let (_dir, store) = temp_placement_store();
+
+    // Two VMs on node fd00::1, one on fd00::2.
+    store
+        .add_placement(&make_placement("vpc-1", "vm-1", "fd00::1", "subnet-1"))
+        .unwrap();
+    store
+        .add_placement(&make_placement("vpc-2", "vm-3", "fd00::1", "subnet-2"))
+        .unwrap();
+    store
+        .add_placement(&make_placement("vpc-1", "vm-2", "fd00::2", "subnet-1"))
+        .unwrap();
+
+    let node1 = store.list_by_node("fd00::1").unwrap();
+    assert_eq!(node1.len(), 2, "expected 2 placements on fd00::1");
+    assert!(node1.iter().all(|p| p.hosting_node == "fd00::1"));
+
+    let node2 = store.list_by_node("fd00::2").unwrap();
+    assert_eq!(node2.len(), 1, "expected 1 placement on fd00::2");
+
+    let node3 = store.list_by_node("fd00::99").unwrap();
+    assert_eq!(node3.len(), 0, "expected 0 placements on fd00::99");
 }
