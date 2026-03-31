@@ -93,6 +93,11 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
+    async fn remove_arp_proxy(&self, vxlan: &str, ip: &str) -> Result<()> {
+        self.record(format!("remove_arp_proxy({vxlan}, {ip})"));
+        Ok(())
+    }
+
     // ── Bridge ─────────────────────────────────────────────────────────
 
     async fn create_bridge(&self, name: &str) -> Result<()> {
@@ -201,6 +206,7 @@ mod tests {
         b.add_arp_proxy("syfvx-100", "10.1.1.3", "02:00:0a:01:01:03")
             .await
             .unwrap();
+        b.remove_arp_proxy("syfvx-100", "10.1.1.3").await.unwrap();
 
         b.create_bridge("syfbr-100").await.unwrap();
         b.add_bridge_ip("syfbr-100", "10.1.1.1", 24).await.unwrap();
@@ -226,7 +232,7 @@ mod tests {
             .unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 19, "expected one call per trait method");
+        assert_eq!(calls.len(), 20, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));
@@ -234,20 +240,21 @@ mod tests {
         assert!(calls[2].starts_with("add_fdb_entry("));
         assert!(calls[3].starts_with("remove_fdb_entry("));
         assert!(calls[4].starts_with("add_arp_proxy("));
-        assert!(calls[5].starts_with("create_bridge("));
-        assert!(calls[6].starts_with("add_bridge_ip("));
-        assert!(calls[7].starts_with("remove_bridge_ip("));
-        assert!(calls[8].starts_with("delete_bridge("));
-        assert!(calls[9].starts_with("attach_to_bridge("));
-        assert!(calls[10].starts_with("create_tap("));
-        assert!(calls[11].starts_with("delete_tap("));
-        assert!(calls[12].starts_with("create_veth_pair("));
-        assert!(calls[13].starts_with("apply_vm_rules("));
-        assert!(calls[14].starts_with("remove_vm_rules("));
-        assert!(calls[15].starts_with("apply_nat("));
-        assert!(calls[16].starts_with("remove_nat("));
-        assert!(calls[17].starts_with("apply_peering_rules("));
-        assert!(calls[18].starts_with("remove_peering_rules("));
+        assert!(calls[5].starts_with("remove_arp_proxy("));
+        assert!(calls[6].starts_with("create_bridge("));
+        assert!(calls[7].starts_with("add_bridge_ip("));
+        assert!(calls[8].starts_with("remove_bridge_ip("));
+        assert!(calls[9].starts_with("delete_bridge("));
+        assert!(calls[10].starts_with("attach_to_bridge("));
+        assert!(calls[11].starts_with("create_tap("));
+        assert!(calls[12].starts_with("delete_tap("));
+        assert!(calls[13].starts_with("create_veth_pair("));
+        assert!(calls[14].starts_with("apply_vm_rules("));
+        assert!(calls[15].starts_with("remove_vm_rules("));
+        assert!(calls[16].starts_with("apply_nat("));
+        assert!(calls[17].starts_with("remove_nat("));
+        assert!(calls[18].starts_with("apply_peering_rules("));
+        assert!(calls[19].starts_with("remove_peering_rules("));
 
         // Test reset
         b.reset();

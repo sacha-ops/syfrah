@@ -14,6 +14,7 @@ pub mod sd_watchdog;
 pub mod store;
 pub mod topology;
 pub mod ui;
+pub mod vm_placement;
 pub mod wg;
 
 /// Canonical error returned when a command requires an existing mesh but none

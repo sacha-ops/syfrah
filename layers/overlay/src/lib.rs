@@ -14,8 +14,8 @@ pub use api::OverlayHandler;
 pub use backend::NetworkBackend;
 pub use error::OverlayError;
 pub use fdb::{
-    add_arp_proxy, add_fdb_entry, rebuild_fdb, register_remote_vm, remove_fdb_entry,
-    RebuildSummary, VmPlacement,
+    add_arp_proxy, add_fdb_entry, rebuild_fdb, register_remote_vm, remove_arp_proxy,
+    remove_fdb_entry, sync_placement, PlacementAction, RebuildSummary, VmPlacement,
 };
 pub use linux::LinuxBackend;
 pub use mock::MockBackend;

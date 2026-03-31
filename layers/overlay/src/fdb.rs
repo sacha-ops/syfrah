@@ -9,11 +9,18 @@ use tracing::{info, warn};
 use crate::backend::NetworkBackend;
 use crate::error::{OverlayError, Result};
 
-/// A persisted VM placement record.
+/// Action carried by a VM placement announcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementAction {
+    Add,
+    Remove,
+}
+
+/// Announcement broadcast when a VM is created or deleted.
 ///
-/// Stored in the `vm_placements` redb table. Contains everything needed to
-/// reconstruct FDB + ARP proxy entries on daemon restart.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Each node in the VPC uses this to update its local FDB and ARP proxy tables.
+/// Also used by [`rebuild_fdb`] to re-populate entries on daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmPlacement {
     pub vpc_id: String,
     pub vm_id: String,
@@ -21,6 +28,7 @@ pub struct VmPlacement {
     pub vm_ip: String,
     pub subnet_id: String,
     pub hosting_node: String,
+    pub action: PlacementAction,
 }
 
 /// Summary returned by [`rebuild_fdb`].
@@ -147,6 +155,44 @@ pub async fn register_remote_vm(
     Ok(())
 }
 
+/// Remove an ARP proxy entry from a VXLAN interface.
+pub async fn remove_arp_proxy(backend: &dyn NetworkBackend, vxlan: &str, ip: &str) -> Result<()> {
+    backend.remove_arp_proxy(vxlan, ip).await
+}
+
+/// Synchronise local FDB and ARP proxy tables from a VM placement announcement.
+///
+/// - Skips if the placement refers to the local node (local VMs don't need FDB entries).
+/// - On `Add`: creates both FDB and ARP proxy entries.
+/// - On `Remove`: removes both FDB and ARP proxy entries.
+/// - Idempotent: adding an existing entry or removing a non-existent one does not error.
+pub async fn sync_placement(
+    backend: &dyn NetworkBackend,
+    placement: &VmPlacement,
+    local_node: &str,
+) -> Result<()> {
+    // Don't add FDB entries for VMs running on this node.
+    if placement.hosting_node == local_node {
+        return Ok(());
+    }
+
+    let bridge = format!("syfbr-{}", placement.vpc_id);
+    let vxlan = format!("syfvx-{}", placement.vpc_id);
+
+    match placement.action {
+        PlacementAction::Add => {
+            add_fdb_entry(backend, &bridge, &placement.vm_mac, &placement.hosting_node).await?;
+            add_arp_proxy(backend, &vxlan, &placement.vm_ip, &placement.vm_mac).await?;
+        }
+        PlacementAction::Remove => {
+            remove_fdb_entry(backend, &bridge, &placement.vm_mac).await?;
+            remove_arp_proxy(backend, &vxlan, &placement.vm_ip).await?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +256,76 @@ mod tests {
         assert!(calls[1].starts_with("add_arp_proxy("));
     }
 
+    fn make_placement(action: PlacementAction, hosting_node: &str) -> VmPlacement {
+        VmPlacement {
+            vpc_id: "100".to_string(),
+            vm_id: "vm-1".to_string(),
+            vm_mac: MAC.to_string(),
+            vm_ip: IP.to_string(),
+            subnet_id: "sub-1".to_string(),
+            hosting_node: hosting_node.to_string(),
+            action,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_fdb_on_announce() {
+        let backend = MockBackend::new();
+        let placement = make_placement(PlacementAction::Add, VTEP);
+        sync_placement(&backend, &placement, "fd12:3456:7800::1")
+            .await
+            .unwrap();
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], format!("add_fdb_entry(syfbr-100, {MAC}, {VTEP})"));
+        assert_eq!(calls[1], format!("add_arp_proxy(syfvx-100, {IP}, {MAC})"));
+    }
+
+    #[tokio::test]
+    async fn remove_fdb_on_remove() {
+        let backend = MockBackend::new();
+        let placement = make_placement(PlacementAction::Remove, VTEP);
+        sync_placement(&backend, &placement, "fd12:3456:7800::1")
+            .await
+            .unwrap();
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], format!("remove_fdb_entry(syfbr-100, {MAC})"));
+        assert_eq!(calls[1], format!("remove_arp_proxy(syfvx-100, {IP})"));
+    }
+
+    #[tokio::test]
+    async fn ignore_self_node() {
+        let backend = MockBackend::new();
+        let local = "fd12:3456:7800::1";
+        let placement = make_placement(PlacementAction::Add, local);
+        sync_placement(&backend, &placement, local).await.unwrap();
+
+        assert!(
+            backend.calls().is_empty(),
+            "should not touch FDB for local VMs"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_apply() {
+        let backend = MockBackend::new();
+        let placement = make_placement(PlacementAction::Add, VTEP);
+
+        // Apply twice — the mock always returns Ok, simulating idempotent ops.
+        sync_placement(&backend, &placement, "fd12:3456:7800::1")
+            .await
+            .unwrap();
+        sync_placement(&backend, &placement, "fd12:3456:7800::1")
+            .await
+            .unwrap();
+
+        // Both calls succeed without error; 4 total calls (2 per sync).
+        assert_eq!(backend.calls().len(), 4);
+    }
+
     // ── rebuild_fdb tests ─────────────────────────────────────────────
 
     fn placement(vpc: &str, vm: &str, mac: &str, ip: &str, node: &str) -> VmPlacement {
@@ -220,6 +336,7 @@ mod tests {
             vm_ip: ip.to_string(),
             subnet_id: "sub-1".to_string(),
             hosting_node: node.to_string(),
+            action: PlacementAction::Add,
         }
     }
 
