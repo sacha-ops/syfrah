@@ -104,6 +104,7 @@ impl ComputeRuntime for ChRuntime {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
 
         // Step 1: validate

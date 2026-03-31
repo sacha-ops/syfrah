@@ -51,6 +51,10 @@ pub struct VmSpec {
     /// TODO: wire into NetworkManager once #757 lands.
     #[serde(default)]
     pub subnet: Option<SubnetInfo>,
+    /// Security group names to attach to the VM's NIC.
+    /// Defaults to `["default"]` if empty.
+    #[serde(default)]
+    pub security_groups: Vec<String>,
 }
 
 /// Resolved subnet information passed through to the VM creation flow.
@@ -227,6 +231,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -247,6 +252,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -380,6 +386,7 @@ mod tests {
             ssh_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host".to_string()),
             disk_size_mb: Some(20480),
             subnet: None,
+            security_groups: vec![],
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();

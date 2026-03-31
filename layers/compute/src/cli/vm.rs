@@ -54,6 +54,10 @@ pub enum VmCommand {
         /// Organization name (required with --subnet or for auto-subnet resolution)
         #[arg(long)]
         org: Option<String>,
+        /// Security group names to attach (comma-separated or repeated).
+        /// If omitted, the default SG is auto-attached.
+        #[arg(long)]
+        sg: Vec<String>,
     },
     /// List all virtual machines
     #[command(after_help = "Examples:\n  syfrah compute vm list\n  syfrah compute vm list --json")]
@@ -131,9 +135,11 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
             env,
             project,
             org,
+            sg,
         } => {
             run_create(
-                name, vcpus, memory, image, gpu, tap, ssh_key, disk_size, subnet, env, project, org,
+                name, vcpus, memory, image, gpu, tap, ssh_key, disk_size, subnet, env, project,
+                org, sg,
             )
             .await
         }
@@ -255,6 +261,7 @@ async fn run_create(
     env: Option<String>,
     project: Option<String>,
     org: Option<String>,
+    sg: Vec<String>,
 ) -> anyhow::Result<()> {
     let ssh_key = match ssh_key_path {
         Some(ref path) => Some(read_ssh_key(path)?),
@@ -264,6 +271,13 @@ async fn run_create(
 
     // Resolve subnet if org/project/env context is provided
     let subnet = resolve_subnet(subnet_name, env, project, org).await?;
+
+    // Auto-attach default SG if none specified.
+    let security_groups = if sg.is_empty() {
+        vec!["default".to_string()]
+    } else {
+        sg
+    };
 
     let req = ComputeRequest::CreateVm {
         name,
@@ -275,6 +289,7 @@ async fn run_create(
         ssh_key: ssh_key.clone(),
         disk_size_mb,
         subnet,
+        security_groups,
     };
     let resp = send_compute_request(&control_socket_path(), &req)
         .await
@@ -666,6 +681,7 @@ mod tests {
                 env,
                 project,
                 org,
+                sg,
             } => {
                 assert_eq!(name, "test-vm");
                 assert_eq!(vcpus, 2); // default
@@ -679,6 +695,7 @@ mod tests {
                 assert!(env.is_none());
                 assert!(project.is_none());
                 assert!(org.is_none());
+                assert!(sg.is_empty());
             }
             other => panic!("expected Create, got {other:?}"),
         }

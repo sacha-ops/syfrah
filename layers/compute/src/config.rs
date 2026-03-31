@@ -370,6 +370,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         }
     }
 
@@ -400,6 +401,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         }
     }
 
@@ -552,6 +554,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let errors = validate(&spec).unwrap_err();
         // Should have at least 5 errors: vcpus, memory, image, bdf, volume, tap
@@ -720,6 +723,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         assert!(validate(&spec).is_ok());
     }
@@ -738,6 +742,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         assert!(validate(&spec).is_ok());
     }
@@ -792,6 +797,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let errors = validate(&spec).unwrap_err();
         assert!(
@@ -831,6 +837,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
         let validated = validate(&spec).unwrap();
         let resolved = resolve(
@@ -1030,6 +1037,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             subnet: None,
+            security_groups: vec![],
         };
 
         // Step 1: validate

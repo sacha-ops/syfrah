@@ -252,6 +252,7 @@ async fn create_vm(
         ssh_key: None,
         disk_size_mb: None,
         subnet: None,
+        security_groups: vec![],
     };
 
     match mgr.create_vm(spec).await {
