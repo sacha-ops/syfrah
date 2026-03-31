@@ -67,10 +67,10 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::SubnetCommand,
     },
-    /// Manage security groups and firewall rules
+    /// Manage security groups
     Sg {
         #[command(subcommand)]
-        command: syfrah_overlay::cli::SgCommand,
+        command: syfrah_org::SgCommand,
     },
     /// Inspect and manage layer state databases
     State {
@@ -949,7 +949,7 @@ async fn run() -> Result<()> {
         Commands::Env { command } => syfrah_org::cli::run_env(command).await,
         Commands::Vpc { command } => syfrah_org::cli::run_vpc(command).await,
         Commands::Subnet { command } => syfrah_org::cli::run_subnet(command).await,
-        Commands::Sg { command } => syfrah_overlay::cli::sg::run(command).await,
+        Commands::Sg { command } => syfrah_org::cli::run_sg(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
@@ -1104,167 +1104,6 @@ mod tests {
     fn zone_uppercase_rejected() {
         let err = validate_zone(&Some("ZONE-A".to_string())).unwrap_err();
         assert!(err.to_string().contains("invalid"), "unexpected: {err}");
-    }
-
-    // ── SG rule CLI parsing ─────────────────────────────────────────
-
-    #[test]
-    fn add_rule_parse() {
-        let cli = Cli::try_parse_from([
-            "syfrah",
-            "sg",
-            "add-rule",
-            "web-sg",
-            "--direction",
-            "ingress",
-            "--protocol",
-            "tcp",
-            "--port",
-            "443",
-            "--source",
-            "0.0.0.0/0",
-            "--description",
-            "HTTPS access",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Sg {
-                command:
-                    syfrah_overlay::cli::SgCommand::AddRule {
-                        sg,
-                        direction,
-                        protocol,
-                        port,
-                        source,
-                        source_sg,
-                        description,
-                        priority,
-                    },
-            } => {
-                assert_eq!(sg, "web-sg");
-                assert_eq!(direction, "ingress");
-                assert_eq!(protocol, "tcp");
-                assert_eq!(port.as_deref(), Some("443"));
-                assert_eq!(source.as_deref(), Some("0.0.0.0/0"));
-                assert!(source_sg.is_none());
-                assert_eq!(description.as_deref(), Some("HTTPS access"));
-                assert!(priority.is_none());
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn add_rule_parse_with_source_sg() {
-        let cli = Cli::try_parse_from([
-            "syfrah",
-            "sg",
-            "add-rule",
-            "db-sg",
-            "--direction",
-            "ingress",
-            "--protocol",
-            "tcp",
-            "--port",
-            "5432",
-            "--source-sg",
-            "web-sg",
-            "--priority",
-            "50",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Sg {
-                command:
-                    syfrah_overlay::cli::SgCommand::AddRule {
-                        sg,
-                        source_sg,
-                        priority,
-                        ..
-                    },
-            } => {
-                assert_eq!(sg, "db-sg");
-                assert_eq!(source_sg.as_deref(), Some("web-sg"));
-                assert_eq!(priority, Some(50));
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn remove_rule_parse() {
-        let cli = Cli::try_parse_from([
-            "syfrah",
-            "sg",
-            "remove-rule",
-            "web-sg",
-            "--rule-id",
-            "rule-abc123",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Sg {
-                command: syfrah_overlay::cli::SgCommand::RemoveRule { sg, rule_id },
-            } => {
-                assert_eq!(sg, "web-sg");
-                assert_eq!(rule_id, "rule-abc123");
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn rules_list_parse() {
-        let cli = Cli::try_parse_from(["syfrah", "sg", "rules", "web-sg", "--json"]).unwrap();
-        match cli.command {
-            Commands::Sg {
-                command: syfrah_overlay::cli::SgCommand::Rules { sg, json },
-            } => {
-                assert_eq!(sg, "web-sg");
-                assert!(json);
-            }
-            _ => panic!("unexpected command variant"),
-        }
-
-        // Without --json
-        let cli = Cli::try_parse_from(["syfrah", "sg", "rules", "web-sg"]).unwrap();
-        match cli.command {
-            Commands::Sg {
-                command: syfrah_overlay::cli::SgCommand::Rules { sg, json },
-            } => {
-                assert_eq!(sg, "web-sg");
-                assert!(!json);
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn port_range_parse() {
-        use syfrah_overlay::sg::PortRange;
-
-        // Single port
-        let pr: PortRange = "443".parse().unwrap();
-        assert_eq!(pr, PortRange { from: 443, to: 443 });
-
-        // Range
-        let pr: PortRange = "8000-9000".parse().unwrap();
-        assert_eq!(
-            pr,
-            PortRange {
-                from: 8000,
-                to: 9000
-            }
-        );
-
-        // Invalid: reversed
-        assert!("9000-8000".parse::<PortRange>().is_err());
-
-        // Invalid: zero
-        assert!("0".parse::<PortRange>().is_err());
-
-        // Invalid: non-numeric
-        assert!("abc".parse::<PortRange>().is_err());
     }
 
     // ── suggest_fix ───────────────────────────────────────────────
