@@ -21,7 +21,7 @@ use syfrah_overlay::NetworkBackend;
 /// This stores everything needed to tear down the VM's network on delete.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkInfo {
-    /// VPC ID (used for bridge/VXLAN naming: syfbr-{vpc_id}, syfvx-{vpc_id}).
+    /// VPC ID (used for bridge/VXLAN naming via the `syfrah_overlay::naming` module).
     pub vpc_id: String,
     /// Subnet ID (used for IPAM release).
     pub subnet_id: String,
@@ -31,7 +31,7 @@ pub struct NetworkInfo {
     pub ip: String,
     /// Derived MAC address (e.g., "02:00:0a:00:01:03").
     pub mac: String,
-    /// TAP device name (e.g., "syftap-web-1").
+    /// TAP device name (hash-based, e.g., "syft-a1b2c3d4").
     pub tap_name: String,
     /// Hosting node fabric address (for FDB removal).
     pub hosting_node: String,
@@ -76,8 +76,8 @@ impl<B: NetworkBackend + ?Sized> NetworkCleanup<B> {
         ipam_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
     ) -> CleanupResult {
         let mut result = CleanupResult::default();
-        let bridge = format!("syfbr-{}", info.vpc_id);
-        let vxlan = format!("syfvx-{}", info.vpc_id);
+        let bridge = syfrah_overlay::naming::bridge_name(&info.vpc_id);
+        let vxlan = syfrah_overlay::naming::vxlan_name(&info.vpc_id);
 
         // 1. Remove FDB entry
         if let Err(e) = self.backend.remove_fdb_entry(&bridge, &info.mac).await {
@@ -232,7 +232,7 @@ mod tests {
             subnet_cidr: "10.0.1.0/24".to_string(),
             ip: "10.0.1.3".to_string(),
             mac: "02:00:0a:00:01:03".to_string(),
-            tap_name: "syftap-web-1".to_string(),
+            tap_name: syfrah_overlay::naming::tap_name("web-1"),
             hosting_node: "fd00::1".to_string(),
         }
     }
@@ -266,7 +266,7 @@ mod tests {
 
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "delete_tap(syftap-web-1)"),
+            calls.iter().any(|c| c == &format!("delete_tap({})", syfrah_overlay::naming::tap_name("web-1"))),
             "delete_tap should have been called"
         );
     }
@@ -282,9 +282,10 @@ mod tests {
 
         let calls = backend.calls();
         assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("remove_fdb_entry(syfbr-100")),
+            calls.iter().any(|c| c.starts_with(&format!(
+                "remove_fdb_entry({}",
+                syfrah_overlay::naming::bridge_name("100")
+            ))),
             "remove_fdb_entry should have been called"
         );
     }
@@ -303,18 +304,20 @@ mod tests {
         );
 
         let calls = backend.calls();
+        let br = syfrah_overlay::naming::bridge_name("100");
+        let vx = syfrah_overlay::naming::vxlan_name("100");
         assert!(
-            calls.iter().any(|c| c == "delete_bridge(syfbr-100)"),
+            calls.iter().any(|c| c == &format!("delete_bridge({br})")),
             "delete_bridge should have been called"
         );
         assert!(
-            calls.iter().any(|c| c == "delete_vxlan(syfvx-100)"),
+            calls.iter().any(|c| c == &format!("delete_vxlan({vx})")),
             "delete_vxlan should have been called"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c == "remove_nat(syfbr-100, 10.0.1.0/24)"),
+                .any(|c| c == &format!("remove_nat({br}, 10.0.1.0/24)")),
             "remove_nat should have been called"
         );
     }

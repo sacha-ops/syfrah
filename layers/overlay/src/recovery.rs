@@ -17,13 +17,14 @@ use tracing::{info, warn};
 
 use crate::backend::NetworkBackend;
 use crate::fdb::{add_arp_proxy, add_fdb_entry};
+use crate::naming;
 use crate::vxlan::VXLAN_PORT;
 
 /// A VPC descriptor used during recovery. Mirrors the essential fields
 /// from `syfrah_org::Vpc` without creating a crate dependency.
 #[derive(Debug, Clone)]
 pub struct RecoveryVpc {
-    /// VPC identifier (used in bridge/VXLAN naming: `syfbr-{id}`, `syfvx-{id}`).
+    /// VPC identifier (used in bridge/VXLAN naming via the `naming` module).
     pub id: String,
     /// VXLAN Network Identifier.
     pub vni: u32,
@@ -88,11 +89,20 @@ pub async fn recover_network(
     let mut report = RecoveryReport::default();
 
     // ── 1. Discover kernel interfaces ─────────────────────────────────
-    let kernel_bridges = backend.list_interfaces("syfbr-").await.unwrap_or_default();
-    let kernel_vxlans = backend.list_interfaces("syfvx-").await.unwrap_or_default();
-    let kernel_taps = backend.list_interfaces("syftap-").await.unwrap_or_default();
+    let kernel_bridges = backend
+        .list_interfaces(naming::BRIDGE_PREFIX)
+        .await
+        .unwrap_or_default();
+    let kernel_vxlans = backend
+        .list_interfaces(naming::VXLAN_PREFIX)
+        .await
+        .unwrap_or_default();
+    let kernel_taps = backend
+        .list_interfaces(naming::TAP_PREFIX)
+        .await
+        .unwrap_or_default();
     let kernel_peers = backend
-        .list_interfaces("syfpeer-")
+        .list_interfaces(naming::PEER_PREFIX)
         .await
         .unwrap_or_default();
 
@@ -110,24 +120,24 @@ pub async fn recover_network(
 
     let expected_bridges: HashSet<String> = local_vpc_ids
         .iter()
-        .map(|id| format!("syfbr-{id}"))
+        .map(|id| naming::bridge_name(id))
         .collect();
 
     let expected_vxlans: HashSet<String> = local_vpc_ids
         .iter()
-        .map(|id| format!("syfvx-{id}"))
+        .map(|id| naming::vxlan_name(id))
         .collect();
 
-    // Expected TAPs: local placements -> syftap-{vm_id}
+    // Expected TAPs: local placements -> naming::tap_name(vm_id)
     let expected_taps: HashSet<String> = placements
         .iter()
         .filter(|p| p.hosting_node == local_node)
-        .map(|p| format!("syftap-{}", p.vm_id))
+        .map(|p| naming::tap_name(&p.vm_id))
         .collect();
 
     // ── 3. Re-create missing bridges ──────────────────────────────────
     for vpc in vpcs {
-        let bridge = format!("syfbr-{}", vpc.id);
+        let bridge = naming::bridge_name(&vpc.id);
         if !expected_bridges.contains(&bridge) {
             continue;
         }
@@ -166,8 +176,8 @@ pub async fn recover_network(
 
     // ── 4. Re-create missing VXLANs ───────────────────────────────────
     for vpc in vpcs {
-        let vxlan = format!("syfvx-{}", vpc.id);
-        let bridge = format!("syfbr-{}", vpc.id);
+        let vxlan = naming::vxlan_name(&vpc.id);
+        let bridge = naming::bridge_name(&vpc.id);
 
         if !expected_vxlans.contains(&vxlan) {
             continue;
@@ -198,7 +208,7 @@ pub async fn recover_network(
     // ── 5. Re-apply nftables rules ────────────────────────────────────
     // nftables rules do not survive reboot — re-apply for every local VM.
     for p in placements.iter().filter(|p| p.hosting_node == local_node) {
-        let tap = format!("syftap-{}", p.vm_id);
+        let tap = naming::tap_name(&p.vm_id);
 
         if let Err(e) = backend.apply_vm_rules(&tap, &p.vm_mac, &p.vm_ip).await {
             warn!(
@@ -214,7 +224,7 @@ pub async fn recover_network(
     // Re-apply NAT for subnets that have local VMs.
     for subnet in subnets {
         if local_vpc_ids.contains(subnet.vpc_id.as_str()) {
-            let bridge = format!("syfbr-{}", subnet.vpc_id);
+            let bridge = naming::bridge_name(&subnet.vpc_id);
             if let Err(e) = backend.apply_nat(&bridge, &subnet.cidr).await {
                 warn!(
                     bridge = %bridge, subnet = %subnet.cidr,
@@ -226,8 +236,8 @@ pub async fn recover_network(
 
     // ── 6. Re-populate FDB from placements ────────────────────────────
     for p in placements.iter().filter(|p| p.hosting_node != local_node) {
-        let bridge = format!("syfbr-{}", p.vpc_id);
-        let vxlan = format!("syfvx-{}", p.vpc_id);
+        let bridge = naming::bridge_name(&p.vpc_id);
+        let vxlan = naming::vxlan_name(&p.vpc_id);
 
         // Only rebuild FDB for VPCs where we have local VMs too.
         if !local_vpc_ids.contains(p.vpc_id.as_str()) {
@@ -354,7 +364,7 @@ mod tests {
     async fn bridges_survive_restart() {
         let backend = MockBackend::new();
         // Bridge already exists in the kernel.
-        backend.set_interfaces(vec!["syfbr-100".to_string(), "syfvx-100".to_string()]);
+        backend.set_interfaces(vec![naming::bridge_name("100"), naming::vxlan_name("100")]);
 
         let vpcs = vec![vpc("100", 100)];
         let subnets = vec![subnet("100", "10.1.1.0/24", "10.1.1.1")];
@@ -387,9 +397,9 @@ mod tests {
     async fn taps_survive_restart() {
         let backend = MockBackend::new();
         backend.set_interfaces(vec![
-            "syfbr-100".to_string(),
-            "syfvx-100".to_string(),
-            "syftap-vm-1".to_string(),
+            naming::bridge_name("100"),
+            naming::vxlan_name("100"),
+            naming::tap_name("vm-1"),
         ]);
 
         let vpcs = vec![vpc("100", 100)];
@@ -410,7 +420,9 @@ mod tests {
 
         let calls = backend.calls();
         assert!(
-            !calls.iter().any(|c| c == "delete_tap(syftap-vm-1)"),
+            !calls
+                .iter()
+                .any(|c| c == &format!("delete_tap({})", naming::tap_name("vm-1"))),
             "TAP should not be deleted"
         );
     }
@@ -422,10 +434,10 @@ mod tests {
     async fn nftables_reapplied() {
         let backend = MockBackend::new();
         backend.set_interfaces(vec![
-            "syfbr-100".to_string(),
-            "syfvx-100".to_string(),
-            "syftap-vm-1".to_string(),
-            "syftap-vm-2".to_string(),
+            naming::bridge_name("100"),
+            naming::vxlan_name("100"),
+            naming::tap_name("vm-1"),
+            naming::tap_name("vm-2"),
         ]);
 
         let vpcs = vec![vpc("100", 100)];
@@ -446,8 +458,8 @@ mod tests {
             .filter(|c| c.starts_with("apply_vm_rules("))
             .collect();
         assert_eq!(apply_calls.len(), 2);
-        assert!(apply_calls[0].contains("syftap-vm-1"));
-        assert!(apply_calls[1].contains("syftap-vm-2"));
+        assert!(apply_calls[0].contains(&naming::tap_name("vm-1")));
+        assert!(apply_calls[1].contains(&naming::tap_name("vm-2")));
     }
 
     // ── fdb_repopulated ───────────────────────────────────────────────
@@ -457,9 +469,9 @@ mod tests {
     async fn fdb_repopulated() {
         let backend = MockBackend::new();
         backend.set_interfaces(vec![
-            "syfbr-100".to_string(),
-            "syfvx-100".to_string(),
-            "syftap-vm-local".to_string(),
+            naming::bridge_name("100"),
+            naming::vxlan_name("100"),
+            naming::tap_name("vm-local"),
         ]);
 
         let vpcs = vec![vpc("100", 100)];
@@ -512,9 +524,9 @@ mod tests {
         let backend = MockBackend::new();
         // Kernel has interfaces that are NOT in redb.
         backend.set_interfaces(vec![
-            "syfbr-orphan".to_string(),
-            "syfvx-orphan".to_string(),
-            "syftap-deleted-vm".to_string(),
+            naming::bridge_name("orphan"),
+            naming::vxlan_name("orphan"),
+            naming::tap_name("deleted-vm"),
         ]);
 
         let vpcs: Vec<RecoveryVpc> = vec![];
@@ -527,9 +539,15 @@ mod tests {
         assert_eq!(report.orphans_cleaned, 3);
 
         let calls = backend.calls();
-        assert!(calls.iter().any(|c| c == "delete_bridge(syfbr-orphan)"));
-        assert!(calls.iter().any(|c| c == "delete_vxlan(syfvx-orphan)"));
-        assert!(calls.iter().any(|c| c == "delete_tap(syftap-deleted-vm)"));
+        assert!(calls
+            .iter()
+            .any(|c| c == &format!("delete_bridge({})", naming::bridge_name("orphan"))));
+        assert!(calls
+            .iter()
+            .any(|c| c == &format!("delete_vxlan({})", naming::vxlan_name("orphan"))));
+        assert!(calls
+            .iter()
+            .any(|c| c == &format!("delete_tap({})", naming::tap_name("deleted-vm"))));
     }
 
     // ── missing bridge is re-created ──────────────────────────────────
@@ -557,16 +575,20 @@ mod tests {
         assert_eq!(report.vxlans_recovered, 1);
 
         let calls = backend.calls();
-        assert!(calls.iter().any(|c| c == "create_bridge(syfbr-200)"));
+        let br200 = naming::bridge_name("200");
+        let vx200 = naming::vxlan_name("200");
         assert!(calls
             .iter()
-            .any(|c| c == "add_bridge_ip(syfbr-200, 10.2.1.1, 24)"));
+            .any(|c| c == &format!("create_bridge({br200})")));
         assert!(calls
             .iter()
-            .any(|c| c.starts_with("create_vxlan(syfvx-200")));
+            .any(|c| c == &format!("add_bridge_ip({br200}, 10.2.1.1, 24)")));
         assert!(calls
             .iter()
-            .any(|c| c == "attach_to_bridge(syfvx-200, syfbr-200)"));
+            .any(|c| c.starts_with(&format!("create_vxlan({vx200}"))));
+        assert!(calls
+            .iter()
+            .any(|c| c == &format!("attach_to_bridge({vx200}, {br200})")));
     }
 
     // ── NAT rules re-applied for local subnets ────────────────────────
@@ -574,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn nat_reapplied() {
         let backend = MockBackend::new();
-        backend.set_interfaces(vec!["syfbr-100".to_string(), "syfvx-100".to_string()]);
+        backend.set_interfaces(vec![naming::bridge_name("100"), naming::vxlan_name("100")]);
 
         let vpcs = vec![vpc("100", 100)];
         let subnets = vec![

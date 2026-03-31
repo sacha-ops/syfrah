@@ -1,22 +1,23 @@
 //! VXLAN interface management.
 //!
-//! One VXLAN interface per VPC per node: `syfvx-{vpc_id}`.
+//! One VXLAN interface per VPC per node.
 //! Created on-demand when the first VM in a VPC lands on this node.
 
 use crate::backend::NetworkBackend;
 use crate::error::Result;
+use crate::naming;
 
 /// Default VXLAN UDP destination port.
 pub const VXLAN_PORT: u16 = 4789;
 
 /// Derive the VXLAN interface name from a VPC ID.
 pub fn vxlan_name(vpc_id: &str) -> String {
-    format!("syfvx-{vpc_id}")
+    naming::vxlan_name(vpc_id)
 }
 
 /// Derive the bridge name from a VPC ID.
 pub fn bridge_name(vpc_id: &str) -> String {
-    format!("syfbr-{vpc_id}")
+    naming::bridge_name(vpc_id)
 }
 
 /// Create a VXLAN interface for the given VPC and attach it to the VPC bridge.
@@ -25,7 +26,7 @@ pub fn bridge_name(vpc_id: &str) -> String {
 ///
 /// Steps:
 /// 1. Create with `nolearning` + `proxy` flags, bring up.
-/// 2. Attach to `syfbr-{vpc_id}`.
+/// 2. Attach to VPC bridge.
 pub async fn ensure_vxlan(
     backend: &dyn NetworkBackend,
     vpc_id: &str,
@@ -72,8 +73,16 @@ mod tests {
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], "create_vxlan(syfvx-vpc-100, 100, fd00::1, 4789)");
-        assert_eq!(calls[1], "attach_to_bridge(syfvx-vpc-100, syfbr-vpc-100)");
+        let expected_vxlan = naming::vxlan_name("vpc-100");
+        let expected_bridge = naming::bridge_name("vpc-100");
+        assert_eq!(
+            calls[0],
+            format!("create_vxlan({expected_vxlan}, 100, fd00::1, 4789)")
+        );
+        assert_eq!(
+            calls[1],
+            format!("attach_to_bridge({expected_vxlan}, {expected_bridge})")
+        );
     }
 
     #[tokio::test]
@@ -102,9 +111,11 @@ mod tests {
             .filter(|c| c.starts_with("attach_to_bridge("))
             .collect();
         assert_eq!(attach_calls.len(), 1);
+        let expected_vxlan = naming::vxlan_name("vpc-200");
+        let expected_bridge = naming::bridge_name("vpc-200");
         assert_eq!(
             attach_calls[0],
-            "attach_to_bridge(syfvx-vpc-200, syfbr-vpc-200)"
+            format!("attach_to_bridge({expected_vxlan}, {expected_bridge})")
         );
     }
 
@@ -123,6 +134,9 @@ mod tests {
             .filter(|c| c.starts_with("delete_vxlan("))
             .collect();
         assert_eq!(delete_calls.len(), 1);
-        assert_eq!(delete_calls[0], "delete_vxlan(syfvx-vpc-300)");
+        assert_eq!(
+            delete_calls[0],
+            format!("delete_vxlan({})", naming::vxlan_name("vpc-300"))
+        );
     }
 }

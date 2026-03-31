@@ -178,9 +178,9 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         ip: &str,
         mac: &str,
     ) -> Result<NetworkSetupResult, ComputeError> {
-        let bridge_name = format!("syfbr-{vpc_id}");
-        let vxlan_name = format!("syfvx-{vpc_id}");
-        let tap_name = format!("syftap-{vm_id}");
+        let bridge_name = syfrah_overlay::naming::bridge_name(vpc_id);
+        let vxlan_name = syfrah_overlay::naming::vxlan_name(vpc_id);
+        let tap_name = syfrah_overlay::naming::tap_name(vm_id);
 
         // Parse prefix length from CIDR.
         let prefix_len = parse_prefix_len(subnet_cidr)?;
@@ -345,7 +345,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         ip: &str,
         tap_name: &str,
     ) -> Result<(), ComputeError> {
-        let _bridge_name = format!("syfbr-{vpc_id}");
+        let _bridge_name = syfrah_overlay::naming::bridge_name(vpc_id);
 
         // Remove nftables rules (best-effort).
         if let Err(e) = self.backend.remove_vm_rules(tap_name).await {
@@ -542,14 +542,17 @@ mod tests {
 
         let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
 
-        assert_eq!(result.tap_name, "syftap-web-1");
+        let expected_tap = syfrah_overlay::naming::tap_name("web-1");
+        assert_eq!(result.tap_name, expected_tap);
 
         // Verify TAP was created and attached to bridge
         let calls = h.backend.calls();
-        assert!(calls.iter().any(|c| c == "create_tap(syftap-web-1)"));
         assert!(calls
             .iter()
-            .any(|c| c.starts_with("attach_to_bridge(syftap-web-1")));
+            .any(|c| c == &format!("create_tap({expected_tap})")));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with(&format!("attach_to_bridge({expected_tap}"))));
     }
 
     #[tokio::test]
@@ -562,7 +565,10 @@ mod tests {
         let calls = h.backend.calls();
         // Bridge should be created with the VPC ID
         assert!(
-            calls.iter().any(|c| c.starts_with("create_bridge(syfbr-")),
+            calls.iter().any(|c| c.starts_with(&format!(
+                "create_bridge({}",
+                syfrah_overlay::naming::BRIDGE_PREFIX
+            ))),
             "bridge must be created"
         );
     }

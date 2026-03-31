@@ -151,11 +151,13 @@ mod tests {
         rb.set_ip_allocated("subnet-1", "10.1.1.3");
 
         // Step 2: Bridge creation succeeds
-        backend.create_bridge("syfbr-100").await.unwrap();
-        rb.set_bridge_created("syfbr-100");
+        let br = crate::naming::bridge_name("100");
+        let tap = crate::naming::tap_name("vm1");
+        backend.create_bridge(&br).await.unwrap();
+        rb.set_bridge_created(&br);
 
         // Step 3: TAP creation fails
-        let tap_result = backend.create_tap("syftap-vm1").await;
+        let tap_result = backend.create_tap(&tap).await;
         assert!(tap_result.is_err(), "create_tap should have failed");
 
         // Rollback
@@ -170,7 +172,7 @@ mod tests {
         // Verify: bridge was deleted
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "delete_bridge(syfbr-100)"),
+            calls.iter().any(|c| c == &format!("delete_bridge({br})")),
             "bridge should be rolled back, got: {calls:?}"
         );
 
@@ -196,7 +198,7 @@ mod tests {
         rb.set_ip_allocated("subnet-1", "10.1.1.5");
 
         // TAP fails
-        let tap_result = backend.create_tap("syftap-vm2").await;
+        let tap_result = backend.create_tap(&crate::naming::tap_name("vm2")).await;
         assert!(tap_result.is_err());
 
         let release_cb: IpReleaseCallback = Box::new(move |_subnet, _ip| {
@@ -218,18 +220,19 @@ mod tests {
         rb.set_ip_allocated("subnet-1", "10.1.1.3");
 
         // Bridge created for this VM (first VM in VPC on this node)
-        backend.create_bridge("syfbr-200").await.unwrap();
-        rb.set_bridge_created("syfbr-200");
+        let br = crate::naming::bridge_name("200");
+        backend.create_bridge(&br).await.unwrap();
+        rb.set_bridge_created(&br);
 
         // TAP fails
-        let tap_result = backend.create_tap("syftap-vm3").await;
+        let tap_result = backend.create_tap(&crate::naming::tap_name("vm3")).await;
         assert!(tap_result.is_err());
 
         rb.rollback(&backend, None).await;
 
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "delete_bridge(syfbr-200)"),
+            calls.iter().any(|c| c == &format!("delete_bridge({br})")),
             "bridge must be deleted on rollback, got: {calls:?}"
         );
 
@@ -248,10 +251,12 @@ mod tests {
 
         let mut rb = NetworkRollback::new();
         rb.set_ip_allocated("subnet-1", "10.1.1.3");
-        rb.set_bridge_created("syfbr-100");
-        rb.set_tap_created("syftap-vm1");
-        rb.set_nft_applied("syftap-vm1");
-        rb.set_nat_applied("syfbr-100", "10.1.1.0/24");
+        let br = crate::naming::bridge_name("100");
+        let tap = crate::naming::tap_name("vm1");
+        rb.set_bridge_created(&br);
+        rb.set_tap_created(&tap);
+        rb.set_nft_applied(&tap);
+        rb.set_nat_applied(&br, "10.1.1.0/24");
         rb.set_placement_stored("100", "vm1");
 
         let released = Arc::new(Mutex::new(false));
@@ -289,8 +294,8 @@ mod tests {
 
         let mut rb = NetworkRollback::new();
         rb.set_ip_allocated("subnet-1", "10.1.1.3");
-        rb.set_tap_created("syftap-vm1");
-        rb.set_bridge_created("syfbr-100");
+        rb.set_tap_created(&crate::naming::tap_name("vm1"));
+        rb.set_bridge_created(&crate::naming::bridge_name("100"));
 
         let released = Arc::new(Mutex::new(false));
         let released_clone = Arc::clone(&released);

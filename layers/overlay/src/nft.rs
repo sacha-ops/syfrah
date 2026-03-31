@@ -232,49 +232,55 @@ pub fn generate_remove_peering_rules(bridge_a: &str, bridge_b: &str) -> String {
 mod tests {
     use super::*;
 
-    const TAP: &str = "syftap-vm1";
+    fn tap() -> String {
+        crate::naming::tap_name("vm1")
+    }
     const MAC: &str = "02:00:0a:00:01:05";
     const IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 5);
 
     fn rules() -> String {
-        generate_vm_rules(TAP, MAC, IP)
+        generate_vm_rules(&tap(), MAC, IP)
     }
 
     #[test]
     fn anti_spoof_rules_generated() {
         let r = rules();
-        assert!(r.contains(&format!("iif {TAP} ether saddr != {MAC} drop")));
-        assert!(r.contains(&format!("iif {TAP} ip saddr != {IP} drop")));
+        let t = tap();
+        assert!(r.contains(&format!("iif {t} ether saddr != {MAC} drop")));
+        assert!(r.contains(&format!("iif {t} ip saddr != {IP} drop")));
     }
 
     #[test]
     fn default_deny_ingress() {
         let r = rules();
-        assert!(r.contains(&format!("oif {TAP} drop")));
+        assert!(r.contains(&format!("oif {} drop", tap())));
     }
 
     #[test]
     fn ssh_allowed() {
         let r = rules();
-        assert!(r.contains(&format!("oif {TAP} tcp dport 22 accept")));
+        assert!(r.contains(&format!("oif {} tcp dport 22 accept", tap())));
     }
 
     #[test]
     fn icmp_allowed() {
         let r = rules();
-        assert!(r.contains(&format!("oif {TAP} icmp type echo-request accept")));
+        assert!(r.contains(&format!("oif {} icmp type echo-request accept", tap())));
     }
 
     #[test]
     fn egress_allowed() {
         let r = rules();
-        assert!(r.contains(&format!("iif {TAP} accept")));
+        assert!(r.contains(&format!("iif {} accept", tap())));
     }
 
     #[test]
     fn conntrack_established() {
         let r = rules();
-        assert!(r.contains(&format!("oif {TAP} ct state established,related accept")));
+        assert!(r.contains(&format!(
+            "oif {} ct state established,related accept",
+            tap()
+        )));
     }
 
     #[test]
@@ -289,8 +295,9 @@ mod tests {
         let r = rules();
         let mac_spoof_pos = r.find("ether saddr !=").expect("MAC spoof rule");
         let ip_spoof_pos = r.find("ip saddr !=").expect("IP spoof rule");
-        let egress_pos = r.find(&format!("iif {TAP} accept")).expect("egress rule");
-        let deny_pos = r.find(&format!("oif {TAP} drop")).expect("deny rule");
+        let t = tap();
+        let egress_pos = r.find(&format!("iif {t} accept")).expect("egress rule");
+        let deny_pos = r.find(&format!("oif {t} drop")).expect("deny rule");
         let ssh_pos = r.find("tcp dport 22 accept").expect("SSH rule");
         assert!(mac_spoof_pos < ip_spoof_pos);
         assert!(ip_spoof_pos < egress_pos);
@@ -299,16 +306,19 @@ mod tests {
 
     #[test]
     fn subnet_isolation_blocks_both_directions() {
-        let rules = generate_subnet_isolation("syfbr-100", "10.1.1.0/24", "10.1.2.0/24");
+        let br = crate::naming::bridge_name("100");
+        let rules = generate_subnet_isolation(&br, "10.1.1.0/24", "10.1.2.0/24");
         assert!(rules.contains("ip saddr 10.1.1.0/24 ip daddr 10.1.2.0/24 drop"));
         assert!(rules.contains("ip saddr 10.1.2.0/24 ip daddr 10.1.1.0/24 drop"));
     }
 
     #[test]
     fn vpc_isolation_blocks_both_directions() {
-        let rules = generate_vpc_isolation("syfbr-100", "syfbr-200");
-        assert!(rules.contains("iif syfbr-100 oif syfbr-200 drop"));
-        assert!(rules.contains("iif syfbr-200 oif syfbr-100 drop"));
+        let br_a = crate::naming::bridge_name("100");
+        let br_b = crate::naming::bridge_name("200");
+        let rules = generate_vpc_isolation(&br_a, &br_b);
+        assert!(rules.contains(&format!("iif {br_a} oif {br_b} drop")));
+        assert!(rules.contains(&format!("iif {br_b} oif {br_a} drop")));
     }
 
     #[test]
@@ -318,38 +328,48 @@ mod tests {
 
     #[test]
     fn subnet_isolation_uses_bridge_name() {
-        let rules = generate_subnet_isolation("syfbr-vpc42", "10.0.1.0/24", "10.0.2.0/24");
-        assert!(rules.contains("iif syfbr-vpc42 oif syfbr-vpc42"));
+        let br = crate::naming::bridge_name("vpc42");
+        let rules = generate_subnet_isolation(&br, "10.0.1.0/24", "10.0.2.0/24");
+        assert!(rules.contains(&format!("iif {br} oif {br}")));
     }
 
     // ── SNAT tests ──────────────────────────────────────────────────
 
     #[test]
     fn snat_rule_generated() {
-        let rules = generate_nat_rules("syfbr-100", "10.1.1.0/24");
+        let br = crate::naming::bridge_name("100");
+        let rules = generate_nat_rules(&br, "10.1.1.0/24");
         assert!(rules.contains("masquerade"));
         assert!(rules.contains("10.1.1.0/24"));
-        assert!(rules.contains("syfbr-100"));
+        assert!(rules.contains(&br));
     }
 
     #[test]
     fn masquerade_per_bridge() {
-        let expr = masquerade_rule_expr("syfbr-200", "10.2.0.0/16");
-        assert_eq!(expr, "oif != \"syfbr-200\" ip saddr 10.2.0.0/16 masquerade");
+        let br = crate::naming::bridge_name("200");
+        let expr = masquerade_rule_expr(&br, "10.2.0.0/16");
+        assert_eq!(
+            expr,
+            format!("oif != \"{br}\" ip saddr 10.2.0.0/16 masquerade")
+        );
     }
 
     // ── Peering tests ───────────────────────────────────────────────
 
     #[test]
     fn peering_forward_rules() {
-        let rules = generate_peering_rules("syfbr-100", "syfbr-200");
-        assert!(rules.contains("iif syfbr-100 oif syfbr-200 accept"));
-        assert!(rules.contains("iif syfbr-200 oif syfbr-100 accept"));
+        let br_a = crate::naming::bridge_name("100");
+        let br_b = crate::naming::bridge_name("200");
+        let rules = generate_peering_rules(&br_a, &br_b);
+        assert!(rules.contains(&format!("iif {br_a} oif {br_b} accept")));
+        assert!(rules.contains(&format!("iif {br_b} oif {br_a} accept")));
     }
 
     #[test]
     fn peering_rules_removed() {
-        let rules = generate_remove_peering_rules("syfbr-100", "syfbr-200");
-        assert!(rules.contains("remove peering rules syfbr-100 <-> syfbr-200"));
+        let br_a = crate::naming::bridge_name("100");
+        let br_b = crate::naming::bridge_name("200");
+        let rules = generate_remove_peering_rules(&br_a, &br_b);
+        assert!(rules.contains(&format!("remove peering rules {br_a} <-> {br_b}")));
     }
 }
