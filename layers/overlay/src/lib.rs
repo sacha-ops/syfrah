@@ -5,6 +5,7 @@ pub mod fdb;
 pub mod linux;
 pub mod mock;
 pub mod nft;
+pub mod recovery;
 pub mod sysctl;
 pub mod tap;
 pub mod veth_peer;
@@ -19,6 +20,9 @@ pub use fdb::{
 };
 pub use linux::LinuxBackend;
 pub use mock::MockBackend;
+pub use recovery::{
+    recover_network, RecoveryPlacement, RecoveryReport, RecoverySubnet, RecoveryVpc,
+};
 pub use sysctl::ensure_ip_forwarding;
 
 #[cfg(test)]

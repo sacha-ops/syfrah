@@ -9,6 +9,8 @@ pub struct MockBackend {
     calls: Mutex<Vec<String>>,
     /// Method names that should return an error (e.g. "add_fdb_entry").
     fail_methods: Mutex<HashSet<String>>,
+    /// Interfaces returned by `list_interfaces`.
+    interfaces: Mutex<Vec<String>>,
 }
 
 impl MockBackend {
@@ -16,6 +18,7 @@ impl MockBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             fail_methods: Mutex::new(HashSet::new()),
+            interfaces: Mutex::new(Vec::new()),
         }
     }
 
@@ -35,6 +38,12 @@ impl MockBackend {
             .lock()
             .expect("lock poisoned")
             .insert(method.to_string());
+    }
+
+    /// Seed the mock with a list of kernel interfaces that `list_interfaces`
+    /// will return (filtered by prefix).
+    pub fn set_interfaces(&self, ifaces: Vec<String>) {
+        *self.interfaces.lock().expect("lock poisoned") = ifaces;
     }
 
     fn record(&self, call: String) {
@@ -173,6 +182,17 @@ impl NetworkBackend for MockBackend {
         self.record(format!("remove_peering_rules({bridge_a}, {bridge_b})"));
         Ok(())
     }
+
+    // ── Discovery ──────────────────────────────────────────────────────
+
+    async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
+        self.record(format!("list_interfaces({prefix})"));
+        let all = self.interfaces.lock().expect("lock poisoned").clone();
+        Ok(all
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -230,9 +250,10 @@ mod tests {
         b.remove_peering_rules("syfbr-100", "syfbr-200")
             .await
             .unwrap();
+        b.list_interfaces("syfbr-").await.unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 20, "expected one call per trait method");
+        assert_eq!(calls.len(), 21, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));
@@ -255,6 +276,7 @@ mod tests {
         assert!(calls[17].starts_with("remove_nat("));
         assert!(calls[18].starts_with("apply_peering_rules("));
         assert!(calls[19].starts_with("remove_peering_rules("));
+        assert!(calls[20].starts_with("list_interfaces("));
 
         // Test reset
         b.reset();

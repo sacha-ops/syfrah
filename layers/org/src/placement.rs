@@ -60,6 +60,15 @@ impl PlacementStore {
             .collect())
     }
 
+    /// List all placements across all VPCs and nodes.
+    ///
+    /// Used by the daemon restart recovery path to rebuild the complete
+    /// network state from persisted placement records.
+    pub fn list_all(&self) -> Result<Vec<VmPlacement>> {
+        let entries: Vec<(String, VmPlacement)> = self.db.list(TABLE)?;
+        Ok(entries.into_iter().map(|(_, p)| p).collect())
+    }
+
     /// List all placements hosted on a given node (fabric IPv6).
     pub fn list_by_node(&self, hosting_node: &str) -> Result<Vec<VmPlacement>> {
         let entries: Vec<(String, VmPlacement)> = self.db.list(TABLE)?;
