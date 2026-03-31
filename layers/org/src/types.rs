@@ -419,6 +419,32 @@ pub struct Route {
     pub created_at: u64,
 }
 
+/// Unique identifier for a NAT Gateway.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NatGatewayId(pub String);
+
+impl fmt::Display for NatGatewayId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A NAT Gateway — provides SNAT masquerade for a VPC's subnets.
+///
+/// Placed in a specific subnet, uses the node's public IP for outbound traffic.
+/// State transitions: Pending → Active (nftables applied), Pending → Failed,
+/// Active → Deleting → Deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatGateway {
+    pub id: NatGatewayId,
+    pub name: String,
+    pub vpc_id: VpcId,
+    pub subnet_id: SubnetId,
+    pub public_ip: String,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
 /// Whether a VM placement is being added or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementAction {

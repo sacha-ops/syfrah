@@ -6,10 +6,10 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringId, PeeringStatus, Project,
-    ProjectId, ResourceState, Route, RouteId, RouteOrigin, RouteStatus, RouteTable, RouteTableId,
-    RouteTarget, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment, VpcId,
-    VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NatGateway, NatGatewayId, NetworkInterface, Org, OrgId, PeeringId,
+    PeeringStatus, Project, ProjectId, ResourceState, Route, RouteId, RouteOrigin, RouteStatus,
+    RouteTable, RouteTableId, RouteTarget, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc,
+    VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -26,6 +26,7 @@ const NICS_TABLE: &str = "network_interfaces";
 const ROUTE_TABLES_TABLE: &str = "route_tables";
 const ROUTES_TABLE: &str = "routes";
 const SUBNET_ROUTE_ASSOC_TABLE: &str = "subnet_route_associations";
+const NAT_GATEWAYS_TABLE: &str = "nat_gateways";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
@@ -1493,6 +1494,136 @@ impl OrgStore {
         // Fall back to default.
         self.get_default_route_table(&subnet.vpc_id)?
             .ok_or_else(|| OrgError::RouteTableNotFound("default".to_string()))
+    }
+
+    // ── NAT Gateway operations ─────────────────────────────────────
+
+    /// Key format for NAT gateway entries: "vpc_id/name".
+    fn nat_gw_key(vpc_id: &VpcId, name: &str) -> String {
+        format!("{}/{name}", vpc_id.0)
+    }
+
+    /// Create a new NAT Gateway. Starts in Pending state.
+    pub fn create_nat_gw(
+        &self,
+        name: &str,
+        vpc_id: &VpcId,
+        subnet_id: &SubnetId,
+        public_ip: &str,
+    ) -> Result<NatGateway> {
+        validate_name(name, "nat-gw")?;
+
+        let key = Self::nat_gw_key(vpc_id, name);
+        if self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
+            return Err(OrgError::NatGwAlreadyExists(name.to_string()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let gw = NatGateway {
+            id: NatGatewayId(format!("nat-{name}")),
+            name: name.to_string(),
+            vpc_id: vpc_id.clone(),
+            subnet_id: subnet_id.clone(),
+            public_ip: public_ip.to_string(),
+            state: ResourceState::Pending,
+            created_at: now,
+        };
+
+        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        Ok(gw)
+    }
+
+    /// Get a NAT Gateway by VPC ID and name.
+    pub fn get_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<Option<NatGateway>> {
+        let key = Self::nat_gw_key(vpc_id, name);
+        Ok(self.db.get(NAT_GATEWAYS_TABLE, &key)?)
+    }
+
+    /// Get a NAT Gateway by name alone (scans all VPCs). Returns error if ambiguous.
+    pub fn get_nat_gw_by_name(&self, name: &str) -> Result<Option<NatGateway>> {
+        let all = self.list_nat_gws()?;
+        let matches: Vec<_> = all.into_iter().filter(|g| g.name == name).collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches.into_iter().next().unwrap())),
+            n => Err(OrgError::Ambiguous(format!(
+                "nat-gw name '{name}' exists in {n} VPCs — specify --vpc"
+            ))),
+        }
+    }
+
+    /// List all NAT Gateways.
+    pub fn list_nat_gws(&self) -> Result<Vec<NatGateway>> {
+        let entries: Vec<(String, NatGateway)> = self.db.list(NAT_GATEWAYS_TABLE)?;
+        Ok(entries.into_iter().map(|(_, g)| g).collect())
+    }
+
+    /// List NAT Gateways belonging to a specific VPC.
+    pub fn list_nat_gws_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<NatGateway>> {
+        let prefix = format!("{}/", vpc_id.0);
+        let all: Vec<(String, NatGateway)> = self.db.list(NAT_GATEWAYS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, g)| g)
+            .collect())
+    }
+
+    /// List NAT Gateways by VPC name (CLI convenience wrapper).
+    pub fn list_nat_gws_by_vpc_name(&self, vpc_name: Option<&str>) -> Result<Vec<NatGateway>> {
+        match vpc_name {
+            Some(vname) => {
+                let vpc = self
+                    .get_vpc(vname)?
+                    .ok_or_else(|| OrgError::VpcNotFound(vname.to_string()))?;
+                self.list_nat_gws_by_vpc(&vpc.id)
+            }
+            None => self.list_nat_gws(),
+        }
+    }
+
+    /// Update the state of a NAT Gateway.
+    pub fn update_nat_gw_state(
+        &self,
+        vpc_id: &VpcId,
+        name: &str,
+        state: ResourceState,
+    ) -> Result<NatGateway> {
+        let key = Self::nat_gw_key(vpc_id, name);
+        let mut gw: NatGateway = self
+            .db
+            .get(NAT_GATEWAYS_TABLE, &key)?
+            .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
+        gw.state = state;
+        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        Ok(gw)
+    }
+
+    /// Delete a NAT Gateway record from the store.
+    pub fn delete_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
+        let key = Self::nat_gw_key(vpc_id, name);
+        if !self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
+            return Err(OrgError::NatGwNotFound(name.to_string()));
+        }
+        self.db.delete(NAT_GATEWAYS_TABLE, &key)?;
+        Ok(())
+    }
+
+    /// Check if any routes in the VPC reference the given NAT Gateway name.
+    pub fn routes_referencing_nat_gw(
+        &self,
+        vpc_id: &VpcId,
+        nat_gw_name: &str,
+    ) -> Result<Vec<Route>> {
+        let routes = self.list_routes_by_vpc(vpc_id)?;
+        Ok(routes
+            .into_iter()
+            .filter(|r| matches!(&r.target, RouteTarget::NatGateway(n) if n == nat_gw_name))
+            .collect())
     }
 
     // ── NIC operations (convenience wrappers for attach/detach) ────
@@ -3492,5 +3623,160 @@ mod tests {
 
         let err = store.remove_route(&rt.id, "10.2.0.0/16").unwrap_err();
         assert!(matches!(err, OrgError::CannotDeletePropagatedRoute));
+    }
+
+    // ── NAT Gateway tests ──────────────────────────────────────────
+
+    fn setup_vpc_and_subnet(store: &OrgStore) -> (Vpc, Subnet) {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+        let vpc = store
+            .create_vpc(
+                "test-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let subnet = store
+            .create_subnet("test-vpc", &env_id, "frontend", Some("10.1.1.0/24"))
+            .unwrap();
+        (vpc, subnet)
+    }
+
+    #[test]
+    fn test_create_nat_gw() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        let gw = store
+            .create_nat_gw("main-gw", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        assert_eq!(gw.name, "main-gw");
+        assert_eq!(gw.vpc_id, vpc.id);
+        assert_eq!(gw.subnet_id, subnet.id);
+        assert_eq!(gw.public_ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn test_nat_gw_state_pending() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        let gw = store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        assert_eq!(gw.state, ResourceState::Pending);
+    }
+
+    #[test]
+    fn test_nat_gw_state_active() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        let gw = store
+            .update_nat_gw_state(&vpc.id, "gw1", ResourceState::Active)
+            .unwrap();
+        assert_eq!(gw.state, ResourceState::Active);
+    }
+
+    #[test]
+    fn test_nat_gw_state_failed() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        let gw = store
+            .update_nat_gw_state(&vpc.id, "gw1", ResourceState::Failed)
+            .unwrap();
+        assert_eq!(gw.state, ResourceState::Failed);
+    }
+
+    #[test]
+    fn test_nat_gw_public_ip_resolved() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        let gw = store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "203.0.113.5")
+            .unwrap();
+        assert_eq!(gw.public_ip, "203.0.113.5");
+    }
+
+    #[test]
+    fn test_list_nat_gws_by_vpc() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        store
+            .create_nat_gw("gw2", &vpc.id, &subnet.id, "1.2.3.5")
+            .unwrap();
+
+        let gws = store.list_nat_gws_by_vpc(&vpc.id).unwrap();
+        assert_eq!(gws.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_nat_gw() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        store.delete_nat_gw(&vpc.id, "gw1").unwrap();
+
+        let gw = store.get_nat_gw(&vpc.id, "gw1").unwrap();
+        assert!(gw.is_none());
+    }
+
+    #[test]
+    fn test_nat_gw_duplicate_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+        let err = store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.5")
+            .unwrap_err();
+        assert!(matches!(err, OrgError::NatGwAlreadyExists(_)));
+    }
+
+    #[test]
+    fn test_routes_referencing_nat_gw() {
+        let (_dir, store) = temp_store();
+        let (vpc, subnet) = setup_vpc_and_subnet(&store);
+
+        store
+            .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        store
+            .add_route(
+                &rt.id,
+                "0.0.0.0/0",
+                RouteTarget::NatGateway("gw1".to_string()),
+                None,
+            )
+            .unwrap();
+
+        let refs = store.routes_referencing_nat_gw(&vpc.id, "gw1").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].destination, "0.0.0.0/0");
     }
 }
