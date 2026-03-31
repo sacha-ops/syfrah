@@ -92,6 +92,7 @@ The relationship is strict:
 ### 3. Hypervisor as a first-class resource
 
 ```rust
+// Canonical Hypervisor record (persisted in Raft/redb)
 struct Hypervisor {
     /// Globally unique identifier. Format: hv-{ulid}.
     /// Assigned at registration time. Immutable.
@@ -138,11 +139,32 @@ struct Hypervisor {
     /// Unix timestamp (seconds) when this hypervisor was registered.
     created_at: u64,
 
+    // NOTE: last_heartbeat is NOT part of the canonical record.
+    // See HypervisorStatus below.
+}
+
+// Runtime status (observed, not persisted in Raft).
+// Ephemeral — rebuilt from gossip on restart.
+struct HypervisorStatus {
+    /// The hypervisor this status describes.
+    hypervisor_id: HypervisorId,
+
     /// Unix timestamp of the last heartbeat received via gossip.
-    /// Used by the scheduler to determine liveness.
+    /// Observed by other nodes, not self-reported to Raft.
     last_heartbeat: u64,
+
+    /// Can other nodes reach this Forge?
+    reachable: bool,
+
+    /// Running Forge binary version.
+    forge_version: String,
+
+    /// Forge process uptime in seconds.
+    uptime_seconds: u64,
 }
 ```
+
+> **Note:** The canonical Hypervisor record contains only persisted, authoritative fields. Runtime/observed fields live in HypervisorStatus, which is ephemeral and rebuilt from gossip.
 
 > **Note:** Field-level details in the structs below are illustrative. The implementation may adjust field names and types.
 
@@ -214,29 +236,53 @@ Capacity is the bridge between hardware reality and scheduling decisions. The hy
 
 ```rust
 struct AllocatableCapacity {
-    // --- CPU ---
-    /// Total vCPUs available for allocation.
-    /// Computed as: cpu_threads_logical * overcommit_cpu.
-    /// Example: 128 threads * 2.0 overcommit = 256 allocatable vCPUs.
-    total_vcpus: u32,
+    // --- Physical hardware (detected, immutable) ---
+    /// Logical threads from hardware (physical cores * threads-per-core).
+    physical_vcpus: u32,
 
-    /// vCPUs currently allocated to running VMs.
-    used_vcpus: u32,
+    /// Installed RAM in MB (from /proc/meminfo).
+    physical_memory_mb: u64,
 
-    /// vCPUs available for new VMs.
-    /// Computed as: total_vcpus - used_vcpus - reserved_vcpus.
+    // --- Allocatable (computed from physical - reserved, * overcommit) ---
+    /// physical_vcpus * overcommit_cpu - reserved_vcpus.
+    /// Example: 128 threads * 2.0 overcommit - 1 reserved = 255 allocatable vCPUs.
     allocatable_vcpus: u32,
 
-    // --- Memory ---
-    /// Total memory available for allocation in MB.
-    /// Computed as: (memory_gb * 1024) * overcommit_memory - reserved_memory_mb.
-    total_memory_mb: u64,
+    /// physical_memory_mb - reserved_memory_mb (no memory overcommit by default).
+    allocatable_memory_mb: u64,
+
+    // --- Currently used ---
+    /// vCPUs currently allocated to running VMs.
+    used_vcpus: u32,
 
     /// Memory currently allocated to running VMs in MB.
     used_memory_mb: u64,
 
-    /// Memory available for new VMs in MB.
-    allocatable_memory_mb: u64,
+    // --- Available right now ---
+    /// allocatable_vcpus - used_vcpus.
+    available_vcpus: u32,
+
+    /// allocatable_memory_mb - used_memory_mb.
+    available_memory_mb: u64,
+
+    // --- Configuration ---
+    /// vCPUs reserved for the host OS and Syfrah daemon overhead.
+    /// Default: 1 (for OS + Syfrah).
+    reserved_vcpus: u32,
+
+    /// Memory reserved for the host OS and Syfrah daemon overhead in MB.
+    /// Default: 1024 MB (1 GB).
+    reserved_memory_mb: u64,
+
+    /// CPU overcommit ratio. Default: 2.0.
+    /// A ratio of 2.0 means a 128-thread machine can allocate 256 vCPUs.
+    /// Set to 1.0 for dedicated/performance-sensitive workloads.
+    overcommit_cpu: f32,
+
+    /// Memory overcommit ratio. Default: 1.0 (no overcommit).
+    /// Memory overcommit is dangerous — OOM kills are destructive.
+    /// Only increase if workloads are known to be memory-sparse.
+    overcommit_memory: f32,
 
     // --- Local disk ---
     /// Scratch space for VM runtime (rootfs clones, config-drives) in GB.
@@ -256,26 +302,6 @@ struct AllocatableCapacity {
 
     // Remote storage (ZeroFS/S3) is NOT bounded per-hypervisor.
     // The scheduler does NOT filter by remote volume capacity.
-
-    // --- Reservations ---
-    /// vCPUs reserved for the host OS and Syfrah daemon overhead.
-    /// Default: 2 vCPUs.
-    reserved_vcpus: u32,
-
-    /// Memory reserved for the host OS and Syfrah daemon overhead in MB.
-    /// Default: 2048 MB (2 GB).
-    reserved_memory_mb: u64,
-
-    // --- Overcommit ratios ---
-    /// CPU overcommit ratio. Default: 2.0.
-    /// A ratio of 2.0 means a 128-thread machine can allocate 256 vCPUs.
-    /// Set to 1.0 for dedicated/performance-sensitive workloads.
-    overcommit_cpu: f32,
-
-    /// Memory overcommit ratio. Default: 1.0 (no overcommit).
-    /// Memory overcommit is dangerous — OOM kills are destructive.
-    /// Only increase if workloads are known to be memory-sparse.
-    overcommit_memory: f32,
 }
 ```
 
@@ -299,6 +325,11 @@ Registering → NotReady → Available → Draining → Available
 enum HypervisorState {
     /// Hardware detection in progress, not yet assessed.
     /// The node has been detected but capabilities are still being probed.
+    ///
+    /// Registering is a transient local phase. The hypervisor record exists only in the local
+    /// Forge's redb until probing completes. It is not replicated to Raft or visible in gossip
+    /// until the record is fully materialized and transitions to NotReady. This means other nodes
+    /// cannot see a Registering hypervisor — it becomes cluster-visible only at NotReady.
     Registering,
 
     /// Registered but not schedulable. Missing prerequisites:
@@ -338,7 +369,7 @@ enum HypervisorState {
 | Draining | Available | (automatic) | All VMs migrated/stopped, drain complete |
 | Draining | Maintenance | (automatic) | Drain complete + maintenance requested |
 | Available | Maintenance | `syfrah hypervisor maintenance` | Must be empty (no running VMs) |
-| Maintenance | Available | `syfrah hypervisor undrain` | — |
+| Maintenance | Available | `syfrah hypervisor activate` | — |
 | Available | Decommissioned | `syfrah hypervisor decommission` | No running VMs (must drain first) |
 | Maintenance | Decommissioned | `syfrah hypervisor decommission` | No running VMs |
 | Decommissioned | (none) | — | Terminal state |
@@ -385,7 +416,17 @@ syfrah hypervisor drain hv-001         → state: Draining (evacuating)
 (VMs evacuated)                        → state: Available (empty but schedulable)
 syfrah hypervisor maintenance hv-001   → state: Maintenance (must be empty)
 (work done)
-syfrah hypervisor undrain hv-001       → state: Available
+syfrah hypervisor activate hv-001      → state: Available
+
+# activate is the generic "return to schedulable" command. It works from:
+# - NotReady → Available (initial enablement, alias: syfrah hypervisor enable)
+# - Maintenance → Available (post-maintenance return)
+# - Draining → Available (cancel drain, but only if safe — VMs may have already moved)
+
+# For clarity, these are aliases:
+# syfrah hypervisor enable <id>     = activate from NotReady
+# syfrah hypervisor undrain <id>    = activate from Draining (cancel)
+# syfrah hypervisor activate <id>   = generic return to Available
 ```
 
 Or combined:
@@ -468,22 +509,20 @@ struct Toleration {
 
 A fabric node becomes a hypervisor through registration. Two paths:
 
-#### Automatic discovery (not activation)
+### Three distinct operations
 
-When a node joins the mesh via `syfrah fabric join` (or `syfrah fabric init`), the join process checks for KVM capability:
-
-1. **Detect KVM**: check for `/dev/kvm` and verify it is accessible (open + `KVM_GET_API_VERSION` ioctl). → State: **Registering**.
-2. **Detect hardware**: probe system information (CPU, memory, disk, GPU, NIC, architecture). → State: **NotReady**.
-3. **Persist** the record in the control-plane store (redb in bootstrap mode, Raft in distributed mode).
-4. **Wait for operator activation**: `syfrah hypervisor enable <id>` → State: **Available**.
-
-Auto-detection is for DISCOVERY, not for ACTIVATION. The operator decides when a hypervisor is ready for tenant workloads. `syfrah hypervisor enable` can be automated by the operator's provisioning pipeline, but Syfrah itself never auto-promotes to Available.
+**Discover** (automatic, by Forge):
+- Forge detects KVM capability and hardware specs at startup
+- Creates a local record in Registering state
+- No operator action needed
 
 If KVM is not present (`/dev/kvm` does not exist or is inaccessible), the node joins the mesh as a fabric node only. No hypervisor record is created. The node can still run Forge for network transit (VXLAN forwarding, FDB population, bridge management) but is not in the scheduler's placement pool.
 
-#### Manual registration
-
-For nodes where auto-detection is insufficient or where the operator wants to override detected values:
+**Register** (automatic after discovery, or manual):
+- The hypervisor record is persisted to Raft/redb with full hardware specs
+- Transitions to NotReady
+- Becomes visible cluster-wide
+- Manual: `syfrah hypervisor register --region X --zone Y` (for nodes where auto-discovery doesn't apply)
 
 ```bash
 syfrah hypervisor register \
@@ -496,9 +535,15 @@ syfrah hypervisor register \
   --reserved-memory-mb 4096
 ```
 
-This creates a hypervisor record on the current node, overriding auto-detected region/zone if specified, and applying custom labels and capacity parameters.
-
 **Registration is idempotent**: running `hypervisor register` on a node that is already a hypervisor updates the record (re-detects hardware, applies new labels/overrides) without creating a duplicate.
+
+**Enable** (explicit, by operator):
+- `syfrah hypervisor enable <id>`
+- Transitions NotReady → Available
+- Hypervisor becomes schedulable
+- This is ALWAYS an explicit operator decision — Syfrah never auto-enables
+
+Auto-detection is for DISCOVERY, not for ACTIVATION. The operator decides when a hypervisor is ready for tenant workloads. `syfrah hypervisor enable` can be automated by the operator's provisioning pipeline, but Syfrah itself never auto-promotes to Available.
 
 ### 9. Hypervisor auto-discovery on restart
 
@@ -669,8 +714,11 @@ syfrah hypervisor enable <name-or-id>
 # Drain: stop accepting new VMs, optionally migrate existing VMs
 syfrah hypervisor drain <name-or-id> [--timeout 30m] [--force]
 
-# Undrain: resume accepting VMs
+# Undrain: cancel a drain in progress, resume accepting VMs
 syfrah hypervisor undrain <name-or-id>
+
+# Activate: generic return to Available (from NotReady, Maintenance, or Draining)
+syfrah hypervisor activate <name-or-id>
 
 # Maintenance: mark for planned work (must be empty, or use --drain)
 syfrah hypervisor maintenance <name-or-id> [--drain]
@@ -969,6 +1017,21 @@ This ADR introduces renames and refactors across existing designs. Every instanc
 - **Topology-aware network cost**: intra-zone traffic is cheaper than cross-region. The scheduler should factor network topology into placement decisions for latency-sensitive workloads.
 - **Hypervisor groups / pools**: grouping hypervisors beyond region/zone (e.g., "GPU pool", "high-memory pool") for administrative convenience. Currently achievable via labels, but a formal group concept may be warranted.
 - **Automatic rebalancing**: when a new hypervisor joins an under-provisioned zone, automatically migrate VMs to balance load. Requires live migration and a rebalancing policy.
+
+### Future: in-flight placement reservations
+
+In v1, concurrent placements rely on Forge admission control to reject overbooked
+hypervisors. Under burst scheduling (many VMs created simultaneously), this causes
+retry storms as the scheduler picks the same "best" hypervisor multiple times.
+
+Future versions may add placement reservations at the scheduler level:
+- Scheduler tentatively reserves capacity on the chosen hypervisor
+- Reservation is visible to concurrent scheduler invocations
+- If Forge confirms: reservation becomes allocation
+- If Forge rejects: reservation released, scheduler retries on different hypervisor
+- Reservations expire after 30s to prevent leaks
+
+This reduces contention from O(N^2) retries to O(1) placement for concurrent bursts.
 
 ## Rejected alternatives
 
