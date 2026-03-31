@@ -234,6 +234,80 @@ pub struct SecurityGroup {
     pub rules: Vec<SecurityGroupRule>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Whether this is the default security group (cannot be deleted).
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+// ── Deletion guards ───────────────────────────────────────────────
+
+/// Errors returned by deletion guard checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionGuardError {
+    /// Cannot delete the default security group.
+    IsDefault,
+    /// Cannot delete SG that has NICs attached.
+    HasAttachedNics(usize),
+    /// Cannot delete SG that is referenced by rules in other SGs.
+    ReferencedByRules(Vec<String>),
+}
+
+impl fmt::Display for DeletionGuardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeletionGuardError::IsDefault => {
+                write!(f, "cannot delete the default security group")
+            }
+            DeletionGuardError::HasAttachedNics(n) => {
+                write!(f, "cannot delete security group with {n} attached NIC(s)")
+            }
+            DeletionGuardError::ReferencedByRules(sgs) => {
+                write!(
+                    f,
+                    "cannot delete security group referenced by rules in: {}",
+                    sgs.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// Check if a security group can be safely deleted.
+///
+/// Returns `Ok(())` if deletion is allowed, or `Err` with the reason.
+///
+/// Guards:
+/// 1. Cannot delete the default SG
+/// 2. Cannot delete SG with attached NICs
+/// 3. Cannot delete SG referenced by other SG rules
+pub fn check_sg_deletion(
+    sg: &SecurityGroup,
+    attached_nic_count: usize,
+    referencing_sgs: &[String],
+) -> Result<(), DeletionGuardError> {
+    if sg.is_default {
+        return Err(DeletionGuardError::IsDefault);
+    }
+    if attached_nic_count > 0 {
+        return Err(DeletionGuardError::HasAttachedNics(attached_nic_count));
+    }
+    if !referencing_sgs.is_empty() {
+        return Err(DeletionGuardError::ReferencedByRules(
+            referencing_sgs.to_vec(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check if a NIC can be deleted from a running VM.
+///
+/// Returns an error message if the VM is running (NICs of running VMs
+/// cannot be deleted).
+pub fn check_nic_deletion(vm_is_running: bool) -> Result<(), String> {
+    if vm_is_running {
+        return Err("cannot delete NIC of a running VM".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,5 +385,78 @@ mod tests {
     fn traffic_source_invalid() {
         assert!("not-cidr".parse::<TrafficSource>().is_err());
         assert!("sg:".parse::<TrafficSource>().is_err());
+    }
+
+    // ── Deletion guard tests ──────────────────────────────────────
+
+    fn test_sg(name: &str, is_default: bool) -> SecurityGroup {
+        SecurityGroup {
+            id: SecurityGroupId(format!("sg-{name}")),
+            name: name.to_string(),
+            description: String::new(),
+            vpc_id: "vpc-1".to_string(),
+            rules: vec![],
+            created_at: 0,
+            updated_at: 0,
+            is_default,
+        }
+    }
+
+    #[test]
+    fn delete_default_sg_blocked() {
+        let sg = test_sg("default", true);
+        let result = check_sg_deletion(&sg, 0, &[]);
+        assert_eq!(result, Err(DeletionGuardError::IsDefault));
+    }
+
+    #[test]
+    fn delete_sg_with_attached_nics_blocked() {
+        let sg = test_sg("web-sg", false);
+        let result = check_sg_deletion(&sg, 3, &[]);
+        assert_eq!(result, Err(DeletionGuardError::HasAttachedNics(3)));
+    }
+
+    #[test]
+    fn delete_sg_referenced_by_rules_blocked() {
+        let sg = test_sg("web-sg", false);
+        let result = check_sg_deletion(&sg, 0, &["db-sg".to_string()]);
+        assert_eq!(
+            result,
+            Err(DeletionGuardError::ReferencedByRules(vec![
+                "db-sg".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn delete_sg_allowed() {
+        let sg = test_sg("web-sg", false);
+        let result = check_sg_deletion(&sg, 0, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn delete_nic_running_vm_blocked() {
+        assert!(check_nic_deletion(true).is_err());
+    }
+
+    #[test]
+    fn delete_nic_stopped_vm_allowed() {
+        assert!(check_nic_deletion(false).is_ok());
+    }
+
+    #[test]
+    fn deletion_guard_error_display() {
+        assert!(DeletionGuardError::IsDefault
+            .to_string()
+            .contains("default"));
+        assert!(DeletionGuardError::HasAttachedNics(2)
+            .to_string()
+            .contains("2"));
+        assert!(
+            DeletionGuardError::ReferencedByRules(vec!["sg-a".to_string()])
+                .to_string()
+                .contains("sg-a")
+        );
     }
 }
