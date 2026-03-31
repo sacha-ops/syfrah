@@ -2427,6 +2427,8 @@ dependencies = [
  "syfrah-api",
  "syfrah-compute",
  "syfrah-core",
+ "syfrah-org",
+ "syfrah-overlay",
  "syfrah-state",
  "tempfile",
  "terminal_size",

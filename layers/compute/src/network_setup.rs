@@ -59,7 +59,7 @@ pub struct NetworkSetupResult {
 ///
 /// Holds references to the org store, IPAM store, placement store, and the
 /// network backend. Designed to be called from `VmManager::create_vm()`.
-pub struct NetworkSetup<B: NetworkBackend> {
+pub struct NetworkSetup<B: NetworkBackend + ?Sized> {
     org_store: Arc<OrgStore>,
     ipam_store: Arc<IpamStore>,
     placement_store: Arc<PlacementStore>,
@@ -68,7 +68,7 @@ pub struct NetworkSetup<B: NetworkBackend> {
     local_node: String,
 }
 
-impl<B: NetworkBackend> NetworkSetup<B> {
+impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
     /// Create a new `NetworkSetup` with the given dependencies.
     pub fn new(
         org_store: Arc<OrgStore>,
