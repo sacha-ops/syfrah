@@ -488,7 +488,8 @@ impl VmManager {
                     Arc::clone(backend),
                     local_node.clone(),
                 );
-                match ns.setup(&vm_id_str, &subnet_name).await {
+                let is_container = self.runtime.name().starts_with("container");
+                match ns.setup(&vm_id_str, &subnet_name, is_container).await {
                     Ok(result) => {
                         info!(
                             vm_id = %vm_id_str,
@@ -779,6 +780,49 @@ impl VmManager {
                 return Err(e);
             }
         };
+
+        // -- Container networking: move veth into container netns ----------------
+        // After crun creates the container (PID is known), move the container-
+        // side veth into its network namespace and configure IP/routes.
+        if let Some(ref nr) = network_result {
+            if let Some(ref container_veth) = nr.container_veth {
+                if let Some(ref backend) = self.network_backend {
+                    info!(
+                        vm_id = %vm_id_str,
+                        pid = handle.pid,
+                        veth = %container_veth,
+                        "moving veth into container network namespace"
+                    );
+                    backend
+                        .move_to_netns(container_veth, handle.pid)
+                        .await
+                        .map_err(|e| {
+                            ComputeError::NetworkSetup(format!(
+                                "failed to move veth into container netns: {e}"
+                            ))
+                        })?;
+                    backend
+                        .configure_netns(
+                            handle.pid,
+                            container_veth,
+                            &nr.ip,
+                            nr.prefix_len,
+                            &nr.gateway,
+                        )
+                        .await
+                        .map_err(|e| {
+                            ComputeError::NetworkSetup(format!(
+                                "failed to configure container netns: {e}"
+                            ))
+                        })?;
+                    info!(
+                        vm_id = %vm_id_str,
+                        ip = %nr.ip,
+                        "container network namespace configured"
+                    );
+                }
+            }
+        }
 
         // -- Build VmRuntimeState from the RuntimeHandle ----------------------
         let now = now_unix();

@@ -35,8 +35,10 @@ const DNS_SERVERS: &[&str] = &["8.8.8.8", "1.1.1.1"];
 /// Everything the caller needs after network setup succeeds.
 #[derive(Debug)]
 pub struct NetworkSetupResult {
-    /// TAP device name for the VM (pass to runtime).
+    /// TAP device name for the VM, or host-side veth name for containers.
     pub tap_name: String,
+    /// Container-side veth name (only set for containers, moved into netns).
+    pub container_veth: Option<String>,
     /// MAC address assigned by IPAM.
     pub mac: String,
     /// Allocated IP address.
@@ -45,6 +47,8 @@ pub struct NetworkSetupResult {
     pub subnet_cidr: String,
     /// Gateway IP.
     pub gateway: String,
+    /// Prefix length parsed from the subnet CIDR.
+    pub prefix_len: u8,
     /// Network config for Cloud Hypervisor.
     pub network_config: NetworkConfig,
     /// Cloud-init network config for the config-drive.
@@ -104,6 +108,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         &self,
         vm_id: &str,
         subnet_name: &str,
+        is_container: bool,
     ) -> Result<NetworkSetupResult, ComputeError> {
         // -- 1. Resolve subnet ------------------------------------------------
         let (subnet, vpc) = self.resolve_subnet(subnet_name)?;
@@ -143,6 +148,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
                 &gateway,
                 &ip,
                 &mac,
+                is_container,
             )
             .await
         {
@@ -177,10 +183,10 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         gateway: &str,
         ip: &str,
         mac: &str,
+        is_container: bool,
     ) -> Result<NetworkSetupResult, ComputeError> {
         let bridge_name = syfrah_overlay::naming::bridge_name(vpc_id);
         let vxlan_name = syfrah_overlay::naming::vxlan_name(vpc_id);
-        let tap_name = syfrah_overlay::naming::tap_name(vm_id);
 
         // Parse prefix length from CIDR.
         let prefix_len = parse_prefix_len(subnet_cidr)?;
@@ -209,20 +215,42 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             .await
             .map_err(|e| ComputeError::NetworkSetup(format!("add bridge IP failed: {e}")))?;
 
-        // -- 5. Create TAP, attach to bridge ----------------------------------
-        self.backend
-            .create_tap(&tap_name)
-            .await
-            .map_err(|e| ComputeError::NetworkSetup(format!("TAP creation failed: {e}")))?;
+        // -- 5. Create host-side interface and attach to bridge ----------------
+        // For VMs: create a TAP device.
+        // For containers: create a veth pair (host end attaches to bridge,
+        //   container end will be moved into the netns after crun creates it).
+        let (host_iface, container_veth) = if is_container {
+            let host_veth = syfrah_overlay::naming::veth_host_name(vm_id);
+            let cont_veth = syfrah_overlay::naming::veth_container_name(vm_id);
+            self.backend
+                .create_veth_pair(&host_veth, &cont_veth)
+                .await
+                .map_err(|e| {
+                    ComputeError::NetworkSetup(format!("veth pair creation failed: {e}"))
+                })?;
+            (host_veth, Some(cont_veth))
+        } else {
+            let tap_name = syfrah_overlay::naming::tap_name(vm_id);
+            self.backend
+                .create_tap(&tap_name)
+                .await
+                .map_err(|e| ComputeError::NetworkSetup(format!("TAP creation failed: {e}")))?;
+            (tap_name, None)
+        };
 
         self.backend
-            .attach_to_bridge(&tap_name, &bridge_name)
+            .attach_to_bridge(&host_iface, &bridge_name)
             .await
-            .map_err(|e| ComputeError::NetworkSetup(format!("attach TAP to bridge failed: {e}")))?;
+            .map_err(|e| {
+                ComputeError::NetworkSetup(format!(
+                    "attach {} to bridge failed: {e}",
+                    if is_container { "veth" } else { "TAP" }
+                ))
+            })?;
 
         // -- 6. Apply nftables rules ------------------------------------------
         self.backend
-            .apply_vm_rules(&tap_name, mac, ip)
+            .apply_vm_rules(&host_iface, mac, ip)
             .await
             .map_err(|e| ComputeError::NetworkSetup(format!("nftables rules failed: {e}")))?;
 
@@ -256,14 +284,15 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         info!(
             vm_id,
             %ip, %mac,
-            tap = %tap_name,
+            iface = %host_iface,
             bridge = %bridge_name,
+            is_container,
             "network setup complete"
         );
 
         // Build result
         let network_config = NetworkConfig {
-            tap_name: tap_name.clone(),
+            tap_name: host_iface.clone(),
             mac: Some(mac.to_string()),
         };
 
@@ -276,11 +305,13 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         };
 
         Ok(NetworkSetupResult {
-            tap_name,
+            tap_name: host_iface,
+            container_veth,
             mac: mac.to_string(),
             ip: ip.to_string(),
             subnet_cidr: subnet_cidr.to_string(),
             gateway: gateway.to_string(),
+            prefix_len,
             network_config,
             cloud_init_network,
             placement,
@@ -481,7 +512,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Verify IP and MAC assigned
         assert_eq!(result.ip, "10.0.1.3");
@@ -522,7 +553,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Verify IPAM was called — IP is the first allocatable (.3)
         assert_eq!(result.ip, "10.0.1.3");
@@ -540,7 +571,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         let expected_tap = syfrah_overlay::naming::tap_name("web-1");
         assert_eq!(result.tap_name, expected_tap);
@@ -560,7 +591,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let _result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let _result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         let calls = h.backend.calls();
         // Bridge should be created with the VPC ID
@@ -578,7 +609,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Verify placement was stored
         let stored = h
@@ -600,7 +631,7 @@ mod tests {
         h.backend.set_fail("create_tap");
 
         let ns = h.network_setup();
-        let result = ns.setup("web-1", SUBNET_NAME).await;
+        let result = ns.setup("web-1", SUBNET_NAME, false).await;
 
         assert!(result.is_err(), "setup must fail when TAP creation fails");
 
@@ -620,7 +651,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Verify cloud-init network config
         assert_eq!(result.cloud_init_network.ip, "10.0.1.3");
@@ -635,7 +666,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", "nonexistent").await;
+        let result = ns.setup("web-1", "nonexistent", false).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -649,7 +680,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Mark as assigned (happens after successful boot)
         ns.mark_assigned(&result.placement.subnet_id, &result.ip, "web-1")
@@ -670,7 +701,7 @@ mod tests {
         let h = TestHarness::new();
         let ns = h.network_setup();
 
-        let result = ns.setup("web-1", SUBNET_NAME).await.unwrap();
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
         h.backend.reset();
 
         // Teardown
@@ -698,6 +729,71 @@ mod tests {
         assert!(
             alloc.is_none(),
             "IP allocation must be removed after teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_creates_veth_pair_not_tap() {
+        let h = TestHarness::new();
+        let ns = h.network_setup();
+
+        let result = ns.setup("web-1", SUBNET_NAME, true).await.unwrap();
+
+        // Container should get a veth pair, not a TAP.
+        let expected_host = syfrah_overlay::naming::veth_host_name("web-1");
+        let expected_cont = syfrah_overlay::naming::veth_container_name("web-1");
+        assert_eq!(result.tap_name, expected_host);
+        assert_eq!(result.container_veth, Some(expected_cont.clone()));
+        assert!(result.prefix_len > 0, "prefix_len must be set");
+
+        let calls = h.backend.calls();
+        let call_names: Vec<&str> = calls.iter().map(|c| c.split('(').next().unwrap()).collect();
+
+        assert!(
+            call_names.contains(&"create_veth_pair"),
+            "veth pair must be created for container"
+        );
+        assert!(
+            !call_names.contains(&"create_tap"),
+            "TAP must NOT be created for container"
+        );
+        assert!(
+            call_names.contains(&"attach_to_bridge"),
+            "host veth must be attached to bridge"
+        );
+        assert!(
+            call_names.contains(&"apply_vm_rules"),
+            "nftables must be applied on host veth"
+        );
+
+        // Verify the veth pair call has the right names
+        assert!(calls
+            .iter()
+            .any(|c| c == &format!("create_veth_pair({expected_host}, {expected_cont})")));
+    }
+
+    #[tokio::test]
+    async fn vm_creates_tap_not_veth() {
+        let h = TestHarness::new();
+        let ns = h.network_setup();
+
+        let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
+
+        // VM should get a TAP, not a veth pair.
+        let expected_tap = syfrah_overlay::naming::tap_name("web-1");
+        assert_eq!(result.tap_name, expected_tap);
+        assert!(result.container_veth.is_none());
+
+        let calls = h.backend.calls();
+        let call_names: Vec<&str> = calls.iter().map(|c| c.split('(').next().unwrap()).collect();
+
+        assert!(
+            call_names.contains(&"create_tap"),
+            "TAP must be created for VM"
+        );
+        assert!(
+            !call_names.contains(&"create_veth_pair"),
+            "veth pair must NOT be created for VM"
         );
     }
 }

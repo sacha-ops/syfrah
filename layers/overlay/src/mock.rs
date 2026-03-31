@@ -168,6 +168,27 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
+    async fn move_to_netns(&self, iface: &str, pid: u32) -> Result<()> {
+        self.should_fail("move_to_netns")?;
+        self.record(format!("move_to_netns({iface}, {pid})"));
+        Ok(())
+    }
+
+    async fn configure_netns(
+        &self,
+        pid: u32,
+        iface: &str,
+        ip: &str,
+        prefix_len: u8,
+        gateway: &str,
+    ) -> Result<()> {
+        self.should_fail("configure_netns")?;
+        self.record(format!(
+            "configure_netns({pid}, {iface}, {ip}, {prefix_len}, {gateway})"
+        ));
+        Ok(())
+    }
+
     // ── Firewall ───────────────────────────────────────────────────────
 
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
@@ -261,6 +282,10 @@ mod tests {
         b.create_tap(&tap).await.unwrap();
         b.delete_tap(&tap).await.unwrap();
         b.create_veth_pair(&vh, &vc).await.unwrap();
+        b.move_to_netns(&vc, 1234).await.unwrap();
+        b.configure_netns(1234, &vc, "10.1.1.3", 24, "10.1.1.1")
+            .await
+            .unwrap();
 
         b.apply_vm_rules(&tap, "02:00:0a:01:01:03", "10.1.1.3")
             .await
@@ -275,7 +300,7 @@ mod tests {
             .unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 21, "expected one call per trait method");
+        assert_eq!(calls.len(), 23, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));
@@ -292,13 +317,15 @@ mod tests {
         assert!(calls[11].starts_with("create_tap("));
         assert!(calls[12].starts_with("delete_tap("));
         assert!(calls[13].starts_with("create_veth_pair("));
-        assert!(calls[14].starts_with("apply_vm_rules("));
-        assert!(calls[15].starts_with("remove_vm_rules("));
-        assert!(calls[16].starts_with("apply_nat("));
-        assert!(calls[17].starts_with("remove_nat("));
-        assert!(calls[18].starts_with("apply_peering_rules("));
-        assert!(calls[19].starts_with("remove_peering_rules("));
-        assert!(calls[20].starts_with("list_interfaces("));
+        assert!(calls[14].starts_with("move_to_netns("));
+        assert!(calls[15].starts_with("configure_netns("));
+        assert!(calls[16].starts_with("apply_vm_rules("));
+        assert!(calls[17].starts_with("remove_vm_rules("));
+        assert!(calls[18].starts_with("apply_nat("));
+        assert!(calls[19].starts_with("remove_nat("));
+        assert!(calls[20].starts_with("apply_peering_rules("));
+        assert!(calls[21].starts_with("remove_peering_rules("));
+        assert!(calls[22].starts_with("list_interfaces("));
 
         // Test reset
         b.reset();

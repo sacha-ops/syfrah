@@ -54,6 +54,22 @@ pub trait NetworkBackend: Send + Sync {
     /// Create a veth pair (used by containers).
     async fn create_veth_pair(&self, name_a: &str, name_b: &str) -> Result<()>;
 
+    /// Move a network interface into a container's network namespace.
+    async fn move_to_netns(&self, iface: &str, pid: u32) -> Result<()>;
+
+    /// Configure networking inside a container's network namespace.
+    ///
+    /// Renames `iface` to `eth0`, assigns the given IP/prefix, brings up
+    /// `eth0` and `lo`, and adds a default route via `gateway`.
+    async fn configure_netns(
+        &self,
+        pid: u32,
+        iface: &str,
+        ip: &str,
+        prefix_len: u8,
+        gateway: &str,
+    ) -> Result<()>;
+
     // ── Firewall ───────────────────────────────────────────────────────
 
     /// Apply anti-spoofing + default ingress/egress rules for a VM.
