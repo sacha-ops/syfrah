@@ -5,6 +5,7 @@ pub mod error;
 pub mod ipam;
 pub mod nic;
 pub mod placement;
+pub mod sg_rules;
 pub mod store;
 pub mod ttl;
 pub mod types;
@@ -17,11 +18,13 @@ pub use error::OrgError;
 pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use nic::NicStore;
 pub use placement::PlacementStore;
+pub use sg_rules::SgRuleStore;
 pub use store::OrgStore;
 pub use types::{
-    Environment, EnvironmentId, NetworkInterface, NicId, Org, OrgId, PeeringId, PeeringStatus,
-    PlacementAction, Project, ProjectId, ResourceState, SecurityGroupId, Subnet, SubnetId,
-    VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Direction, Environment, EnvironmentId, NetworkInterface, NicId, Org, OrgId, PeeringId,
+    PeeringStatus, PlacementAction, PortRange, Project, ProjectId, Protocol, ResourceState, RuleId,
+    RuleSource, SecurityGroup, SecurityGroupId, SecurityGroupRule, Subnet, SubnetId, VmPlacement,
+    Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};
