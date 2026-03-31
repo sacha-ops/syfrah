@@ -26,6 +26,7 @@
 
 pub mod api;
 pub mod capacity;
+pub mod generation;
 pub mod health;
 pub mod ownership;
 pub mod reconciler;
@@ -65,6 +66,10 @@ mod tests {
         // runtime types
         let rt = runtime::ForgeRuntime::new();
         assert!(rt.compute().is_err()); // no backend wired
+
+        // generation types
+        let gen_tracker = generation::GenerationTracker::new();
+        let _gen = gen_tracker.register("test-vm");
 
         // task types are tested in task::tests
         // ownership types are tested in ownership::tests
