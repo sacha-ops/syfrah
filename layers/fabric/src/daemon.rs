@@ -1209,6 +1209,7 @@ pub async fn run_daemon(
             forge_capacity.allocatable_memory_mb()
         );
 
+
         let forge_state = std::sync::Arc::new(syfrah_forge::api::ForgeState {
             started_at: std::time::Instant::now(),
             task_store: forge_task_store,
