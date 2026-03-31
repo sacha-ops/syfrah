@@ -726,6 +726,7 @@ pub(crate) async fn spawn_vm_inner(
         ip: None,
         subnet: None,
         vpc: None,
+        network_info: None,
     })
 }
 
@@ -1307,6 +1308,7 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         events::emit(
@@ -1696,6 +1698,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1731,6 +1734,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1766,6 +1770,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1803,6 +1808,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2016,6 +2022,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));
@@ -2157,6 +2164,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -2212,6 +2220,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2332,6 +2341,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));

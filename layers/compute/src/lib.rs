@@ -34,6 +34,7 @@ pub mod events;
 pub mod handler;
 pub mod image;
 pub mod manager;
+pub mod network;
 pub mod network_setup;
 pub mod phase;
 pub mod preflight;
@@ -58,6 +59,7 @@ pub use error::{
 };
 pub use events::emit;
 pub use manager::{ComputeConfig, ReconnectSummary, VmManager};
+pub use network::{CleanupResult, NetworkCleanup, NetworkInfo};
 pub use network_setup::{NetworkSetup, NetworkSetupResult};
 pub use phase::VmPhase;
 pub use runtime_backend::{ComputeRuntime, RuntimeHandle, RuntimeInfo, RuntimeSpec, RuntimeType};

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::network::NetworkInfo;
 use crate::phase::VmPhase;
 use crate::runtime_backend::{RuntimeHandle, RuntimeType};
 use crate::types::{VmId, VmStatus};
@@ -52,6 +53,8 @@ pub(crate) struct VmRuntimeState {
     pub(crate) subnet: Option<String>,
     /// VPC the VM belongs to (e.g. "default").
     pub(crate) vpc: Option<String>,
+    /// Network metadata for teardown on delete. None if VM has no networking.
+    pub(crate) network_info: Option<NetworkInfo>,
 }
 
 #[allow(dead_code)]
@@ -126,6 +129,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            network_info: None,
         }
     }
 
