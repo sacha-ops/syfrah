@@ -1098,6 +1098,7 @@ fn resolve_nic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SecurityGroupId;
 
     fn temp_store() -> (tempfile::TempDir, Arc<OrgStore>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1132,5 +1133,82 @@ mod tests {
             OrgResponse::Org(org) => assert_eq!(org.name, "acme"),
             other => panic!("expected Org, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn evaluate_rules_allows_matching_tcp() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 443, to: 443 }),
+            source: RuleSource::Cidr("0.0.0.0/0".to_string()),
+            priority: 100,
+            description: Some("HTTPS".to_string()),
+        };
+        let (verdict, _) = evaluate_rules(&[rule], 443, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "ALLOWED");
+    }
+
+    #[test]
+    fn evaluate_rules_denies_wrong_port() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 443, to: 443 }),
+            source: RuleSource::Cidr("0.0.0.0/0".to_string()),
+            priority: 100,
+            description: None,
+        };
+        let (verdict, _) = evaluate_rules(&[rule], 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+    }
+
+    #[test]
+    fn evaluate_rules_denies_no_rules() {
+        let (verdict, reason) = evaluate_rules(&[], 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+        assert!(reason.contains("no matching"));
+    }
+
+    #[test]
+    fn evaluate_rules_cidr_source_match() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 22, to: 22 }),
+            source: RuleSource::Cidr("10.0.0.0/8".to_string()),
+            priority: 100,
+            description: None,
+        };
+        let (v1, _) = evaluate_rules(&[rule.clone()], 22, Protocol::Tcp, "10.1.2.3");
+        assert_eq!(v1, "ALLOWED");
+        let (v2, _) = evaluate_rules(&[rule], 22, Protocol::Tcp, "192.168.1.1");
+        assert_eq!(v2, "DENIED");
+    }
+
+    #[test]
+    fn parse_port_range_single() {
+        let pr = parse_port_range("443").unwrap();
+        assert_eq!(pr.from, 443);
+        assert_eq!(pr.to, 443);
+    }
+
+    #[test]
+    fn parse_port_range_range() {
+        let pr = parse_port_range("8000-9000").unwrap();
+        assert_eq!(pr.from, 8000);
+        assert_eq!(pr.to, 9000);
+    }
+
+    #[test]
+    fn parse_port_range_invalid() {
+        assert!(parse_port_range("abc").is_err());
+        assert!(parse_port_range("9000-8000").is_err());
     }
 }
