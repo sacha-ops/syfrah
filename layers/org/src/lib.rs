@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod error;
 pub mod hypervisor;
+pub mod hypervisor_handler;
 pub mod ipam;
 pub mod nic;
 pub mod placement;
@@ -16,11 +17,12 @@ pub mod vpc;
 
 pub use api::{send_org_request, OrgLayerHandler, OrgRequest, OrgResponse, ResolvedSubnet};
 pub use cli::{
-    EnvCommand, NatGwCommand, OrgCommand, ProjectCommand, RouteCommand, RouteTableAction,
-    SgCommand, SubnetCommand, VpcCommand,
+    EnvCommand, HypervisorCommand, NatGwCommand, OrgCommand, ProjectCommand, RouteCommand,
+    RouteTableAction, SgCommand, SubnetCommand, VpcCommand,
 };
 pub use error::OrgError;
 pub use hypervisor::HypervisorStore;
+pub use hypervisor_handler::HypervisorLayerHandler;
 pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use nic::NicStore;
 pub use placement::PlacementStore;

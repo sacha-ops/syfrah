@@ -1,6 +1,7 @@
 //! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, `syfrah subnet ...`, and `syfrah route ...`.
 
 pub mod env;
+pub mod hypervisor;
 pub mod nat_gw;
 pub mod org;
 pub mod project;
@@ -883,5 +884,147 @@ pub async fn run_route(cmd: RouteCommand) -> anyhow::Result<()> {
             destination,
             table,
         } => route::run_delete(&vpc, &destination, table.as_deref()).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hypervisor CLI
+// ---------------------------------------------------------------------------
+
+/// Top-level hypervisor CLI command.
+#[derive(Debug, Subcommand)]
+pub enum HypervisorCommand {
+    /// List hypervisors
+    List {
+        /// Filter by region
+        #[arg(long)]
+        region: Option<String>,
+        /// Filter by zone
+        #[arg(long)]
+        zone: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get hypervisor details
+    Get {
+        /// Hypervisor name
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register this node as a hypervisor (manual)
+    Register {
+        /// Region
+        #[arg(long)]
+        region: String,
+        /// Zone
+        #[arg(long)]
+        zone: String,
+    },
+    /// Enable a hypervisor (NotReady → Available)
+    Enable {
+        /// Hypervisor name
+        name: String,
+    },
+    /// Show this node's hypervisor status
+    Status,
+    /// Show this node's capacity breakdown
+    Capacity,
+    /// Manage labels on a hypervisor
+    Label {
+        /// Hypervisor name
+        name: String,
+        /// Set labels (key=value, repeatable)
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Remove labels by key (repeatable)
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Manage taints on a hypervisor
+    Taint {
+        /// Hypervisor name
+        name: String,
+        /// Add taints (key=value:Effect, repeatable)
+        #[arg(long = "add", value_name = "KEY=VALUE:EFFECT")]
+        add: Vec<String>,
+        /// Remove taints by key (repeatable)
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Drain a hypervisor (stop new VMs, evacuate existing)
+    Drain {
+        /// Hypervisor name
+        name: String,
+        /// Force drain (skip graceful migration)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Activate a hypervisor (return to Available)
+    Activate {
+        /// Hypervisor name
+        name: String,
+    },
+    /// Put a hypervisor into maintenance mode
+    Maintenance {
+        /// Hypervisor name
+        name: String,
+        /// Drain first then enter maintenance
+        #[arg(long)]
+        drain: bool,
+    },
+    /// Decommission a hypervisor (terminal)
+    Decommission {
+        /// Hypervisor name
+        name: String,
+    },
+}
+
+/// Execute a hypervisor CLI command.
+pub async fn run_hypervisor(cmd: HypervisorCommand) -> anyhow::Result<()> {
+    match cmd {
+        HypervisorCommand::List { region, zone, json } => {
+            hypervisor::run_list(region, zone, json).await
+        }
+        HypervisorCommand::Get { name, json } => hypervisor::run_get(name, json).await,
+        HypervisorCommand::Register { region, zone } => {
+            hypervisor::run_register(region, zone).await
+        }
+        HypervisorCommand::Enable { name } => hypervisor::run_enable(name).await,
+        HypervisorCommand::Status => hypervisor::run_status().await,
+        HypervisorCommand::Capacity => hypervisor::run_capacity().await,
+        HypervisorCommand::Label { name, set, remove } => {
+            if !set.is_empty() {
+                let labels: Vec<(String, String)> = set
+                    .iter()
+                    .filter_map(|s| {
+                        let (k, v) = s.split_once('=')?;
+                        Some((k.to_string(), v.to_string()))
+                    })
+                    .collect();
+                hypervisor::run_label_set(name.clone(), labels).await?;
+            }
+            if !remove.is_empty() {
+                hypervisor::run_label_remove(name, remove).await?;
+            }
+            Ok(())
+        }
+        HypervisorCommand::Taint { name, add, remove } => {
+            if !add.is_empty() {
+                hypervisor::run_taint_add(name.clone(), add).await?;
+            }
+            if !remove.is_empty() {
+                hypervisor::run_taint_remove(name, remove).await?;
+            }
+            Ok(())
+        }
+        HypervisorCommand::Drain { name, force } => hypervisor::run_drain(name, force).await,
+        HypervisorCommand::Activate { name } => hypervisor::run_activate(name).await,
+        HypervisorCommand::Maintenance { name, drain } => {
+            hypervisor::run_maintenance(name, drain).await
+        }
+        HypervisorCommand::Decommission { name } => hypervisor::run_decommission(name).await,
     }
 }

@@ -83,6 +83,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::RouteCommand,
     },
+    /// Manage hypervisors (compute hosts)
+    Hypervisor {
+        #[command(subcommand)]
+        command: syfrah_org::HypervisorCommand,
+    },
     /// Inspect and manage layer state databases
     State {
         #[command(subcommand)]
@@ -963,6 +968,7 @@ async fn run() -> Result<()> {
         Commands::Sg { command } => syfrah_org::cli::run_sg(command).await,
         Commands::NatGw { command } => syfrah_org::cli::run_nat_gw(command).await,
         Commands::Route { command } => syfrah_org::cli::run_route(command).await,
+        Commands::Hypervisor { command } => syfrah_org::cli::run_hypervisor(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
