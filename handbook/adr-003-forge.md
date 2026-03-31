@@ -3,7 +3,7 @@
 **Status**: Proposed
 **Date**: 2026-03-30
 **Decided by**: Sacha + team, after architecture review
-**Revision**: v2 — incorporates operational realism review
+**Revision**: v3 — bootstrap mode, projection scope, simplified generation model, control-degraded policy, ownership rebuild
 
 ## Context
 
@@ -120,6 +120,19 @@ The local materialized view is **eventually consistent** with the authoritative 
 - **Projection updates are applied atomically**: each update from the authoritative store is applied as a single redb transaction. Forge never sees a half-applied update
 - **Invalidation signal**: when the control plane commits a change affecting this node, it sends a notification (via the Raft subscription or a direct signal) that triggers immediate reconciliation. The periodic loop is the fallback if the signal is lost
 
+### What the local projection contains
+
+| Category | Included | Reason |
+|----------|----------|--------|
+| Resources where node_id == this_node | Yes | Forge manages local resources |
+| Dependencies of local resources (VPC, subnet, SG, routes) | Yes | Needed for reconciliation |
+| Remote VM placements in VPCs present locally | Yes | Needed for FDB population |
+| Remote node VTEP addresses for local VPCs | Yes | Needed for VXLAN forwarding |
+| Resources on other nodes with no local VPC overlap | No | Not relevant to this node |
+| Global org/project/env hierarchy | Yes (read-only) | Needed for validation and display |
+
+The projection is NOT purely "local resources only". It includes remote placements and VTEP info for VPCs that have local VMs — this is essential for FDB and VXLAN forwarding.
+
 ## Gossip Data Model
 
 Forge interacts with two distinct classes of distributed data. Conflating them leads to incorrect consistency assumptions.
@@ -199,8 +212,8 @@ Every resource carries:
 | `owner` | ResourceOwner | `{ org_id, project_id, env_id }` — the tenant hierarchy |
 | `node_id` | NodeId | Which node this resource is on |
 | `spec_generation` | u64 | Incremented when desired state changes (from control plane) |
-| `observed_generation` | u64 | Incremented when Forge observes/reconciles the resource |
 | `reconcile_generation` | u64 | Which `spec_generation` the last successful reconcile targeted |
+| `last_observed_at` | u64 | Timestamp of last observation (healthcheck, process scan) |
 | `created_at` | u64 | Unix timestamp of creation in authoritative store |
 | `updated_at` | u64 | Unix timestamp of last state change |
 | `last_reconciled_at` | u64 | Unix timestamp of last successful reconciliation |
@@ -208,13 +221,15 @@ Every resource carries:
 
 ### Generation tracking
 
-Three generations track the relationship between desired state and observed reality:
+Two generations and a timestamp track the relationship between desired state and observed reality:
 
 - **`spec_generation`** — incremented by the control plane each time desired state changes (resize, SG update, config change). Forge reads this from the materialized view.
-- **`observed_generation`** — incremented by Forge each time it observes the resource during reconciliation, regardless of whether changes were needed. Tracks "Forge has seen this."
 - **`reconcile_generation`** — set to the `spec_generation` that the last **successful** reconciliation targeted. If the reconciler successfully converges a resource to spec_generation 5, then reconcile_generation = 5.
+- **`last_observed_at`** — timestamp of the last observation (healthcheck, process scan). Tracks "Forge has recently seen this resource."
 
 **Drift detection**: `spec_generation != reconcile_generation` means the resource has not yet converged to the latest desired state. This is the primary signal for the reconciler to act on a resource.
+
+**Staleness detection**: `now - last_observed_at > threshold` means Forge has not recently verified the resource exists and is healthy.
 
 **Optimistic concurrency**: mutation requests from the control plane include the expected `spec_generation`. If the resource's current spec_generation does not match, Forge rejects with `409 Conflict` to prevent lost updates.
 
@@ -252,6 +267,17 @@ Forge maintains an **ownership registry** in redb that tracks every resource it 
 
 The naming convention (`syfbr-*`, `syftap-*`, `syfvx-*`) is a **discovery aid**, not proof of ownership. On reconciliation, Forge consults the ownership registry to determine what it manages. See "Orphan Handling Policy" for how unregistered resources are treated.
 
+### Registry rebuild on startup
+
+When Forge starts, it rebuilds the ownership registry from multiple sources in priority order:
+
+1. **Materialized desired state** (highest priority) — resources that should exist on this node
+2. **Existing registry in redb** — resources Forge previously created (survives restart)
+3. **Kernel discovery** — interfaces, processes matching Syfrah naming conventions
+4. **Naming convention** (lowest priority) — discovery aid, not proof
+
+If a kernel resource matches desired state but is not in the registry, it is adopted (added to registry). If it's in the registry but not in desired state, it's marked for deletion on next reconciliation. If it's in the kernel but matches no known pattern, it is ignored.
+
 ### Resource types
 
 #### Compute resources
@@ -281,7 +307,7 @@ Instance {
     nics: Vec<NicId>,
     volumes: Vec<VolumeAttachment>,
     node_id: NodeId,
-    // ... common metadata fields (including spec/observed/reconcile generations)
+    // ... common metadata fields (including spec/reconcile generations, last_observed_at)
 }
 ```
 
@@ -450,13 +476,12 @@ The reconciliation engine computes the diff and drives actual state toward desir
 ### Authentication and authorization
 
 **Phase 1 (single-operator, WireGuard-only)**:
-- Any mesh node can call any other node's Forge API. Acceptable for a single-operator mesh.
-- The fabric's WireGuard authentication (only nodes with the mesh secret can reach `syfrah0`) is the access control.
-- Bearer token derived from mesh secret for basic request authentication. This is **Phase 1 only**, not the long-term model.
+- Any mesh node can call any other node's Forge API. WireGuard mesh membership is the trust boundary.
+- No additional application-level identity in Phase 1.
 
 **Phase 2+ (application-level authenticated identity)**:
-- **Minimum**: signed requests — every mutation carries a cryptographic signature from the originating control-plane identity. The signing key is not the mesh secret.
-- **Recommended**: mTLS between control plane and Forge endpoints. Each node gets a unique certificate issued by a cluster CA. This provides per-node identity, not just "is this node in the mesh."
+- Control plane signs operation requests with its Raft leader key. Forge verifies signatures before executing.
+- mTLS optional but recommended for defense in depth.
 - Role separation: only the Raft leader (or nodes acting on its behalf) can call mutation endpoints. Other nodes can only call read-only endpoints (`/v1/node/*`, `GET` on any resource).
 - All mutation requests carry a `raft_term` and `raft_index` to prevent stale commands from a deposed leader.
 
@@ -468,6 +493,8 @@ The relationship between API, tasks, and reconciliation is strict:
 2. **Reconciler executes**: the reconciliation engine reads the desired state (including newly-written intents), computes the diff against actual state, and applies changes through forge-runtime.
 3. **Tasks track progress**: a task is an execution record for client observability. It tracks which operation was requested, its current progress, and its outcome. Tasks are NOT the source of truth — resource state is.
 4. **Restart safety**: if Forge restarts mid-operation, the reconciler picks up from **resource state** (what exists in the kernel and in the materialized view), not from task state. Incomplete tasks are marked as interrupted; the reconciler re-derives what needs to happen from the resource diff.
+
+Forge never mutates authoritative desired state. Mutation endpoints create local execution records and/or request control-plane updates, depending on deployment phase. The local operation queue is non-authoritative — it is an execution request, not a state mutation.
 
 ### Versioning
 
@@ -816,7 +843,7 @@ Forge detects and corrects the following drift scenarios:
 
 ### Convergence guarantees
 
-- **Eventually consistent**: after a bounded number of reconciliation cycles, actual state matches desired state for all non-failed resources. The bound is: at most 3 cycles for a single resource (1 to detect, 1 to act, 1 to verify).
+- **Eventually consistent**: under normal non-failure conditions, a simple single-resource change typically converges within 1-3 reconciliation cycles. Complex changes with dependencies (e.g., new VPC + subnet + VM) may take more cycles as dependencies are resolved in order. Transient failures, stale projections, or resource contention can extend convergence further.
 - **Idempotent**: applying the same desired state any number of times produces the same result.
 - **Safe**: Forge only manages resources in its ownership registry. See "Orphan Handling Policy" for how unregistered resources are treated.
 - **Observable**: every reconciliation cycle produces a structured log entry with: cycle ID, duration, resources checked, drift detected, changes applied, errors encountered.
@@ -1091,6 +1118,20 @@ Overall status derivation:
 - `degraded` — at least one category is degraded, none are unhealthy
 - `unhealthy` — at least one category is unhealthy
 
+### Behavior when control health is degraded
+
+When the control plane is unreachable or the projection is stale beyond threshold:
+
+| Operation | Behavior |
+|-----------|----------|
+| Read (list, get, status) | Allowed — uses last known projection |
+| Reconcile existing resources | Allowed — continues with last known desired state |
+| Create new resources | Denied — cannot validate against authoritative state |
+| Delete resources | Denied — cannot confirm deletion is intentional |
+| Stop/start existing resources | Allowed — operational, not state-changing |
+
+Forge does NOT go fully read-only when control is degraded. It continues to maintain existing workloads (the most important behavior). It only blocks mutations that could diverge from the authoritative state.
+
 ## Drain and Maintenance
 
 ### Node drain
@@ -1166,25 +1207,21 @@ When the syfrah binary is updated, it may include a new version of the Cloud Hyp
 
 Security evolves through phases as the system matures:
 
-**Phase 1: WireGuard-only transport security**
+### Phase 1 — WireGuard trust domain
 
-Acceptable for single-operator deployments:
-- Forge API bound to `syfrah0` — unreachable from the public internet
-- WireGuard provides mutual authentication (only nodes with the mesh secret can reach `syfrah0`) and encryption
-- Bearer token derived from mesh secret provides basic request-level authentication
-- This is sufficient when the operator controls all nodes and trusts the mesh
+Phase 1 relies entirely on WireGuard mesh membership as the trust boundary. Any node in the mesh can call any other node's Forge API. There is no additional application-level identity.
 
-**Acknowledged risk**: a compromised mesh node has lateral access to every other node's Forge API. In Phase 1, mesh membership = full trust. This is acceptable for a single operator managing their own fleet, but not for multi-tenant or high-security environments.
+This is acceptable for single-operator deployments where the operator controls all nodes. It is NOT acceptable for multi-tenant or multi-operator scenarios.
 
-**Phase 2+: Application-level authenticated identity**
+Acknowledged risk: a compromised mesh node has lateral access to all Forge APIs in the mesh.
 
-Required for production and multi-operator deployments:
-- **Minimum**: signed requests. Every mutation carries a cryptographic signature from the requesting identity. The signing key is per-identity, not the shared mesh secret.
-- **Recommended**: mTLS between control plane and Forge. Each node gets a unique TLS certificate from a cluster CA. This provides per-node identity and prevents a compromised node from impersonating another.
-- Role separation: only the Raft leader can issue mutations. Bearer tokens are replaced by proper identity certificates.
-- Raft term and index on all mutations prevent stale commands from deposed leaders.
+### Phase 2+ — Application-level identity
 
-The Phase 1 bearer-token-from-mesh-secret model is explicitly **not the long-term model**. It is a pragmatic starting point that will be replaced.
+When the control plane exists, Forge authenticates callers via signed requests:
+- Control plane signs operation requests with its Raft leader key
+- Forge verifies the signature before executing
+- Individual nodes cannot forge control-plane requests
+- mTLS optional but recommended for defense in depth
 
 ### Attack surface
 
@@ -1192,7 +1229,7 @@ The Phase 1 bearer-token-from-mesh-secret model is explicitly **not the long-ter
 |---|---|---|
 | Forge API | Bound to `syfrah0` only | + mTLS with per-node certificates |
 | Fabric access | WireGuard mesh secret | + per-node identity |
-| API authentication | Bearer token from mesh secret | Signed requests / mTLS |
+| API authentication | WireGuard mesh membership | Signed requests / mTLS |
 | Lateral movement | Mesh membership = full trust | Per-node certificates limit blast radius |
 | Input validation | All inputs validated. Resource IDs: alphanumeric + hyphen. IPs: parsed and range-checked. Names: regex-validated. | Same |
 | Command execution | Pre-defined operations only (ip, nft, bridge). No arbitrary shell commands. No `exec` with user-provided strings. | Same |
@@ -1431,6 +1468,22 @@ The current fabric daemon (`layers/fabric/src/daemon.rs`) is the proto-Forge. Th
 2. The daemon will be extended with: REST API (axum on port 7100), compute integration (VmManager), overlay integration (NetworkBackend), reconciliation engine, capacity tracker, health monitor — structured as forge-api, forge-reconciler, forge-capacity, forge-health, forge-runtime, forge-task modules.
 3. The result IS Forge. There is no separate "Forge process." The daemon evolves into Forge.
 
+## Bootstrap / Single-Node Mode
+
+Before a distributed control plane exists, Forge operates in bootstrap mode:
+
+- **Local authoritative store**: redb on this node IS the source of truth (no Raft, no projection)
+- **Same API, same reconciler**: the Forge API and reconciliation loop work identically
+- **Same CLI flow**: `syfrah` CLI → Forge API (local) → reconciler → compute/overlay
+- **No cross-node coordination**: VM placement is local-only, no scheduler
+- **Migration to distributed mode**: when control plane is introduced, the local authoritative store becomes a read-only projection of the distributed Raft store. The transition is:
+  1. Control plane starts, imports local state as initial Raft state
+  2. Forge switches from local-authoritative to projection-consumer
+  3. CLI reroutes from local Forge to control plane for mutations
+  4. No data loss, no downtime — existing VMs continue running
+
+This means Phase 1 implementation does NOT need Raft. Forge works fully with local redb as the desired state store. The architecture is designed so that replacing the local store with a Raft projection is a configuration change, not a rewrite.
+
 ## Configuration
 
 Forge configuration lives in `~/.syfrah/config.toml` under the `[forge]` section:
@@ -1555,7 +1608,7 @@ Once the Forge API is stable, route all CLI compute commands through Forge (loca
 - Admission control with allocatable CPU model (forge-capacity)
 - Ownership registry in redb
 - Structured error responses with FORGE_ prefix
-- Generation tracking (spec/observed/reconcile)
+- Generation tracking (spec/reconcile + last_observed_at)
 
 ### Phase 2 — Network endpoints + reconciliation (8-10 issues)
 
@@ -1634,7 +1687,7 @@ Forge enables the transition from "a collection of scripts that manage VMs" to "
 
 **Considered**: use a single `generation` counter for both spec changes and reconciliation tracking.
 
-**Rejected**: a single counter conflates "the spec changed" with "Forge has reconciled." Three separate generations (`spec_generation`, `observed_generation`, `reconcile_generation`) provide clear answers to: "has the spec changed?" (`spec_generation` incremented), "has Forge seen this?" (`observed_generation` incremented), and "has Forge converged to this spec?" (`spec_generation == reconcile_generation`).
+**Rejected**: a single counter conflates "the spec changed" with "Forge has reconciled." Two generations plus a timestamp (`spec_generation`, `reconcile_generation`, `last_observed_at`) provide clear answers to: "has the spec changed?" (`spec_generation` incremented), "has Forge converged to this spec?" (`spec_generation == reconcile_generation`), and "has Forge recently seen this resource?" (`last_observed_at` vs now).
 
 ### 5. Forge manages desired state directly (no Raft)
 
