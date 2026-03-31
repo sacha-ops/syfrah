@@ -6,8 +6,9 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
-    SubnetId, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, NicId, Org, OrgId, PeeringId, PeeringStatus,
+    Project, ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc,
+    VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -22,6 +23,8 @@ const PEERINGS_TABLE: &str = "vpc_peerings";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
+const SECURITY_GROUPS_TABLE: &str = "security_groups";
+const NICS_TABLE: &str = "network_interfaces";
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -909,6 +912,257 @@ impl OrgStore {
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
         let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
         Ok(self.db.get(PEERINGS_TABLE, &key)?)
+    }
+
+    // ── Security Group operations ───────────────────────────────────
+
+    /// Create a new security group in a VPC.
+    pub fn create_sg(&self, name: &str, vpc_id: &str, description: &str) -> Result<SecurityGroup> {
+        validate_name(name, "security group")?;
+
+        // Verify VPC exists
+        self.get_vpc(vpc_id)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_id.to_string()))?;
+
+        let key = format!("{vpc_id}/{name}");
+        if self.db.exists(SECURITY_GROUPS_TABLE, &key)? {
+            return Err(OrgError::SgAlreadyExists(name.to_string()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sg = SecurityGroup {
+            id: SecurityGroupId(key.clone()),
+            name: name.to_string(),
+            description: description.to_string(),
+            vpc_id: VpcId(vpc_id.to_string()),
+            state: ResourceState::Active,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        Ok(sg)
+    }
+
+    /// Get a security group by VPC-scoped name.
+    pub fn get_sg(&self, vpc_id: &str, name: &str) -> Result<Option<SecurityGroup>> {
+        let key = format!("{vpc_id}/{name}");
+        Ok(self.db.get(SECURITY_GROUPS_TABLE, &key)?)
+    }
+
+    /// Get a security group by its full ID (vpc_id/name).
+    pub fn get_sg_by_id(&self, sg_id: &str) -> Result<Option<SecurityGroup>> {
+        Ok(self.db.get(SECURITY_GROUPS_TABLE, sg_id)?)
+    }
+
+    /// List all security groups, optionally filtered by VPC.
+    pub fn list_sgs(&self, vpc_id: Option<&str>) -> Result<Vec<SecurityGroup>> {
+        let all: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+        let sgs = all
+            .into_iter()
+            .map(|(_, sg)| sg)
+            .filter(|sg| {
+                vpc_id.is_none_or(|v| sg.vpc_id.0 == v) && sg.state != ResourceState::Deleted
+            })
+            .collect();
+        Ok(sgs)
+    }
+
+    /// Find a security group by name across all VPCs. Returns the SG if unique.
+    pub fn find_sg_by_name(&self, name: &str) -> Result<Option<SecurityGroup>> {
+        let all: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+        let matches: Vec<SecurityGroup> = all
+            .into_iter()
+            .map(|(_, sg)| sg)
+            .filter(|sg| sg.name == name && sg.state != ResourceState::Deleted)
+            .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches.into_iter().next().unwrap())),
+            _ => Ok(matches.into_iter().next()), // return first match
+        }
+    }
+
+    /// Delete a security group.
+    pub fn delete_sg(&self, vpc_id: &str, name: &str) -> Result<()> {
+        let key = format!("{vpc_id}/{name}");
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, &key)?
+            .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
+
+        // Check if any NIC references this SG
+        let nics: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        let attached_count = nics
+            .iter()
+            .filter(|(_, nic)| nic.security_groups.contains(&sg.id))
+            .count();
+        if attached_count > 0 {
+            return Err(OrgError::SgNotFound(format!(
+                "security group is attached to {attached_count} network interface(s)"
+            )));
+        }
+
+        self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
+        Ok(())
+    }
+
+    // ── NIC operations ──────────────────────────────────────────────
+
+    /// Create a new network interface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_nic(
+        &self,
+        name: &str,
+        vm_id: Option<&str>,
+        subnet_id: &str,
+        vpc_id: &str,
+        private_ip: &str,
+        mac: &str,
+        security_groups: Vec<SecurityGroupId>,
+    ) -> Result<NetworkInterface> {
+        let nic_id = format!("nic-{name}");
+        if self.db.exists(NICS_TABLE, &nic_id)? {
+            return Err(OrgError::NicAlreadyExists(nic_id));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let nic = NetworkInterface {
+            id: NicId(nic_id.clone()),
+            name: name.to_string(),
+            vm_id: vm_id.map(String::from),
+            subnet_id: SubnetId(subnet_id.to_string()),
+            vpc_id: VpcId(vpc_id.to_string()),
+            private_ip: private_ip.to_string(),
+            mac: mac.to_string(),
+            security_groups,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        self.db.set(NICS_TABLE, &nic_id, &nic)?;
+        Ok(nic)
+    }
+
+    /// Get a NIC by its ID.
+    pub fn get_nic(&self, nic_id: &str) -> Result<Option<NetworkInterface>> {
+        Ok(self.db.get(NICS_TABLE, nic_id)?)
+    }
+
+    /// Find the primary NIC for a VM.
+    pub fn find_nic_by_vm(&self, vm_id: &str) -> Result<Option<NetworkInterface>> {
+        let all: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        let nic = all
+            .into_iter()
+            .map(|(_, nic)| nic)
+            .find(|nic| nic.vm_id.as_deref() == Some(vm_id) && nic.state == ResourceState::Active);
+        Ok(nic)
+    }
+
+    /// List all NICs, optionally filtered by VPC.
+    pub fn list_nics(&self, vpc_id: Option<&str>) -> Result<Vec<NetworkInterface>> {
+        let all: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        let nics = all
+            .into_iter()
+            .map(|(_, nic)| nic)
+            .filter(|nic| {
+                vpc_id.is_none_or(|v| nic.vpc_id.0 == v) && nic.state != ResourceState::Deleted
+            })
+            .collect();
+        Ok(nics)
+    }
+
+    /// Attach a security group to a NIC.
+    pub fn attach_sg_to_nic(&self, sg_id: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, sg_id)?
+            .ok_or_else(|| OrgError::SgNotFound(sg_id.to_string()))?;
+
+        let mut nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        // VPC match check
+        if sg.vpc_id != nic.vpc_id {
+            return Err(OrgError::SgVpcMismatch {
+                sg: sg.name.clone(),
+                sg_vpc: sg.vpc_id.0.clone(),
+                nic_vpc: nic.vpc_id.0.clone(),
+            });
+        }
+
+        // Already attached?
+        if nic.security_groups.contains(&sg.id) {
+            return Err(OrgError::SgAlreadyAttached {
+                sg: sg.name.clone(),
+                nic: nic.name.clone(),
+            });
+        }
+
+        nic.security_groups.push(sg.id);
+        self.db.set(NICS_TABLE, nic_id, &nic)?;
+        Ok(nic)
+    }
+
+    /// Detach a security group from a NIC.
+    pub fn detach_sg_from_nic(&self, sg_id: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, sg_id)?
+            .ok_or_else(|| OrgError::SgNotFound(sg_id.to_string()))?;
+
+        let mut nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        // Is it attached?
+        if !nic.security_groups.contains(&sg.id) {
+            return Err(OrgError::SgNotAttached {
+                sg: sg.name.clone(),
+                nic: nic.name.clone(),
+            });
+        }
+
+        // Can't detach the last SG
+        if nic.security_groups.len() <= 1 {
+            return Err(OrgError::DetachLastSg {
+                nic: nic.name.clone(),
+            });
+        }
+
+        nic.security_groups.retain(|id| id != &sg.id);
+        self.db.set(NICS_TABLE, nic_id, &nic)?;
+        Ok(nic)
+    }
+
+    /// List security groups attached to a NIC.
+    pub fn list_sgs_for_nic(&self, nic_id: &str) -> Result<Vec<SecurityGroup>> {
+        let nic: NetworkInterface = self
+            .db
+            .get(NICS_TABLE, nic_id)?
+            .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
+
+        let mut sgs = Vec::new();
+        for sg_id in &nic.security_groups {
+            if let Some(sg) = self
+                .db
+                .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, &sg_id.0)?
+            {
+                sgs.push(sg);
+            }
+        }
+        Ok(sgs)
     }
 }
 
@@ -2336,5 +2590,186 @@ mod tests {
 
         let err = store.delete_vpc(&a).unwrap_err();
         assert!(matches!(err, OrgError::VpcHasPeerings { .. }));
+    }
+
+    // ── Security Group + NIC attach/detach tests ────────────────────
+
+    /// Helper: set up org, project, env, VPC, and subnet for SG tests.
+    fn setup_sg_env(store: &OrgStore) -> (String, String) {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        store
+            .create_env("acme", "backend", "prod", None, false, HashMap::new())
+            .unwrap();
+        let vpc = store
+            .create_vpc(
+                "my-vpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".into())),
+                false,
+            )
+            .unwrap();
+        let env_id = EnvironmentId("acme/backend/prod".into());
+        let subnet = store
+            .create_subnet(&vpc.name, &env_id, "frontend", None)
+            .unwrap();
+        (vpc.name, subnet.name)
+    }
+
+    /// Helper: create a NIC attached to a VM for testing.
+    fn create_test_nic(
+        store: &OrgStore,
+        name: &str,
+        vm_id: &str,
+        vpc_id: &str,
+        subnet_id: &str,
+        default_sg: SecurityGroupId,
+    ) -> NetworkInterface {
+        store
+            .create_nic(
+                name,
+                Some(vm_id),
+                subnet_id,
+                vpc_id,
+                "10.1.1.2",
+                "02:00:0a:01:01:02",
+                vec![default_sg],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn attach_sg() {
+        let (_dir, store) = temp_store();
+        let (vpc, _subnet) = setup_sg_env(&store);
+
+        let default_sg = store.create_sg("default", &vpc, "Default SG").unwrap();
+        let web_sg = store.create_sg("web-sg", &vpc, "Web tier").unwrap();
+
+        let nic = create_test_nic(
+            &store,
+            "web-1-nic",
+            "web-1",
+            &vpc,
+            &format!("{vpc}/frontend"),
+            default_sg.id.clone(),
+        );
+
+        let updated = store.attach_sg_to_nic(&web_sg.id.0, &nic.id.0).unwrap();
+        assert_eq!(updated.security_groups.len(), 2);
+        assert!(updated.security_groups.contains(&default_sg.id));
+        assert!(updated.security_groups.contains(&web_sg.id));
+    }
+
+    #[test]
+    fn detach_sg() {
+        let (_dir, store) = temp_store();
+        let (vpc, _subnet) = setup_sg_env(&store);
+
+        let default_sg = store.create_sg("default", &vpc, "Default SG").unwrap();
+        let web_sg = store.create_sg("web-sg", &vpc, "Web tier").unwrap();
+
+        let nic = create_test_nic(
+            &store,
+            "web-2-nic",
+            "web-2",
+            &vpc,
+            &format!("{vpc}/frontend"),
+            default_sg.id.clone(),
+        );
+
+        // Attach then detach
+        store.attach_sg_to_nic(&web_sg.id.0, &nic.id.0).unwrap();
+        let updated = store.detach_sg_from_nic(&web_sg.id.0, &nic.id.0).unwrap();
+        assert_eq!(updated.security_groups.len(), 1);
+        assert!(updated.security_groups.contains(&default_sg.id));
+        assert!(!updated.security_groups.contains(&web_sg.id));
+    }
+
+    #[test]
+    fn attach_wrong_vpc_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc, _subnet) = setup_sg_env(&store);
+
+        // Create a second VPC
+        let vpc2 = store
+            .create_vpc(
+                "other-vpc",
+                "10.2.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".into())),
+                false,
+            )
+            .unwrap();
+
+        let default_sg = store.create_sg("default", &vpc, "Default SG").unwrap();
+        let other_sg = store
+            .create_sg("other-sg", &vpc2.name, "Other VPC SG")
+            .unwrap();
+
+        let nic = create_test_nic(
+            &store,
+            "web-3-nic",
+            "web-3",
+            &vpc,
+            &format!("{vpc}/frontend"),
+            default_sg.id.clone(),
+        );
+
+        let err = store
+            .attach_sg_to_nic(&other_sg.id.0, &nic.id.0)
+            .unwrap_err();
+        assert!(matches!(err, OrgError::SgVpcMismatch { .. }));
+    }
+
+    #[test]
+    fn detach_last_sg_rejected() {
+        let (_dir, store) = temp_store();
+        let (vpc, _subnet) = setup_sg_env(&store);
+
+        let default_sg = store.create_sg("default", &vpc, "Default SG").unwrap();
+
+        let nic = create_test_nic(
+            &store,
+            "web-4-nic",
+            "web-4",
+            &vpc,
+            &format!("{vpc}/frontend"),
+            default_sg.id.clone(),
+        );
+
+        let err = store
+            .detach_sg_from_nic(&default_sg.id.0, &nic.id.0)
+            .unwrap_err();
+        assert!(matches!(err, OrgError::DetachLastSg { .. }));
+    }
+
+    #[test]
+    fn list_attached_sgs() {
+        let (_dir, store) = temp_store();
+        let (vpc, _subnet) = setup_sg_env(&store);
+
+        let default_sg = store.create_sg("default", &vpc, "Default SG").unwrap();
+        let web_sg = store.create_sg("web-sg", &vpc, "Web tier").unwrap();
+        let api_sg = store.create_sg("api-sg", &vpc, "API tier").unwrap();
+
+        let nic = create_test_nic(
+            &store,
+            "web-5-nic",
+            "web-5",
+            &vpc,
+            &format!("{vpc}/frontend"),
+            default_sg.id.clone(),
+        );
+
+        store.attach_sg_to_nic(&web_sg.id.0, &nic.id.0).unwrap();
+        store.attach_sg_to_nic(&api_sg.id.0, &nic.id.0).unwrap();
+
+        let sgs = store.list_sgs_for_nic(&nic.id.0).unwrap();
+        assert_eq!(sgs.len(), 3);
+
+        let names: Vec<&str> = sgs.iter().map(|sg| sg.name.as_str()).collect();
+        assert!(names.contains(&"default"));
+        assert!(names.contains(&"web-sg"));
+        assert!(names.contains(&"api-sg"));
     }
 }

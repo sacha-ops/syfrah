@@ -2,6 +2,87 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+// ---------------------------------------------------------------------------
+// ResourceState — unified lifecycle for network resources
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state for mutable network resources (NIC, SG, NAT Gateway, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceState {
+    Pending,
+    Active,
+    Failed,
+    Deleting,
+    Deleted,
+}
+
+impl fmt::Display for ResourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceState::Pending => f.write_str("Pending"),
+            ResourceState::Active => f.write_str("Active"),
+            ResourceState::Failed => f.write_str("Failed"),
+            ResourceState::Deleting => f.write_str("Deleting"),
+            ResourceState::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityGroup
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a security group.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecurityGroupId(pub String);
+
+impl fmt::Display for SecurityGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A security group — a set of allow-only firewall rules attached to NICs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroup {
+    pub id: SecurityGroupId,
+    pub name: String,
+    pub description: String,
+    pub vpc_id: VpcId,
+    pub state: ResourceState,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// NetworkInterface (NIC)
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a network interface.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NicId(pub String);
+
+impl fmt::Display for NicId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A network interface — the attachment point for security groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkInterface {
+    pub id: NicId,
+    pub name: String,
+    pub vm_id: Option<String>,
+    pub subnet_id: SubnetId,
+    pub vpc_id: VpcId,
+    pub private_ip: String,
+    pub mac: String,
+    pub security_groups: Vec<SecurityGroupId>,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
 /// Unique identifier for a VPC.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VpcId(pub String);

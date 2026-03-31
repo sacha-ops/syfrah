@@ -16,8 +16,8 @@ use tokio::net::UnixStream;
 
 use crate::store::OrgStore;
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringStatus, Project, ProjectId, Subnet, Vpc,
-    VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, Project, ProjectId,
+    SecurityGroup, Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +141,44 @@ pub enum OrgRequest {
         project: Option<String>,
         org: Option<String>,
     },
+
+    // -- Security Groups --
+    SgCreate {
+        name: String,
+        vpc: String,
+        description: String,
+    },
+    SgList {
+        vpc: Option<String>,
+    },
+    SgDelete {
+        name: String,
+        vpc: String,
+    },
+    SgAttach {
+        sg: String,
+        vm: Option<String>,
+        nic: Option<String>,
+    },
+    SgDetach {
+        sg: String,
+        vm: Option<String>,
+        nic: Option<String>,
+    },
+    SgListForNic {
+        vm: Option<String>,
+        nic: Option<String>,
+    },
+
+    // -- NIC --
+    NicCreate {
+        name: String,
+        vm_id: Option<String>,
+        subnet_id: String,
+        vpc_id: String,
+        private_ip: String,
+        mac: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +196,10 @@ pub enum OrgResponse {
     SubnetList(Vec<Subnet>),
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
+    Sg(SecurityGroup),
+    SgList(Vec<SecurityGroup>),
+    Nic(NetworkInterface),
+    NicSgList(Vec<SecurityGroup>),
     Ok,
     Error(String),
 }
@@ -500,6 +542,103 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
             }
         }
 
+        // -- Security Groups --
+        OrgRequest::SgCreate {
+            name,
+            vpc,
+            description,
+        } => match store.create_sg(&name, &vpc, &description) {
+            Ok(sg) => OrgResponse::Sg(sg),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgList { vpc } => match store.list_sgs(vpc.as_deref()) {
+            Ok(sgs) => OrgResponse::SgList(sgs),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgDelete { name, vpc } => match store.delete_sg(&vpc, &name) {
+            Ok(()) => OrgResponse::Ok,
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgAttach { sg, vm, nic } => {
+            // Resolve the SG — try by name across all VPCs
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sg_id = sg_record.id.0.clone();
+
+            // Resolve the NIC
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            match store.attach_sg_to_nic(&sg_id, &nic_id) {
+                Ok(updated_nic) => OrgResponse::Nic(updated_nic),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::SgDetach { sg, vm, nic } => {
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sg_id = sg_record.id.0.clone();
+
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            match store.detach_sg_from_nic(&sg_id, &nic_id) {
+                Ok(updated_nic) => OrgResponse::Nic(updated_nic),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::SgListForNic { vm, nic } => {
+            let nic_id = match resolve_nic(store, vm.as_deref(), nic.as_deref()) {
+                Ok(id) => id,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            match store.list_sgs_for_nic(&nic_id) {
+                Ok(sgs) => OrgResponse::NicSgList(sgs),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        // -- NIC --
+        OrgRequest::NicCreate {
+            name,
+            vm_id,
+            subnet_id,
+            vpc_id,
+            private_ip,
+            mac,
+        } => {
+            // New NICs get the VPC's default SG
+            let default_sg_key = format!("{vpc_id}/default");
+            let default_sgs = match store.get_sg_by_id(&default_sg_key) {
+                Ok(Some(sg)) => vec![sg.id],
+                _ => Vec::new(),
+            };
+
+            match store.create_nic(
+                &name,
+                vm_id.as_deref(),
+                &subnet_id,
+                &vpc_id,
+                &private_ip,
+                &mac,
+                default_sgs,
+            ) {
+                Ok(nic) => OrgResponse::Nic(nic),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
         // -- Subnet resolution (for compute layer) --
         OrgRequest::SubnetResolve {
             subnet_name,
@@ -570,6 +709,30 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
                 },
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NIC resolution helper
+// ---------------------------------------------------------------------------
+
+/// Resolve a NIC ID from either a VM name or a NIC ID.
+fn resolve_nic(
+    store: &OrgStore,
+    vm: Option<&str>,
+    nic: Option<&str>,
+) -> std::result::Result<String, String> {
+    match (vm, nic) {
+        (Some(vm_name), _) => {
+            // Find the VM's primary NIC
+            match store.find_nic_by_vm(vm_name) {
+                Ok(Some(n)) => Ok(n.id.0),
+                Ok(None) => Err(format!("VM '{vm_name}' has no NIC")),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        (None, Some(nic_id)) => Ok(nic_id.to_string()),
+        (None, None) => Err("specify either --vm or --nic".to_string()),
     }
 }
 

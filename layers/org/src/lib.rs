@@ -11,14 +11,15 @@ pub mod validation;
 pub mod vpc;
 
 pub use api::{send_org_request, OrgLayerHandler, OrgRequest, OrgResponse, ResolvedSubnet};
-pub use cli::{EnvCommand, OrgCommand, ProjectCommand, SubnetCommand, VpcCommand};
+pub use cli::{EnvCommand, OrgCommand, ProjectCommand, SgCommand, SubnetCommand, VpcCommand};
 pub use error::OrgError;
 pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use placement::PlacementStore;
 pub use store::OrgStore;
 pub use types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, PlacementAction, Project,
-    ProjectId, Subnet, SubnetId, VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, NicId, Org, OrgId, PeeringId, PeeringStatus,
+    PlacementAction, Project, ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet,
+    SubnetId, VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};
