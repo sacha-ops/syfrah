@@ -1121,6 +1121,15 @@ impl OrgStore {
         Ok(self.db.get(NICS_TABLE, nic_id)?)
     }
 
+    /// Delete a NIC by its ID.
+    pub fn delete_nic(&self, nic_id: &str) -> Result<()> {
+        let existed = self.db.delete(NICS_TABLE, nic_id)?;
+        if !existed {
+            return Err(OrgError::NicNotFound(nic_id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Find the primary NIC for a given VM.
     pub fn find_nic_by_vm(&self, vm_id: &str) -> Result<Option<NetworkInterface>> {
         let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;

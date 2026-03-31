@@ -11,7 +11,10 @@ use tracing::{info, warn};
 
 use syfrah_org::ipam::IpamStore;
 use syfrah_org::store::OrgStore;
-use syfrah_org::types::{PlacementAction, Subnet, VmPlacement, Vpc};
+use syfrah_org::types::{
+    NetworkInterface, NicId, PlacementAction, ResourceState, SecurityGroupId, Subnet, VmPlacement,
+    Vpc,
+};
 use syfrah_org::PlacementStore;
 use syfrah_overlay::backend::NetworkBackend;
 
@@ -312,6 +315,45 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             .add_placement(&placement)
             .map_err(|e| ComputeError::NetworkSetup(format!("placement store failed: {e}")))?;
 
+        // -- 9. Create NIC record ------------------------------------------------
+        // Build security group list: use specified SGs or default to "default".
+        let sg_ids: Vec<SecurityGroupId> = if security_groups.is_empty() {
+            // Look up the default SG for this VPC.
+            let default_sg_key = format!("sg-default-{vpc_id}");
+            vec![SecurityGroupId(default_sg_key)]
+        } else {
+            security_groups
+                .iter()
+                .filter_map(|name| {
+                    self.org_store
+                        .find_sg_by_name(name)
+                        .ok()
+                        .flatten()
+                        .map(|sg| sg.id)
+                })
+                .collect()
+        };
+
+        let nic_id = format!("nic-{vm_id}");
+        let nic = NetworkInterface {
+            id: NicId(nic_id.clone()),
+            name: format!("eth0-{vm_id}"),
+            vm_id: Some(vm_id.to_string()),
+            subnet_id: subnet_id.to_string(),
+            vpc_id: vpc_id.to_string(),
+            private_ip: ip.to_string(),
+            mac: mac.to_string(),
+            security_groups: sg_ids,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        if let Err(e) = self.org_store.create_nic(&nic) {
+            warn!(vm_id, error = %e, "failed to create NIC record (non-fatal)");
+        } else {
+            info!(vm_id, nic_id = %nic_id, "NIC record created");
+        }
+
         info!(
             vm_id,
             %ip, %mac,
@@ -427,6 +469,14 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         // Release IP.
         if let Err(e) = self.ipam_store.release_ip(subnet_id, subnet_cidr, ip) {
             warn!(vm_id, error = %e, "failed to release IP");
+        }
+
+        // Delete NIC record (best-effort).
+        let nic_id = format!("nic-{vm_id}");
+        if let Ok(Some(_)) = self.org_store.get_nic(&nic_id) {
+            if let Err(e) = self.org_store.delete_nic(&nic_id) {
+                warn!(vm_id, error = %e, "failed to delete NIC record");
+            }
         }
 
         info!(vm_id, "network teardown complete");
