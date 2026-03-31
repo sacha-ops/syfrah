@@ -1,17 +1,21 @@
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::backend::NetworkBackend;
-use crate::error::Result;
+use crate::error::{OverlayError, Result};
 
 /// In-memory mock that records every call for test assertions.
 pub struct MockBackend {
     calls: Mutex<Vec<String>>,
+    /// Method names that should return an error (e.g. "add_fdb_entry").
+    fail_methods: Mutex<HashSet<String>>,
 }
 
 impl MockBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            fail_methods: Mutex::new(HashSet::new()),
         }
     }
 
@@ -25,8 +29,30 @@ impl MockBackend {
         self.calls.lock().expect("lock poisoned").clear();
     }
 
+    /// Make a specific method return an error on every invocation.
+    pub fn set_fail(&self, method: &str) {
+        self.fail_methods
+            .lock()
+            .expect("lock poisoned")
+            .insert(method.to_string());
+    }
+
     fn record(&self, call: String) {
         self.calls.lock().expect("lock poisoned").push(call);
+    }
+
+    fn should_fail(&self, method: &str) -> Result<()> {
+        if self
+            .fail_methods
+            .lock()
+            .expect("lock poisoned")
+            .contains(method)
+        {
+            return Err(OverlayError::CommandFailed(format!(
+                "{method} injected failure"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -51,6 +77,7 @@ impl NetworkBackend for MockBackend {
     }
 
     async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()> {
+        self.should_fail("add_fdb_entry")?;
         self.record(format!("add_fdb_entry({bridge}, {mac}, {vtep})"));
         Ok(())
     }
@@ -61,6 +88,7 @@ impl NetworkBackend for MockBackend {
     }
 
     async fn add_arp_proxy(&self, vxlan: &str, ip: &str, mac: &str) -> Result<()> {
+        self.should_fail("add_arp_proxy")?;
         self.record(format!("add_arp_proxy({vxlan}, {ip}, {mac})"));
         Ok(())
     }
