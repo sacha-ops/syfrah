@@ -1,12 +1,17 @@
 //! Full hierarchy integration test: Org -> Project -> Environment lifecycle.
 //! VM placement persistence tests.
+//! Security group rule persistence tests.
 
 use std::collections::HashMap;
 
 use crate::error::OrgError;
 use crate::placement::PlacementStore;
+use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
-use crate::types::{PlacementAction, VmPlacement};
+use crate::types::{
+    Direction, PlacementAction, PortRange, Protocol, RuleId, RuleSource, SecurityGroupId,
+    SecurityGroupRule, VmPlacement,
+};
 
 fn temp_store() -> (tempfile::TempDir, OrgStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -229,4 +234,163 @@ fn list_by_node() {
 
     let node3 = store.list_by_node("fd00::99").unwrap();
     assert_eq!(node3.len(), 0, "expected 0 placements on fd00::99");
+}
+
+// ── Security Group Rule tests ──────────────────────────────────────
+
+fn temp_sg_rule_store() -> (tempfile::TempDir, SgRuleStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sg-rule-test.redb");
+    let db = syfrah_state::LayerDb::open_at(&path).unwrap();
+    (dir, SgRuleStore::new(db))
+}
+
+fn make_rule(id: &str, sg_id: &str, direction: Direction, protocol: Protocol) -> SecurityGroupRule {
+    SecurityGroupRule {
+        id: RuleId(id.to_string()),
+        sg_id: SecurityGroupId(sg_id.to_string()),
+        direction,
+        protocol,
+        port_range: Some(PortRange { from: 80, to: 80 }),
+        source: RuleSource::Cidr("10.0.0.0/16".to_string()),
+        priority: 100,
+        description: Some("test rule".to_string()),
+    }
+}
+
+#[test]
+fn add_rule() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    let rule = make_rule("rule-1", "sg-1", Direction::Ingress, Protocol::Tcp);
+    store.add_rule(&rule).unwrap();
+
+    let rules = store.list_rules().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id.0, "rule-1");
+    assert_eq!(rules[0].sg_id.0, "sg-1");
+}
+
+#[test]
+fn remove_rule() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    let rule = make_rule("rule-1", "sg-1", Direction::Ingress, Protocol::Tcp);
+    store.add_rule(&rule).unwrap();
+
+    store.remove_rule("rule-1").unwrap();
+
+    let rules = store.list_rules().unwrap();
+    assert!(rules.is_empty(), "rules should be empty after removal");
+
+    // Removing again should error.
+    let err = store.remove_rule("rule-1").unwrap_err();
+    assert!(
+        matches!(err, OrgError::RuleNotFound(_)),
+        "expected RuleNotFound, got: {err}"
+    );
+}
+
+#[test]
+fn list_rules_by_sg() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    // Two rules in sg-1, one in sg-2.
+    store
+        .add_rule(&make_rule("r1", "sg-1", Direction::Ingress, Protocol::Tcp))
+        .unwrap();
+    store
+        .add_rule(&make_rule("r2", "sg-1", Direction::Egress, Protocol::Udp))
+        .unwrap();
+    store
+        .add_rule(&make_rule("r3", "sg-2", Direction::Ingress, Protocol::All))
+        .unwrap();
+
+    let sg1_rules = store
+        .list_rules_by_sg(&SecurityGroupId("sg-1".to_string()))
+        .unwrap();
+    assert_eq!(sg1_rules.len(), 2, "expected 2 rules in sg-1");
+    assert!(sg1_rules.iter().all(|r| r.sg_id.0 == "sg-1"));
+
+    let sg2_rules = store
+        .list_rules_by_sg(&SecurityGroupId("sg-2".to_string()))
+        .unwrap();
+    assert_eq!(sg2_rules.len(), 1, "expected 1 rule in sg-2");
+
+    let sg3_rules = store
+        .list_rules_by_sg(&SecurityGroupId("sg-3".to_string()))
+        .unwrap();
+    assert_eq!(sg3_rules.len(), 0, "expected 0 rules in sg-3");
+}
+
+#[test]
+fn default_rules_created() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    let sg_id = SecurityGroupId("sg-default".to_string());
+    let rules = store.create_default_rules(&sg_id, "10.0.0.0/16").unwrap();
+
+    assert_eq!(rules.len(), 2, "expected 2 default rules");
+
+    // SSH rule
+    let ssh = rules.iter().find(|r| r.protocol == Protocol::Tcp).unwrap();
+    assert_eq!(ssh.direction, Direction::Ingress);
+    assert_eq!(ssh.port_range, Some(PortRange { from: 22, to: 22 }));
+    assert_eq!(ssh.source, RuleSource::Cidr("10.0.0.0/16".to_string()));
+
+    // ICMP rule
+    let icmp = rules.iter().find(|r| r.protocol == Protocol::Icmp).unwrap();
+    assert_eq!(icmp.direction, Direction::Ingress);
+    assert!(icmp.port_range.is_none());
+    assert_eq!(icmp.source, RuleSource::Cidr("10.0.0.0/16".to_string()));
+
+    // Verify they are persisted
+    let persisted = store.list_rules_by_sg(&sg_id).unwrap();
+    assert_eq!(persisted.len(), 2, "default rules should be persisted");
+}
+
+#[test]
+fn invalid_port_rejected() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    // Port 0 is invalid
+    let mut rule = make_rule("r-bad", "sg-1", Direction::Ingress, Protocol::Tcp);
+    rule.port_range = Some(PortRange { from: 0, to: 80 });
+
+    let err = store.add_rule(&rule).unwrap_err();
+    assert!(
+        matches!(err, OrgError::InvalidPortRange { .. }),
+        "expected InvalidPortRange, got: {err}"
+    );
+
+    // from > to is invalid
+    rule.port_range = Some(PortRange { from: 8080, to: 80 });
+    let err = store.add_rule(&rule).unwrap_err();
+    assert!(
+        matches!(err, OrgError::InvalidPortRange { .. }),
+        "expected InvalidPortRange, got: {err}"
+    );
+}
+
+#[test]
+fn duplicate_rule_handling() {
+    let (_dir, store) = temp_sg_rule_store();
+
+    let rule = make_rule("rule-dup", "sg-1", Direction::Ingress, Protocol::Tcp);
+    store.add_rule(&rule).unwrap();
+
+    // Adding the same rule_id again should fail
+    let err = store.add_rule(&rule).unwrap_err();
+    assert!(
+        matches!(err, OrgError::RuleAlreadyExists(_)),
+        "expected RuleAlreadyExists, got: {err}"
+    );
+
+    // Only one rule should exist
+    let rules = store.list_rules().unwrap();
+    assert_eq!(
+        rules.len(),
+        1,
+        "should have exactly 1 rule, not a duplicate"
+    );
 }

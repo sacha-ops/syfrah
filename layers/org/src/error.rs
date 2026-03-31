@@ -136,6 +136,15 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
+    #[error("security group rule already exists: {0}")]
+    RuleAlreadyExists(String),
+
+    #[error("security group rule not found: {0}")]
+    RuleNotFound(String),
+
+    #[error("invalid port range: {reason}")]
+    InvalidPortRange { reason: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }
