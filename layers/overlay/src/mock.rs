@@ -221,55 +221,58 @@ mod tests {
     #[tokio::test]
     async fn mock_backend_records_calls() {
         let backend = MockBackend::new();
-        backend.create_bridge("syfbr-100").await.unwrap();
+        let br = crate::naming::bridge_name("100");
+        backend.create_bridge(&br).await.unwrap();
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], "create_bridge(syfbr-100)");
+        assert_eq!(calls[0], format!("create_bridge({br})"));
     }
 
     #[tokio::test]
     async fn trait_method_coverage() {
         let b = MockBackend::new();
+        let br100 = crate::naming::bridge_name("100");
+        let br200 = crate::naming::bridge_name("200");
+        let vx100 = crate::naming::vxlan_name("100");
+        let tap = crate::naming::tap_name("vm1");
+        let vh = crate::naming::veth_host_name("a");
+        let vc = crate::naming::veth_container_name("b");
 
-        b.create_vxlan("syfvx-100", 100, "fd00::1", 4789)
+        b.create_vxlan(&vx100, 100, "fd00::1", 4789).await.unwrap();
+        b.delete_vxlan(&vx100).await.unwrap();
+        b.add_fdb_entry(&br100, "02:00:0a:01:01:03", "fd00::2")
             .await
             .unwrap();
-        b.delete_vxlan("syfvx-100").await.unwrap();
-        b.add_fdb_entry("syfbr-100", "02:00:0a:01:01:03", "fd00::2")
+        b.remove_fdb_entry(&br100, "02:00:0a:01:01:03")
             .await
             .unwrap();
-        b.remove_fdb_entry("syfbr-100", "02:00:0a:01:01:03")
+        b.add_arp_proxy(&vx100, "10.1.1.3", "02:00:0a:01:01:03")
             .await
             .unwrap();
-        b.add_arp_proxy("syfvx-100", "10.1.1.3", "02:00:0a:01:01:03")
-            .await
-            .unwrap();
-        b.remove_arp_proxy("syfvx-100", "10.1.1.3").await.unwrap();
+        b.remove_arp_proxy(&vx100, "10.1.1.3").await.unwrap();
 
-        b.create_bridge("syfbr-100").await.unwrap();
-        b.add_bridge_ip("syfbr-100", "10.1.1.1", 24).await.unwrap();
-        b.remove_bridge_ip("syfbr-100", "10.1.1.1").await.unwrap();
-        b.delete_bridge("syfbr-100").await.unwrap();
-        b.attach_to_bridge("syfvx-100", "syfbr-100").await.unwrap();
+        b.create_bridge(&br100).await.unwrap();
+        b.add_bridge_ip(&br100, "10.1.1.1", 24).await.unwrap();
+        b.remove_bridge_ip(&br100, "10.1.1.1").await.unwrap();
+        b.delete_bridge(&br100).await.unwrap();
+        b.attach_to_bridge(&vx100, &br100).await.unwrap();
 
-        b.create_tap("syftap-vm1").await.unwrap();
-        b.delete_tap("syftap-vm1").await.unwrap();
-        b.create_veth_pair("syfve-a", "syfve-b").await.unwrap();
+        b.create_tap(&tap).await.unwrap();
+        b.delete_tap(&tap).await.unwrap();
+        b.create_veth_pair(&vh, &vc).await.unwrap();
 
-        b.apply_vm_rules("syftap-vm1", "02:00:0a:01:01:03", "10.1.1.3")
+        b.apply_vm_rules(&tap, "02:00:0a:01:01:03", "10.1.1.3")
             .await
             .unwrap();
-        b.remove_vm_rules("syftap-vm1").await.unwrap();
-        b.apply_nat("syfbr-100", "10.1.1.0/24").await.unwrap();
-        b.remove_nat("syfbr-100", "10.1.1.0/24").await.unwrap();
-        b.apply_peering_rules("syfbr-100", "syfbr-200")
+        b.remove_vm_rules(&tap).await.unwrap();
+        b.apply_nat(&br100, "10.1.1.0/24").await.unwrap();
+        b.remove_nat(&br100, "10.1.1.0/24").await.unwrap();
+        b.apply_peering_rules(&br100, &br200).await.unwrap();
+        b.remove_peering_rules(&br100, &br200).await.unwrap();
+        b.list_interfaces(crate::naming::BRIDGE_PREFIX)
             .await
             .unwrap();
-        b.remove_peering_rules("syfbr-100", "syfbr-200")
-            .await
-            .unwrap();
-        b.list_interfaces("syfbr-").await.unwrap();
 
         let calls = b.calls();
         assert_eq!(calls.len(), 21, "expected one call per trait method");

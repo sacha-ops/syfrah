@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::backend::NetworkBackend;
 use crate::error::{OverlayError, Result};
+use crate::naming;
 
 /// Action carried by a VM placement announcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,8 +63,8 @@ pub async fn rebuild_fdb(
             continue;
         }
 
-        let bridge = format!("syfbr-{}", p.vpc_id);
-        let vxlan = format!("syfvx-{}", p.vpc_id);
+        let bridge = naming::bridge_name(&p.vpc_id);
+        let vxlan = naming::vxlan_name(&p.vpc_id);
 
         match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hosting_node).await {
             Ok(()) => {}
@@ -104,12 +105,12 @@ pub async fn rebuild_fdb(
 
 /// Naming convention: VXLAN interface for a given bridge.
 ///
-/// Bridge name: `syfbr-{vpc_id}` -> VXLAN name: `syfvx-{vpc_id}`.
+/// Bridge name: `syfb-{hash}` -> VXLAN name: `syfx-{hash}`.
 fn vxlan_name_from_bridge(bridge: &str) -> Result<String> {
     let suffix = bridge
-        .strip_prefix("syfbr-")
+        .strip_prefix(naming::BRIDGE_PREFIX)
         .ok_or_else(|| OverlayError::InterfaceNotFound(bridge.to_string()))?;
-    Ok(format!("syfvx-{suffix}"))
+    Ok(format!("{}{suffix}", naming::VXLAN_PREFIX))
 }
 
 /// Add a static FDB entry for a remote VM.
@@ -176,8 +177,8 @@ pub async fn sync_placement(
         return Ok(());
     }
 
-    let bridge = format!("syfbr-{}", placement.vpc_id);
-    let vxlan = format!("syfvx-{}", placement.vpc_id);
+    let bridge = naming::bridge_name(&placement.vpc_id);
+    let vxlan = naming::vxlan_name(&placement.vpc_id);
 
     match placement.action {
         PlacementAction::Add => {
@@ -198,8 +199,12 @@ mod tests {
     use super::*;
     use crate::mock::MockBackend;
 
-    const BRIDGE: &str = "syfbr-100";
-    const VXLAN: &str = "syfvx-100";
+    fn bridge_100() -> String {
+        naming::bridge_name("100")
+    }
+    fn vxlan_100() -> String {
+        naming::vxlan_name("100")
+    }
     const MAC: &str = "02:00:0a:00:01:05";
     const IP: &str = "10.0.1.5";
     const VTEP: &str = "fd12:3456:7800::2";
@@ -207,11 +212,12 @@ mod tests {
     #[tokio::test]
     async fn add_fdb_entry_correct_mac_and_vtep() {
         let backend = MockBackend::new();
-        add_fdb_entry(&backend, BRIDGE, MAC, VTEP).await.unwrap();
+        let bridge = bridge_100();
+        add_fdb_entry(&backend, &bridge, MAC, VTEP).await.unwrap();
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], format!("add_fdb_entry({BRIDGE}, {MAC}, {VTEP})"));
+        assert_eq!(calls[0], format!("add_fdb_entry({bridge}, {MAC}, {VTEP})"));
     }
 
     #[tokio::test]
@@ -225,28 +231,32 @@ mod tests {
     #[tokio::test]
     async fn remove_fdb_entry_cleanup() {
         let backend = MockBackend::new();
-        add_fdb_entry(&backend, BRIDGE, MAC, VTEP).await.unwrap();
-        remove_fdb_entry(&backend, BRIDGE, MAC).await.unwrap();
+        let bridge = bridge_100();
+        add_fdb_entry(&backend, &bridge, MAC, VTEP).await.unwrap();
+        remove_fdb_entry(&backend, &bridge, MAC).await.unwrap();
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1], format!("remove_fdb_entry({BRIDGE}, {MAC})"));
+        assert_eq!(calls[1], format!("remove_fdb_entry({bridge}, {MAC})"));
     }
 
     #[tokio::test]
     async fn add_arp_proxy_entry() {
         let backend = MockBackend::new();
-        add_arp_proxy(&backend, VXLAN, IP, MAC).await.unwrap();
+        let vxlan = vxlan_100();
+        add_arp_proxy(&backend, &vxlan, IP, MAC).await.unwrap();
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], format!("add_arp_proxy({VXLAN}, {IP}, {MAC})"));
+        assert_eq!(calls[0], format!("add_arp_proxy({vxlan}, {IP}, {MAC})"));
     }
 
     #[tokio::test]
     async fn register_remote_vm_adds_fdb_and_arp() {
         let backend = MockBackend::new();
-        register_remote_vm(&backend, BRIDGE, VXLAN, MAC, IP, VTEP)
+        let bridge = bridge_100();
+        let vxlan = vxlan_100();
+        register_remote_vm(&backend, &bridge, &vxlan, MAC, IP, VTEP)
             .await
             .unwrap();
 
@@ -277,9 +287,11 @@ mod tests {
             .unwrap();
 
         let calls = backend.calls();
+        let bridge = bridge_100();
+        let vxlan = vxlan_100();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], format!("add_fdb_entry(syfbr-100, {MAC}, {VTEP})"));
-        assert_eq!(calls[1], format!("add_arp_proxy(syfvx-100, {IP}, {MAC})"));
+        assert_eq!(calls[0], format!("add_fdb_entry({bridge}, {MAC}, {VTEP})"));
+        assert_eq!(calls[1], format!("add_arp_proxy({vxlan}, {IP}, {MAC})"));
     }
 
     #[tokio::test]
@@ -292,8 +304,10 @@ mod tests {
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], format!("remove_fdb_entry(syfbr-100, {MAC})"));
-        assert_eq!(calls[1], format!("remove_arp_proxy(syfvx-100, {IP})"));
+        let bridge = bridge_100();
+        let vxlan = vxlan_100();
+        assert_eq!(calls[0], format!("remove_fdb_entry({bridge}, {MAC})"));
+        assert_eq!(calls[1], format!("remove_arp_proxy({vxlan}, {IP})"));
     }
 
     #[tokio::test]
@@ -360,8 +374,10 @@ mod tests {
         let calls = backend.calls();
         // 3 remote placements x 2 calls each (FDB + ARP)
         assert_eq!(calls.len(), 6);
-        assert!(calls[0].contains("add_fdb_entry(syfbr-100"));
-        assert!(calls[1].contains("add_arp_proxy(syfvx-100"));
+        let bridge = bridge_100();
+        let vxlan = vxlan_100();
+        assert!(calls[0].contains(&format!("add_fdb_entry({bridge}")));
+        assert!(calls[1].contains(&format!("add_arp_proxy({vxlan}")));
     }
 
     #[tokio::test]

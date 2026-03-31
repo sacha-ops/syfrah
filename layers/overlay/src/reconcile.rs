@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::backend::NetworkBackend;
+use crate::naming;
 
 // ── Expected state (from redb) ─────────────────────────────────────────
 
@@ -155,7 +156,8 @@ async fn check_bridges(
     state: &NetworkState,
     report: &mut ReconcileReport,
 ) {
-    let kernel_bridges: HashSet<String> = match backend.list_interfaces("syfbr-").await {
+    let kernel_bridges: HashSet<String> = match backend.list_interfaces(naming::BRIDGE_PREFIX).await
+    {
         Ok(list) => list.into_iter().collect(),
         Err(e) => {
             report.warnings.push(format!("failed to list bridges: {e}"));
@@ -187,7 +189,7 @@ async fn check_taps(
     state: &NetworkState,
     report: &mut ReconcileReport,
 ) {
-    let kernel_taps: HashSet<String> = match backend.list_interfaces("syftap-").await {
+    let kernel_taps: HashSet<String> = match backend.list_interfaces(naming::TAP_PREFIX).await {
         Ok(list) => list.into_iter().collect(),
         Err(e) => {
             report.warnings.push(format!("failed to list TAPs: {e}"));
@@ -276,7 +278,7 @@ async fn detect_orphaned_interfaces(
     let expected_taps: HashSet<&str> = state.vms.iter().map(|vm| vm.tap_name.as_str()).collect();
 
     // Check kernel bridges
-    if let Ok(kernel_bridges) = backend.list_interfaces("syfbr-").await {
+    if let Ok(kernel_bridges) = backend.list_interfaces(naming::BRIDGE_PREFIX).await {
         for name in &kernel_bridges {
             if !expected_bridges.contains(name.as_str()) {
                 let msg = format!("orphaned bridge in kernel: {name}");
@@ -287,7 +289,7 @@ async fn detect_orphaned_interfaces(
     }
 
     // Build a map of expected TAP names by prefix to avoid re-listing
-    if let Ok(kernel_taps) = backend.list_interfaces("syftap-").await {
+    if let Ok(kernel_taps) = backend.list_interfaces(naming::TAP_PREFIX).await {
         for name in &kernel_taps {
             if !expected_taps.contains(name.as_str()) {
                 let msg = format!("orphaned TAP in kernel: {name}");
@@ -337,14 +339,14 @@ mod tests {
     async fn orphaned_tap_detected() {
         let backend = MockBackend::new();
         // Kernel has a TAP that IS in expected state, but also has one that is NOT
-        backend.add_interface("syftap-vm1");
-        backend.add_interface("syftap-orphan");
+        backend.add_interface(&naming::tap_name("vm1"));
+        backend.add_interface(&naming::tap_name("orphan"));
 
         let mut state = make_state();
         state.vms.push(ExpectedVm {
             vm_id: "vm1".into(),
             vpc_id: "100".into(),
-            tap_name: "syftap-vm1".into(),
+            tap_name: naming::tap_name("vm1"),
             mac: "02:00:0a:01:01:03".into(),
             ip: "10.1.1.3".into(),
         });
@@ -353,10 +355,10 @@ mod tests {
 
         // The orphaned TAP should trigger a warning
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("orphaned TAP in kernel: syftap-orphan")),
+            report.warnings.iter().any(|w| w.contains(&format!(
+                "orphaned TAP in kernel: {}",
+                naming::tap_name("orphan")
+            ))),
             "expected orphaned TAP warning, got: {:?}",
             report.warnings
         );
@@ -369,7 +371,7 @@ mod tests {
 
         let mut state = make_state();
         state.bridges.push(ExpectedBridge {
-            name: "syfbr-100".into(),
+            name: naming::bridge_name("100"),
             vpc_id: "100".into(),
         });
 
@@ -379,7 +381,9 @@ mod tests {
         // Verify the backend was called to create the bridge
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "create_bridge(syfbr-100)"),
+            calls
+                .iter()
+                .any(|c| c == &format!("create_bridge({})", naming::bridge_name("100"))),
             "expected create_bridge call, got: {:?}",
             calls
         );
@@ -388,11 +392,11 @@ mod tests {
     #[tokio::test]
     async fn existing_bridge_not_recreated() {
         let backend = MockBackend::new();
-        backend.add_interface("syfbr-100");
+        backend.add_interface(&naming::bridge_name("100"));
 
         let mut state = make_state();
         state.bridges.push(ExpectedBridge {
-            name: "syfbr-100".into(),
+            name: naming::bridge_name("100"),
             vpc_id: "100".into(),
         });
 
@@ -411,16 +415,14 @@ mod tests {
         let backend = MockBackend::new();
 
         let mut state = make_state();
-        state.vm_rules.push((
-            "syftap-vm1".into(),
-            "02:00:0a:01:01:03".into(),
-            "10.1.1.3".into(),
-        ));
-        state.vm_rules.push((
-            "syftap-vm2".into(),
-            "02:00:0a:01:01:04".into(),
-            "10.1.1.4".into(),
-        ));
+        let tap1 = naming::tap_name("vm1");
+        let tap2 = naming::tap_name("vm2");
+        state
+            .vm_rules
+            .push((tap1.clone(), "02:00:0a:01:01:03".into(), "10.1.1.3".into()));
+        state
+            .vm_rules
+            .push((tap2.clone(), "02:00:0a:01:01:04".into(), "10.1.1.4".into()));
 
         let report = reconcile_network(&backend, &state).await;
 
@@ -428,10 +430,10 @@ mod tests {
         let calls = backend.calls();
         assert!(calls
             .iter()
-            .any(|c| c == "apply_vm_rules(syftap-vm1, 02:00:0a:01:01:03, 10.1.1.3)"));
+            .any(|c| c == &format!("apply_vm_rules({tap1}, 02:00:0a:01:01:03, 10.1.1.3)")));
         assert!(calls
             .iter()
-            .any(|c| c == "apply_vm_rules(syftap-vm2, 02:00:0a:01:01:04, 10.1.1.4)"));
+            .any(|c| c == &format!("apply_vm_rules({tap2}, 02:00:0a:01:01:04, 10.1.1.4)")));
     }
 
     #[tokio::test]
@@ -491,7 +493,7 @@ mod tests {
         state.vms.push(ExpectedVm {
             vm_id: "vm1".into(),
             vpc_id: "100".into(),
-            tap_name: "syftap-vm1".into(),
+            tap_name: naming::tap_name("vm1"),
             mac: "02:00:0a:01:01:03".into(),
             ip: "10.1.1.3".into(),
         });
@@ -499,7 +501,10 @@ mod tests {
         let report = reconcile_network(&backend, &state).await;
 
         assert!(
-            report.warnings.iter().any(|w| w.contains("syftap-vm1")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(&naming::tap_name("vm1"))),
             "should warn about missing TAP"
         );
         // Bridges fixed should be 0 — we only warn for TAPs
@@ -509,7 +514,8 @@ mod tests {
     #[tokio::test]
     async fn orphaned_bridge_detected() {
         let backend = MockBackend::new();
-        backend.add_interface("syfbr-orphan");
+        let orphan_bridge = naming::bridge_name("orphan");
+        backend.add_interface(&orphan_bridge);
 
         let state = make_state();
         // No expected bridges
@@ -520,7 +526,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.contains("orphaned bridge in kernel: syfbr-orphan")),
+                .any(|w| w.contains(&format!("orphaned bridge in kernel: {orphan_bridge}"))),
             "expected orphaned bridge warning"
         );
     }
@@ -528,18 +534,18 @@ mod tests {
     #[tokio::test]
     async fn clean_state_no_actions() {
         let backend = MockBackend::new();
-        backend.add_interface("syfbr-100");
-        backend.add_interface("syftap-vm1");
+        backend.add_interface(&naming::bridge_name("100"));
+        backend.add_interface(&naming::tap_name("vm1"));
 
         let mut state = make_state();
         state.bridges.push(ExpectedBridge {
-            name: "syfbr-100".into(),
+            name: naming::bridge_name("100"),
             vpc_id: "100".into(),
         });
         state.vms.push(ExpectedVm {
             vm_id: "vm1".into(),
             vpc_id: "100".into(),
-            tap_name: "syftap-vm1".into(),
+            tap_name: naming::tap_name("vm1"),
             mac: "02:00:0a:01:01:03".into(),
             ip: "10.1.1.3".into(),
         });
@@ -557,33 +563,35 @@ mod tests {
         let backend = MockBackend::new();
         // Kernel: has bridge 100, missing bridge 200, orphaned bridge 999
         // Kernel: has tap vm1, orphaned tap ghost
-        backend.add_interface("syfbr-100");
-        backend.add_interface("syfbr-999");
-        backend.add_interface("syftap-vm1");
-        backend.add_interface("syftap-ghost");
+        let br_999 = naming::bridge_name("999");
+        let tap_ghost = naming::tap_name("ghost");
+        backend.add_interface(&naming::bridge_name("100"));
+        backend.add_interface(&br_999);
+        backend.add_interface(&naming::tap_name("vm1"));
+        backend.add_interface(&tap_ghost);
 
         let mut state = make_state();
         state.now = 1_000_000;
 
         state.bridges.push(ExpectedBridge {
-            name: "syfbr-100".into(),
+            name: naming::bridge_name("100"),
             vpc_id: "100".into(),
         });
         state.bridges.push(ExpectedBridge {
-            name: "syfbr-200".into(),
+            name: naming::bridge_name("200"),
             vpc_id: "200".into(),
         });
 
         state.vms.push(ExpectedVm {
             vm_id: "vm1".into(),
             vpc_id: "100".into(),
-            tap_name: "syftap-vm1".into(),
+            tap_name: naming::tap_name("vm1"),
             mac: "02:00:0a:01:01:03".into(),
             ip: "10.1.1.3".into(),
         });
 
         state.vm_rules.push((
-            "syftap-vm1".into(),
+            naming::tap_name("vm1"),
             "02:00:0a:01:01:03".into(),
             "10.1.1.3".into(),
         ));
@@ -606,7 +614,7 @@ mod tests {
         assert_eq!(report.orphans_reclaimed, 1, "one orphaned IP reclaimed");
 
         // Warnings: orphaned bridge 999, orphaned TAP ghost
-        assert!(report.warnings.iter().any(|w| w.contains("syfbr-999")));
-        assert!(report.warnings.iter().any(|w| w.contains("syftap-ghost")));
+        assert!(report.warnings.iter().any(|w| w.contains(&br_999)));
+        assert!(report.warnings.iter().any(|w| w.contains(&tap_ghost)));
     }
 }

@@ -79,7 +79,7 @@ pub trait NetworkBackend: Send + Sync {
     /// List kernel network interfaces matching a given prefix.
     ///
     /// Used by the reconciliation loop and daemon restart recovery to
-    /// discover existing `syfbr-*`, `syfvx-*`, `syftap-*`, and
-    /// `syfpeer-*` interfaces.
+    /// discover existing `syfb-*`, `syfx-*`, `syft-*`, and
+    /// `syfp*` interfaces.
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>>;
 }

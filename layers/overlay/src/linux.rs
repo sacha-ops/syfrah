@@ -170,13 +170,13 @@ impl NetworkBackend for LinuxBackend {
     }
 
     async fn add_fdb_entry(&self, bridge: &str, mac: &str, vtep: &str) -> Result<()> {
-        let vxlan = bridge.replace("syfbr-", "syfvx-");
+        let vxlan = bridge.replace(crate::naming::BRIDGE_PREFIX, crate::naming::VXLAN_PREFIX);
         Self::run("bridge", &["fdb", "add", mac, "dev", &vxlan, "dst", vtep]).await?;
         Ok(())
     }
 
     async fn remove_fdb_entry(&self, bridge: &str, mac: &str) -> Result<()> {
-        let vxlan = bridge.replace("syfbr-", "syfvx-");
+        let vxlan = bridge.replace(crate::naming::BRIDGE_PREFIX, crate::naming::VXLAN_PREFIX);
         Self::run("bridge", &["fdb", "del", mac, "dev", &vxlan]).await?;
         Ok(())
     }
@@ -344,7 +344,7 @@ impl NetworkBackend for LinuxBackend {
             if !trimmed.contains(tap) {
                 continue;
             }
-            // Lines look like: "iif "syftap-xxx" ... # handle 42"
+            // Lines look like: "iif "syft-xxx" ... # handle 42"
             if let Some(handle_pos) = trimmed.rfind("# handle ") {
                 let handle = trimmed[handle_pos + 9..].trim();
                 Self::run(
