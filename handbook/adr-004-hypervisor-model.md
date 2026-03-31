@@ -47,7 +47,7 @@ Region (eu-west, us-east, ap-south)
               └── VM Instance (web-1, db-1, gpu-train-1)
 ```
 
-Regions and zones are **metadata labels** on fabric nodes (unchanged from zones-and-regions.md). Hypervisors are **first-class resources** created when a node with KVM capability joins the mesh or is explicitly registered by the operator. VMs are scheduled onto hypervisors by the control plane.
+Regions and zones are **metadata labels** on fabric nodes (unchanged from zones-and-regions.md). Hypervisors are first-class compute host resources. They are discovered on KVM-capable nodes, registered into the control-plane store, and made schedulable only after explicit operator activation. VMs are scheduled onto hypervisors by the control plane.
 
 ```
     Region: eu-west                    Region: eu-central
@@ -235,6 +235,9 @@ struct GpuSpec {
 Capacity is the bridge between hardware reality and scheduling decisions. The hypervisor knows its total resources, what's consumed by the OS and Syfrah overhead, what's reserved, and what's free for new VMs.
 
 ```rust
+// NOTE: This struct combines configuration (reserved, overcommit) with runtime metrics
+// (used, available). A future refinement may split into CapacityConfig + CapacitySnapshot.
+// For v1, a single struct is acceptable.
 struct AllocatableCapacity {
     // --- Physical hardware (detected, immutable) ---
     /// Logical threads from hardware (physical cores * threads-per-core).
@@ -316,9 +319,21 @@ struct AllocatableCapacity {
 A hypervisor progresses through a well-defined state machine:
 
 ```
-Registering → NotReady → Available → Draining → Available
-                                   → Maintenance → Available
-                                   → Decommissioned (terminal)
+                    discover        register         enable
+              ──────────────► Registering ──────► NotReady ──────► Available
+                                                                    │
+                                              ┌─────────────────────┤
+                                              │         drain       │ maintenance
+                                              ▼                     ▼
+                                          Draining ──────────► Maintenance
+                                              │                     │
+                                              │ activate            │ activate
+                                              ▼                     ▼
+                                          Available             Available
+                                              │
+                                              │ decommission
+                                              ▼
+                                        Decommissioned
 ```
 
 ```rust
@@ -421,7 +436,16 @@ syfrah hypervisor activate hv-001      → state: Available
 # activate is the generic "return to schedulable" command. It works from:
 # - NotReady → Available (initial enablement, alias: syfrah hypervisor enable)
 # - Maintenance → Available (post-maintenance return)
-# - Draining → Available (cancel drain, but only if safe — VMs may have already moved)
+# - Draining → Available (cancel drain — see note below)
+
+# Activating from Draining does NOT roll back already-migrated VMs. It:
+# 1. Stops future evacuation (VMs still local remain local)
+# 2. Removes the NoSchedule taint
+# 3. Returns the hypervisor to Available
+#
+# VMs that were already migrated to other hypervisors during the drain
+# stay where they are. The hypervisor simply becomes schedulable again
+# with whatever VMs remain on it.
 
 # For clarity, these are aliases:
 # syfrah hypervisor enable <id>     = activate from NotReady
@@ -963,6 +987,15 @@ This ADR introduces renames and refactors across existing designs. Every instanc
 **Fabric remains unchanged.** The fabric layer uses "node" and "peer" exclusively. These are mesh-level concepts. The fabric does not know or care whether a node is a hypervisor. This separation is deliberate — it keeps the fabric simple and compute-unaware.
 
 ### 20. Hypervisor auto-discovery summary
+
+**The four steps from mesh join to schedulable:**
+
+1. Node joins mesh → Forge starts
+2. Forge detects `/dev/kvm` → state: **Registering** (local only, not cluster-visible)
+3. Hardware probed → record persisted → state: **NotReady** (now cluster-visible)
+4. Operator runs `syfrah hypervisor enable` → state: **Available** (now schedulable)
+
+Syfrah never auto-enables. Step 4 is always an explicit operator decision.
 
 ```
     Node joins mesh (syfrah fabric join)
