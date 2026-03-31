@@ -203,6 +203,88 @@ pub struct Environment {
     pub expires_at: Option<u64>,
 }
 
+/// Unique identifier for a security group rule.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuleId(pub String);
+
+impl fmt::Display for RuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Traffic direction for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Ingress,
+    Egress,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Ingress => f.write_str("Ingress"),
+            Direction::Egress => f.write_str("Egress"),
+        }
+    }
+}
+
+/// Network protocol for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+    All,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Tcp => f.write_str("TCP"),
+            Protocol::Udp => f.write_str("UDP"),
+            Protocol::Icmp => f.write_str("ICMP"),
+            Protocol::All => f.write_str("All"),
+        }
+    }
+}
+
+/// A port range (inclusive). Single port: from == to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub from: u16,
+    pub to: u16,
+}
+
+/// The source (for ingress) or destination (for egress) of traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleSource {
+    Cidr(String),
+    SecurityGroup(SecurityGroupId),
+}
+
+impl fmt::Display for RuleSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuleSource::Cidr(cidr) => write!(f, "{cidr}"),
+            RuleSource::SecurityGroup(sg_id) => write!(f, "sg:{sg_id}"),
+        }
+    }
+}
+
+/// A rule within a security group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroupRule {
+    pub id: RuleId,
+    pub sg_id: SecurityGroupId,
+    pub direction: Direction,
+    pub protocol: Protocol,
+    pub port_range: Option<PortRange>,
+    pub source: RuleSource,
+    pub priority: u32,
+    pub description: Option<String>,
+}
+
 /// Whether a VM placement is being added or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementAction {

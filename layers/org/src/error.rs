@@ -145,6 +145,15 @@ pub enum OrgError {
     #[error("cannot delete default security group: {0}")]
     SgIsDefault(String),
 
+    #[error("security group rule already exists: {0}")]
+    RuleAlreadyExists(String),
+
+    #[error("security group rule not found: {0}")]
+    RuleNotFound(String),
+
+    #[error("invalid port range: {reason}")]
+    InvalidPortRange { reason: String },
+
     #[error("store error: {0}")]
     StoreError(String),
 }
