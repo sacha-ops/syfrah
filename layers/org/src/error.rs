@@ -136,6 +136,36 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
+    #[error("route table already exists: {0}")]
+    RouteTableAlreadyExists(String),
+
+    #[error("route table not found: {0}")]
+    RouteTableNotFound(String),
+
+    #[error("cannot delete the default route table")]
+    CannotDeleteDefaultRouteTable,
+
+    #[error("route table '{name}' is associated with {count} subnet(s) — disassociate them first")]
+    RouteTableHasSubnets { name: String, count: usize },
+
+    #[error("route already exists for destination: {0}")]
+    RouteAlreadyExists(String),
+
+    #[error("route not found for destination: {0}")]
+    RouteNotFound(String),
+
+    #[error("cannot delete system-managed route")]
+    CannotDeleteSystemRoute,
+
+    #[error("cannot delete propagated route — remove the peering instead")]
+    CannotDeletePropagatedRoute,
+
+    #[error("target resource '{0}' not found")]
+    RouteTargetNotFound(String),
+
+    #[error("target resource '{name}' is not active (current state: {state})")]
+    RouteTargetNotActive { name: String, state: String },
+
     #[error("security group already exists: {0}")]
     SgAlreadyExists(String),
 
