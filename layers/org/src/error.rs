@@ -136,6 +136,15 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
+    #[error("security group already exists: {0}")]
+    SgAlreadyExists(String),
+
+    #[error("security group not found: {0}")]
+    SgNotFound(String),
+
+    #[error("cannot delete default security group: {0}")]
+    SgIsDefault(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }

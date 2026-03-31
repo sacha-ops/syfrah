@@ -2,6 +2,50 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Lifecycle state for mutable network resources (SGs, NICs, NAT GWs, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceState {
+    Pending,
+    Active,
+    Failed,
+    Deleting,
+    Deleted,
+}
+
+impl fmt::Display for ResourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceState::Pending => f.write_str("Pending"),
+            ResourceState::Active => f.write_str("Active"),
+            ResourceState::Failed => f.write_str("Failed"),
+            ResourceState::Deleting => f.write_str("Deleting"),
+            ResourceState::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
+/// Unique identifier for a security group.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecurityGroupId(pub String);
+
+impl fmt::Display for SecurityGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A security group — a stateful firewall ruleset scoped to a VPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroup {
+    pub id: SecurityGroupId,
+    pub name: String,
+    pub vpc_id: VpcId,
+    pub description: Option<String>,
+    pub is_default: bool,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
 /// Unique identifier for a VPC.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VpcId(pub String);
