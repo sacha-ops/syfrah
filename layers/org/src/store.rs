@@ -1661,6 +1661,16 @@ impl OrgStore {
         Ok(())
     }
 
+    /// List all NICs in a given VPC.
+    pub fn list_nics_by_vpc(&self, vpc_id: &str) -> Result<Vec<NetworkInterface>> {
+        let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, nic)| nic.vpc_id == vpc_id && nic.state != ResourceState::Deleted)
+            .map(|(_, nic)| nic)
+            .collect())
+    }
+
     /// Find the primary NIC for a given VM.
     pub fn find_nic_by_vm(&self, vm_id: &str) -> Result<Option<NetworkInterface>> {
         let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
