@@ -1,5 +1,6 @@
 pub mod api;
 pub mod backend;
+pub mod cli;
 pub mod error;
 pub mod fdb;
 pub mod linux;
@@ -9,6 +10,7 @@ pub mod nft;
 pub mod reconcile;
 pub mod recovery;
 pub mod rollback;
+pub mod sg;
 pub mod sysctl;
 pub mod tap;
 pub mod veth_peer;

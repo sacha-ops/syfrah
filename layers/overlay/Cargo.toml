@@ -12,9 +12,14 @@ categories.workspace = true
 syfrah-core = { path = "../core" }
 syfrah-api = { path = "../api" }
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+console = "0.15"
+terminal_size = "0.4"
 thiserror.workspace = true
+anyhow.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync", "process"] }
+tokio = { workspace = true, features = ["sync", "process", "net", "io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 
