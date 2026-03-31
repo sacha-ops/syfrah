@@ -1,6 +1,7 @@
 //! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, `syfrah subnet ...`, and `syfrah route ...`.
 
 pub mod env;
+pub mod nat_gw;
 pub mod org;
 pub mod project;
 pub mod route;
@@ -430,6 +431,53 @@ pub enum RouteTableAction {
     },
 }
 
+/// Top-level NAT Gateway CLI command.
+#[derive(Debug, Subcommand)]
+pub enum NatGwCommand {
+    /// Create a new NAT gateway
+    #[command(
+        after_help = "Examples:\n  syfrah nat-gw create main-gw --vpc acme-backend-default --subnet frontend"
+    )]
+    Create {
+        /// NAT gateway name (lowercase alphanumeric and hyphens, 3-63 chars)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// VPC the NAT gateway belongs to
+        #[arg(long)]
+        vpc: String,
+        /// Subnet to place the NAT gateway in
+        #[arg(long)]
+        subnet: String,
+    },
+    /// List NAT gateways
+    #[command(
+        after_help = "Examples:\n  syfrah nat-gw list --vpc acme-backend-default\n  syfrah nat-gw list --json"
+    )]
+    List {
+        /// Filter by VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show NAT gateway details
+    #[command(after_help = "Examples:\n  syfrah nat-gw show main-gw")]
+    Show {
+        /// NAT gateway name
+        name: String,
+    },
+    /// Delete a NAT gateway
+    #[command(after_help = "Examples:\n  syfrah nat-gw delete main-gw --yes")]
+    Delete {
+        /// NAT gateway name
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
 /// Top-level SG CLI command.
 #[derive(Debug, Subcommand)]
 pub enum SgCommand {
@@ -787,6 +835,18 @@ pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
             protocol,
             source,
         } => sg::run_check(&vm, port, &protocol, source.as_deref()).await,
+    }
+}
+
+/// Execute a NAT gateway CLI command.
+pub async fn run_nat_gw(cmd: NatGwCommand) -> anyhow::Result<()> {
+    match cmd {
+        NatGwCommand::Create { name, vpc, subnet } => {
+            nat_gw::run_create(&name, &vpc, &subnet).await
+        }
+        NatGwCommand::List { vpc, json } => nat_gw::run_list(vpc.as_deref(), json).await,
+        NatGwCommand::Show { name } => nat_gw::run_show(&name).await,
+        NatGwCommand::Delete { name, yes } => nat_gw::run_delete(&name, yes).await,
     }
 }
 

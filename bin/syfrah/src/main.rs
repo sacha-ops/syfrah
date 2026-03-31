@@ -72,6 +72,12 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::SgCommand,
     },
+    /// Manage NAT gateways
+    #[command(name = "nat-gw")]
+    NatGw {
+        #[command(subcommand)]
+        command: syfrah_org::NatGwCommand,
+    },
     /// Manage route tables and routes
     Route {
         #[command(subcommand)]
@@ -955,6 +961,7 @@ async fn run() -> Result<()> {
         Commands::Vpc { command } => syfrah_org::cli::run_vpc(command).await,
         Commands::Subnet { command } => syfrah_org::cli::run_subnet(command).await,
         Commands::Sg { command } => syfrah_org::cli::run_sg(command).await,
+        Commands::NatGw { command } => syfrah_org::cli::run_nat_gw(command).await,
         Commands::Route { command } => syfrah_org::cli::run_route(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();

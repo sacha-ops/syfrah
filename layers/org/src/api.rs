@@ -17,8 +17,8 @@ use tokio::net::UnixStream;
 use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
-    Direction, Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, PortRange,
-    Project, ProjectId, Protocol, Route, RouteTable, RouteTarget, RuleId, RuleSource,
+    Direction, Environment, EnvironmentId, NatGateway, NetworkInterface, Org, OrgId, PeeringStatus,
+    PortRange, Project, ProjectId, Protocol, Route, RouteTable, RouteTarget, RuleId, RuleSource,
     SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
@@ -193,6 +193,22 @@ pub enum OrgRequest {
         source: Option<String>,
     },
 
+    // -- NAT Gateway --
+    NatGwCreate {
+        name: String,
+        vpc: String,
+        subnet: String,
+    },
+    NatGwList {
+        vpc: Option<String>,
+    },
+    NatGwShow {
+        name: String,
+    },
+    NatGwDelete {
+        name: String,
+    },
+
     // -- Route Table --
     RouteTableCreate {
         name: String,
@@ -267,6 +283,8 @@ pub enum OrgResponse {
         verdict: String,
         reason: String,
     },
+    NatGwResp(NatGateway),
+    NatGwList(Vec<NatGateway>),
     RouteTableResp(RouteTable),
     RouteTableList(Vec<RouteTable>),
     RouteResp(Route),
@@ -908,6 +926,82 @@ fn handle_org_request(
             OrgResponse::SgCheckResult { verdict, reason }
         }
 
+        // -- NAT Gateway --
+        OrgRequest::NatGwCreate { name, vpc, subnet } => {
+            // Resolve VPC.
+            let vpc_obj = match store.get_vpc(&vpc) {
+                Ok(Some(v)) => v,
+                Ok(None) => return OrgResponse::Error(format!("VPC not found: {vpc}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            // Resolve subnet.
+            let sub = match store.find_subnets_by_name(&subnet) {
+                Ok(matches) => {
+                    let in_vpc: Vec<_> = matches
+                        .into_iter()
+                        .filter(|(_, s)| s.vpc_id == vpc_obj.id)
+                        .collect();
+                    match in_vpc.len() {
+                        0 => {
+                            return OrgResponse::Error(format!(
+                                "subnet '{subnet}' not found in VPC '{vpc}'"
+                            ))
+                        }
+                        1 => in_vpc.into_iter().next().unwrap().1,
+                        _ => {
+                            return OrgResponse::Error(format!(
+                                "ambiguous subnet '{subnet}' in VPC '{vpc}'"
+                            ))
+                        }
+                    }
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            // Auto-detect public IP.
+            let public_ip = detect_public_ip();
+            match store.create_nat_gw(&name, &vpc_obj.id, &sub.id, &public_ip) {
+                Ok(gw) => OrgResponse::NatGwResp(gw),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::NatGwList { vpc } => match store.list_nat_gws_by_vpc_name(vpc.as_deref()) {
+            Ok(gws) => OrgResponse::NatGwList(gws),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::NatGwShow { name } => match store.get_nat_gw_by_name(&name) {
+            Ok(Some(gw)) => OrgResponse::NatGwResp(gw),
+            Ok(None) => OrgResponse::Error(format!("nat-gw not found: {name}")),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::NatGwDelete { name } => {
+            let gw = match store.get_nat_gw_by_name(&name) {
+                Ok(Some(g)) => g,
+                Ok(None) => return OrgResponse::Error(format!("nat-gw not found: {name}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            // Check for routes referencing this NAT GW.
+            match store.routes_referencing_nat_gw(&gw.vpc_id, &name) {
+                Ok(refs) => {
+                    if !refs.is_empty() {
+                        let r = &refs[0];
+                        // Find the route table name.
+                        let table_name = r.route_table_id.0.clone();
+                        return OrgResponse::Error(format!(
+                            "cannot delete nat-gw '{}': referenced by route {} in route table '{}'",
+                            name, r.destination, table_name
+                        ));
+                    }
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            }
+
+            match store.delete_nat_gw(&gw.vpc_id, &name) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
         // -- Route Table --
         OrgRequest::RouteTableCreate { name, vpc } => {
             match store.create_route_table_by_vpc_name(&name, &vpc) {
@@ -1178,6 +1272,25 @@ pub async fn send_org_request(
         LayerResponse::UnknownLayer(name) => Err(format!("unknown layer: {name}").into()),
         other => Err(format!("unexpected response variant: {other:?}").into()),
     }
+}
+
+/// Detect the node's public IP from the default route interface.
+fn detect_public_ip() -> String {
+    // Try to find the IP of the default route interface.
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Output format: "8.8.8.8 via ... dev ... src <IP> ..."
+        if let Some(src_idx) = stdout.find(" src ") {
+            let after_src = &stdout[src_idx + 5..];
+            if let Some(ip) = after_src.split_whitespace().next() {
+                return ip.to_string();
+            }
+        }
+    }
+    "0.0.0.0".to_string()
 }
 
 /// Parse a port range string like "443" or "8000-9000".
