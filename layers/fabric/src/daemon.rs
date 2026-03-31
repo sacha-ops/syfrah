@@ -1034,6 +1034,7 @@ pub async fn run_daemon(
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
     // and register the compute handler in the router.
+    let shared_vm_manager: Option<Arc<syfrah_compute::VmManager>>;
     {
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
@@ -1161,12 +1162,14 @@ pub async fn run_daemon(
                 router.register("compute", Arc::new(compute_handler));
 
                 info!("compute layer initialised");
+                shared_vm_manager = Some(vm_manager);
             }
             Err(e) => {
                 // Compute init failure is non-fatal: the daemon still runs for
                 // fabric operations, but compute CLI commands will get
                 // "unknown layer" errors.
                 warn!("compute layer init failed (non-fatal): {e}");
+                shared_vm_manager = None;
             }
         }
     }
@@ -1177,6 +1180,31 @@ pub async fn run_daemon(
     let mut control_task = tokio::spawn(async move {
         control::start_control_listener(&control_path, router).await;
     });
+
+    // -- Forge HTTP API server -----------------------------------------------
+    //
+    // Start the Forge HTTP API on the fabric IPv6 address, port 7100.
+    // This coexists with the control socket — CLI uses the socket, API
+    // consumers use HTTP.
+    let (forge_shutdown_tx, forge_shutdown_rx) = tokio::sync::watch::channel(false);
+    let forge_task = {
+        let forge_state = std::sync::Arc::new(syfrah_forge::api::ForgeState {
+            started_at: std::time::Instant::now(),
+            task_store: None,
+            vm_manager: shared_vm_manager.clone(),
+        });
+
+        let bind_addr: std::net::SocketAddr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(my_record.mesh_ipv6), 7100);
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                syfrah_forge::ForgeServer::serve(bind_addr, forge_state, forge_shutdown_rx).await
+            {
+                warn!("Forge HTTP API error: {e}");
+            }
+        })
+    };
 
     // Bounded retry queue for announces that cannot be processed immediately.
     let (announce_queue_tx, announce_queue_rx) =
@@ -2088,6 +2116,7 @@ pub async fn run_daemon(
         _ = sighup_reload => {}
         _ = api_task => {}
         _ = grpc_task => {}
+        _ = forge_task => {}
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
         }
@@ -2127,6 +2156,9 @@ pub async fn run_daemon(
 
     // Signal gRPC API server to shut down gracefully.
     let _ = grpc_shutdown_tx.send(true);
+
+    // Signal Forge HTTP API server to shut down gracefully.
+    let _ = forge_shutdown_tx.send(true);
 
     // Tell systemd we are shutting down gracefully.
     sd_watchdog::notify_stopping();

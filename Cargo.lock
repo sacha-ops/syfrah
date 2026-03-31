@@ -2428,6 +2428,7 @@ dependencies = [
  "syfrah-api",
  "syfrah-compute",
  "syfrah-core",
+ "syfrah-forge",
  "syfrah-org",
  "syfrah-overlay",
  "syfrah-state",
@@ -2447,11 +2448,24 @@ dependencies = [
 name = "syfrah-forge"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "axum",
+ "http-body-util",
+ "hyper",
  "serde",
  "serde_json",
  "syfrah-api",
+ "syfrah-compute",
+ "syfrah-org",
+ "syfrah-overlay",
+ "syfrah-state",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

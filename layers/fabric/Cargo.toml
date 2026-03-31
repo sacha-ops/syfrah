@@ -15,6 +15,7 @@ syfrah-org = { path = "../org" }
 syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
 syfrah-api = { path = "../api" }
+syfrah-forge = { path = "../forge" }
 wireguard-control = "1.7"
 tokio.workspace = true
 tracing.workspace = true
