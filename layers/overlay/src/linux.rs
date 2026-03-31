@@ -240,6 +240,52 @@ impl NetworkBackend for LinuxBackend {
         Ok(())
     }
 
+    async fn move_to_netns(&self, iface: &str, pid: u32) -> Result<()> {
+        Self::run("ip", &["link", "set", iface, "netns", &pid.to_string()]).await?;
+        Ok(())
+    }
+
+    async fn configure_netns(
+        &self,
+        pid: u32,
+        iface: &str,
+        ip: &str,
+        prefix_len: u8,
+        gateway: &str,
+    ) -> Result<()> {
+        let ns = format!("/proc/{pid}/ns/net");
+        let cidr = format!("{ip}/{prefix_len}");
+
+        // Rename the veth endpoint to eth0 inside the namespace.
+        Self::run(
+            "nsenter",
+            &["--net", &ns, "ip", "link", "set", iface, "name", "eth0"],
+        )
+        .await?;
+        // Assign the allocated IP.
+        Self::run(
+            "nsenter",
+            &["--net", &ns, "ip", "addr", "add", &cidr, "dev", "eth0"],
+        )
+        .await?;
+        // Bring up eth0 and loopback.
+        Self::run(
+            "nsenter",
+            &["--net", &ns, "ip", "link", "set", "eth0", "up"],
+        )
+        .await?;
+        Self::run("nsenter", &["--net", &ns, "ip", "link", "set", "lo", "up"]).await?;
+        // Default route through the bridge gateway.
+        Self::run(
+            "nsenter",
+            &[
+                "--net", &ns, "ip", "route", "add", "default", "via", gateway,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     // ── Firewall ───────────────────────────────────────────────────
 
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
