@@ -1,8 +1,9 @@
-//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, and `syfrah subnet ...`.
+//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, `syfrah subnet ...`, and `syfrah route ...`.
 
 pub mod env;
 pub mod org;
 pub mod project;
+pub mod route;
 pub mod sg;
 pub mod subnet;
 pub mod vpc;
@@ -318,6 +319,114 @@ pub enum SubnetCommand {
         /// Skip confirmation prompt
         #[arg(long, short)]
         yes: bool,
+    },
+}
+
+/// Top-level route CLI command.
+#[derive(Debug, Subcommand)]
+pub enum RouteCommand {
+    /// Manage route tables
+    Table {
+        #[command(subcommand)]
+        action: RouteTableAction,
+    },
+    /// List routes in a VPC
+    #[command(
+        after_help = "Examples:\n  syfrah route list --vpc my-vpc\n  syfrah route list --vpc my-vpc --table default --json"
+    )]
+    List {
+        /// VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Route table name (default: all tables in VPC)
+        #[arg(long)]
+        table: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a route to a route table
+    #[command(
+        after_help = "Examples:\n  syfrah route add --vpc my-vpc --destination 10.99.0.0/24 --target blackhole\n  syfrah route add --vpc my-vpc --destination 0.0.0.0/0 --target nat-gw:my-nat"
+    )]
+    Add {
+        /// VPC name
+        #[arg(long)]
+        vpc: String,
+        /// Destination CIDR
+        #[arg(long)]
+        destination: String,
+        /// Target: local, blackhole, nat-gw:<name>, peering:<name>
+        #[arg(long)]
+        target: String,
+        /// Route table name (default: "default")
+        #[arg(long)]
+        table: Option<String>,
+        /// Priority (lower = evaluated first, default: 100)
+        #[arg(long)]
+        priority: Option<u32>,
+    },
+    /// Delete a route from a route table
+    #[command(
+        after_help = "Examples:\n  syfrah route delete --vpc my-vpc --destination 10.99.0.0/24"
+    )]
+    Delete {
+        /// VPC name
+        #[arg(long)]
+        vpc: String,
+        /// Destination CIDR to remove
+        #[arg(long)]
+        destination: String,
+        /// Route table name (default: "default")
+        #[arg(long)]
+        table: Option<String>,
+    },
+}
+
+/// Route table management subcommands.
+#[derive(Debug, Subcommand)]
+pub enum RouteTableAction {
+    /// Create a new route table
+    Create {
+        /// Route table name
+        name: String,
+        /// VPC the route table belongs to
+        #[arg(long)]
+        vpc: String,
+    },
+    /// List route tables
+    List {
+        /// Filter by VPC name
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a route table
+    Delete {
+        /// Route table name
+        name: String,
+        /// VPC the route table belongs to
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Associate a route table with a subnet
+    Associate {
+        /// Route table name
+        table: String,
+        /// Subnet to associate
+        #[arg(long)]
+        subnet: String,
+    },
+    /// Disassociate a subnet from its custom route table (reverts to default)
+    Disassociate {
+        /// Subnet to disassociate
+        #[arg(long)]
+        subnet: String,
     },
 }
 
@@ -678,5 +787,41 @@ pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
             protocol,
             source,
         } => sg::run_check(&vm, port, &protocol, source.as_deref()).await,
+    }
+}
+
+/// Execute a route CLI command.
+pub async fn run_route(cmd: RouteCommand) -> anyhow::Result<()> {
+    match cmd {
+        RouteCommand::Table { action } => match action {
+            RouteTableAction::Create { name, vpc } => route::run_table_create(&name, &vpc).await,
+            RouteTableAction::List { vpc, json } => {
+                route::run_table_list(vpc.as_deref(), json).await
+            }
+            RouteTableAction::Delete { name, vpc, yes } => {
+                route::run_table_delete(&name, vpc.as_deref(), yes).await
+            }
+            RouteTableAction::Associate { table, subnet } => {
+                route::run_table_associate(&table, &subnet).await
+            }
+            RouteTableAction::Disassociate { subnet } => {
+                route::run_table_disassociate(&subnet).await
+            }
+        },
+        RouteCommand::List { vpc, table, json } => {
+            route::run_list(vpc.as_deref(), table.as_deref(), json).await
+        }
+        RouteCommand::Add {
+            vpc,
+            destination,
+            target,
+            table,
+            priority,
+        } => route::run_add(&vpc, &destination, &target, table.as_deref(), priority).await,
+        RouteCommand::Delete {
+            vpc,
+            destination,
+            table,
+        } => route::run_delete(&vpc, &destination, table.as_deref()).await,
     }
 }

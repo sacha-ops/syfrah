@@ -321,6 +321,104 @@ pub struct SecurityGroupRule {
     pub description: Option<String>,
 }
 
+/// Unique identifier for a route table.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteTableId(pub String);
+
+impl fmt::Display for RouteTableId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A route table — a collection of routes scoped to a VPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTable {
+    pub id: RouteTableId,
+    pub name: String,
+    pub vpc_id: VpcId,
+    pub is_default: bool,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
+/// Unique identifier for a route.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteId(pub String);
+
+impl fmt::Display for RouteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The target of a route — where matching traffic is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteTarget {
+    Local,
+    NatGateway(String),
+    VpcPeering(String),
+    Blackhole,
+}
+
+impl fmt::Display for RouteTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteTarget::Local => f.write_str("local"),
+            RouteTarget::NatGateway(id) => write!(f, "nat-gw:{id}"),
+            RouteTarget::VpcPeering(id) => write!(f, "peering:{id}"),
+            RouteTarget::Blackhole => f.write_str("blackhole"),
+        }
+    }
+}
+
+/// How a route was created — determines deletion rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteOrigin {
+    System,
+    User,
+    Propagated,
+}
+
+impl fmt::Display for RouteOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteOrigin::System => f.write_str("system"),
+            RouteOrigin::User => f.write_str("user"),
+            RouteOrigin::Propagated => f.write_str("propagated"),
+        }
+    }
+}
+
+/// Status of a route — whether it is actively forwarding traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteStatus {
+    Active,
+    Blackhole,
+}
+
+impl fmt::Display for RouteStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteStatus::Active => f.write_str("active"),
+            RouteStatus::Blackhole => f.write_str("blackhole"),
+        }
+    }
+}
+
+/// A route within a route table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    pub id: RouteId,
+    pub route_table_id: RouteTableId,
+    pub destination: String,
+    pub target: RouteTarget,
+    pub origin: RouteOrigin,
+    pub status: RouteStatus,
+    pub priority: u32,
+    pub created_at: u64,
+}
+
 /// Whether a VM placement is being added or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementAction {

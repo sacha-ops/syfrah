@@ -7,8 +7,9 @@ use syfrah_state::LayerDb;
 use crate::error::{OrgError, Result};
 use crate::types::{
     Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringId, PeeringStatus, Project,
-    ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment,
-    VpcId, VpcOwner, VpcPeering,
+    ProjectId, ResourceState, Route, RouteId, RouteOrigin, RouteStatus, RouteTable, RouteTableId,
+    RouteTarget, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment, VpcId,
+    VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -22,6 +23,9 @@ const SUBNETS_TABLE: &str = "subnets";
 const PEERINGS_TABLE: &str = "vpc_peerings";
 const SECURITY_GROUPS_TABLE: &str = "security_groups";
 const NICS_TABLE: &str = "network_interfaces";
+const ROUTE_TABLES_TABLE: &str = "route_tables";
+const ROUTES_TABLE: &str = "routes";
+const SUBNET_ROUTE_ASSOC_TABLE: &str = "subnet_route_associations";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
@@ -432,6 +436,9 @@ impl OrgStore {
         // Auto-create the default security group for this VPC.
         self.create_default_sg(&vpc)?;
 
+        // Auto-create the default route table for this VPC.
+        self.create_default_route_table(&vpc)?;
+
         Ok(vpc)
     }
 
@@ -752,6 +759,12 @@ impl OrgStore {
         };
 
         self.db.set(SUBNETS_TABLE, &key, &subnet)?;
+
+        // Auto-add system route for this subnet's CIDR in the VPC's default route table.
+        if let Ok(Some(default_rt)) = self.get_default_route_table(&vpc.id) {
+            let _ = self.add_system_route(&default_rt, &subnet.cidr);
+        }
+
         Ok(subnet)
     }
 
@@ -807,12 +820,22 @@ impl OrgStore {
     /// Delete a subnet by VPC name and subnet name.
     pub fn delete_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<()> {
         let key = Self::subnet_key(vpc_name, subnet_name);
-        if !self.db.exists(SUBNETS_TABLE, &key)? {
-            return Err(OrgError::SubnetNotFound {
-                vpc: vpc_name.to_string(),
-                subnet: subnet_name.to_string(),
-            });
+        let subnet: Subnet =
+            self.db
+                .get(SUBNETS_TABLE, &key)?
+                .ok_or_else(|| OrgError::SubnetNotFound {
+                    vpc: vpc_name.to_string(),
+                    subnet: subnet_name.to_string(),
+                })?;
+
+        // Remove the system route for this subnet's CIDR from the default route table.
+        if let Ok(Some(default_rt)) = self.get_default_route_table(&subnet.vpc_id) {
+            let _ = self.remove_route_force(&default_rt.id, &subnet.cidr);
         }
+
+        // Remove any route table association for this subnet.
+        let _ = self.disassociate_subnet_route_table(&subnet.id);
+
         self.db.delete(SUBNETS_TABLE, &key)?;
         Ok(())
     }
@@ -1093,6 +1116,383 @@ impl OrgStore {
         }
 
         self.delete_sg(&sg.vpc_id, name)
+    }
+
+    // ── Route Table operations ──────────────────────────────────────
+
+    /// Build the redb key for a route table: "vpc_id/table_name".
+    fn route_table_key(vpc_id: &VpcId, name: &str) -> String {
+        format!("{}/{}", vpc_id.0, name)
+    }
+
+    /// Build the redb key for a route: "table_id/destination".
+    fn route_key(table_id: &RouteTableId, destination: &str) -> String {
+        format!("{}/{}", table_id.0, destination)
+    }
+
+    /// Create the default route table for a VPC. Called automatically
+    /// during VPC creation.
+    pub fn create_default_route_table(&self, vpc: &Vpc) -> Result<RouteTable> {
+        let key = Self::route_table_key(&vpc.id, "default");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let table = RouteTable {
+            id: RouteTableId(format!("rtb-default-{}", vpc.name)),
+            name: "default".to_string(),
+            vpc_id: vpc.id.clone(),
+            is_default: true,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+
+        // Add the VPC CIDR local route as a system route.
+        self.add_system_route(&table, &vpc.cidr)?;
+
+        Ok(table)
+    }
+
+    /// Create a named route table within a VPC.
+    pub fn create_route_table(&self, name: &str, vpc_id: &VpcId) -> Result<RouteTable> {
+        validate_name(name, "route table")?;
+
+        let key = Self::route_table_key(vpc_id, name);
+        if self.db.exists(ROUTE_TABLES_TABLE, &key)? {
+            return Err(OrgError::RouteTableAlreadyExists(name.to_string()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let table = RouteTable {
+            id: RouteTableId(format!("rtb-{name}")),
+            name: name.to_string(),
+            vpc_id: vpc_id.clone(),
+            is_default: false,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+        Ok(table)
+    }
+
+    /// Get a route table by VPC ID and name.
+    pub fn get_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<Option<RouteTable>> {
+        let key = Self::route_table_key(vpc_id, name);
+        Ok(self.db.get(ROUTE_TABLES_TABLE, &key)?)
+    }
+
+    /// Get the default route table for a VPC.
+    pub fn get_default_route_table(&self, vpc_id: &VpcId) -> Result<Option<RouteTable>> {
+        self.get_route_table(vpc_id, "default")
+    }
+
+    /// List all route tables.
+    pub fn list_route_tables(&self) -> Result<Vec<RouteTable>> {
+        let entries: Vec<(String, RouteTable)> = self.db.list(ROUTE_TABLES_TABLE)?;
+        Ok(entries.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// List route tables belonging to a specific VPC.
+    pub fn list_route_tables_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<RouteTable>> {
+        let prefix = format!("{}/", vpc_id.0);
+        let all: Vec<(String, RouteTable)> = self.db.list(ROUTE_TABLES_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, t)| t)
+            .collect())
+    }
+
+    /// Delete a route table. Fails if it is the default table or has associated subnets.
+    pub fn delete_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
+        let key = Self::route_table_key(vpc_id, name);
+
+        let table: RouteTable = self
+            .db
+            .get(ROUTE_TABLES_TABLE, &key)?
+            .ok_or_else(|| OrgError::RouteTableNotFound(name.to_string()))?;
+
+        if table.is_default {
+            return Err(OrgError::CannotDeleteDefaultRouteTable);
+        }
+
+        // Check if any subnets are associated with this table.
+        let assoc_count = self.count_subnets_for_route_table(&table.id)?;
+        if assoc_count > 0 {
+            return Err(OrgError::RouteTableHasSubnets {
+                name: name.to_string(),
+                count: assoc_count,
+            });
+        }
+
+        // Delete all routes in this table.
+        let routes = self.list_routes_by_table(&table.id)?;
+        for route in &routes {
+            let rkey = Self::route_key(&table.id, &route.destination);
+            self.db.delete(ROUTES_TABLE, &rkey)?;
+        }
+
+        self.db.delete(ROUTE_TABLES_TABLE, &key)?;
+        Ok(())
+    }
+
+    /// Delete a route table by VPC name (CLI convenience wrapper).
+    pub fn delete_route_table_by_vpc_name(&self, vpc_name: &str, table_name: &str) -> Result<()> {
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+        self.delete_route_table(&vpc.id, table_name)
+    }
+
+    /// Create a route table by VPC name (CLI convenience wrapper).
+    pub fn create_route_table_by_vpc_name(&self, name: &str, vpc_name: &str) -> Result<RouteTable> {
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+        self.create_route_table(name, &vpc.id)
+    }
+
+    /// List route tables by VPC name (CLI convenience wrapper).
+    pub fn list_route_tables_by_vpc_name(&self, vpc_name: Option<&str>) -> Result<Vec<RouteTable>> {
+        match vpc_name {
+            Some(vname) => {
+                let vpc = self
+                    .get_vpc(vname)?
+                    .ok_or_else(|| OrgError::VpcNotFound(vname.to_string()))?;
+                self.list_route_tables_by_vpc(&vpc.id)
+            }
+            None => self.list_route_tables(),
+        }
+    }
+
+    /// Count subnets associated with a specific route table.
+    fn count_subnets_for_route_table(&self, table_id: &RouteTableId) -> Result<usize> {
+        let entries: Vec<(String, String)> = self.db.list(SUBNET_ROUTE_ASSOC_TABLE)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, tid)| *tid == table_id.0)
+            .count())
+    }
+
+    // ── Route operations ──────────────────────────────────────────────
+
+    /// Add a system route (auto-created, undeletable).
+    pub fn add_system_route(&self, table: &RouteTable, destination: &str) -> Result<Route> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let route = Route {
+            id: RouteId(format!(
+                "rt-sys-{}-{}",
+                table.name,
+                destination.replace('/', "_")
+            )),
+            route_table_id: table.id.clone(),
+            destination: destination.to_string(),
+            target: RouteTarget::Local,
+            origin: RouteOrigin::System,
+            status: RouteStatus::Active,
+            priority: 0,
+            created_at: now,
+        };
+
+        let key = Self::route_key(&table.id, destination);
+        self.db.set(ROUTES_TABLE, &key, &route)?;
+        Ok(route)
+    }
+
+    /// Add a user-created route.
+    pub fn add_route(
+        &self,
+        table_id: &RouteTableId,
+        destination: &str,
+        target: RouteTarget,
+        priority: Option<u32>,
+    ) -> Result<Route> {
+        let key = Self::route_key(table_id, destination);
+        if self.db.exists(ROUTES_TABLE, &key)? {
+            return Err(OrgError::RouteAlreadyExists(destination.to_string()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let status = match &target {
+            RouteTarget::Blackhole => RouteStatus::Active,
+            RouteTarget::Local => RouteStatus::Active,
+            _ => RouteStatus::Active,
+        };
+
+        let route = Route {
+            id: RouteId(format!("rt-{}", destination.replace('/', "_"))),
+            route_table_id: table_id.clone(),
+            destination: destination.to_string(),
+            target,
+            origin: RouteOrigin::User,
+            status,
+            priority: priority.unwrap_or(100),
+            created_at: now,
+        };
+
+        self.db.set(ROUTES_TABLE, &key, &route)?;
+        Ok(route)
+    }
+
+    /// Add a propagated route (auto-created from peering).
+    pub fn add_propagated_route(
+        &self,
+        table_id: &RouteTableId,
+        destination: &str,
+        target: RouteTarget,
+    ) -> Result<Route> {
+        let key = Self::route_key(table_id, destination);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let route = Route {
+            id: RouteId(format!("rt-prop-{}", destination.replace('/', "_"))),
+            route_table_id: table_id.clone(),
+            destination: destination.to_string(),
+            target,
+            origin: RouteOrigin::Propagated,
+            status: RouteStatus::Active,
+            priority: 50,
+            created_at: now,
+        };
+
+        self.db.set(ROUTES_TABLE, &key, &route)?;
+        Ok(route)
+    }
+
+    /// Remove a route. Fails if the route is system or propagated origin.
+    pub fn remove_route(&self, table_id: &RouteTableId, destination: &str) -> Result<()> {
+        let key = Self::route_key(table_id, destination);
+
+        let route: Route = self
+            .db
+            .get(ROUTES_TABLE, &key)?
+            .ok_or_else(|| OrgError::RouteNotFound(destination.to_string()))?;
+
+        match route.origin {
+            RouteOrigin::System => {
+                return Err(OrgError::CannotDeleteSystemRoute);
+            }
+            RouteOrigin::Propagated => {
+                return Err(OrgError::CannotDeletePropagatedRoute);
+            }
+            RouteOrigin::User => {}
+        }
+
+        self.db.delete(ROUTES_TABLE, &key)?;
+        Ok(())
+    }
+
+    /// Force-remove a route regardless of origin (used internally for cleanup).
+    pub fn remove_route_force(&self, table_id: &RouteTableId, destination: &str) -> Result<()> {
+        let key = Self::route_key(table_id, destination);
+        self.db.delete(ROUTES_TABLE, &key)?;
+        Ok(())
+    }
+
+    /// List all routes in a specific route table.
+    pub fn list_routes_by_table(&self, table_id: &RouteTableId) -> Result<Vec<Route>> {
+        let prefix = format!("{}/", table_id.0);
+        let all: Vec<(String, Route)> = self.db.list(ROUTES_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, r)| r)
+            .collect())
+    }
+
+    /// List all routes across all tables in a VPC.
+    pub fn list_routes_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<Route>> {
+        let tables = self.list_route_tables_by_vpc(vpc_id)?;
+        let mut routes = Vec::new();
+        for table in &tables {
+            routes.extend(self.list_routes_by_table(&table.id)?);
+        }
+        Ok(routes)
+    }
+
+    /// Get a specific route by table ID and destination.
+    pub fn get_route(&self, table_id: &RouteTableId, destination: &str) -> Result<Option<Route>> {
+        let key = Self::route_key(table_id, destination);
+        Ok(self.db.get(ROUTES_TABLE, &key)?)
+    }
+
+    /// Update a route's status field.
+    pub fn update_route_status(
+        &self,
+        table_id: &RouteTableId,
+        destination: &str,
+        status: RouteStatus,
+    ) -> Result<()> {
+        let key = Self::route_key(table_id, destination);
+        let mut route: Route = self
+            .db
+            .get(ROUTES_TABLE, &key)?
+            .ok_or_else(|| OrgError::RouteNotFound(destination.to_string()))?;
+        route.status = status;
+        self.db.set(ROUTES_TABLE, &key, &route)?;
+        Ok(())
+    }
+
+    // ── Subnet-RouteTable association ──────────────────────────────────
+
+    /// Associate a subnet with a route table.
+    pub fn associate_subnet_route_table(
+        &self,
+        subnet_id: &SubnetId,
+        table_id: &RouteTableId,
+    ) -> Result<()> {
+        self.db
+            .set(SUBNET_ROUTE_ASSOC_TABLE, &subnet_id.0, &table_id.0)?;
+        Ok(())
+    }
+
+    /// Disassociate a subnet from its custom route table (reverts to default).
+    pub fn disassociate_subnet_route_table(&self, subnet_id: &SubnetId) -> Result<()> {
+        self.db.delete(SUBNET_ROUTE_ASSOC_TABLE, &subnet_id.0)?;
+        Ok(())
+    }
+
+    /// Get the route table ID for a subnet (None means use default).
+    pub fn get_subnet_route_table_id(&self, subnet_id: &SubnetId) -> Result<Option<RouteTableId>> {
+        let val: Option<String> = self.db.get(SUBNET_ROUTE_ASSOC_TABLE, &subnet_id.0)?;
+        Ok(val.map(RouteTableId))
+    }
+
+    /// Resolve the effective route table for a subnet — explicit association or VPC default.
+    pub fn resolve_subnet_route_table(&self, subnet: &Subnet) -> Result<RouteTable> {
+        if let Some(table_id) = self.get_subnet_route_table_id(&subnet.id)? {
+            // Find the table by scanning (table_id is the value, not key).
+            let tables = self.list_route_tables_by_vpc(&subnet.vpc_id)?;
+            for t in tables {
+                if t.id == table_id {
+                    return Ok(t);
+                }
+            }
+        }
+        // Fall back to default.
+        self.get_default_route_table(&subnet.vpc_id)?
+            .ok_or_else(|| OrgError::RouteTableNotFound("default".to_string()))
     }
 
     // ── NIC operations (convenience wrappers for attach/detach) ────
@@ -2744,5 +3144,353 @@ mod tests {
 
         let err = store.delete_sg(&vpc_id, "default").unwrap_err();
         assert!(matches!(err, OrgError::SgIsDefault(_)));
+    }
+
+    // ── Route Table tests ─────────────────────────────────────────
+
+    #[test]
+    fn default_route_table_auto_created() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let default_rt = store.get_default_route_table(&vpc.id).unwrap();
+        assert!(default_rt.is_some());
+        let rt = default_rt.unwrap();
+        assert!(rt.is_default);
+        assert_eq!(rt.name, "default");
+        assert_eq!(rt.vpc_id, vpc.id);
+    }
+
+    #[test]
+    fn default_route_table_has_vpc_cidr_route() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        let routes = store.list_routes_by_table(&rt.id).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "10.1.0.0/16");
+        assert_eq!(routes[0].target, RouteTarget::Local);
+        assert_eq!(routes[0].origin, RouteOrigin::System);
+        assert_eq!(routes[0].priority, 0);
+    }
+
+    #[test]
+    fn create_route_table() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.create_route_table("custom", &vpc.id).unwrap();
+        assert_eq!(rt.name, "custom");
+        assert!(!rt.is_default);
+        assert_eq!(rt.vpc_id, vpc.id);
+    }
+
+    #[test]
+    fn list_route_tables_by_vpc() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store.create_route_table("custom-a", &vpc.id).unwrap();
+        store.create_route_table("custom-b", &vpc.id).unwrap();
+
+        let tables = store.list_route_tables_by_vpc(&vpc.id).unwrap();
+        assert_eq!(tables.len(), 3); // default + 2 custom
+    }
+
+    #[test]
+    fn cannot_delete_default_route_table() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let err = store.delete_route_table(&vpc.id, "default").unwrap_err();
+        assert!(matches!(err, OrgError::CannotDeleteDefaultRouteTable));
+    }
+
+    #[test]
+    fn delete_route_table_succeeds() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store.create_route_table("ephemeral", &vpc.id).unwrap();
+        store.delete_route_table(&vpc.id, "ephemeral").unwrap();
+
+        let tables = store.list_route_tables_by_vpc(&vpc.id).unwrap();
+        assert_eq!(tables.len(), 1); // only default remains
+    }
+
+    #[test]
+    fn add_user_route_and_list() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+
+        let route = store
+            .add_route(&rt.id, "10.99.0.0/24", RouteTarget::Blackhole, None)
+            .unwrap();
+        assert_eq!(route.origin, RouteOrigin::User);
+        assert_eq!(route.priority, 100);
+
+        let routes = store.list_routes_by_table(&rt.id).unwrap();
+        assert_eq!(routes.len(), 2); // VPC CIDR system route + user route
+    }
+
+    #[test]
+    fn cannot_delete_system_route() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        let err = store.remove_route(&rt.id, "10.1.0.0/16").unwrap_err();
+        assert!(matches!(err, OrgError::CannotDeleteSystemRoute));
+    }
+
+    #[test]
+    fn delete_user_route_succeeds() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        store
+            .add_route(&rt.id, "10.99.0.0/24", RouteTarget::Blackhole, None)
+            .unwrap();
+        store.remove_route(&rt.id, "10.99.0.0/24").unwrap();
+
+        let routes = store.list_routes_by_table(&rt.id).unwrap();
+        assert_eq!(routes.len(), 1); // only system route remains
+    }
+
+    #[test]
+    fn subnet_creation_adds_local_route() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        // Create an environment for the subnet.
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+        store
+            .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        let routes = store.list_routes_by_table(&rt.id).unwrap();
+        // Should have: VPC CIDR route + subnet CIDR route
+        assert_eq!(routes.len(), 2);
+        let subnet_route = routes.iter().find(|r| r.destination == "10.1.1.0/24");
+        assert!(subnet_route.is_some());
+        assert_eq!(subnet_route.unwrap().origin, RouteOrigin::System);
+    }
+
+    #[test]
+    fn subnet_deletion_removes_local_route() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+        store
+            .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
+            .unwrap();
+
+        store.delete_subnet("myvpc", "web").unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        let routes = store.list_routes_by_table(&rt.id).unwrap();
+        // Only VPC CIDR route should remain.
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "10.1.0.0/16");
+    }
+
+    #[test]
+    fn subnet_route_table_association() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let subnet = store
+            .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
+            .unwrap();
+
+        // Default: resolves to default route table.
+        let resolved = store.resolve_subnet_route_table(&subnet).unwrap();
+        assert!(resolved.is_default);
+
+        // Create custom table and associate.
+        let custom = store.create_route_table("custom", &vpc.id).unwrap();
+        store
+            .associate_subnet_route_table(&subnet.id, &custom.id)
+            .unwrap();
+
+        let resolved = store.resolve_subnet_route_table(&subnet).unwrap();
+        assert_eq!(resolved.name, "custom");
+
+        // Disassociate: back to default.
+        store.disassociate_subnet_route_table(&subnet.id).unwrap();
+        let resolved = store.resolve_subnet_route_table(&subnet).unwrap();
+        assert!(resolved.is_default);
+    }
+
+    #[test]
+    fn cannot_delete_route_table_with_subnets() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        store
+            .create_env("acme", "backend", "production", None, false, HashMap::new())
+            .unwrap();
+
+        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let subnet = store
+            .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
+            .unwrap();
+
+        let custom = store.create_route_table("custom", &vpc.id).unwrap();
+        store
+            .associate_subnet_route_table(&subnet.id, &custom.id)
+            .unwrap();
+
+        let err = store.delete_route_table(&vpc.id, "custom").unwrap_err();
+        assert!(matches!(err, OrgError::RouteTableHasSubnets { .. }));
+    }
+
+    #[test]
+    fn cannot_delete_propagated_route() {
+        let (_dir, store) = temp_store();
+        setup_org_and_project(&store);
+        let vpc = store
+            .create_vpc(
+                "myvpc",
+                "10.1.0.0/16",
+                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                false,
+            )
+            .unwrap();
+
+        let rt = store.get_default_route_table(&vpc.id).unwrap().unwrap();
+        store
+            .add_propagated_route(
+                &rt.id,
+                "10.2.0.0/16",
+                RouteTarget::VpcPeering("peering-123".to_string()),
+            )
+            .unwrap();
+
+        let err = store.remove_route(&rt.id, "10.2.0.0/16").unwrap_err();
+        assert!(matches!(err, OrgError::CannotDeletePropagatedRoute));
     }
 }

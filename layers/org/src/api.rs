@@ -18,8 +18,8 @@ use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
     Direction, Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, PortRange,
-    Project, ProjectId, Protocol, RuleId, RuleSource, SecurityGroup, SecurityGroupRule, Subnet,
-    Vpc, VpcOwner, VpcPeering,
+    Project, ProjectId, Protocol, Route, RouteTable, RouteTarget, RuleId, RuleSource,
+    SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +193,44 @@ pub enum OrgRequest {
         source: Option<String>,
     },
 
+    // -- Route Table --
+    RouteTableCreate {
+        name: String,
+        vpc: String,
+    },
+    RouteTableList {
+        vpc: Option<String>,
+    },
+    RouteTableDelete {
+        name: String,
+        vpc: Option<String>,
+    },
+    RouteTableAssociate {
+        table: String,
+        subnet: String,
+    },
+    RouteTableDisassociate {
+        subnet: String,
+    },
+
+    // -- Route --
+    RouteAdd {
+        vpc: String,
+        table: Option<String>,
+        destination: String,
+        target: String,
+        priority: Option<u32>,
+    },
+    RouteDelete {
+        vpc: String,
+        table: Option<String>,
+        destination: String,
+    },
+    RouteList {
+        vpc: Option<String>,
+        table: Option<String>,
+    },
+
     // -- Subnet resolution (used by compute layer) --
     SubnetResolve {
         subnet_name: Option<String>,
@@ -229,6 +267,10 @@ pub enum OrgResponse {
         verdict: String,
         reason: String,
     },
+    RouteTableResp(RouteTable),
+    RouteTableList(Vec<RouteTable>),
+    RouteResp(Route),
+    RouteListResp(Vec<Route>),
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
     Ok,
@@ -866,6 +908,179 @@ fn handle_org_request(
             OrgResponse::SgCheckResult { verdict, reason }
         }
 
+        // -- Route Table --
+        OrgRequest::RouteTableCreate { name, vpc } => {
+            match store.create_route_table_by_vpc_name(&name, &vpc) {
+                Ok(table) => OrgResponse::RouteTableResp(table),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteTableList { vpc } => {
+            match store.list_route_tables_by_vpc_name(vpc.as_deref()) {
+                Ok(tables) => OrgResponse::RouteTableList(tables),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteTableDelete { name, vpc } => {
+            // Resolve VPC: if given, use it; otherwise scan all tables.
+            let result = if let Some(vname) = vpc {
+                store.delete_route_table_by_vpc_name(&vname, &name)
+            } else {
+                // Try to find the table across all VPCs.
+                let tables = match store.list_route_tables() {
+                    Ok(t) => t,
+                    Err(e) => return OrgResponse::Error(e.to_string()),
+                };
+                let matching: Vec<_> = tables.iter().filter(|t| t.name == name).collect();
+                match matching.len() {
+                    0 => Err(crate::error::OrgError::RouteTableNotFound(name.clone())),
+                    1 => store.delete_route_table(&matching[0].vpc_id, &name),
+                    _ => Err(crate::error::OrgError::Ambiguous(format!(
+                        "route table '{name}' exists in multiple VPCs — specify --vpc"
+                    ))),
+                }
+            };
+            match result {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteTableAssociate { table, subnet } => {
+            // Find the subnet, then find the route table in the same VPC.
+            let matches = match store.find_subnets_by_name(&subnet) {
+                Ok(m) => m,
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sub = match matches.len() {
+                0 => return OrgResponse::Error(format!("subnet not found: {subnet}")),
+                1 => matches.into_iter().next().unwrap().1,
+                _ => {
+                    return OrgResponse::Error(format!(
+                        "subnet '{subnet}' exists in multiple VPCs — specify --vpc"
+                    ));
+                }
+            };
+            let rt = match store.get_route_table(&sub.vpc_id, &table) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return OrgResponse::Error(format!("route table not found: {table}"));
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            match store.associate_subnet_route_table(&sub.id, &rt.id) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteTableDisassociate { subnet } => {
+            let matches = match store.find_subnets_by_name(&subnet) {
+                Ok(m) => m,
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let sub = match matches.len() {
+                0 => return OrgResponse::Error(format!("subnet not found: {subnet}")),
+                1 => matches.into_iter().next().unwrap().1,
+                _ => {
+                    return OrgResponse::Error(format!(
+                        "subnet '{subnet}' exists in multiple VPCs — specify --vpc"
+                    ));
+                }
+            };
+            match store.disassociate_subnet_route_table(&sub.id) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        // -- Route --
+        OrgRequest::RouteAdd {
+            vpc,
+            table,
+            destination,
+            target,
+            priority,
+        } => {
+            let vpc_obj = match store.get_vpc(&vpc) {
+                Ok(Some(v)) => v,
+                Ok(None) => return OrgResponse::Error(format!("VPC not found: {vpc}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let table_name = table.as_deref().unwrap_or("default");
+            let rt = match store.get_route_table(&vpc_obj.id, table_name) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return OrgResponse::Error(format!("route table not found: {table_name}"));
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let route_target = match parse_route_target(&target) {
+                Ok(t) => t,
+                Err(e) => return OrgResponse::Error(e),
+            };
+
+            // Validate target resources exist if applicable.
+            if let Err(e) = validate_route_target(store, &route_target) {
+                return OrgResponse::Error(e);
+            }
+
+            match store.add_route(&rt.id, &destination, route_target, priority) {
+                Ok(route) => OrgResponse::RouteResp(route),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteDelete {
+            vpc,
+            table,
+            destination,
+        } => {
+            let vpc_obj = match store.get_vpc(&vpc) {
+                Ok(Some(v)) => v,
+                Ok(None) => return OrgResponse::Error(format!("VPC not found: {vpc}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            let table_name = table.as_deref().unwrap_or("default");
+            let rt = match store.get_route_table(&vpc_obj.id, table_name) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return OrgResponse::Error(format!("route table not found: {table_name}"));
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+            match store.remove_route(&rt.id, &destination) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+        OrgRequest::RouteList { vpc, table } => {
+            if let Some(vname) = &vpc {
+                let vpc_obj = match store.get_vpc(vname) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return OrgResponse::Error(format!("VPC not found: {vname}")),
+                    Err(e) => return OrgResponse::Error(e.to_string()),
+                };
+                if let Some(tname) = &table {
+                    let rt = match store.get_route_table(&vpc_obj.id, tname) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            return OrgResponse::Error(format!("route table not found: {tname}"));
+                        }
+                        Err(e) => return OrgResponse::Error(e.to_string()),
+                    };
+                    match store.list_routes_by_table(&rt.id) {
+                        Ok(routes) => OrgResponse::RouteListResp(routes),
+                        Err(e) => OrgResponse::Error(e.to_string()),
+                    }
+                } else {
+                    match store.list_routes_by_vpc(&vpc_obj.id) {
+                        Ok(routes) => OrgResponse::RouteListResp(routes),
+                        Err(e) => OrgResponse::Error(e.to_string()),
+                    }
+                }
+            } else {
+                OrgResponse::Error("specify --vpc to list routes".to_string())
+            }
+        }
+
         // -- Subnet resolution (for compute layer) --
         OrgRequest::SubnetResolve {
             subnet_name,
@@ -966,6 +1181,69 @@ pub async fn send_org_request(
 }
 
 /// Parse a port range string like "443" or "8000-9000".
+/// Parse a route target string like "local", "blackhole", "nat-gw:foo", "peering:bar".
+fn parse_route_target(s: &str) -> std::result::Result<RouteTarget, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("local") {
+        Ok(RouteTarget::Local)
+    } else if s.eq_ignore_ascii_case("blackhole") {
+        Ok(RouteTarget::Blackhole)
+    } else if let Some(name) = s.strip_prefix("nat-gw:") {
+        if name.is_empty() {
+            return Err("nat-gw target requires a name".to_string());
+        }
+        Ok(RouteTarget::NatGateway(name.to_string()))
+    } else if let Some(name) = s.strip_prefix("peering:") {
+        if name.is_empty() {
+            return Err("peering target requires a name".to_string());
+        }
+        Ok(RouteTarget::VpcPeering(name.to_string()))
+    } else {
+        Err(format!(
+            "invalid route target: '{s}'. Valid: local, blackhole, nat-gw:<name>, peering:<name>"
+        ))
+    }
+}
+
+/// Validate that a route target's referenced resource exists and is active.
+fn validate_route_target(
+    store: &OrgStore,
+    target: &RouteTarget,
+) -> std::result::Result<(), String> {
+    match target {
+        RouteTarget::Local | RouteTarget::Blackhole => Ok(()),
+        RouteTarget::VpcPeering(name) => {
+            // Check if peering exists and is active.
+            match store.list_peerings() {
+                Ok(peerings) => {
+                    let found = peerings
+                        .iter()
+                        .find(|p| p.vpc_a == *name || p.vpc_b == *name || p.id.0 == *name);
+                    match found {
+                        Some(p) => {
+                            if p.status == crate::types::PeeringStatus::Active {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "target resource '{}' is not active (current state: {})",
+                                    name, p.status
+                                ))
+                            }
+                        }
+                        None => Err(format!("target resource '{name}' not found")),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        RouteTarget::NatGateway(_name) => {
+            // NAT Gateway is not yet implemented (Phase 3 placeholder).
+            // For now, accept the target — it will be validated when NAT GW is implemented.
+            Ok(())
+        }
+    }
+}
+
 fn parse_port_range(s: &str) -> std::result::Result<PortRange, String> {
     if let Some((from_s, to_s)) = s.split_once('-') {
         let from: u16 = from_s
@@ -1190,7 +1468,7 @@ mod tests {
             priority: 100,
             description: None,
         };
-        let (v1, _) = evaluate_rules(&[rule.clone()], 22, Protocol::Tcp, "10.1.2.3");
+        let (v1, _) = evaluate_rules(std::slice::from_ref(&rule), 22, Protocol::Tcp, "10.1.2.3");
         assert_eq!(v1, "ALLOWED");
         let (v2, _) = evaluate_rules(&[rule], 22, Protocol::Tcp, "192.168.1.1");
         assert_eq!(v2, "DENIED");
