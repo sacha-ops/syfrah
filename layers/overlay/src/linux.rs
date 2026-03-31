@@ -252,6 +252,7 @@ impl NetworkBackend for LinuxBackend {
         ip: &str,
         prefix_len: u8,
         gateway: &str,
+        mac: &str,
     ) -> Result<()> {
         // Use --net=<path> (not --net <path>) for compatibility with
         // util-linux nsenter which requires the = form.
@@ -262,6 +263,12 @@ impl NetworkBackend for LinuxBackend {
         Self::run(
             "nsenter",
             &[&ns_flag, "ip", "link", "set", iface, "name", "eth0"],
+        )
+        .await?;
+        // Set MAC address to match IPAM-derived MAC (required for anti-spoofing)
+        Self::run(
+            "nsenter",
+            &[&ns_flag, "ip", "link", "set", "eth0", "address", mac],
         )
         .await?;
         // Assign the allocated IP.

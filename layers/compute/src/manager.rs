@@ -809,6 +809,7 @@ impl VmManager {
                             &nr.ip,
                             nr.prefix_len,
                             &nr.gateway,
+                            &nr.mac,
                         )
                         .await
                         .map_err(|e| {

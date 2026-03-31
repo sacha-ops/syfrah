@@ -181,10 +181,11 @@ impl NetworkBackend for MockBackend {
         ip: &str,
         prefix_len: u8,
         gateway: &str,
+        mac: &str,
     ) -> Result<()> {
         self.should_fail("configure_netns")?;
         self.record(format!(
-            "configure_netns({pid}, {iface}, {ip}, {prefix_len}, {gateway})"
+            "configure_netns({pid}, {iface}, {ip}, {prefix_len}, {gateway}, {mac})"
         ));
         Ok(())
     }
@@ -283,7 +284,7 @@ mod tests {
         b.delete_tap(&tap).await.unwrap();
         b.create_veth_pair(&vh, &vc).await.unwrap();
         b.move_to_netns(&vc, 1234).await.unwrap();
-        b.configure_netns(1234, &vc, "10.1.1.3", 24, "10.1.1.1")
+        b.configure_netns(1234, &vc, "10.1.1.3", 24, "10.1.1.1", "02:00:0a:01:01:03")
             .await
             .unwrap();
 
