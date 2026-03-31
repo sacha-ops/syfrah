@@ -173,6 +173,7 @@ fn error_to_status(err: &ComputeError) -> StatusCode {
         ComputeError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ComputeError::Client(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ComputeError::Image(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        ComputeError::NetworkSetup(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

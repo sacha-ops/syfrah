@@ -2367,6 +2367,7 @@ dependencies = [
  "sha2",
  "syfrah-api",
  "syfrah-org",
+ "syfrah-overlay",
  "syfrah-state",
  "tempfile",
  "terminal_size",

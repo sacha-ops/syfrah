@@ -25,6 +25,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 syfrah-api = { path = "../api" }
 syfrah-org = { path = "../org" }
+syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
 thiserror = { workspace = true }
 terminal_size = "0.4"
