@@ -73,4 +73,11 @@ pub trait NetworkBackend: Send + Sync {
 
     /// Remove peering forwarding rules.
     async fn remove_peering_rules(&self, bridge_a: &str, bridge_b: &str) -> Result<()>;
+
+    // ── Query ──────────────────────────────────────────────────────────
+
+    /// List all network interfaces whose names start with the given prefix.
+    ///
+    /// Used by the reconciliation loop to discover kernel-side state.
+    async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>>;
 }
