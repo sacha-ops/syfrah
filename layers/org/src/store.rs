@@ -1020,6 +1020,79 @@ impl OrgStore {
         self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
         Ok(())
     }
+
+    // ── Security Group CLI helpers (VPC-name based) ────────────────
+
+    /// Create a security group by VPC name (CLI convenience wrapper).
+    pub fn create_security_group(
+        &self,
+        name: &str,
+        vpc_name: &str,
+        description: &str,
+    ) -> Result<SecurityGroup> {
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Err(OrgError::NotFound(format!("VPC '{vpc_name}'"))),
+        };
+        self.create_sg(name, &vpc.id, Some(description))
+    }
+
+    /// List security groups, optionally filtered by VPC name.
+    pub fn list_security_groups(&self, vpc_name: Option<&str>) -> Result<Vec<SecurityGroup>> {
+        if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            self.list_sgs_by_vpc(&vpc.id)
+        } else {
+            self.list_sgs()
+        }
+    }
+
+    /// Get a security group by name. Searches all VPCs or a specific one.
+    pub fn get_security_group(
+        &self,
+        name: &str,
+        vpc_name: Option<&str>,
+    ) -> Result<Option<SecurityGroup>> {
+        if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            self.get_sg(&vpc.id, name)
+        } else {
+            let all = self.list_sgs()?;
+            let matches: Vec<SecurityGroup> =
+                all.into_iter().filter(|sg| sg.name == name).collect();
+            match matches.len() {
+                0 => Ok(None),
+                1 => Ok(Some(matches.into_iter().next().unwrap())),
+                _ => Err(OrgError::Ambiguous(format!(
+                    "security group '{name}' exists in multiple VPCs — specify --vpc"
+                ))),
+            }
+        }
+    }
+
+    /// Delete a security group by name.
+    pub fn delete_security_group(&self, name: &str, vpc_name: Option<&str>) -> Result<()> {
+        let sg = match self.get_security_group(name, vpc_name)? {
+            Some(sg) => sg,
+            None => {
+                return Err(OrgError::NotFound(format!("security group '{name}'")));
+            }
+        };
+
+        if sg.is_default {
+            return Err(OrgError::CannotDelete(
+                "cannot delete the default security group".to_string(),
+            ));
+        }
+
+        self.delete_sg(&sg.vpc_id, name)
+    }
 }
 
 #[cfg(test)]

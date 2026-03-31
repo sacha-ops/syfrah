@@ -16,8 +16,8 @@ use tokio::net::UnixStream;
 
 use crate::store::OrgStore;
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringStatus, Project, ProjectId, Subnet, Vpc,
-    VpcOwner, VpcPeering,
+    Environment, EnvironmentId, Org, OrgId, PeeringStatus, Project, ProjectId, SecurityGroup,
+    Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +134,24 @@ pub enum OrgRequest {
         vpc: Option<String>,
     },
 
+    // -- Security Group --
+    SgCreate {
+        name: String,
+        vpc: String,
+        description: String,
+    },
+    SgList {
+        vpc: Option<String>,
+    },
+    SgShow {
+        name: String,
+        vpc: Option<String>,
+    },
+    SgDelete {
+        name: String,
+        vpc: Option<String>,
+    },
+
     // -- Subnet resolution (used by compute layer) --
     SubnetResolve {
         subnet_name: Option<String>,
@@ -156,6 +174,8 @@ pub enum OrgResponse {
     PeeringList(Vec<VpcPeering>),
     Subnet(Subnet),
     SubnetList(Vec<Subnet>),
+    Sg(SecurityGroup),
+    SgList(Vec<SecurityGroup>),
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
     Ok,
@@ -495,6 +515,31 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
                 }
             };
             match store.delete_subnet(&vpc_name, &name) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        // -- Security Group --
+        OrgRequest::SgCreate {
+            name,
+            vpc,
+            description,
+        } => match store.create_security_group(&name, &vpc, &description) {
+            Ok(sg) => OrgResponse::Sg(sg),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgList { vpc } => match store.list_security_groups(vpc.as_deref()) {
+            Ok(sgs) => OrgResponse::SgList(sgs),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgShow { name, vpc } => match store.get_security_group(&name, vpc.as_deref()) {
+            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            Ok(None) => OrgResponse::Error(format!("security group '{name}' not found")),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgDelete { name, vpc } => {
+            match store.delete_security_group(&name, vpc.as_deref()) {
                 Ok(()) => OrgResponse::Ok,
                 Err(e) => OrgResponse::Error(e.to_string()),
             }
