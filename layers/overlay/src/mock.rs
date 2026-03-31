@@ -150,6 +150,7 @@ impl NetworkBackend for MockBackend {
     }
 
     async fn remove_vm_rules(&self, tap: &str) -> Result<()> {
+        self.should_fail("remove_vm_rules")?;
         self.record(format!("remove_vm_rules({tap})"));
         Ok(())
     }

@@ -4,17 +4,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{ComputeError, ProcessError};
 use crate::events;
 use crate::image::store::ImageStore;
 use crate::image::types::{ImageCatalog, PullPolicy};
+use crate::network::{NetworkCleanup, NetworkInfo};
 use crate::process;
 use crate::runtime::VmRuntimeState;
 use crate::runtime_backend::{ComputeRuntime, RuntimeSpec};
 use crate::runtime_ch;
 use crate::types::{VmEvent, VmId, VmSpec, VmStatus};
+
+use syfrah_overlay::NetworkBackend;
 
 // ---------------------------------------------------------------------------
 // ComputeConfig
@@ -179,6 +182,15 @@ pub struct ReconnectSummary {
 /// How long a cached health-check result is considered fresh.
 const HEALTH_CHECK_TTL: Duration = Duration::from_secs(30);
 
+/// Callback type: counts remaining VMs on a bridge. Args: (vpc_id, vm_id_being_deleted).
+type BridgeVmCounter = Arc<dyn Fn(&str, &str) -> usize + Send + Sync>;
+
+/// Callback type: releases an IPAM allocation. Args: (subnet_id, subnet_cidr, ip).
+type IpamReleaser = Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>;
+
+/// Callback type: removes a VmPlacement. Args: (vpc_id, vm_id).
+type PlacementRemover = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+
 pub struct VmManager {
     config: ComputeConfig,
     /// Resolved cloud-hypervisor binary path (validated at construction).
@@ -199,6 +211,17 @@ pub struct VmManager {
     /// Cached health-check result: (timestamp, status, warnings).
     /// Avoids repeated stat syscalls when status is polled frequently.
     last_health_check: std::sync::Mutex<Option<(Instant, &'static str, Vec<String>)>>,
+    /// Optional network backend for cleaning up network resources on VM delete.
+    network_backend: Option<Arc<dyn NetworkBackend>>,
+    /// Callback to count remaining VMs on a bridge (vpc_id -> count, excluding the deleted VM).
+    /// If None, bridge cleanup is skipped.
+    bridge_vm_counter: Option<BridgeVmCounter>,
+    /// Callback to release an IP from IPAM. Args: (subnet_id, subnet_cidr, ip).
+    /// If None, IPAM release is skipped.
+    ipam_releaser: Option<IpamReleaser>,
+    /// Callback to remove a VmPlacement from the placement store. Args: (vpc_id, vm_id).
+    /// If None, placement removal is skipped.
+    placement_remover: Option<PlacementRemover>,
 }
 
 impl VmManager {
@@ -261,7 +284,31 @@ impl VmManager {
             catalog,
             image_refcounts: Arc::new(RwLock::new(HashMap::new())),
             last_health_check: std::sync::Mutex::new(None),
+            network_backend: None,
+            bridge_vm_counter: None,
+            ipam_releaser: None,
+            placement_remover: None,
         })
+    }
+
+    /// Set the network backend and cleanup callbacks for VM delete.
+    ///
+    /// - `backend`: the overlay `NetworkBackend` (real or mock).
+    /// - `bridge_vm_counter`: given (vpc_id, vm_id_being_deleted), returns how many
+    ///   other VMs remain on the bridge.
+    /// - `ipam_releaser`: releases an IP; args: (subnet_id, subnet_cidr, ip).
+    /// - `placement_remover`: removes the VmPlacement; args: (vpc_id, vm_id).
+    pub fn set_network(
+        &mut self,
+        backend: Arc<dyn NetworkBackend>,
+        bridge_vm_counter: BridgeVmCounter,
+        ipam_releaser: IpamReleaser,
+        placement_remover: PlacementRemover,
+    ) {
+        self.network_backend = Some(backend);
+        self.bridge_vm_counter = Some(bridge_vm_counter);
+        self.ipam_releaser = Some(ipam_releaser);
+        self.placement_remover = Some(placement_remover);
     }
 
     /// Set the image catalog (e.g., after fetching from a remote endpoint).
@@ -616,6 +663,7 @@ impl VmManager {
             image_name: Some(spec.image.clone()),
             instance_dir_path,
             runtime_handle: Some(handle),
+            network_info: None,
         };
 
         let status = state.to_status(now);
@@ -764,12 +812,18 @@ impl VmManager {
         // Capture image name before delete for refcount tracking.
         let image_name = guard.image_name.clone();
         let instance_dir_path = guard.instance_dir_path.clone();
+        let network_info = guard.network_info.clone();
 
         let handle = guard.to_runtime_handle(&self.config.base_dir);
         drop(guard);
 
         // Delegate to the runtime backend for stop + cleanup of runtime artifacts.
         self.runtime.delete(&handle).await?;
+
+        // -- Network cleanup (best-effort) ----------------------------------------
+        if let Some(ref net_info) = network_info {
+            self.cleanup_network(id, net_info).await;
+        }
 
         // Clean up instance directory (if image management was used).
         if let Some(ref inst_path) = instance_dir_path {
@@ -814,6 +868,58 @@ impl VmManager {
         );
 
         Ok(())
+    }
+
+    /// Best-effort network cleanup for a deleted VM.
+    ///
+    /// Removes FDB entry, releases IPAM, deletes TAP, removes nftables rules,
+    /// and optionally tears down the bridge if no VMs remain on it.
+    async fn cleanup_network(&self, vm_id: &str, net_info: &NetworkInfo) {
+        // Remove VmPlacement from persistent store
+        if let Some(ref remover) = self.placement_remover {
+            if let Err(e) = remover(&net_info.vpc_id, vm_id) {
+                warn!(
+                    vm_id = %vm_id, vpc_id = %net_info.vpc_id,
+                    error = %e, "failed to remove VmPlacement (best-effort)"
+                );
+            }
+        }
+
+        // Use the NetworkCleanup struct for backend operations
+        if let Some(ref backend) = self.network_backend {
+            let cleanup = NetworkCleanup::new(Arc::clone(backend));
+
+            // Count remaining VMs on this bridge
+            let remaining = self
+                .bridge_vm_counter
+                .as_ref()
+                .map(|counter| counter(&net_info.vpc_id, vm_id))
+                .unwrap_or(1); // Default to 1 (keep bridge) if no counter
+
+            // Build IPAM release callback
+            let ipam_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>> =
+                if let Some(ref releaser) = self.ipam_releaser {
+                    let releaser = Arc::clone(releaser);
+                    let subnet_id = net_info.subnet_id.clone();
+                    let subnet_cidr = net_info.subnet_cidr.clone();
+                    let ip = net_info.ip.clone();
+                    Some(Box::new(move || releaser(&subnet_id, &subnet_cidr, &ip)))
+                } else {
+                    None
+                };
+
+            let result = cleanup.cleanup(net_info, remaining, ipam_release).await;
+
+            info!(
+                vm_id = %vm_id,
+                fdb_removed = result.fdb_removed,
+                ip_released = result.ip_released,
+                tap_removed = result.tap_removed,
+                nft_removed = result.nft_removed,
+                bridge_deleted = result.bridge_deleted,
+                "network cleanup complete"
+            );
+        }
     }
 
     /// Get the external status of a single VM.
@@ -888,6 +994,7 @@ impl VmManager {
                     image_name: handle.image_name.clone(),
                     instance_dir_path: None,
                     runtime_handle: Some(handle),
+                    network_info: None,
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;

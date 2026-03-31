@@ -723,6 +723,7 @@ pub(crate) async fn spawn_vm_inner(
         image_name: Some(spec.image.clone()),
         instance_dir_path: None, // Caller (spawn_vm) sets these
         runtime_handle: None,    // Caller sets from RuntimeHandle
+        network_info: None,
     })
 }
 
@@ -1301,6 +1302,7 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
             image_name: meta.image_name.clone(),
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         events::emit(
@@ -1686,6 +1688,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1718,6 +1721,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1750,6 +1754,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1784,6 +1789,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -1994,6 +2000,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));
@@ -2132,6 +2139,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -2184,6 +2192,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2301,6 +2310,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));

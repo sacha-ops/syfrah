@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::network::NetworkInfo;
 use crate::phase::VmPhase;
 use crate::runtime_backend::{RuntimeHandle, RuntimeType};
 use crate::types::{VmId, VmStatus};
@@ -46,6 +47,8 @@ pub(crate) struct VmRuntimeState {
     pub(crate) instance_dir_path: Option<PathBuf>,
     /// Handle returned by the runtime backend that created this workload.
     pub(crate) runtime_handle: Option<RuntimeHandle>,
+    /// Network metadata for teardown on delete. None if VM has no networking.
+    pub(crate) network_info: Option<NetworkInfo>,
 }
 
 #[allow(dead_code)]
@@ -114,6 +117,7 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            network_info: None,
         }
     }
 
