@@ -68,6 +68,7 @@ pub trait NetworkBackend: Send + Sync {
         ip: &str,
         prefix_len: u8,
         gateway: &str,
+        mac: &str,
     ) -> Result<()>;
 
     // ── Firewall ───────────────────────────────────────────────────────
