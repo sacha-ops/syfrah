@@ -47,6 +47,29 @@ pub struct VmSpec {
     /// Root disk size in megabytes. `None` uses the image default.
     #[serde(default)]
     pub disk_size_mb: Option<u32>,
+    /// Resolved subnet info for overlay networking.
+    /// TODO: wire into NetworkManager once #757 lands.
+    #[serde(default)]
+    pub subnet: Option<SubnetInfo>,
+}
+
+/// Resolved subnet information passed through to the VM creation flow.
+///
+/// Populated by the CLI's `--subnet` resolution logic and carried through
+/// `VmSpec` so that downstream networking (overlay, IPAM) can allocate an
+/// IP address and configure the VXLAN bridge for this VM.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SubnetInfo {
+    /// Subnet name (e.g., `"frontend"`).
+    pub name: String,
+    /// Subnet CIDR (e.g., `"10.1.1.0/24"`).
+    pub cidr: String,
+    /// Gateway address (e.g., `"10.1.1.1"`).
+    pub gateway: String,
+    /// VPC ID that owns this subnet.
+    pub vpc_id: String,
+    /// Environment ID (e.g., `"acme/backend/production"`).
+    pub env_id: String,
 }
 
 /// TAP device configuration, provided by overlay via forge.
@@ -194,6 +217,7 @@ mod tests {
             },
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -213,6 +237,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -342,6 +367,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host".to_string()),
             disk_size_mb: Some(20480),
+            subnet: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();

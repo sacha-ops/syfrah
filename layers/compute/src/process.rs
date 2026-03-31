@@ -1652,6 +1652,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let h1 = compute_spec_hash(&spec);
         let h2 = compute_spec_hash(&spec);

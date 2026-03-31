@@ -241,6 +241,7 @@ async fn create_vm(
         gpu: parse_gpu_mode(body.gpu),
         ssh_key: None,
         disk_size_mb: None,
+        subnet: None,
     };
 
     match mgr.create_vm(spec).await {

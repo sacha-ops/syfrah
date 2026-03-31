@@ -2366,6 +2366,8 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "syfrah-api",
+ "syfrah-org",
+ "syfrah-state",
  "tempfile",
  "terminal_size",
  "thiserror 2.0.18",

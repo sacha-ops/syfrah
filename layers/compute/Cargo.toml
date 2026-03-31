@@ -24,6 +24,8 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 sha2 = "0.10"
 syfrah-api = { path = "../api" }
+syfrah-org = { path = "../org" }
+syfrah-state = { path = "../state" }
 thiserror = { workspace = true }
 terminal_size = "0.4"
 tokio = { workspace = true }
