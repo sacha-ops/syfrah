@@ -214,11 +214,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_control_basic() {
+    fn admit_when_capacity_available() {
         let tracker = CapacityTracker::with_capacity(8, 16384);
         assert!(tracker.can_admit(2, 4096));
-        assert!(!tracker.can_admit(10, 4096));
-        assert!(!tracker.can_admit(2, 32768));
+        assert!(tracker.can_admit(8, 16384)); // exact fit
+    }
+
+    #[test]
+    fn reject_when_insufficient() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+        // Too many vCPUs
+        assert!(!tracker.can_admit(5, 4096));
+        // Too much memory
+        assert!(!tracker.can_admit(2, 16384));
+        // Both exceed
+        assert!(!tracker.can_admit(10, 32768));
+    }
+
+    #[test]
+    fn reservation_expires() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+
+        // Insert a reservation with a past timestamp (simulate expiry).
+        {
+            let mut reservations = tracker.reservations.lock().unwrap();
+            reservations.insert(
+                "expired-vm".to_string(),
+                Reservation {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    created_at: Instant::now() - Duration::from_secs(120),
+                },
+            );
+        }
+
+        // Expired reservation should not block admission.
+        assert!(tracker.can_admit(4, 8192));
+        assert_eq!(tracker.available_vcpus(), 4);
+        assert_eq!(tracker.available_memory_mb(), 8192);
+    }
+
+    #[test]
+    fn reservation_released_on_failure() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+
+        // Reserve resources.
+        tracker.reserve("vm-1", 2, 4096);
+        assert_eq!(tracker.available_vcpus(), 2);
+        assert_eq!(tracker.available_memory_mb(), 4096);
+
+        // Simulate failure: release instead of commit.
+        tracker.release("vm-1", 2, 4096);
+        assert_eq!(tracker.available_vcpus(), 4);
+        assert_eq!(tracker.available_memory_mb(), 8192);
+    }
+
+    #[test]
+    fn overcommit_ratio_applied() {
+        // On a system with e.g. 4 CPUs and 8GB, allocatable should be:
+        // vCPUs: (4-1)*2 = 6, memory: 8192-1024 = 7168
+        let tracker = CapacityTracker::with_capacity(6, 7168);
+        assert_eq!(tracker.allocatable_vcpus(), 6);
+        assert_eq!(tracker.allocatable_memory_mb(), 7168);
+
+        // Can fit a 4-vCPU VM thanks to 2:1 overcommit
+        assert!(tracker.can_admit(4, 4096));
+        // But not 7 vCPUs
+        assert!(!tracker.can_admit(7, 4096));
     }
 
     #[test]
@@ -234,11 +296,34 @@ mod tests {
     }
 
     #[test]
-    fn release_resources() {
-        let tracker = CapacityTracker::with_capacity(4, 8192);
+    fn multiple_reservations_stack() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
+        tracker.reserve("vm-1", 2, 4096);
+        tracker.reserve("vm-2", 2, 4096);
+        assert_eq!(tracker.available_vcpus(), 4);
+        assert_eq!(tracker.available_memory_mb(), 8192);
+
+        // Third reservation should be rejected by admission
+        assert!(!tracker.can_admit(5, 8192));
+        assert!(tracker.can_admit(4, 8192));
+    }
+
+    #[test]
+    fn snapshot_reflects_current_state() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
         tracker.commit("vm-1", 2, 4096);
-        assert_eq!(tracker.available_vcpus(), 2);
-        tracker.release("vm-1", 2, 4096);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.total_vcpus, 8);
+        assert_eq!(snap.total_memory_mb, 16384);
+        assert_eq!(snap.used_vcpus, 2);
+        assert_eq!(snap.used_memory_mb, 4096);
+    }
+
+    #[test]
+    fn sync_used_updates_counters() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
+        tracker.sync_used(4, 8192);
         assert_eq!(tracker.available_vcpus(), 4);
         assert_eq!(tracker.available_memory_mb(), 8192);
     }
