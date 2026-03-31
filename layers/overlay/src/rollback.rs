@@ -294,8 +294,8 @@ mod tests {
 
         let mut rb = NetworkRollback::new();
         rb.set_ip_allocated("subnet-1", "10.1.1.3");
-        rb.set_tap_created(&crate::naming::tap_name("vm1"));
-        rb.set_bridge_created(&crate::naming::bridge_name("100"));
+        rb.set_tap_created(crate::naming::tap_name("vm1"));
+        rb.set_bridge_created(crate::naming::bridge_name("100"));
 
         let released = Arc::new(Mutex::new(false));
         let released_clone = Arc::clone(&released);
