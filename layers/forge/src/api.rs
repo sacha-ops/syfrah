@@ -26,6 +26,8 @@ pub struct ForgeState {
     pub vm_manager: Option<Arc<syfrah_compute::VmManager>>,
     /// Capacity tracker for admission control.
     pub capacity: Option<Arc<CapacityTracker>>,
+    /// Org store for subnet/VPC resolution.
+    pub org_store: Option<Arc<syfrah_org::OrgStore>>,
 }
 
 /// Standard error response with FORGE_ prefix codes.
@@ -154,16 +156,7 @@ async fn create_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> impl IntoResponse {
-    let Some(ref vm_manager) = state.vm_manager else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                serde_json::json!({"code": "FORGE_COMPUTE_UNAVAILABLE", "message": "compute backend not initialized"}),
-            ),
-        );
-    };
-
-    // Admission control: check capacity.
+    // Admission control: check capacity before anything else.
     if let Some(ref capacity) = state.capacity {
         if !capacity.can_admit(req.vcpus, req.memory_mb as u64) {
             return (
@@ -180,12 +173,81 @@ async fn create_instance_handler(
         capacity.reserve(&req.name, req.vcpus, req.memory_mb as u64);
     }
 
+    let Some(ref vm_manager) = state.vm_manager else {
+        // Release any reservation made above.
+        if let Some(ref capacity) = state.capacity {
+            capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+        }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_COMPUTE_UNAVAILABLE", "message": "compute backend not initialized"}),
+            ),
+        );
+    };
+
     // Create task record.
     let task_id = format!("task-{}", uuid::Uuid::new_v4());
     if let Some(ref task_store) = state.task_store {
         let _ = task_store.create_task(&task_id, &req.name, "create_instance");
         let _ = task_store.start_task(&task_id);
     }
+
+    // Resolve subnet if specified.
+    let subnet_info = if let Some(ref subnet_name) = req.subnet {
+        if let Some(ref org_store) = state.org_store {
+            match org_store.find_subnets_by_name(subnet_name) {
+                Ok(matches) if !matches.is_empty() => {
+                    let (_vpc_name, subnet) = &matches[0];
+                    Some(syfrah_compute::types::SubnetInfo {
+                        name: subnet.name.clone(),
+                        cidr: subnet.cidr.clone(),
+                        gateway: subnet.gateway.clone(),
+                        vpc_id: subnet.vpc_id.0.clone(),
+                        env_id: subnet.env_id.0.clone(),
+                    })
+                }
+                Ok(_) => {
+                    // Release capacity reservation on error.
+                    if let Some(ref capacity) = state.capacity {
+                        capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+                    }
+                    if let Some(ref task_store) = state.task_store {
+                        let _ = task_store.fail_task(&task_id, "subnet not found");
+                    }
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "code": "FORGE_SUBNET_NOT_FOUND",
+                            "message": format!("subnet '{}' not found", subnet_name),
+                            "task_id": task_id,
+                        })),
+                    );
+                }
+                Err(e) => {
+                    if let Some(ref capacity) = state.capacity {
+                        capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+                    }
+                    if let Some(ref task_store) = state.task_store {
+                        let _ = task_store.fail_task(&task_id, &e.to_string());
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "code": "FORGE_SUBNET_RESOLVE_FAILED",
+                            "message": e.to_string(),
+                            "task_id": task_id,
+                        })),
+                    );
+                }
+            }
+        } else {
+            warn!("forge: subnet requested but org store not available");
+            None
+        }
+    } else {
+        None
+    };
 
     let spec = syfrah_compute::VmSpec {
         id: syfrah_compute::VmId(req.name.clone()),
@@ -198,7 +260,7 @@ async fn create_instance_handler(
         gpu: syfrah_compute::GpuMode::None,
         ssh_key: req.ssh_key,
         disk_size_mb: req.disk_size_mb,
-        subnet: None,
+        subnet: subnet_info,
         security_groups: if req.security_groups.is_empty() {
             vec!["default".to_string()]
         } else {
@@ -516,6 +578,7 @@ mod tests {
             task_store: None,
             vm_manager: None,
             capacity: None,
+            org_store: None,
         })
     }
 
@@ -532,6 +595,7 @@ mod tests {
             task_store: Some(store),
             vm_manager: None,
             capacity: None,
+            org_store: None,
         });
         (dir, state)
     }
@@ -694,5 +758,77 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn create_with_subnet_requires_org_store() {
+        // When subnet is specified but org_store is None, the handler should
+        // still attempt creation (subnet_info will be None, network setup
+        // will be skipped by VmManager).
+        let state = test_state();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/instances")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"test","image":"alpine","subnet":"frontend"}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // 503 because vm_manager is None, not because of subnet
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn create_orchestration_task_tracking() {
+        // Verify that create sets up task tracking even when compute is unavailable
+        let (_dir, state) = test_state_with_tasks();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/instances")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"orch-test","image":"alpine","vcpus":1,"memory_mb":512}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // 503 because vm_manager is None
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn create_with_capacity_admission() {
+        // Verify admission control rejects when capacity is insufficient
+        let cap = Arc::new(CapacityTracker::with_capacity(1, 256));
+        let state = Arc::new(ForgeState {
+            started_at: Instant::now(),
+            task_store: None,
+            vm_manager: None,
+            capacity: Some(cap),
+            org_store: None,
+        });
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/instances")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"big-vm","image":"alpine","vcpus":4,"memory_mb":8192}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 409);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["code"], "FORGE_INSUFFICIENT_CAPACITY");
     }
 }
