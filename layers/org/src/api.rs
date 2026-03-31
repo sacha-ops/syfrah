@@ -1029,16 +1029,30 @@ fn handle_org_request(
                 Err(e) => return OrgResponse::Error(e.to_string()),
             };
 
-            // Check for routes referencing this NAT GW.
+            // Guard 1: Check for routes referencing this NAT GW.
             match store.routes_referencing_nat_gw(&gw.vpc_id, &name) {
                 Ok(refs) => {
                     if !refs.is_empty() {
                         let r = &refs[0];
-                        // Find the route table name.
                         let table_name = r.route_table_id.0.clone();
                         return OrgResponse::Error(format!(
                             "cannot delete nat-gw '{}': referenced by route {} in route table '{}'",
                             name, r.destination, table_name
+                        ));
+                    }
+                }
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            }
+
+            // Guard 2: Check for VMs actively using this NAT GW.
+            // A NAT GW is "in use" if there are active NICs in the VPC.
+            match store.list_nics_by_vpc(&gw.vpc_id.0) {
+                Ok(nics) => {
+                    let active_count = nics.len();
+                    if active_count > 0 {
+                        return OrgResponse::Error(format!(
+                            "cannot delete nat-gw '{}': {} VM(s) in VPC are actively using it",
+                            name, active_count
                         ));
                     }
                 }
