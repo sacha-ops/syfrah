@@ -32,6 +32,9 @@ pub enum ComputeError {
 
     #[error("image error: {0}")]
     Image(#[from] crate::image::error::ImageError),
+
+    #[error("network setup error: {0}")]
+    NetworkSetup(String),
 }
 
 /// Precondition not met before spawning a VM.

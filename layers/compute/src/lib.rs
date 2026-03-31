@@ -34,6 +34,7 @@ pub mod events;
 pub mod handler;
 pub mod image;
 pub mod manager;
+pub mod network_setup;
 pub mod phase;
 pub mod preflight;
 #[allow(dead_code)]
@@ -57,6 +58,7 @@ pub use error::{
 };
 pub use events::emit;
 pub use manager::{ComputeConfig, ReconnectSummary, VmManager};
+pub use network_setup::{NetworkSetup, NetworkSetupResult};
 pub use phase::VmPhase;
 pub use runtime_backend::{ComputeRuntime, RuntimeHandle, RuntimeInfo, RuntimeSpec, RuntimeType};
 pub use types::{GpuMode, NetworkConfig, VmEvent, VmId, VmSpec, VmStatus, VolumeAttachment};
