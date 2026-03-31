@@ -876,6 +876,7 @@ impl VmManager {
             ip: vm_ip,
             subnet: vm_subnet,
             vpc: vm_vpc,
+            security_groups: spec.security_groups.clone(),
             network_info: net_info,
         };
 
@@ -1242,6 +1243,7 @@ impl VmManager {
                     ip: None,
                     subnet: None,
                     vpc: None,
+                    security_groups: vec![],
                     network_info: None,
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));

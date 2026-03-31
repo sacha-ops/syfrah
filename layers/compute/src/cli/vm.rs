@@ -443,9 +443,20 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 println!("  vCPUs:     {vcpus}");
                 println!("  Memory:    {memory} MB");
                 println!("  Uptime:    {uptime}");
+                let sgs = v
+                    .get("security_groups")
+                    .and_then(|s| s.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| "-".to_string());
                 println!("  IP:        {ip}");
                 println!("  Subnet:    {subnet_val}");
                 println!("  VPC:       {vpc_val}");
+                println!("  SGs:       {sgs}");
             }
             Ok(())
         }

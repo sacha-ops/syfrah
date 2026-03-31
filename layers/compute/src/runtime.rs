@@ -53,6 +53,8 @@ pub(crate) struct VmRuntimeState {
     pub(crate) subnet: Option<String>,
     /// VPC the VM belongs to (e.g. "default").
     pub(crate) vpc: Option<String>,
+    /// Security groups attached to the VM's NIC.
+    pub(crate) security_groups: Vec<String>,
     /// Network metadata for teardown on delete. None if VM has no networking.
     pub(crate) network_info: Option<NetworkInfo>,
 }
@@ -100,6 +102,7 @@ impl VmRuntimeState {
             ip: self.ip.clone(),
             subnet: self.subnet.clone(),
             vpc: self.vpc.clone(),
+            security_groups: self.security_groups.clone(),
         }
     }
 }
@@ -129,6 +132,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            security_groups: vec![],
             network_info: None,
         }
     }
