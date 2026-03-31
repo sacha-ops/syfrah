@@ -18,8 +18,8 @@ use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
     Direction, Environment, EnvironmentId, NatGateway, NetworkInterface, Org, OrgId, PeeringStatus,
-    PortRange, Project, ProjectId, Protocol, Route, RouteTable, RouteTarget, RuleId, RuleSource,
-    SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
+    PortRange, Project, ProjectId, Protocol, ResourceState, Route, RouteTable, RouteTarget, RuleId,
+    RuleSource, SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -959,9 +959,35 @@ fn handle_org_request(
             };
             // Auto-detect public IP.
             let public_ip = detect_public_ip();
-            match store.create_nat_gw(&name, &vpc_obj.id, &sub.id, &public_ip) {
-                Ok(gw) => OrgResponse::NatGwResp(gw),
-                Err(e) => OrgResponse::Error(e.to_string()),
+            let _gw = match store.create_nat_gw(&name, &vpc_obj.id, &sub.id, &public_ip) {
+                Ok(g) => g,
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            // Collect all subnet CIDRs in this VPC for masquerade rules.
+            let subnet_cidrs: Vec<String> = match store.list_subnets(&vpc) {
+                Ok(subs) => subs.into_iter().map(|s| s.cidr).collect(),
+                Err(e) => {
+                    // Failed state — can't list subnets.
+                    let _ = store.update_nat_gw_state(&vpc_obj.id, &name, ResourceState::Failed);
+                    return OrgResponse::Error(format!("failed to list subnets: {e}"));
+                }
+            };
+
+            // Apply nftables masquerade rules.
+            match apply_nat_gw_nftables(&vpc, &subnet_cidrs) {
+                Ok(()) => {
+                    // Transition to Active.
+                    match store.update_nat_gw_state(&vpc_obj.id, &name, ResourceState::Active) {
+                        Ok(active_gw) => OrgResponse::NatGwResp(active_gw),
+                        Err(e) => OrgResponse::Error(e.to_string()),
+                    }
+                }
+                Err(nft_err) => {
+                    // Transition to Failed.
+                    let _ = store.update_nat_gw_state(&vpc_obj.id, &name, ResourceState::Failed);
+                    OrgResponse::Error(format!("nftables apply failed: {nft_err}"))
+                }
             }
         }
         OrgRequest::NatGwList { vpc } => match store.list_nat_gws_by_vpc_name(vpc.as_deref()) {
@@ -994,6 +1020,22 @@ fn handle_org_request(
                     }
                 }
                 Err(e) => return OrgResponse::Error(e.to_string()),
+            }
+
+            // Transition to Deleting state.
+            if let Err(e) = store.update_nat_gw_state(&gw.vpc_id, &name, ResourceState::Deleting) {
+                return OrgResponse::Error(e.to_string());
+            }
+
+            // Look up the VPC name for nftables comment matching.
+            let vpc_name = match store.get_vpc_by_id(&gw.vpc_id) {
+                Ok(Some(v)) => v.name,
+                _ => gw.vpc_id.0.clone(),
+            };
+
+            // Remove nftables masquerade rules.
+            if let Err(nft_err) = remove_nat_gw_nftables(&vpc_name) {
+                return OrgResponse::Error(format!("failed to remove nftables rules: {nft_err}"));
             }
 
             match store.delete_nat_gw(&gw.vpc_id, &name) {
@@ -1272,6 +1314,123 @@ pub async fn send_org_request(
         LayerResponse::UnknownLayer(name) => Err(format!("unknown layer: {name}").into()),
         other => Err(format!("unexpected response variant: {other:?}").into()),
     }
+}
+
+/// Detect the default outbound interface name.
+fn detect_public_iface() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Format: "8.8.8.8 via ... dev <iface> src ..."
+        if let Some(dev_idx) = stdout.find(" dev ") {
+            let after_dev = &stdout[dev_idx + 5..];
+            if let Some(iface) = after_dev.split_whitespace().next() {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Apply SNAT masquerade nftables rules for a NAT Gateway.
+///
+/// Adds masquerade rules for all subnets in the VPC via the public interface.
+fn apply_nat_gw_nftables(
+    vpc_name: &str,
+    subnet_cidrs: &[String],
+) -> std::result::Result<(), String> {
+    let public_iface = detect_public_iface()
+        .ok_or_else(|| "cannot detect public interface for NAT masquerade".to_string())?;
+
+    let mut ruleset = String::new();
+    use std::fmt::Write;
+    writeln!(ruleset, "add table ip syfrah_nat").unwrap();
+    writeln!(
+        ruleset,
+        "add chain ip syfrah_nat postrouting {{ type nat hook postrouting priority 100; policy accept; }}"
+    )
+    .unwrap();
+
+    for cidr in subnet_cidrs {
+        writeln!(
+            ruleset,
+            "add rule ip syfrah_nat postrouting ip saddr {cidr} oifname \"{public_iface}\" masquerade comment \"nat-gw:{vpc_name}\""
+        )
+        .unwrap();
+    }
+
+    apply_nft_ruleset(&ruleset)
+}
+
+/// Remove SNAT masquerade nftables rules for a NAT Gateway.
+fn remove_nat_gw_nftables(vpc_name: &str) -> std::result::Result<(), String> {
+    let output = std::process::Command::new("nft")
+        .args(["-a", "list", "chain", "ip", "syfrah_nat", "postrouting"])
+        .output()
+        .map_err(|e| format!("nft list failed: {e}"))?;
+
+    if !output.status.success() {
+        // Table/chain may not exist — nothing to remove.
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let comment_tag = format!("nat-gw:{vpc_name}");
+    let mut delete_cmds = String::new();
+    use std::fmt::Write;
+
+    for line in stdout.lines() {
+        if line.contains(&comment_tag) {
+            // Extract handle: "... # handle <N>"
+            if let Some(handle_str) = line.rsplit("# handle ").next() {
+                if let Ok(handle) = handle_str.trim().parse::<u64>() {
+                    writeln!(
+                        delete_cmds,
+                        "delete rule ip syfrah_nat postrouting handle {handle}"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    if !delete_cmds.is_empty() {
+        apply_nft_ruleset(&delete_cmds)?;
+    }
+    Ok(())
+}
+
+/// Apply an nftables ruleset via `nft -f -`.
+fn apply_nft_ruleset(ruleset: &str) -> std::result::Result<(), String> {
+    use std::io::Write as IoWrite;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn nft: {e}"))?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("failed to write to nft stdin: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("nft wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("nft failed: {stderr}"));
+    }
+    Ok(())
 }
 
 /// Detect the node's public IP from the default route interface.
