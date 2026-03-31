@@ -3,6 +3,7 @@
 **Status**: Proposed
 **Date**: 2026-03-30
 **Decided by**: Sacha + team, after architecture review
+**Revision**: v2 — incorporates operational realism review
 
 ## Context
 
@@ -39,7 +40,7 @@ Forge owns the full lifecycle of every resource on its node:
 - **Storage**: ZeroFS volumes, NBD connections, snapshots (future)
 - **Security**: security group rule enforcement, anti-spoofing, infrastructure protection rules
 
-Forge does not make scheduling decisions, does not know about other nodes' workloads, and does not own desired state. It receives desired state from the control plane (via Raft replication to the local redb store), observes actual state from the kernel and running processes, computes the diff, and acts.
+Forge does not make scheduling decisions, does not know about other nodes' workloads, and does not own desired state. It receives desired state via a **local materialized view** of the authoritative control-plane store (see "Desired State Projection" below), observes actual state from the kernel and running processes, computes the diff, and acts.
 
 ```
     ┌─────────────────────────────────────────────────────────────┐
@@ -48,8 +49,9 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
     │   in VPC prod, subnet frontend, SG web-sg"                  │
     └────────────────────────┬────────────────────────────────────┘
                              │
-                             │  Raft log replicated to all nodes
-                             │  (each node has local redb replica)
+                             │  Authoritative store replicated
+                             │  → local materialized view (redb)
+                             │  indexed by node_id + dependencies
                              ▼
     ┌─────────────────────────────────────────────────────────────┐
     │  Forge (Node B)                                              │
@@ -58,8 +60,8 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
     │                                                              │
     │  ┌──────────────────────────────────────────────────────┐   │
     │  │  Reconciliation Engine                                │   │
-    │  │  desired state (redb) ↔ actual state (kernel/procs)  │   │
-    │  │  → compute diff → apply changes → report via gossip   │   │
+    │  │  desired (materialized view) ↔ actual (kernel/procs)  │   │
+    │  │  → compute diff → apply changes → report telemetry    │   │
     │  └──────────────────────────────────────────────────────┘   │
     │                                                              │
     │  ┌─────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
@@ -76,7 +78,7 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
 
 1. **Forge manages ONLY local resources.** It creates, modifies, and destroys resources on this node. It never reaches across the fabric to mutate resources on another node. Cross-node coordination is the control plane's job.
 
-2. **Forge is stateless in intent.** Desired state comes from the control plane via Raft, replicated to the local redb store. Forge reads desired state, never writes it. Forge writes only observed state (via gossip) and derived state (kernel interfaces, nftables rules, FDB entries).
+2. **Forge is stateless in intent.** Desired state comes from the control plane via a local materialized view of the authoritative store. Forge reads desired state, never writes it. Forge writes only observed state (via gossip telemetry) and derived state (kernel interfaces, nftables rules, FDB entries).
 
 3. **Forge exposes a REST API on the fabric interface only.** Bound to the node's `syfrah0` IPv6 address on port 7100 (configurable). HTTP, not HTTPS — WireGuard provides encryption. Consistent with the Forge README's transport decision and api-architecture.md's internal transport.
 
@@ -87,6 +89,86 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
 6. **VMs are independent of Forge's process.** Cloud Hypervisor runs as a separate OS process per VM. Forge restart does not affect running VMs. This is the foundation of zero-downtime platform upgrades.
 
 7. **Forge subsumes the current daemon.** The current fabric daemon that runs the mesh, peering, control socket, and compute operations is the proto-Forge. Forge replaces and extends it — not as a separate process, but as the evolution of the daemon.
+
+8. **Mutation endpoints enqueue, reconciler executes.** API mutation endpoints enqueue an operation record and trigger immediate reconciliation. The API does NOT execute operations directly. Tasks are execution records for client observability. Resource state (not task state) is the authoritative source of truth. If Forge restarts mid-operation, the reconciler picks up from resource state, not from task state.
+
+## Desired State Projection
+
+Forge does NOT consume the global Raft log directly. Forge consumes a **local materialized view** of desired state, stored in the local redb instance.
+
+### How the materialized view works
+
+The authoritative control-plane store (Raft-based) contains the full desired state for all nodes. Each node maintains a **local projection** — a materialized subset containing only the resources relevant to that node.
+
+The projection is:
+- **Indexed by `node_id`**: every resource in the local view has `node_id == this_node`
+- **Indexed by resource dependencies**: if a VM is on this node, its VPC, subnet, security groups, route tables, and NAT gateways are also projected into the local view
+- **Materialized from the authoritative store**: the control plane pushes updates to each node's projection, or the node pulls its projection on startup and subscribes to incremental changes
+
+### Projection latency and staleness
+
+The local materialized view is **eventually consistent** with the authoritative store:
+
+- **Normal latency**: projection updates arrive within 1-2 Raft heartbeat intervals (typically < 1 second)
+- **Staleness bound**: Forge tracks a `projection_version` that corresponds to the last applied update from the authoritative store. If the projection falls behind by more than a configurable threshold (default: 30 seconds), Forge marks its `control_health` as degraded
+- **Stale reads are safe**: Forge always converges toward whatever desired state it sees. A stale projection means Forge reconciles against slightly-old desired state — this produces correct (if delayed) behavior, never incorrect behavior
+- **Full resync**: on startup, or if the projection version gap exceeds a threshold, Forge performs a full resync from the authoritative store rather than attempting incremental catch-up
+
+### Cache invalidation
+
+- **No local caching on top of the projection**: the redb materialized view IS the cache. There is no second layer of in-memory cache to invalidate
+- **Projection updates are applied atomically**: each update from the authoritative store is applied as a single redb transaction. Forge never sees a half-applied update
+- **Invalidation signal**: when the control plane commits a change affecting this node, it sends a notification (via the Raft subscription or a direct signal) that triggers immediate reconciliation. The periodic loop is the fallback if the signal is lost
+
+## Gossip Data Model
+
+Forge interacts with two distinct classes of distributed data. Conflating them leads to incorrect consistency assumptions.
+
+### Telemetry and hints (via gossip)
+
+Gossip carries **best-effort, eventually consistent** data used for scheduling hints and operational awareness:
+
+- **Node capacity**: available vCPUs, memory, disk — used by the scheduler as a placement hint
+- **Node health**: agent health status, drain status — used by the scheduler to avoid unhealthy nodes
+- **VM state hints**: which VMs are running/stopped/failed on each node — used for UI dashboards and fast status checks
+- **Drain status**: whether a node is draining — used by the scheduler to stop placing new workloads
+
+This data is **advisory**. The scheduler uses it for informed decisions, but the authoritative check happens at the node (Forge admission control). Gossip data may be stale by seconds. That is acceptable — it is a hint, not a contract.
+
+### Operational data (NOT gossip)
+
+The following data is **derived from the authoritative desired-state store** and MUST NOT be distributed or reconstructed via gossip:
+
+- **FDB entries**: derived from VM placement records in the authoritative store. Each node's Forge builds its local FDB table from the materialized view of which VMs are on which nodes in each VPC
+- **VM placements**: the authoritative source is the control-plane store, not gossip announcements
+- **Security group rules**: derived from the SG definitions in the authoritative store
+- **Route table entries**: derived from route table definitions in the authoritative store
+
+**Rebuild from authoritative store, not from event replay.** If a node restarts, it rebuilds FDB entries and other derived data from its local materialized view, not by replaying gossip events it may have missed. Gossip events are fire-and-forget hints; the authoritative store is the reconstruction source.
+
+## Internal Modularity
+
+Forge is a single binary with modular internals. Each module has a clear responsibility boundary:
+
+```
+forge-api         — HTTP server, request routing, auth middleware, request validation
+forge-reconciler  — reconciliation loop, drift detection, convergence engine
+forge-capacity    — resource tracking, admission control, reservation management
+forge-health      — self-health, node-health, workload-health, control-health checks
+forge-runtime     — delegates to compute (VmManager) and overlay (NetworkBackend)
+forge-task        — operation records, status tracking, progress reporting
+```
+
+### Module boundaries
+
+- **forge-api** accepts HTTP requests, validates input, writes intent records (desired mutations), and triggers the reconciler. It never executes infrastructure operations directly.
+- **forge-reconciler** is the core loop. It reads desired state from the materialized view, observes actual state from the kernel and running processes, computes diffs, and applies changes through forge-runtime. It processes resources in dependency order (see "Dependency Graph" below).
+- **forge-capacity** tracks total, used, reserved, and available resources. It answers admission queries ("can this node fit a 4-vCPU VM?") and manages reservations with expiry.
+- **forge-health** runs independent health checks across four categories (see "Health Monitoring" below) and computes the aggregate node health status.
+- **forge-runtime** wraps the compute layer's `VmManager` and the overlay layer's `NetworkBackend`. It translates reconciler commands into concrete infrastructure operations.
+- **forge-task** creates operation records when mutations are requested, tracks progress as the reconciler executes, and exposes status to API callers for observability.
+
+This is a single binary, not a microservices deployment. The modules are Rust modules (or crates in a workspace), not separate processes. The modularity prevents a monolith service where everything lives in one struct.
 
 ## Resource Model
 
@@ -113,14 +195,62 @@ Every resource carries:
 |---|---|---|
 | `id` | String | Globally unique identifier (assigned by control plane) |
 | `state` | ResourceState | Current lifecycle state (see state machine below) |
-| `desired_state` | DesiredState | What the control plane wants (from Raft) |
+| `desired_state` | DesiredState | What the control plane wants (from materialized view) |
 | `owner` | ResourceOwner | `{ org_id, project_id, env_id }` — the tenant hierarchy |
 | `node_id` | NodeId | Which node this resource is on |
-| `generation` | u64 | Version counter, incremented on every mutation. For optimistic concurrency. |
-| `created_at` | u64 | Unix timestamp of creation in Raft |
+| `spec_generation` | u64 | Incremented when desired state changes (from control plane) |
+| `observed_generation` | u64 | Incremented when Forge observes/reconciles the resource |
+| `reconcile_generation` | u64 | Which `spec_generation` the last successful reconcile targeted |
+| `created_at` | u64 | Unix timestamp of creation in authoritative store |
 | `updated_at` | u64 | Unix timestamp of last state change |
 | `last_reconciled_at` | u64 | Unix timestamp of last successful reconciliation |
 | `labels` | HashMap<String, String> | User-defined metadata (inherited from environment) |
+
+### Generation tracking
+
+Three generations track the relationship between desired state and observed reality:
+
+- **`spec_generation`** — incremented by the control plane each time desired state changes (resize, SG update, config change). Forge reads this from the materialized view.
+- **`observed_generation`** — incremented by Forge each time it observes the resource during reconciliation, regardless of whether changes were needed. Tracks "Forge has seen this."
+- **`reconcile_generation`** — set to the `spec_generation` that the last **successful** reconciliation targeted. If the reconciler successfully converges a resource to spec_generation 5, then reconcile_generation = 5.
+
+**Drift detection**: `spec_generation != reconcile_generation` means the resource has not yet converged to the latest desired state. This is the primary signal for the reconciler to act on a resource.
+
+**Optimistic concurrency**: mutation requests from the control plane include the expected `spec_generation`. If the resource's current spec_generation does not match, Forge rejects with `409 Conflict` to prevent lost updates.
+
+### Desired spec vs runtime attachments
+
+Every resource has a clear separation between what should exist (spec) and what actually exists (runtime):
+
+```
+Instance:
+  spec:     { vcpus: 2, memory_mb: 2048, image: "alpine-3.20", subnet: "frontend", sg: ["web-sg"] }
+  runtime:  { pid: 1234, tap: "syft-abc", ip: "10.1.0.3", mac: "02:00:0a:01:00:03", uptime_secs: 3600 }
+
+Bridge:
+  spec:     { vpc_id: "vpc-prod", vni: 100 }
+  runtime:  { kernel_ifindex: 42, attached_taps: ["syft-abc", "syft-def"], gateway_ips: ["10.1.0.1/24"] }
+
+NIC:
+  spec:     { subnet_id: "sub-frontend", vm_id: "vm-01HX", security_groups: ["sg-web"] }
+  runtime:  { tap_name: "syft-abc", nft_chains: ["vm_abc_in", "vm_abc_out"], fdb_installed: true }
+```
+
+**Spec** = what should exist (from the control plane). **Runtime** = what actually exists (from the kernel and processes). Forge reconciles runtime toward spec. Spec is immutable from Forge's perspective — only the control plane changes it.
+
+### Ownership registry
+
+Forge maintains an **ownership registry** in redb that tracks every resource it has created:
+
+| Field | Type | Description |
+|---|---|---|
+| `resource_id` | String | The resource's globally unique ID |
+| `resource_type` | String | `vm`, `bridge`, `nic`, `vxlan`, `nftables_chain`, etc. |
+| `kernel_name` | Option<String> | The Linux kernel name (e.g., `syfbr-abc`, `syftap-def`) |
+| `created_at` | u64 | When Forge created this resource |
+| `last_seen_at` | u64 | When Forge last verified this resource exists |
+
+The naming convention (`syfbr-*`, `syftap-*`, `syfvx-*`) is a **discovery aid**, not proof of ownership. On reconciliation, Forge consults the ownership registry to determine what it manages. See "Orphan Handling Policy" for how unregistered resources are treated.
 
 ### Resource types
 
@@ -139,20 +269,23 @@ Instance {
         kernel: Option<String>,
         gpu: GpuMode,
     },
-    nics: Vec<NicId>,
-    volumes: Vec<VolumeAttachment>,
-    node_id: NodeId,
     runtime: Option<VmRuntime {
         pid: u32,
         socket_path: String,
         ch_version: String,
         uptime_seconds: u64,
+        tap_name: String,
+        ip: Ipv4Addr,
+        mac: MacAddr,
     }>,
-    // ... common metadata fields
+    nics: Vec<NicId>,
+    volumes: Vec<VolumeAttachment>,
+    node_id: NodeId,
+    // ... common metadata fields (including spec/observed/reconcile generations)
 }
 ```
 
-Forge delegates to the compute layer's `VmManager` for Cloud Hypervisor process management. The compute layer handles spawn, monitor, reconnect, and kill chain. Forge orchestrates the full lifecycle: network setup → volume attach → compute spawn → SG apply → FDB announce.
+Forge delegates to the compute layer's `VmManager` for Cloud Hypervisor process management. The compute layer handles spawn, monitor, reconnect, and kill chain. Forge orchestrates the full lifecycle: network setup → volume attach → compute spawn → SG apply → FDB populate.
 
 #### Network resources
 
@@ -188,7 +321,7 @@ NetworkInterface {
 }
 ```
 
-**FDB entry** — derived state, not a first-class resource. Forge creates FDB entries from VM placement data and repopulates them on restart.
+**FDB entry** — derived state, not a first-class resource. Forge creates FDB entries from VM placement data in the materialized view and repopulates them on restart from that same source (not from gossip replay).
 
 **nftables rules** — derived state. Generated from security group rules, anti-spoofing config, NAT gateway config, and route table config. Recomputed atomically on any change.
 
@@ -210,7 +343,7 @@ Volume {
 
 #### Security resources
 
-**SecurityGroup** — definition and rules stored in redb (from Raft). Forge enforces them as nftables rules on local NICs.
+**SecurityGroup** — definition and rules stored in redb (from the materialized view). Forge enforces them as nftables rules on local NICs.
 
 **NatGateway** — per ADR-002. Forge configures nftables masquerade chains for NAT gateways on this node.
 
@@ -224,12 +357,13 @@ Every resource follows a strict lifecycle with explicit, auditable transitions.
 
 ```
 enum ResourceState {
-    Pending,        // resource defined in Raft, not yet acted on by Forge
-    Creating,       // Forge is actively provisioning (spawning process, creating interface)
+    Pending,        // resource defined in desired state, not yet acted on by Forge
+    Creating,       // Forge is actively provisioning for the FIRST time (spawning process, creating interface)
     Active,         // resource is operational and reconciled
-    Updating,       // Forge is applying a change (resize, SG update, route change)
-    Stopping,       // VM being gracefully stopped
-    Stopped,        // VM stopped, resources still allocated
+    Updating,       // Forge is applying a spec change (resize, SG update, route change)
+    Stopping,       // graceful shutdown in progress
+    Stopped,        // resource stopped, runtime artifacts still allocated
+    Starting,       // restart of an existing resource (NOT first creation)
     Deleting,       // Forge is tearing down the resource
     Deleted,        // resource fully cleaned up, record retained for audit
     Failed,         // unrecoverable error, requires operator attention or control plane action
@@ -239,41 +373,51 @@ enum ResourceState {
 ### Transition diagram
 
 ```
-Pending ──→ Creating ──→ Active
+Pending ──→ Creating ──→ Active           (first materialization)
                 │            │
-                ▼            ├──→ Updating ──→ Active
+                ▼            ├──→ Updating ──→ Active       (resize, config change)
               Failed         │
-                │            ├──→ Stopping ──→ Stopped ──→ Starting ──→ Active
+                │            ├──→ Stopping ──→ Stopped      (graceful stop)
                 │            │                    │
-                │            │                    ├──→ Deleting ──→ Deleted
+                │            │                    ├──→ Starting ──→ Active   (restart)
+                │            │                    │
+                │            │                    ├──→ Deleting ──→ Deleted  (removal from stopped)
                 │            │                    │
                 │            │                    └──→ Failed
                 │            │
-                │            ├──→ Deleting ──→ Deleted
+                │            ├──→ Deleting ──→ Deleted       (removal)
                 │            │
                 │            └──→ Failed
                 │
                 └──→ Deleting ──→ Deleted
 ```
 
+### Key distinctions
+
+- **`Creating`** = first materialization of a resource that has never existed. Used only once in a resource's lifecycle.
+- **`Starting`** = restart of an existing resource that was previously `Stopped`. The resource's runtime artifacts (TAP, bridge attachment, etc.) may still exist. Never reuse `Creating` for restart.
+- **`Stopping`** = graceful shutdown is in progress. The VM has been asked to shut down (ACPI/SIGTERM) but the process has not yet exited. This is a transient state — it resolves to `Stopped` or `Failed`.
+
 ### Transition rules
 
 | From | To | Trigger | Who |
 |---|---|---|---|
-| Pending | Creating | Forge begins provisioning | Forge (reconciliation loop) |
+| Pending | Creating | Forge begins first-time provisioning | Forge (reconciliation loop) |
 | Creating | Active | All provisioning steps succeeded | Forge |
 | Creating | Failed | Provisioning step failed after retries | Forge |
-| Active | Updating | Spec change detected (resize, SG update) | Forge (reconciliation loop) |
+| Active | Updating | Spec change detected (`spec_generation != reconcile_generation` with spec diff) | Forge (reconciliation loop) |
 | Updating | Active | Update applied successfully | Forge |
 | Updating | Failed | Update failed after retries | Forge |
-| Active | Stopping | Stop requested in Raft desired state | Forge (reconciliation loop) |
-| Stopping | Stopped | VM process exited cleanly | Forge |
+| Active | Stopping | Stop requested in desired state | Forge (reconciliation loop) |
+| Stopping | Stopped | Process exited cleanly | Forge |
 | Stopping | Failed | Kill chain exhausted, process still alive | Forge |
-| Stopped | Creating | Restart requested in Raft desired state | Forge (reconciliation loop) |
-| Stopped | Deleting | Delete requested in Raft desired state | Forge (reconciliation loop) |
-| Active | Deleting | Delete requested in Raft desired state | Forge (reconciliation loop) |
+| Stopped | Starting | Restart requested in desired state | Forge (reconciliation loop) |
+| Starting | Active | Resource is running again | Forge |
+| Starting | Failed | Restart failed after retries | Forge |
+| Stopped | Deleting | Delete requested in desired state | Forge (reconciliation loop) |
+| Active | Deleting | Delete requested in desired state | Forge (reconciliation loop) |
 | Active | Failed | Runtime failure (process crash, interface disappeared) | Forge (monitor) |
-| Failed | Deleting | Delete requested in Raft desired state | Forge (reconciliation loop) |
+| Failed | Deleting | Delete requested in desired state | Forge (reconciliation loop) |
 | Deleting | Deleted | All cleanup completed | Forge |
 | Deleting | Failed | Cleanup failed (e.g., resource stuck) | Forge |
 
@@ -281,7 +425,7 @@ Pending ──→ Creating ──→ Active
 
 ### Desired state vs observed state
 
-The control plane writes **desired state** to Raft:
+The control plane writes **desired state** to the authoritative store:
 - "VM web-1 should be Running with 2 vCPUs, 4GB, on Node B, in VPC prod"
 - "Security group web-sg should have rules [TCP 80, TCP 443 from 0.0.0.0/0]"
 - "NAT Gateway nat-1 should exist in VPC prod, subnet frontend"
@@ -300,19 +444,30 @@ The reconciliation engine computes the diff and drives actual state toward desir
 - **Protocol**: HTTP/1.1 + JSON
 - **Bind address**: Node's fabric IPv6 address (`syfrah0`) — never `0.0.0.0` or `::`
 - **Port**: 7100 (configurable via `[forge] port` in `config.toml`)
-- **Encryption**: WireGuard provides encryption at the fabric layer. No TLS on top. This matches the Forge README design and is consistent with Kubernetes kubelet, AWS Nitro host agent, and other cloud provider host agents.
+- **Encryption**: WireGuard provides encryption at the fabric layer. See "Security" section for the phased security model.
 - **Reachability**: Only from within the mesh. A port scan from the internet will never find Forge. The binding itself is the access control.
 
 ### Authentication and authorization
 
-**Phase 1 (pre-control plane)**:
+**Phase 1 (single-operator, WireGuard-only)**:
 - Any mesh node can call any other node's Forge API. Acceptable for a single-operator mesh.
 - The fabric's WireGuard authentication (only nodes with the mesh secret can reach `syfrah0`) is the access control.
+- Bearer token derived from mesh secret for basic request authentication. This is **Phase 1 only**, not the long-term model.
 
-**Phase 2 (with control plane)**:
-- Bearer token derived from mesh secret. The control plane leader includes the token when sending commands.
+**Phase 2+ (application-level authenticated identity)**:
+- **Minimum**: signed requests — every mutation carries a cryptographic signature from the originating control-plane identity. The signing key is not the mesh secret.
+- **Recommended**: mTLS between control plane and Forge endpoints. Each node gets a unique certificate issued by a cluster CA. This provides per-node identity, not just "is this node in the mesh."
 - Role separation: only the Raft leader (or nodes acting on its behalf) can call mutation endpoints. Other nodes can only call read-only endpoints (`/v1/node/*`, `GET` on any resource).
 - All mutation requests carry a `raft_term` and `raft_index` to prevent stale commands from a deposed leader.
+
+### API/task/reconciliation contract
+
+The relationship between API, tasks, and reconciliation is strict:
+
+1. **API writes intent**: mutation endpoints (POST, DELETE, PATCH) create an operation record describing the desired change and trigger immediate reconciliation. They do NOT execute infrastructure operations directly.
+2. **Reconciler executes**: the reconciliation engine reads the desired state (including newly-written intents), computes the diff against actual state, and applies changes through forge-runtime.
+3. **Tasks track progress**: a task is an execution record for client observability. It tracks which operation was requested, its current progress, and its outcome. Tasks are NOT the source of truth — resource state is.
+4. **Restart safety**: if Forge restarts mid-operation, the reconciler picks up from **resource state** (what exists in the kernel and in the materialized view), not from task state. Incomplete tasks are marked as interrupted; the reconciler re-derives what needs to happen from the resource diff.
 
 ### Versioning
 
@@ -337,7 +492,8 @@ Every response includes:
 {
   "request_id": "req-a7f3e29b1c04",
   "resource": { ... },
-  "generation": 42,
+  "spec_generation": 5,
+  "reconcile_generation": 4,
   "timestamp": 1711555200
 }
 ```
@@ -369,7 +525,7 @@ Error code prefix: `FORGE_` for all Forge-level errors. Consistent with api-arch
 |---|---|---|
 | `POST` | `/v1/instances` | Create a VM instance |
 | `GET` | `/v1/instances` | List all VM instances on this node |
-| `GET` | `/v1/instances/:id` | Get instance details (spec, state, runtime, NICs, volumes) |
+| `GET` | `/v1/instances/:id` | Get instance details (spec, runtime, NICs, volumes) |
 | `DELETE` | `/v1/instances/:id` | Delete instance (triggers full cleanup) |
 | `POST` | `/v1/instances/:id/start` | Start a stopped instance |
 | `POST` | `/v1/instances/:id/stop` | Stop a running instance (graceful shutdown) |
@@ -397,31 +553,31 @@ POST /v1/instances
 }
 ```
 
-Forge executes the following steps (any failure triggers rollback of completed steps):
+The API writes the intent and returns a `task_id`. The reconciler then executes the following steps. If any step fails, Forge performs **compensating cleanup** of already-applied steps (best-effort, not transactional — see "Failure Handling"):
 
 1. **Admission**: check node capacity (vCPUs, memory). If insufficient, reject with `409 Conflict`.
 2. **Reserve resources**: mark vCPUs and memory as reserved in local tracker. Reservation expires after 60s.
 3. **Network setup**: ensure VPC bridge + VXLAN exist (create if first VM in VPC on this node). Create TAP device. Attach TAP to bridge. Add subnet gateway IP to bridge if needed.
 4. **Security**: apply nftables rules — anti-spoofing (source MAC/IP = assigned values), ingress rules from security groups, egress rules, conntrack. Use the per-VM chain architecture from ADR-002.
-5. **FDB + ARP**: add local FDB entry. Add ARP proxy entry. Store `VmPlacement` record. Announce to fabric peers (gossip-based distribution).
+5. **FDB + ARP**: add local FDB entry. Add ARP proxy entry. Store placement record in local state.
 6. **Config-drive**: generate cloud-init ISO with IP, gateway, DNS, MTU=1350, SSH keys.
 7. **Storage**: if volumes are requested, connect ZeroFS NBD and attach to VM config.
 8. **Compute**: spawn Cloud Hypervisor process, create VM via CH REST API, boot.
-9. **Confirm**: verify VM is running (ping CH API). Release resource reservation (now counted as used). Transition state to Active. Gossip status.
+9. **Confirm**: verify VM is running (ping CH API). Release resource reservation (now counted as used). Transition state to Active. Register in ownership registry. Report telemetry via gossip.
 
 **Delete instance** orchestration:
 
 1. Transition state to `Deleting`.
 2. Stop VM (graceful shutdown chain: ACPI → power button → SIGTERM → SIGKILL).
-3. Announce `VmPlacement{Remove}` to all fabric peers.
-4. Remove FDB + ARP proxy entries.
-5. Remove nftables chains for this VM.
-6. Delete TAP device.
-7. Remove subnet gateway IP from bridge (if no other VMs on this subnet on this node).
-8. Delete bridge + VXLAN (if no other VMs in this VPC on this node).
-9. Release IPAM allocation.
-10. Detach and disconnect volumes.
-11. Clean up compute runtime directory (`/run/syfrah/vms/{id}/`).
+3. Remove FDB + ARP proxy entries.
+4. Remove nftables chains for this VM.
+5. Delete TAP device.
+6. Remove subnet gateway IP from bridge (if no other VMs on this subnet on this node).
+7. Delete bridge + VXLAN (if no other VMs in this VPC on this node).
+8. Release IPAM allocation.
+9. Detach and disconnect volumes.
+10. Clean up compute runtime directory (`/run/syfrah/vms/{id}/`).
+11. Remove from ownership registry.
 12. Transition state to `Deleted`.
 
 #### Network
@@ -460,8 +616,8 @@ Forge executes the following steps (any failure triggers rollback of completed s
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v1/node/status` | Node health (healthy/degraded/unhealthy), uptime, pending operations |
-| `GET` | `/v1/node/health` | Detailed health checks (each subsystem pass/fail) |
+| `GET` | `/v1/node/status` | Node health (composite of 4 health categories), uptime, pending operations |
+| `GET` | `/v1/node/health` | Detailed health checks (4 categories, each with independent status) |
 | `GET` | `/v1/node/capacity` | Total vs used vs reserved resources |
 | `GET` | `/v1/node/metrics` | CPU, memory, disk, network utilization |
 | `GET` | `/v1/node/resources` | Summary of all managed resources by type and state |
@@ -477,7 +633,7 @@ Forge executes the following steps (any failure triggers rollback of completed s
 | `GET` | `/v1/tasks/:id` | Status of an async operation (creating VM, etc.) |
 | `GET` | `/v1/tasks` | List recent tasks |
 
-Long-running operations (VM create, VM delete) return immediately with a `task_id`. The caller polls `/v1/tasks/:id` for completion. The reconciliation loop also drives these operations forward, so polling is optional — the control plane can rely on gossip to learn when operations complete.
+Long-running operations (VM create, VM delete) return immediately with a `task_id`. The caller polls `/v1/tasks/:id` for completion. The reconciliation loop drives these operations forward, so polling is optional — the control plane can rely on gossip telemetry to learn when operations complete. Tasks are execution records for client observability; resource state is always the authoritative source of truth.
 
 ### Idempotency
 
@@ -494,32 +650,74 @@ All operations are idempotent:
 
 The `X-Idempotency-Key` header provides additional protection for create operations: if the same key is used twice, the second request returns the resource created by the first, even if the caller crashed before receiving the response.
 
-Generation-based optimistic concurrency: every mutation response includes a `generation` counter. If a caller sends a mutation with an outdated generation, Forge rejects it with `409 Conflict`. This prevents lost updates when multiple control plane operations target the same resource.
+## Dependency Graph
+
+Forge maintains a local dependency graph that determines the order in which resources are created, updated, and destroyed.
+
+### Resource dependency tree
+
+```
+VPC presence on node
+  └── Bridge (syfbr-*)
+        ├── VXLAN (syfvx-*)
+        ├── NIC (TAP/veth)
+        │     ├── SG rules (nftables chains)
+        │     └── FDB entry
+        └── NAT masquerade (if NAT GW exists)
+              └── Route pointing to NAT GW
+
+VM Instance
+  ├── NIC (must exist before boot)
+  ├── Config-drive (with network config)
+  └── Runtime process (CH or crun)
+```
+
+### Ordering rules
+
+**Creation/update** — apply changes in dependency order (top-down):
+1. VPC bridge + VXLAN (infrastructure must exist first)
+2. NICs / TAP devices (must exist before VM boot)
+3. Security group rules (applied before VM traffic flows)
+4. VM compute process (depends on network and storage)
+5. FDB + ARP entries (propagated after VM is running)
+6. Storage volume attach (can happen after VM is running)
+
+**Deletion/cleanup** — apply changes in **reverse** dependency order (bottom-up):
+1. Storage volume detach
+2. FDB + ARP entry removal
+3. VM compute process stop
+4. Security group rule flush
+5. NIC / TAP device removal
+6. Bridge + VXLAN removal (only if no other VMs in VPC on this node)
+
+The reconciler processes resources according to this graph. A resource is not processed until its dependencies are satisfied. Circular dependencies are a design error and are rejected at validation time.
 
 ## Reconciliation Engine
 
-The reconciliation engine is Forge's core. It runs continuously, comparing desired state (from Raft/redb) with actual state (from the kernel and running processes), and acting on the differences.
+The reconciliation engine is Forge's core. It runs continuously, comparing desired state (from the local materialized view) with actual state (from the kernel and running processes), and acting on the differences.
 
 ### Architecture
 
 ```
     ┌─────────────────────────────────────────────────┐
-    │  Local redb replica (synced from Raft)           │
+    │  Local materialized view (redb)                  │
+    │  Projected from authoritative control-plane store│
     │  Contains: VMs, NICs, SGs, VPCs, subnets,       │
     │  routes, NAT GWs scheduled for this node         │
+    │  Indexed by: node_id, resource dependencies      │
     └────────────────────┬────────────────────────────┘
                          │ read
                          ▼
     ┌─────────────────────────────────────────────────┐
-    │  Reconciliation Engine                           │
+    │  Reconciliation Engine (forge-reconciler)        │
     │                                                  │
-    │  1. Read desired state (from redb)              │
+    │  1. Read desired state (from materialized view) │
     │  2. Observe actual state (from kernel/procs)    │
-    │  3. Compute diff                                │
-    │  4. Apply changes (create/update/delete)        │
-    │  5. Report observed state (via gossip)          │
+    │  3. Compute diff (spec_gen != reconcile_gen?)   │
+    │  4. Apply changes in dependency order            │
+    │  5. Report telemetry via gossip                  │
     │                                                  │
-    │  Runs every 5s (configurable) + on Raft events  │
+    │  Runs every 5s (configurable) + on state events │
     └────────────────────┬────────────────────────────┘
                          │ write
                          ▼
@@ -537,7 +735,7 @@ At a configurable interval (default 5 seconds, set via `[forge] reconcile_interv
 
 **Step 1 — Read desired state**
 
-Query the local redb for all resources scheduled on this node:
+Query the local materialized view for all resources scheduled on this node:
 - VMs with `node_id == this_node` and desired state `Running` or `Stopped`
 - VPCs that have VMs on this node (to ensure bridges exist)
 - Subnets, NICs, security groups, route tables, NAT gateways for those VPCs
@@ -566,11 +764,11 @@ For each resource type, compare desired vs actual:
 | VM should be Running | CH process alive | No action (converged) |
 | VM should be Stopped | CH process alive | Stop VM (graceful shutdown chain) |
 | VM should be Deleted | CH process exists | Delete (full cleanup) |
-| No VM desired | CH process running | Stop and cleanup (orphaned) |
+| No VM desired | CH process running, in registry | Stop and cleanup (orphaned) |
 | VPC has VMs here | No bridge exists | Create VXLAN + bridge |
 | VPC has no VMs here | Bridge exists | Delete bridge + VXLAN (cleanup) |
 | SG rules changed | nftables rules stale | Recompute and atomically replace chains |
-| FDB entry missing | Remote VM exists in VPC | Add FDB entry |
+| FDB entry missing | Remote VM exists in VPC | Add FDB entry (from materialized view) |
 | FDB entry present | Remote VM deleted | Remove FDB entry |
 | NAT GW desired | No masquerade chain | Configure masquerade |
 | NAT GW deleted | Masquerade chain present | Remove masquerade |
@@ -578,30 +776,24 @@ For each resource type, compare desired vs actual:
 
 **Step 4 — Apply changes**
 
-Changes are applied in dependency order:
-1. Network infrastructure first (bridges, VXLANs) — these must exist before VMs can be created
-2. NICs (TAP devices) — must exist before VMs boot
-3. Security (nftables rules) — applied before VM traffic flows
-4. Compute (VM lifecycle) — depends on network and storage
-5. FDB + ARP — propagated after VM is running
-6. Storage (volume attach/detach) — can happen after VM is running
+Changes are applied in dependency order (see "Dependency Graph" above). Each change is logged with: resource ID, action taken, duration, success/failure.
 
-Each change is logged with: resource ID, action taken, duration, success/failure.
+**Step 5 — Report telemetry**
 
-**Step 5 — Report observed state**
-
-After reconciliation, Forge reports to the gossip layer:
-- State of each VM (Running, Stopped, Failed, with error details)
+After reconciliation, Forge reports telemetry via gossip:
+- State hints for each VM (Running, Stopped, Failed, with error details)
 - Node health and available capacity
 - Reconciliation summary (drift detected, changes applied, errors)
+
+This telemetry is best-effort and eventually consistent. It is used for dashboards and scheduling hints, not for authoritative state queries.
 
 ### Event-driven reconciliation
 
 In addition to the periodic loop, reconciliation is triggered immediately when:
-- A Raft log entry is committed that affects this node (new VM scheduled, SG updated, etc.)
+- A materialized view update arrives that affects this node (new VM scheduled, SG updated, etc.)
 - A VM crash is detected by the process monitor
 - A network interface disappears (detected by netlink monitoring)
-- An API call creates or deletes a resource
+- An API call creates or deletes a resource (API writes intent, triggers reconciler)
 
 This ensures sub-second response to state changes while the periodic loop catches anything missed.
 
@@ -616,18 +808,17 @@ Forge detects and corrects the following drift scenarios:
 | VXLAN missing | `ip link show syfvx-{vpc}` not found | Recreate VXLAN, reattach to bridge |
 | TAP missing | `ip link show syftap-{hash}` not found | Recreate TAP, reattach to bridge. If VM was using it, mark VM Failed. |
 | nftables rules drifted | Compare generated rules vs `nft list` | Atomic replacement of per-VM chain |
-| FDB entry missing | Compare redb placements vs `bridge fdb show` | Re-add missing FDB entries |
+| FDB entry missing | Compare materialized view placements vs `bridge fdb show` | Re-add missing FDB entries |
 | ARP proxy entry missing | Compare IPAM vs `ip neigh show` | Re-add ARP proxy entries |
 | IP address missing from bridge | Compare subnets vs `ip addr show` | Re-add gateway IP |
 | NAT masquerade missing | Compare NAT GW state vs nftables nat | Re-apply masquerade chain |
-| Orphaned process (CH running, no desired state) | PID exists in `/run/syfrah/vms/` but not in redb | Stop and cleanup |
-| Orphaned interface (kernel, no desired state) | `syfbr-*`/`syftap-*` exists but not in redb | Log warning, delete |
+| Orphaned process (owned) | PID in `/run/syfrah/vms/` and in ownership registry, but not in desired state | Stop and cleanup |
 
 ### Convergence guarantees
 
 - **Eventually consistent**: after a bounded number of reconciliation cycles, actual state matches desired state for all non-failed resources. The bound is: at most 3 cycles for a single resource (1 to detect, 1 to act, 1 to verify).
 - **Idempotent**: applying the same desired state any number of times produces the same result.
-- **Safe**: Forge never deletes a resource it did not create. It identifies Syfrah-managed resources by naming convention (`syfbr-*`, `syftap-*`, `syfvx-*`) and metadata in redb.
+- **Safe**: Forge only manages resources in its ownership registry. See "Orphan Handling Policy" for how unregistered resources are treated.
 - **Observable**: every reconciliation cycle produces a structured log entry with: cycle ID, duration, resources checked, drift detected, changes applied, errors encountered.
 - **Bounded**: each reconciliation cycle has a deadline (default 30 seconds). If a cycle exceeds the deadline, it logs the incomplete work and resumes in the next cycle. Resources are processed in priority order (running VMs first, then network, then cleanup).
 
@@ -635,20 +826,64 @@ Forge detects and corrects the following drift scenarios:
 
 When reconciliation fails for a resource:
 
-1. **Retry with backoff**: transient failures (network blip, temporary disk full) are retried up to 3 times with exponential backoff (1s, 2s, 4s).
-2. **Mark as Failed**: if retries are exhausted, the resource's observed state is set to Failed with a structured error (code, message, details).
-3. **Report via gossip**: the control plane sees the failure and can decide: alert the operator, reschedule to another node, or retry later.
-4. **Move on**: the reconciliation loop continues with other resources. One failed resource does not block reconciliation of others.
-5. **Never silently drop**: a failed resource stays in desired state (Raft) until explicitly deleted or the control plane decides to reschedule.
+1. **Compensating cleanup**: if a multi-step operation fails partway through, Forge performs **best-effort compensating cleanup** of already-applied steps. This is NOT a transactional rollback — some cleanup steps may themselves fail.
+2. **Residual artifacts**: any artifacts that compensating cleanup could not remove are caught by the reconciliation loop on the next cycle. The loop re-evaluates the resource's actual state and converges toward the desired state.
+3. **Retry with backoff**: transient failures (network blip, temporary disk full) are retried up to 3 times with exponential backoff (1s, 2s, 4s).
+4. **Mark as Failed**: if retries and compensating cleanup are exhausted, the resource's observed state is set to Failed with a structured error (code, message, details).
+5. **Report via gossip**: the control plane sees the failure and can decide: alert the operator, reschedule to another node, or retry later.
+6. **Move on**: the reconciliation loop continues with other resources. One failed resource does not block reconciliation of others.
+7. **Never silently drop**: a failed resource stays in desired state until explicitly deleted or the control plane decides to reschedule.
+8. **Never claim complete rollback**: the system provides compensating cleanup + eventual convergence via the reconciliation loop. This is honest about the reality of infrastructure operations — they are not transactional.
 
 ### What the reconciliation loop does NOT do
 
 - **Does not make scheduling decisions** — the control plane scheduler decides which node runs which VM.
-- **Does not write to Raft** — it only reads Raft (via local redb replica) and writes to gossip.
-- **Does not coordinate with other nodes** — each Forge reconciles independently. Cross-node coordination (e.g., FDB distribution) is handled by the gossip protocol, triggered by Forge.
+- **Does not write to the authoritative store** — it only reads the materialized view and writes gossip telemetry.
+- **Does not coordinate with other nodes** — each Forge reconciles independently. Cross-node data (e.g., FDB entries) is derived from the materialized view.
 - **Does not retry forever** — after N retries, it marks the resource as Failed and moves on.
 
+## Orphan Handling Policy
+
+Forge uses a 3-tier policy for resources discovered on the local system:
+
+### Tier 1 — Known owned
+
+Resources that exist in the **ownership registry**: manage normally. These are resources Forge created and tracks. Reconcile them against desired state as usual.
+
+### Tier 2 — Suspected owned
+
+Resources that **match the naming convention** (`syfbr-*`, `syftap-*`, `syfvx-*`) but are **NOT in the ownership registry**: quarantine.
+
+- Log a warning: `"suspected orphaned resource: syfbr-abc123 matches naming convention but not in ownership registry"`
+- Do NOT delete. Do NOT modify.
+- On the next reconcile cycle, if the resource matches a desired-state entry (e.g., a bridge that should exist for a VPC on this node), add it to the ownership registry and manage it going forward.
+- If it does not match any desired state after 3 consecutive reconcile cycles, escalate: log an error and report via gossip for operator attention.
+
+### Tier 3 — Unknown
+
+Resources that **do not match the naming convention**: ignore completely. Forge never touches resources it does not recognize. A bridge named `docker0` or a TAP named `virbr0-nic` is invisible to Forge.
+
+This 3-tier policy prevents Forge from accidentally destroying resources it did not create while still recovering from edge cases (e.g., Forge restarted with an empty registry but resources from a previous run still exist in the kernel).
+
 ## Node Capacity and Resource Management
+
+### CPU capacity model
+
+Forge's CPU capacity is a **scheduler-facing allocatable compute unit abstraction**, not a raw hardware measurement:
+
+| Concept | Value | Source |
+|---|---|---|
+| **Logical CPUs** | `sysconf(_SC_NPROCESSORS_ONLN)` | Detected at startup |
+| **Host reserved** | Configurable (default: 1 vCPU) | Reserved for Forge process, daemon, OS overhead |
+| **Allocatable** | Logical CPUs - Host reserved | What the scheduler can allocate against |
+| **Overcommit capacity** | Allocatable * overcommit ratio | Maximum vCPUs that can be sold |
+
+Example: a 32-logical-CPU node with 1 reserved and 2:1 overcommit has `(32 - 1) * 2 = 62` allocatable vCPUs.
+
+Important caveats:
+- This is explicitly a **scheduling abstraction**, not a claim about real CPU capacity. A "vCPU" is a time-share of a logical CPU, not a dedicated core.
+- The overcommit ratio is applied to allocatable capacity, not to raw hardware count.
+- **Future**: topology-aware capacity (NUMA nodes, SMT/hyperthreading awareness, CPU pinning, cpusets). The current model treats all logical CPUs as fungible, which is adequate for general-purpose workloads but insufficient for latency-sensitive or NUMA-aware workloads.
 
 ### Resource tracking
 
@@ -656,7 +891,7 @@ Forge tracks the capacity of its node:
 
 | Resource | Total | Source |
 |---|---|---|
-| vCPUs | Physical cores (from `/proc/cpuinfo`) | Detected at startup, cached |
+| vCPUs | Allocatable compute units (see above) | Detected at startup, cached |
 | Memory | Total RAM (from `/proc/meminfo`) | Detected at startup, cached |
 | Disk | Filesystem space (from `statvfs` on `/opt/syfrah/`) | Checked periodically |
 | Network NICs | Count of TAP devices | Tracked dynamically |
@@ -664,11 +899,13 @@ Forge tracks the capacity of its node:
 Resource accounting:
 
 ```
-Available = Total - System_Reserved - Used - Pending_Reserved
+Available = Allocatable - Used - Pending_Reserved
 
 Where:
-  System_Reserved = configurable amount reserved for the host OS and Syfrah itself
-                    (default: 2 vCPUs, 4GB RAM, 20GB disk)
+  Allocatable = (Logical_CPUs - Host_Reserved) * Overcommit_Ratio   [for CPU]
+  Allocatable = Total - System_Reserved                              [for memory, disk]
+  System_Reserved = configurable amount reserved for host OS and Syfrah itself
+                    (default: 1 vCPU, 4GB RAM, 20GB disk)
   Used = sum of all Active VM allocations
   Pending_Reserved = sum of all in-flight reservations (creating VMs)
 ```
@@ -681,8 +918,6 @@ Where:
 | Memory | 1:1 (no overcommit) | Yes (`[forge] memory_overcommit_ratio`) | Memory overcommit leads to OOM kills. Default to safe. |
 | Disk | 1:1 (no overcommit) | No | Disk overcommit leads to data loss. Never overcommit. |
 
-With 2:1 CPU overcommit, a 32-core node can host VMs totaling 64 vCPUs. The operator can adjust this based on workload characteristics.
-
 ### Resource reporting
 
 Forge reports capacity to the gossip layer every 10 seconds (configurable via `[forge] capacity_report_interval_secs`):
@@ -690,10 +925,10 @@ Forge reports capacity to the gossip layer every 10 seconds (configurable via `[
 ```json
 {
   "node_id": "node-01HX...",
-  "total_vcpus": 32,
+  "allocatable_vcpus": 62,
   "used_vcpus": 18,
   "reserved_vcpus": 4,
-  "available_vcpus": 42,
+  "available_vcpus": 40,
   "total_memory_mb": 131072,
   "used_memory_mb": 65536,
   "reserved_memory_mb": 8192,
@@ -703,13 +938,13 @@ Forge reports capacity to the gossip layer every 10 seconds (configurable via `[
   "available_disk_gb": 630,
   "instance_count": 12,
   "instance_count_by_state": { "Active": 10, "Creating": 1, "Failed": 1 },
-  "health": "healthy",
+  "health": { "agent": "healthy", "node": "healthy", "workload": "healthy", "control": "healthy" },
   "draining": false,
   "timestamp": 1711555200
 }
 ```
 
-The scheduler (in the control plane) uses this data to place VMs. Gossip data is a hint, not a guarantee — the scheduler commits placement decisions through Raft, and Forge performs admission control locally.
+The scheduler (in the control plane) uses this data to place VMs. Gossip data is a hint, not a guarantee — the scheduler commits placement decisions through the authoritative store, and Forge performs admission control locally.
 
 ### Admission control
 
@@ -718,7 +953,7 @@ When a create request arrives at Forge:
 1. **Check capacity**: compare requested resources against available capacity (accounting for overcommit).
 2. **Reject if insufficient**: return `409 Conflict` with details about what's unavailable.
 3. **Reserve if sufficient**: atomically mark resources as reserved. This prevents double-booking when multiple VMs are being created concurrently.
-4. **Create**: proceed with resource creation.
+4. **Create**: proceed with resource creation (via reconciler).
 5. **On success**: convert reservation to used allocation.
 6. **On failure**: release reservation, resources become available again.
 
@@ -737,31 +972,63 @@ This is the standard pattern in cloud providers: the scheduler is optimistic, th
 
 ## Health Monitoring
 
-### Self-health checks
+Forge tracks health across four independent categories. Each category has its own status. The overall node health status is the worst of all four.
 
-Forge monitors its own operational health:
+### Health categories
+
+#### 1. Agent health (`agent_health`)
+
+Is the Forge process itself functional?
 
 | Check | Method | Failure means |
 |---|---|---|
-| Fabric reachable | `syfrah0` interface exists and has IPv6 address | Node disconnected from mesh |
-| Database operational | redb read/write test | Local state inaccessible |
+| API responding | Internal liveness ping | Forge is hung or crashed |
+| Database accessible | redb read/write test | Local state inaccessible |
 | System commands available | `ip`, `nft`, `bridge` binaries exist in PATH | Cannot manage network resources |
 | Cloud Hypervisor binary | CH binary exists at configured path | Cannot spawn VMs |
 | KVM available | `/dev/kvm` accessible | VM mode unavailable (fallback to container mode) |
-| Disk pressure | `statvfs` on `/opt/syfrah/` and `/run/syfrah/` | Risk of VM creation failure |
+
+#### 2. Node health (`node_health`)
+
+Is the machine capable of hosting workloads?
+
+| Check | Method | Failure means |
+|---|---|---|
+| CPU pressure | Load average vs core count | Degraded performance, new placements risky |
 | Memory pressure | `/proc/meminfo` available > 5% of total | Risk of OOM |
-| CPU pressure | Load average vs core count | Degraded performance |
+| Disk pressure | `statvfs` on `/opt/syfrah/` and `/run/syfrah/` | Risk of VM creation failure |
+| Fabric reachable | `syfrah0` interface exists and has IPv6 address | Node disconnected from mesh |
 
-### VM health checks
+#### 3. Workload health (`workload_health`)
 
-For each VM managed by Forge:
+Are VMs running correctly?
 
 | Check | Method | Frequency | Failure action |
 |---|---|---|---|
-| Process alive | `kill(pid, 0)` | Every 5 seconds | Mark Failed, emit Crashed event |
-| CH API responsive | `GET /vmm.ping` on Unix socket | Every 15 seconds | Mark Failed if unresponsive for 30s |
+| Process alive | `kill(pid, 0)` | Every 5 seconds | Mark VM Failed, emit Crashed event |
+| CH API responsive | `GET /vmm.ping` on Unix socket | Every 15 seconds | Mark VM Failed if unresponsive for 30s |
 | TAP device exists | `ip link show {tap_name}` | Every reconciliation cycle | Recreate TAP, potentially mark VM Failed |
 | nftables rules intact | Compare generated vs applied | Every reconciliation cycle | Re-apply rules |
+
+Workload health status: `healthy` if all VMs are in expected states, `degraded` if some VMs are Failed, `unhealthy` if majority of VMs are Failed.
+
+#### 4. Control health (`control_health`)
+
+Is Forge connected to the control plane?
+
+| Check | Method | Failure means |
+|---|---|---|
+| Materialized view fresh | `projection_version` lag < threshold | Desired state may be stale |
+| Gossip active | Last gossip send/receive < threshold | Telemetry not propagating |
+
+### Observability scope
+
+Forge observes **local runtime state**: processes, interfaces, nftables rules, FDB entries. Forge does NOT observe functional correctness:
+- Can VM-A actually reach VM-B over the VXLAN? Forge does not test this.
+- Is the application inside the VM healthy? Forge does not know.
+- Are security group rules actually blocking what they should? Forge verifies the rules exist in nftables, not that they produce correct network behavior end-to-end.
+
+Functional health validation is the tenant's responsibility (or a future monitoring product). Forge reports what it can see (process alive, interface exists, rules applied), not what the workload is doing.
 
 ### Health endpoint
 
@@ -770,14 +1037,41 @@ For each VM managed by Forge:
 ```json
 {
   "status": "healthy",
-  "checks": [
-    { "name": "fabric", "status": "pass", "detail": "syfrah0 up, IPv6 assigned" },
-    { "name": "database", "status": "pass", "detail": "redb read/write OK" },
-    { "name": "kvm", "status": "pass", "detail": "/dev/kvm accessible" },
-    { "name": "ch_binary", "status": "pass", "detail": "v43.0 at /usr/local/lib/syfrah/cloud-hypervisor" },
-    { "name": "disk_pressure", "status": "pass", "detail": "65% used, 350GB free" },
-    { "name": "memory_pressure", "status": "pass", "detail": "50% used, 64GB free" }
-  ],
+  "categories": {
+    "agent_health": {
+      "status": "healthy",
+      "checks": [
+        { "name": "api_responding", "status": "pass", "detail": "liveness OK" },
+        { "name": "database", "status": "pass", "detail": "redb read/write OK" },
+        { "name": "kvm", "status": "pass", "detail": "/dev/kvm accessible" },
+        { "name": "ch_binary", "status": "pass", "detail": "v43.0 at /usr/local/lib/syfrah/cloud-hypervisor" },
+        { "name": "system_commands", "status": "pass", "detail": "ip, nft, bridge available" }
+      ]
+    },
+    "node_health": {
+      "status": "healthy",
+      "checks": [
+        { "name": "fabric", "status": "pass", "detail": "syfrah0 up, IPv6 assigned" },
+        { "name": "disk_pressure", "status": "pass", "detail": "65% used, 350GB free" },
+        { "name": "memory_pressure", "status": "pass", "detail": "50% used, 64GB free" },
+        { "name": "cpu_pressure", "status": "pass", "detail": "load 2.1, 32 cores" }
+      ]
+    },
+    "workload_health": {
+      "status": "healthy",
+      "checks": [
+        { "name": "vm_processes", "status": "pass", "detail": "10/10 VMs alive" },
+        { "name": "nftables_integrity", "status": "pass", "detail": "all chains match" }
+      ]
+    },
+    "control_health": {
+      "status": "healthy",
+      "checks": [
+        { "name": "projection_freshness", "status": "pass", "detail": "lag 200ms" },
+        { "name": "gossip_active", "status": "pass", "detail": "last send 3s ago" }
+      ]
+    }
+  },
   "uptime_seconds": 86400,
   "last_reconciliation": {
     "timestamp": 1711555200,
@@ -792,10 +1086,10 @@ For each VM managed by Forge:
 }
 ```
 
-Status values:
-- `healthy` — all checks pass, reconciliation is current
-- `degraded` — some checks fail but VMs are running (e.g., high disk pressure)
-- `unhealthy` — critical checks fail (no fabric, no database, no KVM)
+Overall status derivation:
+- `healthy` — all four categories are healthy
+- `degraded` — at least one category is degraded, none are unhealthy
+- `unhealthy` — at least one category is unhealthy
 
 ## Drain and Maintenance
 
@@ -845,7 +1139,7 @@ Since VMs are independent OS processes (Cloud Hypervisor), upgrading Forge does 
 5. Old Forge exits.
 6. New Forge process starts.
 7. New Forge scans `/run/syfrah/vms/*/meta.json` and reconnects to all running VMs (compute layer reconnect).
-8. New Forge reconciles: re-discovers bridges, TAPs, VXLAN, nftables from kernel state + redb.
+8. New Forge reconciles: re-discovers bridges, TAPs, VXLAN, nftables from kernel state + materialized view. Rebuilds ownership registry from materialized view + kernel discovery.
 9. New Forge reports healthy via gossip.
 
 **Key property**: VMs continue running throughout this process. They are not children of the Forge process — they are independent Cloud Hypervisor processes with their own PID, managed via REST API on Unix sockets.
@@ -868,15 +1162,40 @@ When the syfrah binary is updated, it may include a new version of the Cloud Hyp
 
 ## Security
 
+### Phased security model
+
+Security evolves through phases as the system matures:
+
+**Phase 1: WireGuard-only transport security**
+
+Acceptable for single-operator deployments:
+- Forge API bound to `syfrah0` — unreachable from the public internet
+- WireGuard provides mutual authentication (only nodes with the mesh secret can reach `syfrah0`) and encryption
+- Bearer token derived from mesh secret provides basic request-level authentication
+- This is sufficient when the operator controls all nodes and trusts the mesh
+
+**Acknowledged risk**: a compromised mesh node has lateral access to every other node's Forge API. In Phase 1, mesh membership = full trust. This is acceptable for a single operator managing their own fleet, but not for multi-tenant or high-security environments.
+
+**Phase 2+: Application-level authenticated identity**
+
+Required for production and multi-operator deployments:
+- **Minimum**: signed requests. Every mutation carries a cryptographic signature from the requesting identity. The signing key is per-identity, not the shared mesh secret.
+- **Recommended**: mTLS between control plane and Forge. Each node gets a unique TLS certificate from a cluster CA. This provides per-node identity and prevents a compromised node from impersonating another.
+- Role separation: only the Raft leader can issue mutations. Bearer tokens are replaced by proper identity certificates.
+- Raft term and index on all mutations prevent stale commands from deposed leaders.
+
+The Phase 1 bearer-token-from-mesh-secret model is explicitly **not the long-term model**. It is a pragmatic starting point that will be replaced.
+
 ### Attack surface
 
-| Surface | Mitigation |
-|---|---|
-| Forge API | Bound to `syfrah0` only — unreachable from public internet |
-| Fabric access | Only WireGuard-authenticated mesh members can reach `syfrah0` |
-| API authentication | Mesh secret verification (phase 1), bearer token + Raft term (phase 2) |
-| Input validation | All inputs validated before execution. Resource IDs: alphanumeric + hyphen. IPs: parsed and range-checked. Names: regex-validated. |
-| Command execution | Forge runs pre-defined operations (ip, nft, bridge). No arbitrary shell commands from API. No `exec` with user-provided strings. |
+| Surface | Phase 1 mitigation | Phase 2+ mitigation |
+|---|---|---|
+| Forge API | Bound to `syfrah0` only | + mTLS with per-node certificates |
+| Fabric access | WireGuard mesh secret | + per-node identity |
+| API authentication | Bearer token from mesh secret | Signed requests / mTLS |
+| Lateral movement | Mesh membership = full trust | Per-node certificates limit blast radius |
+| Input validation | All inputs validated. Resource IDs: alphanumeric + hyphen. IPs: parsed and range-checked. Names: regex-validated. | Same |
+| Command execution | Pre-defined operations only (ip, nft, bridge). No arbitrary shell commands. No `exec` with user-provided strings. | Same |
 
 ### Process security
 
@@ -899,12 +1218,12 @@ Forge enforces tenant isolation through multiple layers:
 3. **Anti-spoofing**: source MAC and IP validated on every egress packet. No VM can impersonate another.
 4. **IPAM**: addresses are centrally allocated. No VM chooses its own IP.
 5. **Subnet isolation**: VMs in different subnets within the same VPC are isolated by default (ADR-002 route tables control inter-subnet traffic).
-6. **Resource ownership**: every resource has an owner (org/project/env). Forge validates ownership on every operation.
+6. **Resource ownership**: every resource has an owner (org/project/env). Forge validates ownership on every operation via the ownership registry.
 
 ### Audit trail
 
 Every API call is logged with:
-- Caller identity (node ID in phase 1, bearer token identity in phase 2)
+- Caller identity (node ID in phase 1, certificate identity in phase 2)
 - Operation (HTTP method + path)
 - Resource ID
 - Result (success or error code)
@@ -965,10 +1284,10 @@ forge_api_request_duration_seconds_bucket{method="POST",path="/v1/instances",le=
 #### Node resource metrics
 
 ```
-forge_node_vcpus_total 32
+forge_node_vcpus_allocatable 62
 forge_node_vcpus_used 18
 forge_node_vcpus_reserved 4
-forge_node_vcpus_available 42
+forge_node_vcpus_available 40
 forge_node_memory_bytes_total 137438953472
 forge_node_memory_bytes_used 68719476736
 forge_node_memory_bytes_available 60129542144
@@ -980,12 +1299,26 @@ forge_node_disk_bytes_available 676457349120
 #### Health metrics
 
 ```
-forge_health_check{check="fabric"} 1
-forge_health_check{check="database"} 1
-forge_health_check{check="kvm"} 1
-forge_health_check{check="disk_pressure"} 1
-forge_health_check{check="memory_pressure"} 1
-forge_node_healthy 1
+forge_health_check{category="agent",check="database"} 1
+forge_health_check{category="agent",check="kvm"} 1
+forge_health_check{category="node",check="fabric"} 1
+forge_health_check{category="node",check="disk_pressure"} 1
+forge_health_check{category="node",check="memory_pressure"} 1
+forge_health_check{category="workload",check="vm_processes"} 1
+forge_health_check{category="control",check="projection_freshness"} 1
+forge_health_agent 1
+forge_health_node 1
+forge_health_workload 1
+forge_health_control 1
+```
+
+#### Generation metrics
+
+```
+forge_resource_spec_generation{resource="vm-01HX"} 5
+forge_resource_reconcile_generation{resource="vm-01HX"} 5
+forge_resource_generation_lag{resource="vm-01HX"} 0
+forge_resources_pending_reconcile 0
 ```
 
 ### Structured logging
@@ -1031,23 +1364,22 @@ Trace ID propagated from control plane → Forge API → individual operations. 
 
 The fabric layer provides:
 - WireGuard mesh connectivity (`syfrah0` interface)
-- Peer list (for FDB distribution — which nodes exist)
+- Peer list (for discovering which nodes exist)
 - Peering protocol (node join/leave)
-- Gossip transport (for capacity reporting and status)
+- Gossip transport (for telemetry and capacity hints)
 
 Forge uses fabric's peer list to:
-- Know which remote nodes exist (for FDB entry creation)
+- Know which remote nodes exist (for FDB entry creation, derived from materialized view)
 - Discover VTEP addresses (remote nodes' fabric IPv6 for VXLAN encapsulation)
-- Distribute VM placement announcements
 
 Forge runs alongside fabric in the same daemon process. They share the `syfrah0` interface but have distinct ports: fabric peering on 51821 (TCP), Forge API on 7100 (HTTP).
 
 ### Forge and Compute
 
 Today (ADR-001 architecture): CLI → control socket → daemon → VmManager.
-With Forge: Control Plane → Forge API → VmManager (in-process).
+With Forge: Control Plane → Forge API → forge-reconciler → forge-runtime → VmManager (in-process).
 
-Forge embeds the compute layer's `VmManager`. It calls compute methods directly:
+Forge embeds the compute layer's `VmManager` via forge-runtime. It calls compute methods directly:
 - `VmManager::create(spec)` — spawn Cloud Hypervisor process
 - `VmManager::boot(id)` — boot the VM
 - `VmManager::shutdown_graceful(id)` — ACPI shutdown
@@ -1060,7 +1392,7 @@ Compute remains a pure runtime driver. It does not know about VPCs, subnets, sec
 
 ### Forge and Overlay
 
-Forge calls the overlay layer's `NetworkBackend` trait directly:
+Forge calls the overlay layer's `NetworkBackend` trait via forge-runtime:
 - `create_vxlan(name, vni, local_ip, port)` — create VXLAN interface
 - `create_bridge(name)` — create Linux bridge
 - `add_bridge_ip(bridge, gateway, prefix_len)` — add subnet gateway
@@ -1076,18 +1408,18 @@ With ADR-002, Forge also calls the security group rule engine directly to genera
 
 ### Forge and Org
 
-Forge reads org/project/environment/VPC/subnet state from its local redb replica (synced from Raft). Forge validates that every resource operation references a valid owner in the org hierarchy.
+Forge reads org/project/environment/VPC/subnet state from its local materialized view (projected from the authoritative store). Forge validates that every resource operation references a valid owner in the org hierarchy.
 
-Writes to org state (create org, create project, etc.) go through the control plane → Raft → replicated to all nodes. Forge never writes org state.
+Writes to org state (create org, create project, etc.) go through the control plane → authoritative store → projected to all nodes. Forge never writes org state.
 
 ### Forge and the Control Socket (CLI)
 
 The existing Unix domain socket at `~/.syfrah/control.sock` continues to serve CLI commands. The daemon dispatches CLI requests to the appropriate handler:
 
 - Fabric commands (`syfrah fabric *`) → FabricHandler (existing)
-- Compute commands (`syfrah compute *`) → Forge, which delegates to VmManager
-- Network commands (`syfrah vpc *`, `syfrah subnet *`, `syfrah sg *`) → Forge, which delegates to overlay
-- Org commands (`syfrah org *`, `syfrah project *`, `syfrah env *`) → Forge, which reads/writes via Raft
+- Compute commands (`syfrah compute *`) → Forge (forge-api), which delegates via forge-runtime to VmManager
+- Network commands (`syfrah vpc *`, `syfrah subnet *`, `syfrah sg *`) → Forge, which delegates via forge-runtime to overlay
+- Org commands (`syfrah org *`, `syfrah project *`, `syfrah env *`) → Forge, which reads from materialized view / writes via control plane
 
 In the pre-control plane phase, CLI commands that mutate state go through Forge locally. In the post-control plane phase, mutation commands go through the control plane API, which routes to the appropriate node's Forge.
 
@@ -1096,7 +1428,7 @@ In the pre-control plane phase, CLI commands that mutate state go through Forge 
 The current fabric daemon (`layers/fabric/src/daemon.rs`) is the proto-Forge. The migration path:
 
 1. The daemon already manages: WireGuard mesh, peering, control socket, peer health.
-2. The daemon will be extended with: REST API (axum on port 7100), compute integration (VmManager), overlay integration (NetworkBackend), reconciliation engine, capacity tracker, health monitor.
+2. The daemon will be extended with: REST API (axum on port 7100), compute integration (VmManager), overlay integration (NetworkBackend), reconciliation engine, capacity tracker, health monitor — structured as forge-api, forge-reconciler, forge-capacity, forge-health, forge-runtime, forge-task modules.
 3. The result IS Forge. There is no separate "Forge process." The daemon evolves into Forge.
 
 ## Configuration
@@ -1123,8 +1455,10 @@ cpu_overcommit_ratio = 2.0
 # Memory overcommit ratio (default 1.0, no overcommit)
 memory_overcommit_ratio = 1.0
 
+# Host-reserved vCPUs for Forge/daemon/OS overhead (default 1)
+host_reserved_vcpus = 1
+
 # System-reserved resources (not available for VMs)
-system_reserved_vcpus = 2
 system_reserved_memory_mb = 4096
 system_reserved_disk_gb = 20
 
@@ -1136,6 +1470,9 @@ shutdown_grace_secs = 30
 
 # Resource reservation expiry in seconds (default 60)
 reservation_expiry_secs = 60
+
+# Projection staleness threshold in seconds (default 30)
+projection_staleness_threshold_secs = 30
 ```
 
 All configuration values have sensible defaults. A node can run Forge with zero configuration.
@@ -1151,17 +1488,17 @@ The migration is incremental. Each phase adds functionality without breaking exi
 Add an axum HTTP server to the existing daemon, bound to `syfrah0:7100`. Start with read-only endpoints:
 - `GET /v1/node/status` — node health
 - `GET /v1/node/capacity` — resource summary
-- `GET /v1/node/health` — detailed health checks
+- `GET /v1/node/health` — detailed health checks (4 categories)
 - `GET /metrics` — Prometheus metrics
 
 This can be done without changing any existing functionality.
 
 **Step 2 — Compute endpoints**
 
-Add instance CRUD endpoints that wrap the existing VmManager:
-- `POST /v1/instances` — create (full orchestration: network + security + compute)
+Add instance CRUD endpoints that wrap the existing VmManager via forge-runtime:
+- `POST /v1/instances` — create (write intent → reconciler orchestrates: network + security + compute)
 - `GET /v1/instances` — list
-- `GET /v1/instances/:id` — details
+- `GET /v1/instances/:id` — details (spec + runtime)
 - `DELETE /v1/instances/:id` — delete (full cleanup)
 - `POST /v1/instances/:id/start|stop|reboot`
 
@@ -1172,44 +1509,53 @@ The control socket continues to work for CLI. API calls go through the new HTTP 
 Add network resource endpoints:
 - Bridge, VXLAN, NIC CRUD
 - SG rule application (ADR-002 model)
-- FDB management
+- FDB management (derived from materialized view, not gossip)
 - NAT gateway management
 
 **Step 4 — Reconciliation engine**
 
-Add the core reconciliation loop:
+Add the core reconciliation loop (forge-reconciler):
 - Periodic desired vs actual comparison
-- Drift detection and correction
-- Convergence reporting via gossip
+- Drift detection and correction using generation tracking
+- Dependency-ordered application of changes
+- Compensating cleanup on failure
+- Telemetry reporting via gossip
 
 **Step 5 — Capacity management**
 
-Add resource tracking, overcommit policy, admission control, and reservation system.
+Add resource tracking (forge-capacity): allocatable CPU model, overcommit policy, admission control, and reservation system.
 
-**Step 6 — Drain and maintenance**
+**Step 6 — Ownership registry and orphan handling**
+
+Add ownership registry in redb. Implement 3-tier orphan handling policy. Migrate existing resources into registry.
+
+**Step 7 — Drain and maintenance**
 
 Add drain/undrain endpoints and the drain coordination protocol.
 
-**Step 7 — Observability and hardening**
+**Step 8 — Observability and hardening**
 
-Add Prometheus metrics, OpenTelemetry tracing, structured logging, graceful shutdown protocol.
+Add Prometheus metrics, OpenTelemetry tracing, structured logging, graceful shutdown protocol. Add generation metrics.
 
-**Step 8 — Deprecate direct CLI-to-compute path**
+**Step 9 — Deprecate direct CLI-to-compute path**
 
-Once the Forge API is stable, route all CLI compute commands through Forge (local control socket → Forge handler) instead of directly calling VmManager. This makes Forge the single entry point.
+Once the Forge API is stable, route all CLI compute commands through Forge (local control socket → forge-api handler) instead of directly calling VmManager. This makes Forge the single entry point.
 
 ## Implementation Phases
 
 ### Phase 1 — API scaffold + compute endpoints (8-10 issues)
 
-- Axum HTTP server on `syfrah0:7100`
-- Health, capacity, and metrics endpoints
+- Axum HTTP server on `syfrah0:7100` (forge-api module)
+- Health, capacity, and metrics endpoints (forge-health with 4 categories)
 - Instance CRUD (create, list, get, delete, start, stop, reboot)
-- Full create orchestration (network setup → SG apply → FDB → config-drive → compute)
-- Full delete orchestration (stop → FDB remove → nftables flush → TAP delete → bridge cleanup)
-- Task tracking for async operations
-- Admission control (basic capacity check)
+- API writes intent → forge-reconciler executes (API/task/reconciliation contract)
+- Full create orchestration in dependency order (network setup → SG apply → FDB → config-drive → compute)
+- Full delete orchestration in reverse dependency order
+- Task tracking for async operations (forge-task)
+- Admission control with allocatable CPU model (forge-capacity)
+- Ownership registry in redb
 - Structured error responses with FORGE_ prefix
+- Generation tracking (spec/observed/reconcile)
 
 ### Phase 2 — Network endpoints + reconciliation (8-10 issues)
 
@@ -1218,23 +1564,26 @@ Once the Forge API is stable, route all CLI compute commands through Forge (loca
 - SG application endpoints (ADR-002 model)
 - NAT gateway endpoints
 - Route table enforcement
-- FDB management endpoints
-- Reconciliation engine (periodic + event-driven)
+- FDB management (derived from materialized view)
+- Reconciliation engine — periodic + event-driven (forge-reconciler)
 - Drift detection for all resource types
-- Convergence reporting via gossip
+- Compensating cleanup on failure (not rollback)
+- 3-tier orphan handling policy
+- Telemetry reporting via gossip (hints only)
 
 ### Phase 3 — Capacity management + drain (4-5 issues)
 
-- Full resource tracking with overcommit policy
+- Full resource tracking with overcommit policy on allocatable capacity
 - Reservation system with expiry
 - Capacity reporting to gossip (scheduler integration)
 - Node drain/undrain protocol
 - Drain timeout and force drain
 - Double-booking prevention via local admission
 
-### Phase 4 — Observability + production hardening (4-5 issues)
+### Phase 4 — Security + observability + production hardening (4-5 issues)
 
-- Prometheus metrics (instances, reconciliation, API, node resources, health)
+- Phase 2 security: signed requests minimum, mTLS recommended
+- Prometheus metrics (instances, reconciliation, API, node resources, health categories, generations)
 - Structured JSON logging for all Forge operations
 - OpenTelemetry tracing (API requests, reconciliation cycles, subsystem calls)
 - Graceful shutdown protocol (SIGTERM handling, in-flight completion)
@@ -1275,31 +1624,37 @@ Forge enables the transition from "a collection of scripts that manage VMs" to "
 
 **Rejected**: internal node-to-node APIs are non-contractual (same binary on all nodes, no version skew). HTTP/JSON is simpler to debug (`curl` works), consistent with the existing internal HTTP API (api-architecture.md), and avoids a proto compilation dependency for what is fundamentally an internal interface. The external tenant API uses gRPC (via the gateway). Internal stays simple.
 
-### 3. mTLS on the Forge API
+### 3. Gossip for operational data distribution
 
-**Considered**: add mTLS to authenticate callers at the Forge API level.
+**Considered**: use gossip to distribute FDB entries, VM placements, and other operational data between nodes.
 
-**Rejected for phase 1**: WireGuard already provides mutual authentication (only nodes with the mesh secret can reach `syfrah0`). Adding mTLS on top adds certificate management complexity with no security gain — it would be encrypting an already-encrypted channel and authenticating already-authenticated peers. Phase 2 adds bearer token verification for defense-in-depth when the control plane exists.
+**Rejected**: gossip is best-effort and eventually consistent — acceptable for telemetry and scheduling hints, but not for operational data that affects correctness (FDB entries determine whether traffic reaches the right node). Operational data is derived from the authoritative control-plane store via materialized views. Each node builds its local operational state from its projection, not from gossip events.
 
-### 4. Forge manages desired state directly (no Raft)
+### 4. Single generation counter for optimistic concurrency
+
+**Considered**: use a single `generation` counter for both spec changes and reconciliation tracking.
+
+**Rejected**: a single counter conflates "the spec changed" with "Forge has reconciled." Three separate generations (`spec_generation`, `observed_generation`, `reconcile_generation`) provide clear answers to: "has the spec changed?" (`spec_generation` incremented), "has Forge seen this?" (`observed_generation` incremented), and "has Forge converged to this spec?" (`spec_generation == reconcile_generation`).
+
+### 5. Forge manages desired state directly (no Raft)
 
 **Considered**: Forge could be the source of truth for its node's resources, with cross-node coordination via direct API calls.
 
-**Rejected**: this creates a split-brain problem. If a node goes down, its desired state is lost. Raft provides the single authoritative desired state that survives node failures. Forge is stateless in intent by design — it reads desired state, never owns it.
+**Rejected**: this creates a split-brain problem. If a node goes down, its desired state is lost. The authoritative store (Raft-based) provides the single desired state that survives node failures. Forge is stateless in intent by design — it reads desired state, never owns it.
 
-### 5. Push-based reconciliation only (no periodic loop)
+### 6. Push-based reconciliation only (no periodic loop)
 
-**Considered**: only reconcile when Raft notifies of a change (event-driven, no periodic scan).
+**Considered**: only reconcile when the materialized view updates (event-driven, no periodic scan).
 
 **Rejected**: event-driven reconciliation misses drift caused by external factors (operator manually deletes a bridge, kernel drops an interface, nftables rules are flushed by another tool). The periodic loop is the safety net that catches everything the event-driven path misses. Both are needed: events for responsiveness, periodic for completeness.
 
-### 6. Docker/containerd as the container runtime
+### 7. Docker/containerd as the container runtime
 
 **Considered**: use Docker or containerd for the container fallback mode (when KVM is unavailable).
 
 **Rejected**: Docker adds a daemon dependency and significant surface area. containerd is lighter but still complex. The compute layer chose `crun + gVisor` for minimal overhead with strong isolation. Forge does not need to second-guess this — it delegates to compute, which selects the appropriate runtime.
 
-### 7. Port 9443 for Forge API
+### 8. Port 9443 for Forge API
 
 **Considered**: using a non-standard high port to avoid conflicts.
 
