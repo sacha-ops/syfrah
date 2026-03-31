@@ -1201,10 +1201,19 @@ pub async fn run_daemon(
             }
         };
 
+        // Initialize capacity tracker.
+        let forge_capacity = Arc::new(syfrah_forge::capacity::CapacityTracker::new());
+        info!(
+            "forge: capacity tracker initialised (vcpus={}, memory={}MB)",
+            forge_capacity.allocatable_vcpus(),
+            forge_capacity.allocatable_memory_mb()
+        );
+
         let forge_state = std::sync::Arc::new(syfrah_forge::api::ForgeState {
             started_at: std::time::Instant::now(),
             task_store: forge_task_store,
             vm_manager: shared_vm_manager.clone(),
+            capacity: Some(forge_capacity),
         });
 
         let bind_addr: std::net::SocketAddr =
