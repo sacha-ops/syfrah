@@ -6,6 +6,7 @@ pub mod linux;
 pub mod mock;
 pub mod nft;
 pub mod reconcile;
+pub mod recovery;
 pub mod rollback;
 pub mod sysctl;
 pub mod tap;
@@ -24,6 +25,9 @@ pub use mock::MockBackend;
 pub use reconcile::{
     reconcile_network, AllocationState, ExpectedBridge, ExpectedVm, IpAllocation, NetworkState,
     ReconcileReport,
+};
+pub use recovery::{
+    recover_network, RecoveryPlacement, RecoveryReport, RecoverySubnet, RecoveryVpc,
 };
 pub use rollback::NetworkRollback;
 pub use sysctl::ensure_ip_forwarding;

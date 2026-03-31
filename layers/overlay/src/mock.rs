@@ -51,6 +51,16 @@ impl MockBackend {
             .insert(name.to_string());
     }
 
+    /// Seed the mock with a list of kernel interfaces that `list_interfaces`
+    /// will return (filtered by prefix).
+    pub fn set_interfaces(&self, ifaces: Vec<String>) {
+        let mut guard = self.interfaces.lock().expect("lock poisoned");
+        guard.clear();
+        for iface in ifaces {
+            guard.insert(iface);
+        }
+    }
+
     fn record(&self, call: String) {
         self.calls.lock().expect("lock poisoned").push(call);
     }
