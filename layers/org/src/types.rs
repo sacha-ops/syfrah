@@ -2,6 +2,76 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Lifecycle state for mutable network resources (SGs, NICs, NAT GWs, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceState {
+    Pending,
+    Active,
+    Failed,
+    Deleting,
+    Deleted,
+}
+
+impl fmt::Display for ResourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceState::Pending => f.write_str("Pending"),
+            ResourceState::Active => f.write_str("Active"),
+            ResourceState::Failed => f.write_str("Failed"),
+            ResourceState::Deleting => f.write_str("Deleting"),
+            ResourceState::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
+/// Unique identifier for a security group.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecurityGroupId(pub String);
+
+impl fmt::Display for SecurityGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A security group — a stateful firewall ruleset scoped to a VPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroup {
+    pub id: SecurityGroupId,
+    pub name: String,
+    pub vpc_id: VpcId,
+    pub description: Option<String>,
+    pub is_default: bool,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
+/// Unique identifier for a network interface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NicId(pub String);
+
+impl fmt::Display for NicId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A network interface — the attachment point for security groups.
+/// Every VM has at least one NIC. SGs attach to NICs, not VMs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkInterface {
+    pub id: NicId,
+    pub name: String,
+    pub vm_id: Option<String>,
+    pub subnet_id: String,
+    pub vpc_id: String,
+    pub private_ip: String,
+    pub mac: String,
+    pub security_groups: Vec<SecurityGroupId>,
+    pub state: ResourceState,
+    pub created_at: u64,
+}
+
 /// Unique identifier for a VPC.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VpcId(pub String);
@@ -157,6 +227,88 @@ pub struct Environment {
     pub labels: HashMap<String, String>,
     pub created_at: u64,
     pub expires_at: Option<u64>,
+}
+
+/// Unique identifier for a security group rule.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuleId(pub String);
+
+impl fmt::Display for RuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Traffic direction for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Ingress,
+    Egress,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Ingress => f.write_str("Ingress"),
+            Direction::Egress => f.write_str("Egress"),
+        }
+    }
+}
+
+/// Network protocol for a security group rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+    All,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Tcp => f.write_str("TCP"),
+            Protocol::Udp => f.write_str("UDP"),
+            Protocol::Icmp => f.write_str("ICMP"),
+            Protocol::All => f.write_str("All"),
+        }
+    }
+}
+
+/// A port range (inclusive). Single port: from == to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub from: u16,
+    pub to: u16,
+}
+
+/// The source (for ingress) or destination (for egress) of traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleSource {
+    Cidr(String),
+    SecurityGroup(SecurityGroupId),
+}
+
+impl fmt::Display for RuleSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuleSource::Cidr(cidr) => write!(f, "{cidr}"),
+            RuleSource::SecurityGroup(sg_id) => write!(f, "sg:{sg_id}"),
+        }
+    }
+}
+
+/// A rule within a security group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityGroupRule {
+    pub id: RuleId,
+    pub sg_id: SecurityGroupId,
+    pub direction: Direction,
+    pub protocol: Protocol,
+    pub port_range: Option<PortRange>,
+    pub source: RuleSource,
+    pub priority: u32,
+    pub description: Option<String>,
 }
 
 /// Whether a VM placement is being added or removed.
