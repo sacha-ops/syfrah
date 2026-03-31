@@ -6,8 +6,9 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId, Subnet,
-    SubnetId, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, Project, ProjectId,
+    ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment, VpcId,
+    VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -19,6 +20,7 @@ const VPCS_TABLE: &str = "vpcs";
 const VPC_ATTACHMENTS_TABLE: &str = "vpc_attachments";
 const SUBNETS_TABLE: &str = "subnets";
 const PEERINGS_TABLE: &str = "vpc_peerings";
+const SECURITY_GROUPS_TABLE: &str = "security_groups";
 const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
@@ -425,6 +427,10 @@ impl OrgStore {
         };
 
         self.db.set(VPCS_TABLE, name, &vpc)?;
+
+        // Auto-create the default security group for this VPC.
+        self.create_default_sg(&vpc)?;
+
         Ok(vpc)
     }
 
@@ -909,6 +915,110 @@ impl OrgStore {
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
         let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
         Ok(self.db.get(PEERINGS_TABLE, &key)?)
+    }
+
+    // ── Security Group operations ──────────────────────────────────
+
+    /// Build the redb key for a security group: "vpc_id/sg_name".
+    fn sg_key(vpc_id: &VpcId, name: &str) -> String {
+        format!("{}/{}", vpc_id.0, name)
+    }
+
+    /// Create a security group within a VPC.
+    pub fn create_sg(
+        &self,
+        name: &str,
+        vpc_id: &VpcId,
+        description: Option<&str>,
+    ) -> Result<SecurityGroup> {
+        validate_name(name, "security group")?;
+
+        let key = Self::sg_key(vpc_id, name);
+        if self.db.exists(SECURITY_GROUPS_TABLE, &key)? {
+            return Err(OrgError::SgAlreadyExists(name.to_string()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sg = SecurityGroup {
+            id: SecurityGroupId(format!("sg-{}", name)),
+            name: name.to_string(),
+            vpc_id: vpc_id.clone(),
+            description: description.map(|s| s.to_string()),
+            is_default: false,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        Ok(sg)
+    }
+
+    /// Create the default security group for a VPC. Called automatically
+    /// during VPC creation. The default SG cannot be deleted.
+    pub fn create_default_sg(&self, vpc: &Vpc) -> Result<SecurityGroup> {
+        let key = Self::sg_key(&vpc.id, "default");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sg = SecurityGroup {
+            id: SecurityGroupId(format!("sg-default-{}", vpc.name)),
+            name: "default".to_string(),
+            vpc_id: vpc.id.clone(),
+            description: Some(format!("Default security group for VPC {}", vpc.name)),
+            is_default: true,
+            state: ResourceState::Active,
+            created_at: now,
+        };
+
+        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        Ok(sg)
+    }
+
+    /// Get a security group by VPC ID and name.
+    pub fn get_sg(&self, vpc_id: &VpcId, name: &str) -> Result<Option<SecurityGroup>> {
+        let key = Self::sg_key(vpc_id, name);
+        Ok(self.db.get(SECURITY_GROUPS_TABLE, &key)?)
+    }
+
+    /// List all security groups.
+    pub fn list_sgs(&self) -> Result<Vec<SecurityGroup>> {
+        let entries: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+        Ok(entries.into_iter().map(|(_, sg)| sg).collect())
+    }
+
+    /// List security groups belonging to a specific VPC.
+    pub fn list_sgs_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<SecurityGroup>> {
+        let prefix = format!("{}/", vpc_id.0);
+        let all: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
+        Ok(all
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, sg)| sg)
+            .collect())
+    }
+
+    /// Delete a security group. Fails if the SG is the default for its VPC.
+    pub fn delete_sg(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
+        let key = Self::sg_key(vpc_id, name);
+
+        let sg: SecurityGroup = self
+            .db
+            .get(SECURITY_GROUPS_TABLE, &key)?
+            .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
+
+        if sg.is_default {
+            return Err(OrgError::SgIsDefault(name.to_string()));
+        }
+
+        self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
+        Ok(())
     }
 }
 
@@ -2336,5 +2446,94 @@ mod tests {
 
         let err = store.delete_vpc(&a).unwrap_err();
         assert!(matches!(err, OrgError::VpcHasPeerings { .. }));
+    }
+
+    // ── Security Group tests ───────────────────────────────────────
+
+    /// Helper: create an org, project, and VPC — returns the VpcId.
+    fn setup_vpc_for_sg(store: &OrgStore) -> VpcId {
+        store.create("acme").unwrap();
+        store.create_project("acme", "backend").unwrap();
+        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let vpc = store
+            .create_vpc("myvpc", "10.1.0.0/16", owner, false)
+            .unwrap();
+        vpc.id
+    }
+
+    #[test]
+    fn create_sg() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        let sg = store.create_sg("web", &vpc_id, Some("Web tier")).unwrap();
+        assert_eq!(sg.name, "web");
+        assert_eq!(sg.vpc_id, vpc_id);
+        assert_eq!(sg.description, Some("Web tier".to_string()));
+        assert!(!sg.is_default);
+        assert_eq!(sg.state, ResourceState::Active);
+        assert!(sg.created_at > 0);
+    }
+
+    #[test]
+    fn duplicate_sg_rejected() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        store.create_sg("web", &vpc_id, None).unwrap();
+        let err = store.create_sg("web", &vpc_id, None).unwrap_err();
+        assert!(matches!(err, OrgError::SgAlreadyExists(_)));
+    }
+
+    #[test]
+    fn delete_sg() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        store.create_sg("web", &vpc_id, None).unwrap();
+        store.delete_sg(&vpc_id, "web").unwrap();
+
+        let result = store.get_sg(&vpc_id, "web").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_sgs_by_vpc() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        store.create_sg("web", &vpc_id, None).unwrap();
+        store.create_sg("database", &vpc_id, None).unwrap();
+
+        let sgs = store.list_sgs_by_vpc(&vpc_id).unwrap();
+        // 2 user-created + 1 default = 3
+        assert_eq!(sgs.len(), 3);
+        let names: Vec<&str> = sgs.iter().map(|sg| sg.name.as_str()).collect();
+        assert!(names.contains(&"web"));
+        assert!(names.contains(&"database"));
+        assert!(names.contains(&"default"));
+    }
+
+    #[test]
+    fn default_sg_auto_created() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        let default_sg = store.get_sg(&vpc_id, "default").unwrap();
+        assert!(default_sg.is_some());
+        let sg = default_sg.unwrap();
+        assert!(sg.is_default);
+        assert_eq!(sg.name, "default");
+        assert_eq!(sg.vpc_id, vpc_id);
+        assert!(sg.description.unwrap().contains("myvpc"));
+    }
+
+    #[test]
+    fn default_sg_undeletable() {
+        let (_dir, store) = temp_store();
+        let vpc_id = setup_vpc_for_sg(&store);
+
+        let err = store.delete_sg(&vpc_id, "default").unwrap_err();
+        assert!(matches!(err, OrgError::SgIsDefault(_)));
     }
 }

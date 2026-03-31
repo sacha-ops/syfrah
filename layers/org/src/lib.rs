@@ -18,7 +18,8 @@ pub use placement::PlacementStore;
 pub use store::OrgStore;
 pub use types::{
     Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, PlacementAction, Project,
-    ProjectId, Subnet, SubnetId, VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, VmPlacement, Vpc,
+    VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};
