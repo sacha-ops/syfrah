@@ -81,6 +81,18 @@ impl OwnershipRegistry {
         self.db.list(TABLE)
     }
 
+    /// List resources filtered by type (e.g., "vm", "bridge").
+    pub fn list_by_type(
+        &self,
+        resource_type: &str,
+    ) -> Result<Vec<(String, OwnershipRecord)>, syfrah_state::StateError> {
+        let all = self.list_all()?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, r)| r.resource_type == resource_type)
+            .collect())
+    }
+
     /// Rebuild the registry from a list of known resources.
     pub fn rebuild(
         &self,
