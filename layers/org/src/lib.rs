@@ -30,12 +30,12 @@ pub use sg_rules::SgRuleStore;
 pub use store::OrgStore;
 pub use types::{
     AllocatableCapacity, CpuArchitecture, Direction, DiskType, Environment, EnvironmentId, GpuSpec,
-    HardwareSpec, Hypervisor, HypervisorId, HypervisorState, HypervisorStatus, NatGateway,
-    NatGatewayId, NetworkInterface, NicId, Org, OrgId, PeeringId, PeeringStatus, PlacementAction,
-    PortRange, Project, ProjectId, Protocol, ResourceState, Route, RouteId, RouteOrigin,
-    RouteStatus, RouteTable, RouteTableId, RouteTarget, RuleId, RuleSource, SecurityGroup,
-    SecurityGroupId, SecurityGroupRule, Subnet, SubnetId, Taint, TaintEffect, VmPlacement, Vpc,
-    VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    HardwareSpec, Hypervisor, HypervisorId, HypervisorReport, HypervisorState, HypervisorStatus,
+    NatGateway, NatGatewayId, NetworkInterface, NicId, Org, OrgId, PeeringId, PeeringStatus,
+    PlacementAction, PortRange, Project, ProjectId, Protocol, ResourceState, Route, RouteId,
+    RouteOrigin, RouteStatus, RouteTable, RouteTableId, RouteTarget, RuleId, RuleSource,
+    SecurityGroup, SecurityGroupId, SecurityGroupRule, Subnet, SubnetId, Taint, TaintEffect,
+    VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};

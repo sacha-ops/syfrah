@@ -680,3 +680,46 @@ pub struct Hypervisor {
     pub taints: Vec<Taint>,
     pub created_at: u64,
 }
+
+/// Gossip report published by hypervisor nodes.
+///
+/// Replaces the generic NodeReport for compute-capable nodes.
+/// The scheduler and control plane consume this for placement decisions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HypervisorReport {
+    pub hypervisor_id: HypervisorId,
+    pub fabric_node_id: String,
+    pub state: HypervisorState,
+    pub capacity: AllocatableCapacity,
+    pub vm_count: u32,
+    pub host_cpu_percent: f32,
+    pub host_memory_percent: f32,
+    pub host_disk_percent: f32,
+    pub labels: HashMap<String, String>,
+    pub taints: Vec<Taint>,
+    pub timestamp: u64,
+}
+
+impl HypervisorReport {
+    /// Build a report from a hypervisor record and runtime stats.
+    pub fn from_hypervisor(hv: &Hypervisor, vm_count: u32) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            hypervisor_id: hv.id.clone(),
+            fabric_node_id: hv.fabric_node_id.clone(),
+            state: hv.state.clone(),
+            capacity: hv.capacity.clone(),
+            vm_count,
+            host_cpu_percent: 0.0,
+            host_memory_percent: 0.0,
+            host_disk_percent: 0.0,
+            labels: hv.labels.clone(),
+            taints: hv.taints.clone(),
+            timestamp: now,
+        }
+    }
+}
