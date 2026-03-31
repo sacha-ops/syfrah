@@ -1188,10 +1188,32 @@ pub async fn run_daemon(
     // consumers use HTTP.
     let (forge_shutdown_tx, forge_shutdown_rx) = tokio::sync::watch::channel(false);
     let forge_task = {
+        // Open the task store for Forge operations.
+        let forge_task_store = match syfrah_state::LayerDb::open("forge_tasks") {
+            Ok(db) => {
+                let store = Arc::new(syfrah_forge::task::TaskStore::new(db));
+                info!("forge: task store initialised");
+                Some(store)
+            }
+            Err(e) => {
+                warn!("forge: task store init failed (non-fatal): {e}");
+                None
+            }
+        };
+
+        // Initialize capacity tracker.
+        let forge_capacity = Arc::new(syfrah_forge::capacity::CapacityTracker::new());
+        info!(
+            "forge: capacity tracker initialised (vcpus={}, memory={}MB)",
+            forge_capacity.allocatable_vcpus(),
+            forge_capacity.allocatable_memory_mb()
+        );
+
         let forge_state = std::sync::Arc::new(syfrah_forge::api::ForgeState {
             started_at: std::time::Instant::now(),
-            task_store: None,
+            task_store: forge_task_store,
             vm_manager: shared_vm_manager.clone(),
+            capacity: Some(forge_capacity),
         });
 
         let bind_addr: std::net::SocketAddr =
