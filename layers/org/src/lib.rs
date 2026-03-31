@@ -20,9 +20,9 @@ pub use sg_rules::SgRuleStore;
 pub use store::OrgStore;
 pub use types::{
     Direction, Environment, EnvironmentId, Org, OrgId, PeeringId, PeeringStatus, PlacementAction,
-    PortRange, Project, ProjectId, Protocol, RuleId, RuleSource, SecurityGroupId,
-    SecurityGroupRule, Subnet, SubnetId, VmPlacement, Vpc, VpcAttachment, VpcId, VpcOwner,
-    VpcPeering,
+    PortRange, Project, ProjectId, Protocol, ResourceState, RuleId, RuleSource, SecurityGroup,
+    SecurityGroupId, SecurityGroupRule, Subnet, SubnetId, VmPlacement, Vpc, VpcAttachment, VpcId,
+    VpcOwner, VpcPeering,
 };
 pub use validation::validate_name;
 pub use vpc::{cidrs_overlap, parse_and_validate_cidr, validate_subnet_cidr, VpcStore};
