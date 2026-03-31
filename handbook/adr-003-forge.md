@@ -3,7 +3,7 @@
 **Status**: Proposed
 **Date**: 2026-03-30
 **Decided by**: Sacha + team, after architecture review
-**Revision**: v3 — bootstrap mode, projection scope, simplified generation model, control-degraded policy, ownership rebuild
+**Revision**: v4 — openraft storage architecture, bootstrap/distributed mode split, rejected redb-as-distributed-store
 
 ## Context
 
@@ -49,8 +49,8 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
     │   in VPC prod, subnet frontend, SG web-sg"                  │
     └────────────────────────┬────────────────────────────────────┘
                              │
-                             │  Authoritative store replicated
-                             │  → local materialized view (redb)
+                             │  openraft replicates committed state
+                             │  → state machine applies to local redb
                              │  indexed by node_id + dependencies
                              ▼
     ┌─────────────────────────────────────────────────────────────┐
@@ -94,16 +94,18 @@ Forge does not make scheduling decisions, does not know about other nodes' workl
 
 ## Desired State Projection
 
-Forge does NOT consume the global Raft log directly. Forge consumes a **local materialized view** of desired state, stored in the local redb instance.
+Forge does NOT consume the Raft log directly. Forge consumes a **local materialized view** of desired state — the local redb store IS the Raft state machine output. When openraft commits an entry, the state machine applies it to redb. Forge reads redb; it never reads the Raft log directly.
+
+The projection is not a separate thing from redb. redb IS the materialized view: the accumulated result of applying every committed Raft log entry through the state machine.
 
 ### How the materialized view works
 
-The authoritative control-plane store (Raft-based) contains the full desired state for all nodes. Each node maintains a **local projection** — a materialized subset containing only the resources relevant to that node.
+The authoritative control-plane store (openraft-based) contains the full desired state for all nodes. Each node participates in the Raft cluster and maintains a **local projection** — a materialized subset containing only the resources relevant to that node, stored in redb as the state machine backend.
 
 The projection is:
 - **Indexed by `node_id`**: every resource in the local view has `node_id == this_node`
 - **Indexed by resource dependencies**: if a VM is on this node, its VPC, subnet, security groups, route tables, and NAT gateways are also projected into the local view
-- **Materialized from the authoritative store**: the control plane pushes updates to each node's projection, or the node pulls its projection on startup and subscribes to incremental changes
+- **Materialized via openraft**: committed Raft entries are applied by each node's state machine to its local redb. Each node sees only the entries relevant to it (or the state machine filters during apply)
 
 ### Projection latency and staleness
 
@@ -117,8 +119,8 @@ The local materialized view is **eventually consistent** with the authoritative 
 ### Cache invalidation
 
 - **No local caching on top of the projection**: the redb materialized view IS the cache. There is no second layer of in-memory cache to invalidate
-- **Projection updates are applied atomically**: each update from the authoritative store is applied as a single redb transaction. Forge never sees a half-applied update
-- **Invalidation signal**: when the control plane commits a change affecting this node, it sends a notification (via the Raft subscription or a direct signal) that triggers immediate reconciliation. The periodic loop is the fallback if the signal is lost
+- **Projection updates are applied atomically**: each committed Raft entry is applied to redb as a single transaction. Forge never sees a half-applied update
+- **Invalidation signal**: when openraft commits an entry affecting this node, the state machine apply triggers immediate reconciliation. The periodic loop is the fallback if the signal is lost
 
 ### What the local projection contains
 
@@ -1472,17 +1474,73 @@ The current fabric daemon (`layers/fabric/src/daemon.rs`) is the proto-Forge. Th
 
 Before a distributed control plane exists, Forge operates in bootstrap mode:
 
-- **Local authoritative store**: redb on this node IS the source of truth (no Raft, no projection)
+- **Local authoritative store**: redb on this node is both the authoritative store AND the state machine — reads and writes go directly to redb (no Raft, no log, no replication)
 - **Same API, same reconciler**: the Forge API and reconciliation loop work identically
 - **Same CLI flow**: `syfrah` CLI → Forge API (local) → reconciler → compute/overlay
 - **No cross-node coordination**: VM placement is local-only, no scheduler
-- **Migration to distributed mode**: when control plane is introduced, the local authoritative store becomes a read-only projection of the distributed Raft store. The transition is:
-  1. Control plane starts, imports local state as initial Raft state
-  2. Forge switches from local-authoritative to projection-consumer
+- **Migration to distributed mode**: openraft wraps redb. Reads stay the same (Forge reads redb). Writes go through Raft (client → Raft leader → log replication → commit → state machine apply → redb). The transition from bootstrap to distributed is adding a write path (Raft log → state machine → redb), not changing the read path (Forge → redb). The concrete steps are:
+  1. Control plane starts, imports local redb state as initial Raft snapshot
+  2. openraft wraps redb writes — Forge reads redb as before, but mutations are routed through the Raft log
   3. CLI reroutes from local Forge to control plane for mutations
-  4. No data loss, no downtime — existing VMs continue running
+  4. No data loss, no downtime — existing VMs continue running, redb tables are untouched
 
-This means Phase 1 implementation does NOT need Raft. Forge works fully with local redb as the desired state store. The architecture is designed so that replacing the local store with a Raft projection is a configuration change, not a rewrite.
+This means Phase 1 implementation does NOT need Raft. Forge works fully with local redb as the desired state store. The architecture is designed so that introducing openraft adds a write path (consensus + log replication) on top of the same redb tables — a configuration change, not a rewrite.
+
+### Storage Architecture
+
+#### Bootstrap Mode (single-node, pre-control-plane)
+- redb as local authoritative store (current implementation)
+- No replication, no consensus
+- Single process, exclusive file lock
+- This is the Phase 1 implementation — works today
+
+#### Distributed Mode (multi-node, with control plane)
+- openraft provides Raft consensus across all nodes
+- Every node participates in the Raft cluster
+- Raft components:
+  - **Raft log**: append-only log of state mutations (stored in a dedicated log file or embedded DB per node)
+  - **State machine**: applies committed log entries to produce current state (redb serves as the state machine backend)
+  - **Snapshot**: periodic compaction of the state machine for faster recovery
+
+#### How it works
+
+```
+Client request (e.g. "create VM in az-1")
+    │
+    ▼
+Control Plane (any node, forwarded to Raft leader)
+    │
+    ▼
+Raft leader appends to log, replicates to majority
+    │
+    ▼
+Once committed: each node's state machine applies the entry
+    │
+    ▼
+Forge on each node sees the updated materialized view
+    │
+    ▼
+Forge on the target node reconciles (creates the VM)
+```
+
+#### openraft integration
+
+openraft requires three trait implementations:
+- `RaftLogStorage` — where to store log entries (options: file-backed, sled, custom)
+- `RaftStateMachine` — how to apply entries and produce snapshots
+- `RaftNetwork` — how nodes communicate (over the WireGuard fabric)
+
+Our implementation:
+- `RaftLogStorage` → file-backed append-only log (simple, crash-safe with fsync)
+- `RaftStateMachine` → redb as the applied-state store. When an entry is committed, it is applied to redb tables. This is the "materialized view" that Forge reads.
+- `RaftNetwork` → HTTP/JSON over syfrah0 (fabric IPv6). Same transport as Forge API.
+
+#### What this means for Forge
+
+- In bootstrap mode: Forge reads/writes redb directly (current behavior, unchanged)
+- In distributed mode: Forge reads redb (the state machine output), but WRITES go through Raft
+- The migration: redb tables stay the same. The only change is that writes are routed through openraft instead of direct redb access.
+- Forge's reconciliation loop is identical in both modes — it always reads from the local store
 
 ## Configuration
 
@@ -1590,7 +1648,11 @@ Add drain/undrain endpoints and the drain coordination protocol.
 
 Add Prometheus metrics, OpenTelemetry tracing, structured logging, graceful shutdown protocol. Add generation metrics.
 
-**Step 9 — Deprecate direct CLI-to-compute path**
+**Step 9 — Introduce openraft consensus**
+
+Wrap redb writes with openraft consensus. Implement the three openraft traits (`RaftLogStorage`, `RaftStateMachine`, `RaftNetwork`). Existing redb tables are untouched — openraft adds a log layer on top. Bootstrap mode continues to work (single-node Raft cluster, instant commit). Multi-node clusters gain leader election, log replication, and state machine snapshots.
+
+**Step 10 — Deprecate direct CLI-to-compute path**
 
 Once the Forge API is stable, route all CLI compute commands through Forge (local control socket → forge-api handler) instead of directly calling VmManager. This makes Forge the single entry point.
 
@@ -1689,11 +1751,17 @@ Forge enables the transition from "a collection of scripts that manage VMs" to "
 
 **Rejected**: a single counter conflates "the spec changed" with "Forge has reconciled." Two generations plus a timestamp (`spec_generation`, `reconcile_generation`, `last_observed_at`) provide clear answers to: "has the spec changed?" (`spec_generation` incremented), "has Forge converged to this spec?" (`spec_generation == reconcile_generation`), and "has Forge recently seen this resource?" (`last_observed_at` vs now).
 
-### 5. Forge manages desired state directly (no Raft)
+### 5. redb as distributed store
+
+**Considered**: use redb directly for distributed state coordination across nodes.
+
+**Rejected**: redb is a single-process embedded key-value store with exclusive file locks. It has no replication, no consensus, no multi-writer support. It is excellent as a local state machine backend for Raft (fast reads, ACID transactions, zero-config), but cannot be the distributed coordination layer itself. openraft provides the consensus algorithm; redb provides the local applied-state storage. These are complementary, not interchangeable.
+
+### 6. Forge manages desired state directly (no Raft)
 
 **Considered**: Forge could be the source of truth for its node's resources, with cross-node coordination via direct API calls.
 
-**Rejected**: this creates a split-brain problem. If a node goes down, its desired state is lost. The authoritative store (Raft-based) provides the single desired state that survives node failures. Forge is stateless in intent by design — it reads desired state, never owns it.
+**Rejected**: this creates a split-brain problem. If a node goes down, its desired state is lost. The authoritative store (openraft-based, with redb as state machine backend) provides the single desired state that survives node failures. Forge is stateless in intent by design — it reads desired state, never owns it.
 
 ### 6. Push-based reconciliation only (no periodic loop)
 
