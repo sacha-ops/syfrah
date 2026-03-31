@@ -158,3 +158,36 @@ pub struct Environment {
     pub created_at: u64,
     pub expires_at: Option<u64>,
 }
+
+/// Whether a VM placement is being added or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementAction {
+    Add,
+    Remove,
+}
+
+impl fmt::Display for PlacementAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlacementAction::Add => f.write_str("Add"),
+            PlacementAction::Remove => f.write_str("Remove"),
+        }
+    }
+}
+
+/// Tracks which node a VM is placed on, along with its network coordinates.
+///
+/// Persisted in the `vm_placements` redb table (key: "vpc_id/vm_id").
+/// Used for FDB distribution: when a VM is created or deleted, all nodes
+/// in the VPC must update their forwarding tables accordingly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmPlacement {
+    pub vpc_id: String,
+    pub vm_id: String,
+    pub vm_mac: String,
+    pub vm_ip: String,
+    pub subnet_id: String,
+    pub hosting_node: String,
+    pub action: PlacementAction,
+    pub created_at: u64,
+}
