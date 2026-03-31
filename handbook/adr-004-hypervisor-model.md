@@ -5,6 +5,14 @@
 **Decided by**: Sacha + team
 **Supersedes**: Informal "node" usage in compute/overlay/forge layers
 
+### Terminology note
+
+In Syfrah, "Hypervisor" refers to the **compute host resource** — the dedicated server that hosts VM instances. It does NOT refer to the VMM software (Cloud Hypervisor, QEMU, etc.).
+
+- **Hypervisor** = the schedulable compute host (the machine)
+- **Cloud Hypervisor** = the VMM binary that runs individual VMs (the software)
+- **Forge** = the agent process running on each hypervisor (the daemon)
+
 ## Context
 
 The platform uses "node" loosely across layers. In the fabric, a node is any WireGuard mesh participant — a hypervisor, a router, a control-plane-only box, a monitoring appliance. In the compute and forge layers, "node" implicitly means "a server that runs VMs," but this is never formalized. The result is ambiguity:
@@ -136,6 +144,8 @@ struct Hypervisor {
 }
 ```
 
+> **Note:** Field-level details in the structs below are illustrative. The implementation may adjust field names and types.
+
 ### 4. HardwareSpec — what the machine has
 
 Detected at registration time by probing the host system. Updated on restart if hardware changes (e.g., after a RAM upgrade or GPU installation).
@@ -157,12 +167,12 @@ struct HardwareSpec {
     /// Parsed from /proc/meminfo (MemTotal).
     memory_gb: u32,
 
-    /// Primary storage type.
-    disk_type: DiskType,
+    /// Local disk type (NVMe, SSD, HDD).
+    local_disk_type: DiskType,
 
-    /// Total usable disk capacity in gigabytes.
+    /// Total local disk capacity in gigabytes.
     /// Parsed from lsblk. Excludes the OS partition.
-    disk_gb: u32,
+    local_disk_gb: u32,
 
     /// GPU specification, if present. None for CPU-only servers.
     gpu: Option<GpuSpec>,
@@ -228,15 +238,24 @@ struct AllocatableCapacity {
     /// Memory available for new VMs in MB.
     allocatable_memory_mb: u64,
 
-    // --- Disk ---
-    /// Total disk available for VM volumes in GB.
-    total_disk_gb: u32,
+    // --- Local disk ---
+    /// Scratch space for VM runtime (rootfs clones, config-drives) in GB.
+    local_ephemeral_gb: u32,
 
-    /// Disk currently consumed by VM volumes in GB.
-    used_disk_gb: u32,
+    /// Cached VM images (shared across VMs) in GB.
+    local_image_cache_gb: u32,
 
-    /// Disk available for new VM volumes in GB.
-    allocatable_disk_gb: u32,
+    /// Total local disk in GB.
+    local_total_gb: u32,
+
+    /// Currently used local disk in GB.
+    local_used_gb: u32,
+
+    /// Available for new VMs in GB.
+    local_allocatable_gb: u32,
+
+    // Remote storage (ZeroFS/S3) is NOT bounded per-hypervisor.
+    // The scheduler does NOT filter by remote volume capacity.
 
     // --- Reservations ---
     /// vCPUs reserved for the host OS and Syfrah daemon overhead.
@@ -260,6 +279,8 @@ struct AllocatableCapacity {
 }
 ```
 
+**Disk scheduling note:** The scheduler filters by local disk only (ephemeral + runtime overhead). Remote volumes (ZeroFS) are not hypervisor-bounded — they're attached over the network and backed by S3.
+
 **Why memory overcommit defaults to 1.0**: CPU overcommit is safe — the Linux scheduler time-slices transparently. Memory overcommit is not — when physical memory is exhausted, the OOM killer terminates processes. In a cloud platform where tenants expect VM isolation, OOM-killing a tenant's VM because a neighbor overallocated is unacceptable. Memory overcommit is available for operators who understand the risk (e.g., dev/test environments with bursty workloads) but defaults to conservative.
 
 **Capacity update frequency**: Forge updates `AllocatableCapacity` on every reconciliation cycle (default 10 seconds). The updated capacity is reported via gossip so the scheduler has a near-real-time view.
@@ -269,38 +290,33 @@ struct AllocatableCapacity {
 A hypervisor progresses through a well-defined state machine:
 
 ```
-                      register
-     ───────────────────────────────────► Available
-                                            │
-                             drain          │         undrain
-                       ◄───────────────── │ ────────────────►
-                     Draining              │             Available
-                       │                   │
-                       │ all VMs           │ maintenance
-                       │ migrated/stopped  │
-                       ▼                   ▼
-                    Available         Maintenance
-                                           │
-                                           │ decommission
-                                           ▼
-                                     Decommissioned
-                                       (terminal)
+Registering → NotReady → Available → Draining → Available
+                                   → Maintenance → Available
+                                   → Decommissioned (terminal)
 ```
 
 ```rust
 enum HypervisorState {
-    /// Ready to accept new VM placements.
+    /// Hardware detection in progress, not yet assessed.
+    /// The node has been detected but capabilities are still being probed.
+    Registering,
+
+    /// Registered but not schedulable. Missing prerequisites:
+    /// CH binary not found, overlay not configured, storage not ready,
+    /// or operator hasn't enabled the hypervisor yet.
+    NotReady,
+
+    /// Healthy and schedulable. Ready to accept new VM placements.
     /// The scheduler includes this hypervisor in its placement pool.
     Available,
 
     /// No new VMs will be scheduled here. Existing VMs are being
     /// live-migrated or gracefully stopped.
-    /// Transitions to Available when all VMs are gone (or undrained).
     Draining,
 
-    /// Operator-initiated maintenance window. No new VMs, no drain
-    /// activity — the hypervisor is being serviced (firmware update,
-    /// hardware replacement, OS upgrade).
+    /// Offline for planned work. No VMs, not schedulable.
+    /// Requires drain to complete first (must be empty).
+    /// Operator must explicitly enter and exit maintenance.
     Maintenance,
 
     /// Permanently removed from the platform. The hypervisor record
@@ -314,24 +330,70 @@ enum HypervisorState {
 
 | From | To | Trigger | Precondition |
 |------|----|---------|--------------|
-| (new) | Available | `hypervisor register` | Node has KVM, hardware detected |
-| Available | Draining | `hypervisor drain` | — |
-| Draining | Available | `hypervisor undrain` | — |
+| (new) | Registering | KVM detected on mesh join | Forge detects capabilities |
+| Registering | NotReady | Hardware probed, specs recorded | Detection complete |
+| NotReady | Available | `syfrah hypervisor enable <id>` | Operator explicit activation |
+| Available | Draining | `syfrah hypervisor drain` | — |
+| Draining | Available | `syfrah hypervisor undrain` | — |
 | Draining | Available | (automatic) | All VMs migrated/stopped, drain complete |
-| Available | Maintenance | `hypervisor maintenance` | — |
-| Maintenance | Available | `hypervisor undrain` | — |
-| Available | Decommissioned | `hypervisor decommission` | No running VMs (must drain first) |
-| Maintenance | Decommissioned | `hypervisor decommission` | No running VMs |
+| Draining | Maintenance | (automatic) | Drain complete + maintenance requested |
+| Available | Maintenance | `syfrah hypervisor maintenance` | Must be empty (no running VMs) |
+| Maintenance | Available | `syfrah hypervisor undrain` | — |
+| Available | Decommissioned | `syfrah hypervisor decommission` | No running VMs (must drain first) |
+| Maintenance | Decommissioned | `syfrah hypervisor decommission` | No running VMs |
 | Decommissioned | (none) | — | Terminal state |
+
+> **Note:** `syfrah hypervisor enable` can be automated by the operator's provisioning pipeline, but Syfrah itself never auto-promotes to Available. Auto-detection is for DISCOVERY, not for ACTIVATION. The operator decides when a hypervisor is ready for tenant workloads.
 
 **Scheduler behavior by state:**
 
 | State | Accepts new VMs | Existing VMs | In gossip | In placement pool |
 |-------|----------------|--------------|-----------|-------------------|
+| Registering | No | None | No | No |
+| NotReady | No | None | Yes | No |
 | Available | Yes | Running | Yes | Yes |
 | Draining | No | Being migrated/stopped | Yes | No |
-| Maintenance | No | Should be drained first | Yes | No |
+| Maintenance | No | None (must be drained first) | Yes | No |
 | Decommissioned | No | None (enforced) | No | No |
+
+### Identity and persistence rules
+
+- `fabric_node_id` is the primary machine identity (derived from WireGuard keypair)
+- `hypervisor_id` is a resource identity (ULID, created at registration)
+- Binding: 1:1 between `fabric_node_id` and `hypervisor_id` while the hypervisor exists
+- **Reboot**: same `fabric_node_id` → same `hypervisor_id` (recovered from redb)
+- **Reinstall with same WG keys**: same `fabric_node_id` → same `hypervisor_id`
+- **Reinstall with new WG keys**: new `fabric_node_id` → new `hypervisor_id` (old record stays as Decommissioned or orphaned)
+- **Reprovisioned hardware** (new machine, same rack slot): new everything unless operator explicitly migrates the identity
+- **Rule**: if the machine comes back with the same `fabric_node_id`, it recovers its hypervisor record. If it comes back with a new one, it's a new hypervisor.
+
+### Drain vs. Maintenance
+
+- **Drain** is an OPERATION: "evacuate VMs from this hypervisor"
+  - Can be triggered independently
+  - Hypervisor stays Available after drain completes (just empty)
+  - Or transitions to Maintenance if maintenance was requested
+
+- **Maintenance** is a STATE: "this hypervisor is offline for planned work"
+  - Requires drain to complete first (no VMs)
+  - Not schedulable
+  - Operator must explicitly enter and exit maintenance
+
+Flow:
+```
+syfrah hypervisor drain hv-001         → state: Draining (evacuating)
+(VMs evacuated)                        → state: Available (empty but schedulable)
+syfrah hypervisor maintenance hv-001   → state: Maintenance (must be empty)
+(work done)
+syfrah hypervisor undrain hv-001       → state: Available
+```
+
+Or combined:
+```
+syfrah hypervisor maintenance hv-001 --drain  → Draining → (wait) → Maintenance
+```
+
+Maintenance is a state, not a taint-driven eviction. Drain does the eviction.
 
 ### 7. Taints and tolerations
 
@@ -387,7 +449,6 @@ struct Toleration {
 | Taint | Applied when | Effect | Purpose |
 |-------|-------------|--------|---------|
 | `syfrah.io/draining` | `hypervisor drain` | NoSchedule | Prevent new VMs during drain |
-| `syfrah.io/maintenance` | `hypervisor maintenance` | NoExecute | Evict VMs for maintenance |
 | `syfrah.io/unreachable` | Gossip timeout (60s) | NoSchedule | Scheduler avoids unresponsive nodes |
 
 **Use cases:**
@@ -403,32 +464,20 @@ struct Toleration {
   syfrah hypervisor taint hv-003 --add gpu-only=true:NoSchedule
   ```
 
-- **Maintenance window** (auto-applied):
-  ```bash
-  syfrah hypervisor maintenance hv-002
-  # Automatically adds taint: syfrah.io/maintenance:NoExecute
-  # Existing VMs are evicted (migrated to other hypervisors)
-  ```
-
 ### 8. Hypervisor registration
 
 A fabric node becomes a hypervisor through registration. Two paths:
 
-#### Automatic registration
+#### Automatic discovery (not activation)
 
 When a node joins the mesh via `syfrah fabric join` (or `syfrah fabric init`), the join process checks for KVM capability:
 
-1. **Detect KVM**: check for `/dev/kvm` and verify it is accessible (open + `KVM_GET_API_VERSION` ioctl).
-2. **Detect hardware**: parse system information:
-   - `/proc/cpuinfo` → CPU model, physical cores, logical threads
-   - `/proc/meminfo` → total memory (MemTotal)
-   - `lspci` (or `/sys/bus/pci/devices/`) → GPU model, VRAM, count (filter for VGA/3D controllers with NVIDIA/AMD vendor IDs)
-   - `lsblk --json` → disk type (rotational flag, transport), usable capacity (exclude OS partition)
-   - `ethtool` or `/sys/class/net/*/speed` → NIC bandwidth
-   - `uname -m` → CPU architecture
-3. **Create hypervisor record** with detected specs, region/zone inherited from the fabric node's labels.
-4. **State**: `Available`.
-5. **Persist** the record in the control-plane store (redb in bootstrap mode, Raft in distributed mode).
+1. **Detect KVM**: check for `/dev/kvm` and verify it is accessible (open + `KVM_GET_API_VERSION` ioctl). → State: **Registering**.
+2. **Detect hardware**: probe system information (CPU, memory, disk, GPU, NIC, architecture). → State: **NotReady**.
+3. **Persist** the record in the control-plane store (redb in bootstrap mode, Raft in distributed mode).
+4. **Wait for operator activation**: `syfrah hypervisor enable <id>` → State: **Available**.
+
+Auto-detection is for DISCOVERY, not for ACTIVATION. The operator decides when a hypervisor is ready for tenant workloads. `syfrah hypervisor enable` can be automated by the operator's provisioning pipeline, but Syfrah itself never auto-promotes to Available.
 
 If KVM is not present (`/dev/kvm` does not exist or is inaccessible), the node joins the mesh as a fabric node only. No hypervisor record is created. The node can still run Forge for network transit (VXLAN forwarding, FDB population, bridge management) but is not in the scheduler's placement pool.
 
@@ -458,7 +507,7 @@ When Forge starts on a hypervisor node:
 1. **Load hypervisor record** from the local store.
 2. **Re-detect hardware** — compare with stored `HardwareSpec`. If hardware changed (e.g., RAM upgrade, new GPU), update the record and log the change.
 3. **Recompute capacity** — scan running VMs, sum allocated resources, update `AllocatableCapacity`.
-4. **Resume state** — if the hypervisor was `Available` before shutdown, it returns to `Available`. If it was `Draining`, it resumes draining (checks if drain is complete). `Maintenance` and `Decommissioned` are sticky.
+4. **Resume state** — if the hypervisor was `Available` before shutdown, it returns to `Available`. If it was `Draining`, it resumes draining (checks if drain is complete). `NotReady`, `Maintenance`, and `Decommissioned` are sticky.
 5. **Begin heartbeat** — start reporting via gossip.
 
 ### 10. Relationship to Forge
@@ -614,14 +663,17 @@ syfrah hypervisor taint <name-or-id> --list
 
 # ─── Lifecycle ───
 
+# Enable: promote from NotReady to Available (operator activation)
+syfrah hypervisor enable <name-or-id>
+
 # Drain: stop accepting new VMs, optionally migrate existing VMs
 syfrah hypervisor drain <name-or-id> [--timeout 30m] [--force]
 
 # Undrain: resume accepting VMs
 syfrah hypervisor undrain <name-or-id>
 
-# Maintenance: mark for operator servicing (auto-adds NoExecute taint)
-syfrah hypervisor maintenance <name-or-id>
+# Maintenance: mark for planned work (must be empty, or use --drain)
+syfrah hypervisor maintenance <name-or-id> [--drain]
 
 # Decommission: permanently remove from platform (terminal)
 syfrah hypervisor decommission <name-or-id>
@@ -662,7 +714,7 @@ syfrah compute vm create --name web-3 --spread-topology zone ...
 2. **Filter by zone**: if `--zone` specified, only hypervisors in that zone.
 3. **Filter by node-selector**: if `--node-selector` specified, only hypervisors whose labels match all selectors.
 4. **Filter by taints**: exclude hypervisors with taints not tolerated by the VM spec.
-5. **Filter by capacity**: exclude hypervisors without enough allocatable vCPUs, memory, and disk.
+5. **Filter by capacity**: exclude hypervisors without enough allocatable vCPUs, memory, and local disk.
 6. **Apply anti-affinity**: if `--anti-affinity-group` specified, prefer hypervisors that don't already host VMs in that group. Hard anti-affinity fails if no such hypervisor exists; soft anti-affinity (default) is best-effort.
 7. **Apply spread-topology**: if `--spread-topology zone` specified, prefer zones with fewer VMs from this group.
 8. **Score remaining candidates**: prefer hypervisors with lower actual utilization (from gossip `host_cpu_percent`, `host_memory_percent`). Bin-packing vs. spreading is configurable per-org (default: spreading for resilience).
@@ -785,6 +837,23 @@ Draining a hypervisor is a controlled process that moves workloads off the machi
 3. Transition state to `Available`.
 4. The hypervisor re-enters the scheduler's placement pool.
 
+#### Migration constraints
+
+Not all VMs are migratable during drain:
+
+| VM type | Migratable | Reason |
+|---------|-----------|--------|
+| Stateless (remote volumes only) | Yes | Stop on A, start on B, volumes re-attach |
+| Local ephemeral disk only | Yes (with downtime) | Data is ephemeral, acceptable to lose |
+| Local persistent data | No (until ZeroFS) | Data on local NVMe, can't move without storage layer |
+| GPU passthrough (VFIO) | No | GPU device is physically on this host |
+| Pinned to hypervisor | No | Explicit placement constraint |
+
+Drain with non-migratable VMs:
+- Drain blocks until non-migratable VMs are manually handled
+- `--force` stops non-migratable VMs (data loss for local-disk VMs)
+- Operator must acknowledge: "I understand non-migratable VMs will be stopped"
+
 ### 17. Deletion guards
 
 Hypervisors are long-lived infrastructure. Accidental deletion or premature decommission can cause data loss and service disruption. The following guards are enforced:
@@ -809,6 +878,24 @@ Hypervisors are long-lived infrastructure. Accidental deletion or premature deco
 | Labels | Embedded in hypervisor record | On operator mutation | Replicated via Raft. |
 | Taints | Embedded in hypervisor record | On operator mutation or auto-taint (drain/maintenance) | Replicated via Raft. |
 | HypervisorReport | Gossip (in-memory, ephemeral) | Every gossip dissemination cycle | Not persisted. Rebuilt from live state on restart. |
+
+### Source of truth by field
+
+| Field | Authoritative source | Gossip | Notes |
+|-------|---------------------|--------|-------|
+| hypervisor_id | Raft (distributed) / redb (bootstrap) | — | Immutable after creation |
+| name | Raft / redb | — | Operator-assigned |
+| region, zone | Raft / redb | Echoed in gossip report | Set at registration, rarely changes |
+| state (lifecycle) | Raft / redb | Echoed in gossip | Admin operations go through Raft |
+| hardware_spec | Local Forge (detected) → written to Raft | — | Updated on restart |
+| capacity (used/allocatable) | Local Forge (real-time) | Reported every 10s | Gossip is advisory. Forge is truth for local. |
+| labels | Raft / redb | Echoed in gossip | Operator-managed |
+| taints | Raft / redb | Echoed in gossip | Operator or system-managed |
+| last_heartbeat | Gossip (observed by other nodes) | Yes | Not in Raft |
+| instance list | Raft (desired), Forge (actual) | — | Reconciliation resolves differences |
+
+If gossip says Available but Raft says Maintenance → **Raft wins**.
+If Forge says "20 GB free" but Raft has a stale placement → **Forge admission rejects**, Raft catches up.
 
 ### 19. What changes in existing code
 
@@ -840,10 +927,16 @@ This ADR introduces renames and refactors across existing designs. Every instanc
     │         │
     ▼         ▼
     Detect    Fabric node only.
-    hardware  Forge runs for network
-    specs     transit (bridges, VXLAN,
+    capabil.  Forge runs for network
+    │         transit (bridges, VXLAN,
     │         FDB). Not a hypervisor.
     │         Not in scheduler pool.
+    │
+    ▼
+    state: Registering
+    │
+    ▼
+    Probe hardware, record specs
     │
     ▼
     Create Hypervisor record:
@@ -851,13 +944,17 @@ This ADR introduces renames and refactors across existing designs. Every instanc
     ├── name: fabric node name
     ├── region: from --region flag
     ├── zone: from --zone flag
-    ├── state: Available
+    ├── state: NotReady
     ├── hardware: detected HardwareSpec
     ├── capacity: computed AllocatableCapacity
     ├── labels: empty (operator adds later)
     └── taints: empty
          │
          ▼
+    Operator runs: syfrah hypervisor enable <id>
+         │
+         ▼
+    state: Available
     Hypervisor in scheduler pool.
     Forge manages VMs + network + storage.
     HypervisorReport published via gossip.
