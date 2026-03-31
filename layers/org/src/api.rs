@@ -978,10 +978,33 @@ fn handle_org_request(
             match apply_nat_gw_nftables(&vpc, &subnet_cidrs) {
                 Ok(()) => {
                     // Transition to Active.
-                    match store.update_nat_gw_state(&vpc_obj.id, &name, ResourceState::Active) {
-                        Ok(active_gw) => OrgResponse::NatGwResp(active_gw),
-                        Err(e) => OrgResponse::Error(e.to_string()),
+                    let active_gw = match store.update_nat_gw_state(
+                        &vpc_obj.id,
+                        &name,
+                        ResourceState::Active,
+                    ) {
+                        Ok(g) => g,
+                        Err(e) => return OrgResponse::Error(e.to_string()),
+                    };
+
+                    // Auto-add default route 0.0.0.0/0 -> NatGateway if none exists.
+                    if let Ok(Some(default_rt)) = store.get_default_route_table(&vpc_obj.id) {
+                        let has_default = store
+                            .get_route(&default_rt.id, "0.0.0.0/0")
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        if !has_default {
+                            let _ = store.add_route(
+                                &default_rt.id,
+                                "0.0.0.0/0",
+                                RouteTarget::NatGateway(name.clone()),
+                                Some(100),
+                            );
+                        }
                     }
+
+                    OrgResponse::NatGwResp(active_gw)
                 }
                 Err(nft_err) => {
                     // Transition to Failed.
@@ -1508,10 +1531,22 @@ fn validate_route_target(
                 Err(e) => Err(e.to_string()),
             }
         }
-        RouteTarget::NatGateway(_name) => {
-            // NAT Gateway is not yet implemented (Phase 3 placeholder).
-            // For now, accept the target — it will be validated when NAT GW is implemented.
-            Ok(())
+        RouteTarget::NatGateway(name) => {
+            // Check if NAT GW exists and is Active.
+            match store.get_nat_gw_by_name(name) {
+                Ok(Some(gw)) => {
+                    if gw.state == ResourceState::Active {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "nat-gw '{}' is not active (current state: {})",
+                            name, gw.state
+                        ))
+                    }
+                }
+                Ok(None) => Err(format!("nat-gw '{name}' not found")),
+                Err(e) => Err(e.to_string()),
+            }
         }
     }
 }
