@@ -37,6 +37,8 @@ pub struct RuntimeSpec {
     pub gpu: GpuMode,
     /// Image name (passed through so container meta can persist it for reconnect).
     pub image_name: Option<String>,
+    /// SSH public key to inject into the workload for root access.
+    pub ssh_public_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let cloned = spec.clone();
         assert_eq!(cloned.vcpus, 4);

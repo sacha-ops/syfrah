@@ -413,16 +413,62 @@ fn download_binary(url: &str, dest: &Path, name: &str) -> Result<(), ComputeErro
 
 /// Generate a minimal OCI runtime spec (`config.json`) for the given workload.
 fn generate_oci_config(id: &str, spec: &RuntimeSpec) -> serde_json::Value {
+    // If an SSH key was provided, the init script handles sshd + sleep.
+    // Otherwise, fall back to /sbin/init or sleep infinity.
+    let init_args: Vec<&str> = if spec.ssh_public_key.is_some() {
+        vec!["/bin/sh", "/syfrah-init.sh"]
+    } else {
+        vec!["/bin/sh", "-c", "exec /sbin/init || exec sleep infinity"]
+    };
+
     serde_json::json!({
         "ociVersion": "1.0.0",
         "process": {
             "terminal": false,
             "user": { "uid": 0, "gid": 0 },
-            "args": ["/bin/sh", "-c", "exec /sbin/init || exec sleep infinity"],
+            "args": init_args,
             "env": [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             ],
-            "cwd": "/"
+            "cwd": "/",
+            "capabilities": {
+                "bounding": [
+                    "CAP_NET_BIND_SERVICE",
+                    "CAP_NET_RAW",
+                    "CAP_SYS_CHROOT",
+                    "CAP_SETUID",
+                    "CAP_SETGID",
+                    "CAP_CHOWN",
+                    "CAP_FOWNER",
+                    "CAP_DAC_OVERRIDE",
+                    "CAP_KILL",
+                    "CAP_AUDIT_WRITE"
+                ],
+                "effective": [
+                    "CAP_NET_BIND_SERVICE",
+                    "CAP_NET_RAW",
+                    "CAP_SYS_CHROOT",
+                    "CAP_SETUID",
+                    "CAP_SETGID",
+                    "CAP_CHOWN",
+                    "CAP_FOWNER",
+                    "CAP_DAC_OVERRIDE",
+                    "CAP_KILL",
+                    "CAP_AUDIT_WRITE"
+                ],
+                "permitted": [
+                    "CAP_NET_BIND_SERVICE",
+                    "CAP_NET_RAW",
+                    "CAP_SYS_CHROOT",
+                    "CAP_SETUID",
+                    "CAP_SETGID",
+                    "CAP_CHOWN",
+                    "CAP_FOWNER",
+                    "CAP_DAC_OVERRIDE",
+                    "CAP_KILL",
+                    "CAP_AUDIT_WRITE"
+                ]
+            }
         },
         "root": {
             "path": "rootfs",
@@ -474,6 +520,123 @@ fn generate_oci_config(id: &str, spec: &RuntimeSpec) -> serde_json::Value {
             ]
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Helper: inject SSH setup into container rootfs
+// ---------------------------------------------------------------------------
+
+/// Write an SSH public key and a boot-time init script into the container
+/// rootfs so that `sshd` starts automatically when the container boots.
+///
+/// This is the container equivalent of cloud-init SSH key injection for VMs.
+/// The init script installs `openssh-server` via `apk` (Alpine) or uses the
+/// pre-installed `sshd` if available, then starts the daemon.
+async fn inject_ssh_setup(rootfs: &Path, ssh_public_key: &str) -> Result<(), ComputeError> {
+    // 1. Write authorized_keys for root.
+    let ssh_dir = rootfs.join("root/.ssh");
+    tokio::fs::create_dir_all(&ssh_dir)
+        .await
+        .map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to create /root/.ssh in rootfs: {e}"),
+        })?;
+    let ak_path = ssh_dir.join("authorized_keys");
+    tokio::fs::write(&ak_path, format!("{}\n", ssh_public_key.trim()))
+        .await
+        .map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to write authorized_keys: {e}"),
+        })?;
+
+    // Ensure correct permissions (0700 for .ssh, 0600 for authorized_keys).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .ok();
+        tokio::fs::set_permissions(&ak_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .ok();
+    }
+
+    // 2b. Write /etc/resolv.conf so the container can resolve DNS.
+    let resolv_path = rootfs.join("etc/resolv.conf");
+    tokio::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+        .await
+        .map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to write resolv.conf: {e}"),
+        })?;
+
+    // 3. Write an init script that installs and starts sshd.
+    //    This script is run as PID 1 in the container. It configures SSH,
+    //    then execs into sleep infinity to keep the container alive.
+    let init_script = r#"#!/bin/sh
+# Container init script — installs and starts SSH, keeps container alive.
+# Logs to /var/log/syfrah-init.log for debugging.
+exec >/var/log/syfrah-init.log 2>&1
+
+# Wait for network to be configured (veth is moved in after container starts).
+n=0
+while [ $n -lt 30 ]; do
+    if ip link show eth0 >/dev/null 2>&1; then break; fi
+    n=$((n + 1))
+    sleep 1
+done
+# Give the IP/route config a moment to settle after eth0 appears.
+sleep 2
+
+# Install openssh-server if not present.
+if ! command -v sshd >/dev/null 2>&1; then
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache openssh-server 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq openssh-server 2>&1 || true
+    fi
+fi
+
+# Generate host keys if missing.
+ssh-keygen -A 2>/dev/null || true
+
+# Ensure sshd run directory exists.
+mkdir -p /run/sshd
+
+# Configure sshd for root login with key auth.
+mkdir -p /etc/ssh
+if [ -f /etc/ssh/sshd_config ]; then
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+else
+    cat > /etc/ssh/sshd_config <<SSHEOF
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+SSHEOF
+fi
+
+# Start sshd in the foreground as PID 1 (keeps container alive).
+if command -v sshd >/dev/null 2>&1; then
+    exec /usr/sbin/sshd -D -e 2>&1
+else
+    # Fallback: keep container alive even if sshd isn't available.
+    exec sleep infinity
+fi
+"#;
+    let init_path = rootfs.join("syfrah-init.sh");
+    tokio::fs::write(&init_path, init_script)
+        .await
+        .map_err(|e| ProcessError::SpawnFailed {
+            reason: format!("failed to write syfrah-init.sh: {e}"),
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .ok();
+    }
+
+    info!("SSH setup injected into container rootfs");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +1038,11 @@ impl ComputeRuntime for ContainerRuntime {
 
         // 2. Prepare rootfs.
         prepare_rootfs(&spec.rootfs_path, &runtime_dir).await?;
+
+        // 2b. Inject SSH setup into rootfs (if an SSH key was provided).
+        if let Some(ref ssh_key) = spec.ssh_public_key {
+            inject_ssh_setup(&runtime_dir.join("rootfs"), ssh_key).await?;
+        }
 
         // 3. Write config.json.
         let config = generate_oci_config(id, spec);
@@ -1353,6 +1521,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let config = generate_oci_config("test-vm-1", &spec);
         assert_eq!(config["hostname"], "test-vm-1");
@@ -1368,6 +1537,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let config = generate_oci_config("mem-test", &spec);
         let limit = config["linux"]["resources"]["memory"]["limit"]
@@ -1386,6 +1556,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let config = generate_oci_config("cpu-test", &spec);
         let shares = config["linux"]["resources"]["cpu"]["shares"]
@@ -1404,6 +1575,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let config = generate_oci_config("ns-test", &spec);
         let namespaces = config["linux"]["namespaces"].as_array().unwrap();
@@ -1427,6 +1599,7 @@ mod tests {
             network: None,
             gpu: GpuMode::None,
             image_name: None,
+            ssh_public_key: None,
         };
         let config = generate_oci_config("ver-test", &spec);
         assert_eq!(config["ociVersion"], "1.0.0");

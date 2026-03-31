@@ -727,6 +727,7 @@ impl VmManager {
             network,
             gpu: spec.gpu.clone(),
             image_name: Some(spec.image.clone()),
+            ssh_public_key: spec.ssh_key.clone(),
         };
 
         let handle = match self.runtime.create(&vm_id_str, &runtime_spec).await {
