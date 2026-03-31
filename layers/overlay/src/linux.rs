@@ -235,23 +235,19 @@ impl NetworkBackend for LinuxBackend {
         ))
     }
 
-    // ── Discovery ─────────────────────────────────────────────────
-
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
         let output = Self::run("ip", &["-o", "link", "show"]).await?;
-        let mut result = Vec::new();
+        let mut names = Vec::new();
         for line in output.lines() {
-            // ip -o link output: "N: name: <FLAGS> ..."
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                let name = parts[1].trim();
-                // Handle "name@if123" for veth peers
-                let name = name.split('@').next().unwrap_or(name);
+            // Format: "2: eth0: <...>"
+            if let Some(name_part) = line.split(':').nth(1) {
+                let name = name_part.trim().split('@').next().unwrap_or("").trim();
                 if name.starts_with(prefix) {
-                    result.push(name.to_string());
+                    names.push(name.to_string());
                 }
             }
         }
-        Ok(result)
+        names.sort();
+        Ok(names)
     }
 }

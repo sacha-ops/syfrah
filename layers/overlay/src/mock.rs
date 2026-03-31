@@ -5,12 +5,15 @@ use crate::backend::NetworkBackend;
 use crate::error::{OverlayError, Result};
 
 /// In-memory mock that records every call for test assertions.
+///
+/// Also tracks which interfaces exist so that [`NetworkBackend::list_interfaces`]
+/// returns meaningful data during reconciliation tests.
 pub struct MockBackend {
     calls: Mutex<Vec<String>>,
     /// Method names that should return an error (e.g. "add_fdb_entry").
     fail_methods: Mutex<HashSet<String>>,
-    /// Interfaces returned by `list_interfaces`.
-    interfaces: Mutex<Vec<String>>,
+    /// Simulated kernel interfaces (bridges, TAPs, VXLANs).
+    interfaces: Mutex<HashSet<String>>,
 }
 
 impl MockBackend {
@@ -18,7 +21,7 @@ impl MockBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             fail_methods: Mutex::new(HashSet::new()),
-            interfaces: Mutex::new(Vec::new()),
+            interfaces: Mutex::new(HashSet::new()),
         }
     }
 
@@ -40,10 +43,22 @@ impl MockBackend {
             .insert(method.to_string());
     }
 
+    /// Pre-populate an interface so that `list_interfaces` returns it.
+    pub fn add_interface(&self, name: &str) {
+        self.interfaces
+            .lock()
+            .expect("lock poisoned")
+            .insert(name.to_string());
+    }
+
     /// Seed the mock with a list of kernel interfaces that `list_interfaces`
     /// will return (filtered by prefix).
     pub fn set_interfaces(&self, ifaces: Vec<String>) {
-        *self.interfaces.lock().expect("lock poisoned") = ifaces;
+        let mut guard = self.interfaces.lock().expect("lock poisoned");
+        guard.clear();
+        for iface in ifaces {
+            guard.insert(iface);
+        }
     }
 
     fn record(&self, call: String) {
@@ -137,11 +152,13 @@ impl NetworkBackend for MockBackend {
     // ── TAP / veth ─────────────────────────────────────────────────────
 
     async fn create_tap(&self, name: &str) -> Result<()> {
+        self.should_fail("create_tap")?;
         self.record(format!("create_tap({name})"));
         Ok(())
     }
 
     async fn delete_tap(&self, name: &str) -> Result<()> {
+        self.should_fail("delete_tap")?;
         self.record(format!("delete_tap({name})"));
         Ok(())
     }
@@ -183,15 +200,16 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
-    // ── Discovery ──────────────────────────────────────────────────────
-
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
         self.record(format!("list_interfaces({prefix})"));
-        let all = self.interfaces.lock().expect("lock poisoned").clone();
-        Ok(all
-            .into_iter()
+        let interfaces = self.interfaces.lock().expect("lock poisoned");
+        let mut matched: Vec<String> = interfaces
+            .iter()
             .filter(|name| name.starts_with(prefix))
-            .collect())
+            .cloned()
+            .collect();
+        matched.sort();
+        Ok(matched)
     }
 }
 

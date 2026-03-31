@@ -369,6 +369,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         }
     }
 
@@ -398,6 +399,7 @@ mod tests {
             },
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         }
     }
 
@@ -549,6 +551,7 @@ mod tests {
             },
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let errors = validate(&spec).unwrap_err();
         // Should have at least 5 errors: vcpus, memory, image, bdf, volume, tap
@@ -716,6 +719,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -733,6 +737,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -786,6 +791,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let errors = validate(&spec).unwrap_err();
         assert!(
@@ -824,6 +830,7 @@ mod tests {
             gpu: GpuMode::None,
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
         let validated = validate(&spec).unwrap();
         let resolved = resolve(
@@ -1022,6 +1029,7 @@ mod tests {
             },
             ssh_key: None,
             disk_size_mb: None,
+            subnet: None,
         };
 
         // Step 1: validate
