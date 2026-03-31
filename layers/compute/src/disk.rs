@@ -465,7 +465,8 @@ pub fn generate_cloud_init(
     let network_path = work_dir.join("network-config");
     let has_network = config.network_config.is_some();
     if let Some(net_cfg) = &config.network_config {
-        if let Err(e) = fs::write(&network_path, net_cfg) {
+        let yaml = net_cfg.to_yaml();
+        if let Err(e) = fs::write(&network_path, &yaml) {
             cleanup(&work_dir, &dest);
             return Err(ImageError::CloudInitGenerationFailed {
                 reason: format!("failed to write network-config: {e}"),
@@ -583,6 +584,7 @@ pub fn generate_cloud_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::types::CloudInitNetworkConfig;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1006,7 +1008,13 @@ mod tests {
             ssh_authorized_keys: vec![],
             default_user: "ubuntu".to_string(),
             users: vec![],
-            network_config: Some("network:\n  version: 2\n".to_string()),
+            network_config: Some(CloudInitNetworkConfig {
+                ip: "10.0.1.5".to_string(),
+                prefix_len: 24,
+                gateway: "10.0.1.1".to_string(),
+                mtu: 1500,
+                dns: vec!["8.8.8.8".to_string()],
+            }),
             user_data_extra: None,
         };
 
@@ -1027,6 +1035,10 @@ mod tests {
 
         let content = fs::read_to_string(extract_dir.join("network-config")).unwrap();
         assert!(content.contains("version: 2"));
+        assert!(content.contains("10.0.1.5/24"));
+        assert!(content.contains("gateway4: 10.0.1.1"));
+        assert!(content.contains("mtu: 1500"));
+        assert!(content.contains("8.8.8.8"));
     }
 
     #[test]
@@ -1189,5 +1201,121 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         dir.cleanup().unwrap();
         assert!(!dir_path.exists());
+    }
+
+    // ========================================================================
+    // 5. Combined SSH + network config-drive tests (#756)
+    // ========================================================================
+
+    #[test]
+    fn combined_ssh_and_network() {
+        if !has_tool("mkfs.vfat") || !has_tool("mcopy") {
+            eprintln!("SKIP: mkfs.vfat/mcopy not available");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let id = InstanceId::new();
+        let dir = InstanceDir::create(tmp.path(), &id).unwrap();
+        let config = CloudInitConfig {
+            hostname: "combined-vm".to_string(),
+            ssh_authorized_keys: vec!["ssh-ed25519 AAAA... user@host".to_string()],
+            default_user: "ubuntu".to_string(),
+            users: vec![],
+            network_config: Some(CloudInitNetworkConfig {
+                ip: "10.0.1.5".to_string(),
+                prefix_len: 24,
+                gateway: "10.0.1.1".to_string(),
+                mtu: 1350,
+                dns: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            }),
+            user_data_extra: None,
+        };
+
+        let img_path = generate_cloud_init(&config, &dir, &id).unwrap();
+        let extract_dir = tmp.path().join("extract");
+        fs::create_dir_all(&extract_dir).unwrap();
+
+        // Extract and verify user-data contains SSH key
+        let out = Command::new("mcopy")
+            .args([
+                "-i",
+                &img_path.to_string_lossy(),
+                "::user-data",
+                &extract_dir.join("user-data").to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "user-data should exist");
+        let user_data = fs::read_to_string(extract_dir.join("user-data")).unwrap();
+        assert!(user_data.contains("#cloud-config"));
+        assert!(user_data.contains("ssh-ed25519"));
+
+        // Extract and verify network-config contains IP, gateway, MTU, DNS
+        let out = Command::new("mcopy")
+            .args([
+                "-i",
+                &img_path.to_string_lossy(),
+                "::network-config",
+                &extract_dir.join("network-config").to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "network-config should exist");
+        let net_cfg = fs::read_to_string(extract_dir.join("network-config")).unwrap();
+        assert!(net_cfg.contains("10.0.1.5/24"));
+        assert!(net_cfg.contains("gateway4: 10.0.1.1"));
+        assert!(net_cfg.contains("mtu: 1350"));
+        assert!(net_cfg.contains("8.8.8.8"));
+        assert!(net_cfg.contains("1.1.1.1"));
+    }
+
+    #[test]
+    fn iso_contains_both_files() {
+        if !has_tool("mkfs.vfat") || !has_tool("mcopy") {
+            eprintln!("SKIP: mkfs.vfat/mcopy not available");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let id = InstanceId::new();
+        let dir = InstanceDir::create(tmp.path(), &id).unwrap();
+        let config = CloudInitConfig {
+            hostname: "both-files-vm".to_string(),
+            ssh_authorized_keys: vec!["ssh-ed25519 AAAA... test@host".to_string()],
+            default_user: "ubuntu".to_string(),
+            users: vec![],
+            network_config: Some(CloudInitNetworkConfig {
+                ip: "10.0.2.10".to_string(),
+                prefix_len: 24,
+                gateway: "10.0.2.1".to_string(),
+                mtu: 1350,
+                dns: vec!["8.8.8.8".to_string()],
+            }),
+            user_data_extra: None,
+        };
+
+        let img_path = generate_cloud_init(&config, &dir, &id).unwrap();
+        let extract_dir = tmp.path().join("extract");
+        fs::create_dir_all(&extract_dir).unwrap();
+
+        // Verify all 3 files exist in the image: meta-data, user-data, network-config
+        for name in &["meta-data", "user-data", "network-config"] {
+            let out = Command::new("mcopy")
+                .args([
+                    "-i",
+                    &img_path.to_string_lossy(),
+                    &format!("::{name}"),
+                    &extract_dir.join(name).to_string_lossy(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name} should be present in the config-drive image"
+            );
+            let content = fs::read_to_string(extract_dir.join(name)).unwrap();
+            assert!(!content.is_empty(), "{name} should be non-empty");
+        }
     }
 }

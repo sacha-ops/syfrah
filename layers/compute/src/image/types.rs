@@ -132,6 +132,59 @@ impl fmt::Display for InstanceId {
 }
 
 // ---------------------------------------------------------------------------
+// CloudInitNetworkConfig (#756)
+// ---------------------------------------------------------------------------
+
+/// Structured network configuration for cloud-init config-drive.
+///
+/// Generates a Netplan v2 `network-config` file that cloud-init's NoCloud
+/// data source reads from the config-drive ISO.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CloudInitNetworkConfig {
+    /// Static IPv4 address (e.g. `"10.0.1.5"`).
+    pub ip: String,
+    /// Subnet prefix length (e.g. `24` for `/24`).
+    pub prefix_len: u8,
+    /// Default gateway (e.g. `"10.0.1.1"`).
+    pub gateway: String,
+    /// MTU value (e.g. `1350` for VXLAN overlay).
+    pub mtu: u16,
+    /// DNS nameserver addresses.
+    pub dns: Vec<String>,
+}
+
+impl CloudInitNetworkConfig {
+    /// Render Netplan v2 YAML suitable for the `network-config` file.
+    pub fn to_yaml(&self) -> String {
+        let mut dns_entries = String::new();
+        for addr in &self.dns {
+            dns_entries.push_str(&format!("            - {addr}\n"));
+        }
+
+        format!(
+            "network:\n\
+             \x20 version: 2\n\
+             \x20 ethernets:\n\
+             \x20   id0:\n\
+             \x20     match:\n\
+             \x20       name: en*\n\
+             \x20     addresses:\n\
+             \x20       - {ip}/{prefix}\n\
+             \x20     gateway4: {gw}\n\
+             \x20     mtu: {mtu}\n\
+             \x20     nameservers:\n\
+             \x20       addresses:\n\
+{dns}",
+            ip = self.ip,
+            prefix = self.prefix_len,
+            gw = self.gateway,
+            mtu = self.mtu,
+            dns = dns_entries,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CloudInitConfig (#536)
 // ---------------------------------------------------------------------------
 
@@ -150,8 +203,8 @@ pub struct CloudInitConfig {
     /// Additional user accounts to create.
     #[serde(default)]
     pub users: Vec<UserConfig>,
-    /// Raw YAML for network configuration (written to network-config).
-    pub network_config: Option<String>,
+    /// Structured network configuration for the config-drive.
+    pub network_config: Option<CloudInitNetworkConfig>,
     /// Extra user-data YAML appended to the generated user-data file.
     pub user_data_extra: Option<String>,
 }
@@ -449,7 +502,13 @@ mod tests {
                     shell: None,
                 },
             ],
-            network_config: Some("network:\n  version: 2\n".to_string()),
+            network_config: Some(CloudInitNetworkConfig {
+                ip: "10.0.1.5".to_string(),
+                prefix_len: 24,
+                gateway: "10.0.1.1".to_string(),
+                mtu: 1350,
+                dns: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            }),
             user_data_extra: Some("runcmd:\n  - echo hello\n".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -470,5 +529,39 @@ mod tests {
         let json = serde_json::to_string(&user).unwrap();
         let back: UserConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(user, back);
+    }
+
+    // -- CloudInitNetworkConfig tests (#756) ----------------------------------
+
+    #[test]
+    fn cloud_init_network_config_serde_roundtrip() {
+        let cfg = CloudInitNetworkConfig {
+            ip: "10.0.1.5".to_string(),
+            prefix_len: 24,
+            gateway: "10.0.1.1".to_string(),
+            mtu: 1350,
+            dns: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: CloudInitNetworkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn cloud_init_network_config_to_yaml() {
+        let cfg = CloudInitNetworkConfig {
+            ip: "10.0.1.5".to_string(),
+            prefix_len: 24,
+            gateway: "10.0.1.1".to_string(),
+            mtu: 1350,
+            dns: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        };
+        let yaml = cfg.to_yaml();
+        assert!(yaml.contains("version: 2"));
+        assert!(yaml.contains("10.0.1.5/24"));
+        assert!(yaml.contains("gateway4: 10.0.1.1"));
+        assert!(yaml.contains("mtu: 1350"));
+        assert!(yaml.contains("8.8.8.8"));
+        assert!(yaml.contains("1.1.1.1"));
     }
 }
