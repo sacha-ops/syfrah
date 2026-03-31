@@ -578,6 +578,55 @@ pub fn generate_cloud_init(
 }
 
 // ---------------------------------------------------------------------------
+// Network config v2 (#755)
+// ---------------------------------------------------------------------------
+
+/// Generate a cloud-init network config v2 YAML string.
+///
+/// Produces a NoCloud-compatible `network-config` file with a single ethernet
+/// interface (`eth0`) configured with the given IP, gateway, DNS servers, and
+/// MTU. The MTU is set to 1350 to account for VXLAN (50 bytes) + WireGuard
+/// (80 bytes) overhead on the standard 1500 MTU path.
+pub fn generate_network_config(ip: &str, prefix_len: u8, gateway: &str, mtu: u16) -> String {
+    let mut root = serde_yaml::Mapping::new();
+
+    let mut eth0 = serde_yaml::Mapping::new();
+    eth0.insert(
+        "addresses".into(),
+        YamlValue::Sequence(vec![YamlValue::String(format!("{ip}/{prefix_len}"))]),
+    );
+    eth0.insert("gateway4".into(), YamlValue::String(gateway.to_string()));
+
+    let mut nameservers = serde_yaml::Mapping::new();
+    nameservers.insert(
+        "addresses".into(),
+        YamlValue::Sequence(vec![
+            YamlValue::String("8.8.8.8".to_string()),
+            YamlValue::String("1.1.1.1".to_string()),
+        ]),
+    );
+    eth0.insert("nameservers".into(), YamlValue::Mapping(nameservers));
+    eth0.insert(
+        "mtu".into(),
+        YamlValue::Number(serde_yaml::Number::from(mtu)),
+    );
+
+    let mut ethernets = serde_yaml::Mapping::new();
+    ethernets.insert("eth0".into(), YamlValue::Mapping(eth0));
+
+    let mut network = serde_yaml::Mapping::new();
+    network.insert(
+        "version".into(),
+        YamlValue::Number(serde_yaml::Number::from(2u64)),
+    );
+    network.insert("ethernets".into(), YamlValue::Mapping(ethernets));
+
+    root.insert("network".into(), YamlValue::Mapping(network));
+
+    serde_yaml::to_string(&root).expect("network config serialization cannot fail")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1158,6 +1207,65 @@ mod tests {
         let name = users[0]["name"].as_str().unwrap();
         // Must be a single quoted scalar, not split into YAML keys
         assert_eq!(name, "admin\nruncmd:\n  - rm -rf /");
+    }
+
+    // ========================================================================
+    // 3c. Network config v2 (#755)
+    // ========================================================================
+
+    #[test]
+    fn network_config_generated() {
+        let yaml = generate_network_config("10.0.1.5", 24, "10.0.1.1", 1350);
+        // Must be valid YAML
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(
+            parsed["network"].is_mapping(),
+            "top-level 'network' key expected"
+        );
+        assert_eq!(parsed["network"]["version"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn correct_ip() {
+        let yaml = generate_network_config("10.0.1.5", 24, "10.0.1.1", 1350);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let addresses = parsed["network"]["ethernets"]["eth0"]["addresses"]
+            .as_sequence()
+            .unwrap();
+        let addr = addresses[0].as_str().unwrap();
+        assert_eq!(addr, "10.0.1.5/24");
+    }
+
+    #[test]
+    fn correct_gateway() {
+        let yaml = generate_network_config("10.0.1.5", 24, "10.0.1.1", 1350);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let gw = parsed["network"]["ethernets"]["eth0"]["gateway4"]
+            .as_str()
+            .unwrap();
+        assert_eq!(gw, "10.0.1.1");
+    }
+
+    #[test]
+    fn mtu_1350() {
+        let yaml = generate_network_config("10.0.1.5", 24, "10.0.1.1", 1350);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let mtu = parsed["network"]["ethernets"]["eth0"]["mtu"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(mtu, 1350);
+    }
+
+    #[test]
+    fn dns_servers() {
+        let yaml = generate_network_config("10.0.1.5", 24, "10.0.1.1", 1350);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let dns = parsed["network"]["ethernets"]["eth0"]["nameservers"]["addresses"]
+            .as_sequence()
+            .unwrap();
+        let servers: Vec<&str> = dns.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(servers.contains(&"8.8.8.8"));
+        assert!(servers.contains(&"1.1.1.1"));
     }
 
     // ========================================================================
