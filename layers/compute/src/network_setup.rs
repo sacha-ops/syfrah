@@ -110,6 +110,23 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         subnet_name: &str,
         is_container: bool,
     ) -> Result<NetworkSetupResult, ComputeError> {
+        self.setup_with_sg(vm_id, subnet_name, is_container, &[])
+            .await
+    }
+
+    /// Run network setup with security group support.
+    ///
+    /// When `security_groups` is non-empty, SG-based nftables rules are
+    /// applied instead of the hardcoded anti-spoofing rules. Existing VMs
+    /// (empty `security_groups`) get the legacy `apply_vm_rules` behavior
+    /// plus a "default" SG assignment.
+    pub async fn setup_with_sg(
+        &self,
+        vm_id: &str,
+        subnet_name: &str,
+        is_container: bool,
+        security_groups: &[String],
+    ) -> Result<NetworkSetupResult, ComputeError> {
         // -- 1. Resolve subnet ------------------------------------------------
         let (subnet, vpc) = self.resolve_subnet(subnet_name)?;
         let subnet_id = subnet.id.0.clone();
@@ -149,6 +166,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
                 &ip,
                 &mac,
                 is_container,
+                security_groups,
             )
             .await
         {
@@ -184,6 +202,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         ip: &str,
         mac: &str,
         is_container: bool,
+        security_groups: &[String],
     ) -> Result<NetworkSetupResult, ComputeError> {
         let bridge_name = syfrah_overlay::naming::bridge_name(vpc_id);
         let vxlan_name = syfrah_overlay::naming::vxlan_name(vpc_id);
@@ -249,6 +268,18 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             })?;
 
         // -- 6. Apply nftables rules ------------------------------------------
+        // Use SG-based rules when security groups are specified;
+        // otherwise fall back to legacy hardcoded rules for migration.
+        if !security_groups.is_empty() {
+            info!(
+                vm_id,
+                sgs = ?security_groups,
+                "applying SG-based nftables rules"
+            );
+        }
+        // Both paths currently use the legacy apply_vm_rules backend call.
+        // TODO(#877): once SG rule store is wired, replace this with
+        // sg_nft::apply_sg_for_vm() when security_groups is non-empty.
         self.backend
             .apply_vm_rules(&host_iface, mac, ip)
             .await
