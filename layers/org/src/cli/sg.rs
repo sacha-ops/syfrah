@@ -37,7 +37,10 @@ pub async fn run_create(name: &str, vpc: &str, description: &str) -> Result<()> 
         OrgResponse::Sg(sg) => {
             println!("Security group created: {}", sg.name);
             println!("  VPC:          {}", sg.vpc_id);
-            println!("  Description:  {}", sg.description);
+            println!(
+                "  Description:  {}",
+                sg.description.as_deref().unwrap_or("-")
+            );
             println!("  State:        {}", sg.state);
             println!("  Created:      {}", format_timestamp(sg.created_at));
             Ok(())
@@ -71,21 +74,19 @@ pub async fn run_list(vpc: Option<&str>, json: bool) -> Result<()> {
             }
 
             println!(
-                "{:<20} {:<20} {:<8} {:<10} {:<6} {:<4} CREATED",
-                "NAME", "VPC", "DEFAULT", "STATE", "RULES", "VMs"
+                "{:<20} {:<20} {:<8} {:<10} CREATED",
+                "NAME", "VPC", "DEFAULT", "STATE"
             );
-            println!("{}", "-".repeat(88));
+            println!("{}", "-".repeat(70));
 
             for sg in &sgs {
                 let default_str = if sg.is_default { "yes" } else { "no" };
                 println!(
-                    "{:<20} {:<20} {:<8} {:<10} {:<6} {:<4} {}",
+                    "{:<20} {:<20} {:<8} {:<10} {}",
                     sg.name,
                     sg.vpc_id,
                     default_str,
                     sg.state,
-                    sg.rules.len(),
-                    sg.attached_vms.len(),
                     format_timestamp(sg.created_at),
                 );
             }
@@ -111,56 +112,14 @@ pub async fn run_show(name: &str, vpc: Option<&str>) -> Result<()> {
             println!("Security Group: {}", sg.name);
             println!("  ID:           {}", sg.id);
             println!("  VPC:          {}", sg.vpc_id);
-            println!("  Description:  {}", sg.description);
+            println!(
+                "  Description:  {}",
+                sg.description.as_deref().unwrap_or("-")
+            );
             let default_str = if sg.is_default { "yes" } else { "no" };
             println!("  Default:      {default_str}");
             println!("  State:        {}", sg.state);
             println!("  Created:      {}", format_timestamp(sg.created_at));
-            println!("  Updated:      {}", format_timestamp(sg.updated_at));
-
-            // Rules table
-            println!();
-            if sg.rules.is_empty() {
-                println!("Rules: (none)");
-            } else {
-                println!("Rules:");
-                println!(
-                    "  {:<10} {:<8} {:<12} {:<20} {:<8} DESCRIPTION",
-                    "DIRECTION", "PROTO", "PORTS", "SOURCE/DEST", "PRIORITY"
-                );
-                println!("  {}", "-".repeat(78));
-                for rule in &sg.rules {
-                    let ports = match &rule.port_range {
-                        Some(pr) => pr.to_string(),
-                        None => "-".to_string(),
-                    };
-                    let src_dst = if rule.direction == crate::types::Direction::Ingress {
-                        &rule.source
-                    } else {
-                        &rule.destination
-                    };
-                    println!(
-                        "  {:<10} {:<8} {:<12} {:<20} {:<8} {}",
-                        rule.direction,
-                        rule.protocol,
-                        ports,
-                        src_dst,
-                        rule.priority,
-                        rule.description,
-                    );
-                }
-            }
-
-            // Attached VMs
-            println!();
-            if sg.attached_vms.is_empty() {
-                println!("Attached VMs: (none)");
-            } else {
-                println!("Attached VMs:");
-                for vm in &sg.attached_vms {
-                    println!("  - {vm}");
-                }
-            }
 
             Ok(())
         }

@@ -136,6 +136,33 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
+    #[error("security group already exists: {0}")]
+    SgAlreadyExists(String),
+
+    #[error("security group not found: {0}")]
+    SgNotFound(String),
+
+    #[error("cannot delete default security group: {0}")]
+    SgIsDefault(String),
+
+    #[error("security group rule already exists: {0}")]
+    RuleAlreadyExists(String),
+
+    #[error("security group rule not found: {0}")]
+    RuleNotFound(String),
+
+    #[error("invalid port range: {reason}")]
+    InvalidPortRange { reason: String },
+
+    #[error("nic already exists: {0}")]
+    NicAlreadyExists(String),
+
+    #[error("nic not found: {0}")]
+    NicNotFound(String),
+
+    #[error("security group '{sg}' is not attached to nic '{nic}'")]
+    SgNotAttached { nic: String, sg: String },
+
     #[error("{0}")]
     Ambiguous(String),
 
