@@ -136,23 +136,41 @@ pub enum OrgError {
     #[error("IP already assigned: {ip} in subnet {subnet}")]
     IpAlreadyAssigned { subnet: String, ip: String },
 
-    #[error("security group not found: {0}")]
-    SgNotFound(String),
-
     #[error("security group already exists: {0}")]
     SgAlreadyExists(String),
 
-    #[error("NIC not found: {0}")]
+    #[error("security group not found: {0}")]
+    SgNotFound(String),
+
+    #[error("cannot delete default security group: {0}")]
+    SgIsDefault(String),
+
+    #[error("security group rule already exists: {0}")]
+    RuleAlreadyExists(String),
+
+    #[error("security group rule not found: {0}")]
+    RuleNotFound(String),
+
+    #[error("invalid port range: {reason}")]
+    InvalidPortRange { reason: String },
+
+    #[error("nic already exists: {0}")]
+    NicAlreadyExists(String),
+
+    #[error("nic not found: {0}")]
     NicNotFound(String),
 
-    #[error("NIC already exists: {0}")]
-    NicAlreadyExists(String),
+    #[error("security group '{sg}' is not attached to nic '{nic}'")]
+    SgNotAttached { nic: String, sg: String },
 
     #[error("VM not found: {0}")]
     VmNotFound(String),
 
     #[error("VM '{vm}' has no NIC")]
     VmHasNoNic { vm: String },
+
+    #[error("security group '{sg}' is already attached to NIC '{nic}'")]
+    SgAlreadyAttached { sg: String, nic: String },
 
     #[error("security group '{sg}' is not in the same VPC as VM's subnet (sg vpc: {sg_vpc}, nic vpc: {nic_vpc})")]
     SgVpcMismatch {
@@ -161,14 +179,8 @@ pub enum OrgError {
         nic_vpc: String,
     },
 
-    #[error("security group '{sg}' is already attached to NIC '{nic}'")]
-    SgAlreadyAttached { sg: String, nic: String },
-
-    #[error("security group '{sg}' is not attached to NIC '{nic}'")]
-    SgNotAttached { sg: String, nic: String },
-
     #[error("cannot detach the last security group from NIC '{nic}' — a NIC must always have at least one SG")]
-    DetachLastSg { nic: String },
+    LastSgDetach { nic: String },
 
     #[error("store error: {0}")]
     StoreError(String),

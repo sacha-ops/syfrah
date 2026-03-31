@@ -37,7 +37,10 @@ pub async fn run_create(name: &str, vpc: &str, description: &str) -> Result<()> 
         OrgResponse::Sg(sg) => {
             println!("Security group created: {}", sg.name);
             println!("  VPC:         {}", sg.vpc_id);
-            println!("  Description: {}", sg.description);
+            println!(
+                "  Description: {}",
+                sg.description.as_deref().unwrap_or("-")
+            );
             println!("  State:       {}", sg.state);
             Ok(())
         }
@@ -72,7 +75,10 @@ pub async fn run_list(vpc: Option<&str>, json: bool) -> Result<()> {
             for sg in &sgs {
                 println!(
                     "{:<25} {:<20} {:<10} {}",
-                    sg.name, sg.vpc_id, sg.state, sg.description,
+                    sg.name,
+                    sg.vpc_id,
+                    sg.state,
+                    sg.description.as_deref().unwrap_or("-"),
                 );
             }
 
@@ -170,7 +176,7 @@ pub async fn run_list_attached(vm: Option<&str>, nic: Option<&str>, json: bool) 
         .map_err(daemon_err)?;
 
     match resp {
-        OrgResponse::NicSgList(sgs) => {
+        OrgResponse::SgList(sgs) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&sgs)?);
                 return Ok(());
@@ -191,7 +197,12 @@ pub async fn run_list_attached(vm: Option<&str>, nic: Option<&str>, json: bool) 
             println!("{}", "-".repeat(70));
 
             for sg in &sgs {
-                println!("{:<25} {:<20} {}", sg.name, sg.vpc_id, sg.description,);
+                println!(
+                    "{:<25} {:<20} {}",
+                    sg.name,
+                    sg.vpc_id,
+                    sg.description.as_deref().unwrap_or("-"),
+                );
             }
 
             Ok(())
