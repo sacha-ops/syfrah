@@ -47,6 +47,12 @@ pub(crate) struct VmRuntimeState {
     pub(crate) instance_dir_path: Option<PathBuf>,
     /// Handle returned by the runtime backend that created this workload.
     pub(crate) runtime_handle: Option<RuntimeHandle>,
+    /// IP address assigned to the VM (e.g. "10.1.1.3").
+    pub(crate) ip: Option<String>,
+    /// Subnet the VM belongs to (e.g. "frontend").
+    pub(crate) subnet: Option<String>,
+    /// VPC the VM belongs to (e.g. "default").
+    pub(crate) vpc: Option<String>,
     /// Network metadata for teardown on delete. None if VM has no networking.
     pub(crate) network_info: Option<NetworkInfo>,
 }
@@ -91,6 +97,9 @@ impl VmRuntimeState {
             runtime: self.runtime_handle.as_ref().map(|h| h.runtime_type),
             created_at: Some(self.launched_at),
             uptime_secs,
+            ip: self.ip.clone(),
+            subnet: self.subnet.clone(),
+            vpc: self.vpc.clone(),
         }
     }
 }
@@ -117,6 +126,9 @@ mod tests {
             image_name: None,
             instance_dir_path: None,
             runtime_handle: None,
+            ip: None,
+            subnet: None,
+            vpc: None,
             network_info: None,
         }
     }

@@ -33,6 +33,8 @@ pub enum ComputeRequest {
         ssh_key: Option<String>,
         #[serde(default)]
         disk_size_mb: Option<u32>,
+        #[serde(default)]
+        subnet: Option<crate::types::SubnetInfo>,
     },
     ListVms,
     GetVm {
@@ -123,6 +125,9 @@ fn vm_status_to_json(s: &crate::types::VmStatus) -> serde_json::Value {
         "runtime": runtime,
         "created_at": s.created_at,
         "uptime_secs": s.uptime_secs,
+        "ip": s.ip,
+        "subnet": s.subnet,
+        "vpc": s.vpc,
     })
 }
 
@@ -166,6 +171,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
             tap,
             ssh_key,
             disk_size_mb,
+            subnet,
         } => {
             let gpu = match gpu_bdf {
                 Some(bdf) => GpuMode::Passthrough { bdf },
@@ -186,6 +192,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 gpu,
                 ssh_key,
                 disk_size_mb,
+                subnet,
             };
             match mgr.create_vm(spec).await {
                 Ok(status) => ComputeResponse::Vm(vm_status_to_json(&status)),

@@ -8,13 +8,14 @@ use std::path::PathBuf;
 use clap::Subcommand;
 
 use crate::control::{send_compute_request, ComputeRequest, ComputeResponse};
+use crate::types::SubnetInfo;
 
 /// VM management subcommands.
 #[derive(Debug, Subcommand)]
 pub enum VmCommand {
     /// Create a new virtual machine
     #[command(
-        after_help = "Examples:\n  syfrah compute vm create --name web-1 --image alpine-3.20\n  syfrah compute vm create --name web-1 --image alpine-3.20 --vcpus 4 --memory 4096 --ssh-key ~/.ssh/id_ed25519.pub"
+        after_help = "Examples:\n  syfrah compute vm create --name web-1 --image alpine-3.20\n  syfrah compute vm create --name web-1 --image alpine-3.20 --vcpus 4 --memory 4096 --ssh-key ~/.ssh/id_ed25519.pub\n  syfrah compute vm create --name web-1 --image alpine-3.20 --subnet frontend --env production --project backend --org acme"
     )]
     Create {
         /// Human-readable name for the VM
@@ -41,6 +42,18 @@ pub enum VmCommand {
         /// Disk size in MB (0 = use image default)
         #[arg(long)]
         disk_size: Option<u32>,
+        /// Subnet name to place the VM in (auto-selected if env has exactly one)
+        #[arg(long)]
+        subnet: Option<String>,
+        /// Environment name (required with --subnet or for auto-subnet resolution)
+        #[arg(long)]
+        env: Option<String>,
+        /// Project name (required with --subnet or for auto-subnet resolution)
+        #[arg(long)]
+        project: Option<String>,
+        /// Organization name (required with --subnet or for auto-subnet resolution)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// List all virtual machines
     #[command(after_help = "Examples:\n  syfrah compute vm list\n  syfrah compute vm list --json")]
@@ -114,7 +127,16 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
             tap,
             ssh_key,
             disk_size,
-        } => run_create(name, vcpus, memory, image, gpu, tap, ssh_key, disk_size).await,
+            subnet,
+            env,
+            project,
+            org,
+        } => {
+            run_create(
+                name, vcpus, memory, image, gpu, tap, ssh_key, disk_size, subnet, env, project, org,
+            )
+            .await
+        }
         VmCommand::List { json } => run_list(json).await,
         VmCommand::Get { id, json } => run_get(id, json).await,
         VmCommand::Start { id } => run_start(id).await,
@@ -162,6 +184,95 @@ pub(crate) fn normalize_disk_size(disk_size: Option<u32>) -> Option<u32> {
     }
 }
 
+/// Resolve a subnet for VM placement.
+///
+/// - If `--subnet` is given, look up that specific subnet in the environment.
+/// - If `--subnet` is NOT given but `--env/--project/--org` are, look up all
+///   subnets in the environment. If exactly 1, use it. If 0 or 2+, error.
+/// - If none of the org context flags are given, returns `None` (no subnet).
+fn resolve_subnet(
+    subnet_name: Option<String>,
+    env: Option<String>,
+    project: Option<String>,
+    org: Option<String>,
+) -> anyhow::Result<Option<SubnetInfo>> {
+    // If no org context flags at all, skip subnet resolution
+    let (env_name, project_name, org_name) = match (&env, &project, &org) {
+        (Some(e), Some(p), Some(o)) => (e.as_str(), p.as_str(), o.as_str()),
+        (None, None, None) => {
+            if subnet_name.is_some() {
+                anyhow::bail!(
+                    "--subnet requires --env, --project, and --org to resolve the subnet"
+                );
+            }
+            return Ok(None);
+        }
+        _ => {
+            anyhow::bail!("--env, --project, and --org must all be specified together");
+        }
+    };
+
+    let env_id = syfrah_org::EnvironmentId(format!("{org_name}/{project_name}/{env_name}"));
+
+    let db = syfrah_state::LayerDb::open("org")
+        .map_err(|e| anyhow::anyhow!("failed to open org database: {e}"))?;
+    let store = syfrah_org::OrgStore::new(db);
+
+    let subnets = store
+        .list_subnets_by_env(&env_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match subnet_name {
+        Some(name) => {
+            // Look for the specific subnet by name
+            let subnet = subnets
+                .into_iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "subnet '{name}' not found in environment '{env_name}'. \
+                         Create one with: syfrah subnet create {name} --env {env_name} --project {project_name} --org {org_name}"
+                    )
+                })?;
+            Ok(Some(SubnetInfo {
+                name: subnet.name,
+                cidr: subnet.cidr,
+                gateway: subnet.gateway,
+                vpc_id: subnet.vpc_id.0,
+                env_id: subnet.env_id.0,
+            }))
+        }
+        None => {
+            // Auto-select: must have exactly 1 subnet
+            match subnets.len() {
+                0 => {
+                    anyhow::bail!(
+                        "no subnet found for environment '{env_name}'. \
+                         Create one with: syfrah subnet create <name> --env {env_name} --project {project_name} --org {org_name}"
+                    );
+                }
+                1 => {
+                    let subnet = subnets.into_iter().next().unwrap();
+                    Ok(Some(SubnetInfo {
+                        name: subnet.name,
+                        cidr: subnet.cidr,
+                        gateway: subnet.gateway,
+                        vpc_id: subnet.vpc_id.0,
+                        env_id: subnet.env_id.0,
+                    }))
+                }
+                _ => {
+                    let names: Vec<&str> = subnets.iter().map(|s| s.name.as_str()).collect();
+                    anyhow::bail!(
+                        "environment '{env_name}' has multiple subnets: {}. Specify --subnet",
+                        names.join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_create(
     name: String,
@@ -172,12 +283,19 @@ async fn run_create(
     tap: Option<String>,
     ssh_key_path: Option<PathBuf>,
     disk_size: Option<u32>,
+    subnet_name: Option<String>,
+    env: Option<String>,
+    project: Option<String>,
+    org: Option<String>,
 ) -> anyhow::Result<()> {
     let ssh_key = match ssh_key_path {
         Some(ref path) => Some(read_ssh_key(path)?),
         None => None,
     };
     let disk_size_mb = normalize_disk_size(disk_size);
+
+    // Resolve subnet if org/project/env context is provided
+    let subnet = resolve_subnet(subnet_name, env, project, org)?;
 
     let req = ComputeRequest::CreateVm {
         name,
@@ -188,6 +306,7 @@ async fn run_create(
         tap,
         ssh_key: ssh_key.clone(),
         disk_size_mb,
+        subnet,
     };
     let resp = send_compute_request(&control_socket_path(), &req)
         .await
@@ -249,8 +368,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             } else {
                 let tw = super::term_width();
                 let header = format!(
-                    "{:<20} {:<20} {:<12} {:<12} {:<6} {:<10} {:<10}",
-                    "NAME", "IMAGE", "PHASE", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
+                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10}",
+                    "NAME", "IMAGE", "PHASE", "IP", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
                 );
                 if console::Term::stdout().is_term() {
                     let truncated = &header[..header.len().min(tw)];
@@ -258,7 +377,7 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                 } else {
                     println!("{}", &header[..header.len().min(tw)]);
                 }
-                println!("{}", "-".repeat(90.min(tw)));
+                println!("{}", "-".repeat(106.min(tw)));
                 if vms.is_empty() {
                     println!("(no VMs)");
                 } else {
@@ -266,6 +385,7 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                         let name = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
                         let image = vm.get("image").and_then(|i| i.as_str()).unwrap_or("");
                         let phase = vm.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
+                        let ip = vm.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
                         let runtime = vm.get("runtime").and_then(|r| r.as_str()).unwrap_or("-");
                         let vcpus = vm.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(0);
                         let memory = vm.get("memory_mb").and_then(|m| m.as_u64()).unwrap_or(0);
@@ -276,7 +396,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .unwrap_or_else(|| "-".to_string());
                         let name = super::truncate(name, 19);
                         let image = super::truncate(image, 19);
-                        let row = format!("{name:<20} {image:<20} {phase:<12} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10}");
+                        let ip = super::truncate(ip, 15);
+                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10}");
                         println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
@@ -327,6 +448,9 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                     .and_then(|u| u.as_u64())
                     .map(format_uptime)
                     .unwrap_or_else(|| "-".to_string());
+                let ip = v.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
+                let subnet_val = v.get("subnet").and_then(|s| s.as_str()).unwrap_or("-");
+                let vpc_val = v.get("vpc").and_then(|s| s.as_str()).unwrap_or("-");
                 println!("VM Details");
                 println!("  Name:      {name}");
                 println!("  Image:     {image}");
@@ -335,6 +459,9 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 println!("  vCPUs:     {vcpus}");
                 println!("  Memory:    {memory} MB");
                 println!("  Uptime:    {uptime}");
+                println!("  IP:        {ip}");
+                println!("  Subnet:    {subnet_val}");
+                println!("  VPC:       {vpc_val}");
             }
             Ok(())
         }
@@ -567,6 +694,10 @@ mod tests {
                 tap,
                 ssh_key,
                 disk_size,
+                subnet,
+                env,
+                project,
+                org,
             } => {
                 assert_eq!(name, "test-vm");
                 assert_eq!(vcpus, 2); // default
@@ -576,6 +707,10 @@ mod tests {
                 assert!(tap.is_none());
                 assert!(ssh_key.is_none());
                 assert!(disk_size.is_none());
+                assert!(subnet.is_none());
+                assert!(env.is_none());
+                assert!(project.is_none());
+                assert!(org.is_none());
             }
             other => panic!("expected Create, got {other:?}"),
         }
@@ -608,6 +743,7 @@ mod tests {
                 tap,
                 ssh_key,
                 disk_size,
+                ..
             } => {
                 assert_eq!(name, "gpu-vm");
                 assert_eq!(vcpus, 8);
@@ -852,6 +988,108 @@ mod tests {
             }
             other => panic!("expected Create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_create_with_subnet_flags() {
+        let cmd = parse(&[
+            "create",
+            "--name",
+            "web-1",
+            "--image",
+            "alpine-3.20",
+            "--subnet",
+            "frontend",
+            "--env",
+            "production",
+            "--project",
+            "backend",
+            "--org",
+            "acme",
+        ]);
+        match cmd {
+            VmCommand::Create {
+                name,
+                subnet,
+                env,
+                project,
+                org,
+                ..
+            } => {
+                assert_eq!(name, "web-1");
+                assert_eq!(subnet.as_deref(), Some("frontend"));
+                assert_eq!(env.as_deref(), Some("production"));
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert_eq!(org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_create_with_env_only_no_subnet() {
+        let cmd = parse(&[
+            "create",
+            "--name",
+            "web-1",
+            "--image",
+            "alpine-3.20",
+            "--env",
+            "staging",
+            "--project",
+            "api",
+            "--org",
+            "acme",
+        ]);
+        match cmd {
+            VmCommand::Create {
+                subnet,
+                env,
+                project,
+                org,
+                ..
+            } => {
+                assert!(subnet.is_none());
+                assert_eq!(env.as_deref(), Some("staging"));
+                assert_eq!(project.as_deref(), Some("api"));
+                assert_eq!(org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    // -- Subnet resolution tests ---------------------------------------------
+
+    #[test]
+    fn subnet_requires_org_context() {
+        // --subnet without --env/--project/--org should error
+        let result = resolve_subnet(Some("frontend".to_string()), None, None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--subnet requires --env, --project, and --org"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn subnet_partial_org_context_errors() {
+        // Only --env without --project/--org should error
+        let result = resolve_subnet(None, Some("production".to_string()), None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--env, --project, and --org must all be specified together"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn subnet_none_when_no_context() {
+        // No flags at all should return Ok(None)
+        let result = resolve_subnet(None, None, None, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -234,4 +234,20 @@ impl NetworkBackend for LinuxBackend {
             "nft: not yet implemented".into(),
         ))
     }
+
+    async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
+        let output = Self::run("ip", &["-o", "link", "show"]).await?;
+        let mut names = Vec::new();
+        for line in output.lines() {
+            // Format: "2: eth0: <...>"
+            if let Some(name_part) = line.split(':').nth(1) {
+                let name = name_part.trim().split('@').next().unwrap_or("").trim();
+                if name.starts_with(prefix) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
