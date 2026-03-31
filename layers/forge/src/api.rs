@@ -90,13 +90,90 @@ pub struct InstanceActionRequest {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /v1/node/health
+/// GET /v1/hypervisor/health (alias: /v1/node/health)
 async fn health_handler(State(state): State<Arc<ForgeState>>) -> Json<HealthResponse> {
     let uptime = state.started_at.elapsed().as_secs();
     Json(HealthResponse {
         status: "healthy".to_string(),
         uptime,
     })
+}
+
+/// GET /v1/hypervisor/status (alias: /v1/node/status)
+async fn status_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let uptime = state.started_at.elapsed().as_secs();
+    let vm_count = match state.vm_manager.as_ref() {
+        Some(m) => m.list().await.len(),
+        None => 0,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "healthy",
+            "uptime": uptime,
+            "vm_count": vm_count,
+        })),
+    )
+}
+
+/// GET /v1/hypervisor/capacity (alias: /v1/node/capacity)
+async fn capacity_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    if let Some(ref cap) = state.capacity {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "allocatable_vcpus": cap.allocatable_vcpus(),
+                "allocatable_memory_mb": cap.allocatable_memory_mb(),
+                "available_vcpus": cap.available_vcpus(),
+                "available_memory_mb": cap.available_memory_mb(),
+                "used_vcpus": cap.allocatable_vcpus().saturating_sub(cap.available_vcpus()),
+                "used_memory_mb": cap.allocatable_memory_mb().saturating_sub(cap.available_memory_mb()),
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_CAPACITY_UNAVAILABLE", "message": "capacity tracker not initialized"}),
+            ),
+        )
+    }
+}
+
+/// GET /v1/hypervisor/metrics (alias: /v1/node/metrics)
+async fn metrics_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let uptime = state.started_at.elapsed().as_secs();
+    let vm_count = match state.vm_manager.as_ref() {
+        Some(m) => m.list().await.len(),
+        None => 0,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "uptime_seconds": uptime,
+            "vm_count": vm_count,
+        })),
+    )
+}
+
+/// GET /v1/hypervisor/resources (alias: /v1/node/resources)
+async fn resources_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let vms = match state.vm_manager.as_ref() {
+        Some(m) => m.list().await,
+        None => vec![],
+    };
+
+    let vm_names: Vec<String> = vms.iter().map(|v| v.vm_id.0.clone()).collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "vm_count": vms.len(),
+            "vms": vm_names,
+        })),
+    )
 }
 
 /// GET /v1/tasks/:id
@@ -531,9 +608,22 @@ async fn reboot_instance_handler(
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
+        // -- Hypervisor endpoints (canonical) --
+        .route("/v1/hypervisor/health", get(health_handler))
+        .route("/v1/hypervisor/status", get(status_handler))
+        .route("/v1/hypervisor/capacity", get(capacity_handler))
+        .route("/v1/hypervisor/metrics", get(metrics_handler))
+        .route("/v1/hypervisor/resources", get(resources_handler))
+        // -- Deprecated /v1/node/* aliases --
         .route("/v1/node/health", get(health_handler))
+        .route("/v1/node/status", get(status_handler))
+        .route("/v1/node/capacity", get(capacity_handler))
+        .route("/v1/node/metrics", get(metrics_handler))
+        .route("/v1/node/resources", get(resources_handler))
+        // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
+        // -- Instances --
         .route(
             "/v1/instances",
             get(list_instances_handler).post(create_instance_handler),
