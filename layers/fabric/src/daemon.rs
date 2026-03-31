@@ -1214,6 +1214,7 @@ pub async fn run_daemon(
             task_store: forge_task_store,
             vm_manager: shared_vm_manager.clone(),
             capacity: Some(forge_capacity),
+            org_store: shared_org_store.clone(),
         });
 
         let bind_addr: std::net::SocketAddr =
