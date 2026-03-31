@@ -342,7 +342,15 @@ async fn get_instance_handler(
     }
 }
 
-/// DELETE /v1/instances/:id — delete an instance.
+/// DELETE /v1/instances/:id — delete an instance with reverse dependency cleanup.
+///
+/// Orchestration order (reverse of create):
+///   stop VM -> announce FDB remove -> release IP (IPAM) -> delete NIC record
+///   -> delete TAP/veth -> remove nftables rules -> remove FDB entries
+///   -> if bridge empty: remove gateway IP, NAT, VXLAN, bridge
+///
+/// Best-effort: errors in cleanup steps are logged but do not fail the delete.
+/// The VmManager handles the full reverse-dependency flow internally.
 async fn delete_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Path(id): Path<String>,
@@ -363,18 +371,31 @@ async fn delete_instance_handler(
         let _ = task_store.start_task(&task_id);
     }
 
+    info!(instance = %id, task = %task_id, "starting delete orchestration");
+
     // Get VM info first for capacity release.
     let vm_info = vm_manager.info(&id).await.ok();
 
+    // VmManager::delete_vm handles the full reverse-dependency cleanup:
+    // stop -> FDB remove -> IPAM release -> NIC delete -> TAP delete
+    // -> nftables remove -> bridge cleanup (if empty)
+    // All cleanup steps are best-effort — errors are logged, not propagated.
     match vm_manager.delete_vm(&id).await {
         Ok(()) => {
-            // Release capacity.
+            // Release capacity tracking.
             if let (Some(ref capacity), Some(ref info)) = (&state.capacity, &vm_info) {
                 capacity.release(&id, info.vcpus, info.memory_mb as u64);
+                info!(
+                    instance = %id,
+                    vcpus = info.vcpus,
+                    memory_mb = info.memory_mb,
+                    "capacity released"
+                );
             }
             if let Some(ref task_store) = state.task_store {
                 let _ = task_store.complete_task(&task_id);
             }
+            info!(instance = %id, task = %task_id, "delete orchestration complete");
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -385,10 +406,18 @@ async fn delete_instance_handler(
             )
         }
         Err(e) => {
+            // Even on error, attempt capacity release (best-effort).
+            if let (Some(ref capacity), Some(ref info)) = (&state.capacity, &vm_info) {
+                capacity.release(&id, info.vcpus, info.memory_mb as u64);
+                warn!(
+                    instance = %id,
+                    "released capacity despite delete error (best-effort cleanup)"
+                );
+            }
             if let Some(ref task_store) = state.task_store {
                 let _ = task_store.fail_task(&task_id, &e.to_string());
             }
-            warn!("forge: delete instance failed: {e}");
+            warn!(instance = %id, error = %e, "delete orchestration failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
