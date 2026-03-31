@@ -1008,7 +1008,15 @@ pub async fn run_daemon(
 
                 // Register the org layer handler so CLI org/project/env/vpc/subnet
                 // commands are routed through the daemon's control socket.
-                let org_handler = syfrah_org::OrgLayerHandler::new(Arc::clone(&store));
+                let mut org_handler = syfrah_org::OrgLayerHandler::new(Arc::clone(&store));
+
+                // Open the SG rule store for rule management CLI commands.
+                if let Ok(sg_rules_db) = syfrah_state::LayerDb::open("sg_rules") {
+                    let sg_rule_store = Arc::new(syfrah_org::SgRuleStore::new(sg_rules_db));
+                    org_handler = org_handler.with_sg_rule_store(sg_rule_store);
+                    info!("sg_rules store initialised");
+                }
+
                 router.register("org", Arc::new(org_handler));
 
                 info!("org layer initialised");

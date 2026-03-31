@@ -146,6 +146,9 @@ pub struct VmStatus {
     /// VPC the VM belongs to (e.g. "default").
     #[serde(default)]
     pub vpc: Option<String>,
+    /// Security groups attached to the VM's NIC.
+    #[serde(default)]
+    pub security_groups: Vec<String>,
 }
 
 /// Observable events emitted to forge via a broadcast channel.
@@ -323,6 +326,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            security_groups: vec![],
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: VmStatus = serde_json::from_str(&json).unwrap();
@@ -430,6 +434,7 @@ mod tests {
             ip: Some("10.1.1.3".to_string()),
             subnet: Some("frontend".to_string()),
             vpc: Some("default".to_string()),
+            security_groups: vec![],
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["ip"].as_str(), Some("10.1.1.3"));
@@ -449,6 +454,7 @@ mod tests {
             ip: Some("10.1.2.3".to_string()),
             subnet: Some("database".to_string()),
             vpc: Some("default".to_string()),
+            security_groups: vec![],
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["subnet"].as_str(), Some("database"));
@@ -468,6 +474,7 @@ mod tests {
             ip: Some("10.1.1.4".to_string()),
             subnet: Some("frontend".to_string()),
             vpc: Some("prod-vpc".to_string()),
+            security_groups: vec![],
         };
         let json_str = serde_json::to_string(&status).unwrap();
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();

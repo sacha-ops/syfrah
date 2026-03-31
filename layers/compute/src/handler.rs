@@ -122,6 +122,8 @@ pub struct VmResponse {
     pub subnet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vpc: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub security_groups: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +161,7 @@ fn vm_status_to_response(s: &VmStatus) -> VmResponse {
         ip: s.ip.clone(),
         subnet: s.subnet.clone(),
         vpc: s.vpc.clone(),
+        security_groups: s.security_groups.clone(),
     }
 }
 
@@ -337,6 +340,7 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(id): Path<String>) -> im
                     ip: None,
                     subnet: None,
                     vpc: None,
+                    security_groups: vec![],
                 }),
             )
                 .into_response(),
@@ -669,6 +673,7 @@ mod tests {
             ip: Some("10.1.1.3".to_string()),
             subnet: Some("frontend".to_string()),
             vpc: Some("default".to_string()),
+            security_groups: vec!["web-sg".to_string()],
         };
         let resp = vm_status_to_response(&status);
         assert_eq!(resp.id, "test-vm");
@@ -696,6 +701,7 @@ mod tests {
             ip: None,
             subnet: None,
             vpc: None,
+            security_groups: vec![],
         };
         let resp = vm_status_to_response(&status);
         let json = serde_json::to_string(&resp).unwrap();

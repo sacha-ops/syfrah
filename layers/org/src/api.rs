@@ -14,10 +14,12 @@ use syfrah_api::handler::LayerHandler;
 use syfrah_api::{LayerRequest, LayerResponse};
 use tokio::net::UnixStream;
 
+use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
-    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, Project, ProjectId,
-    SecurityGroup, Subnet, Vpc, VpcOwner, VpcPeering,
+    Direction, Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringStatus, PortRange,
+    Project, ProjectId, Protocol, RuleId, RuleSource, SecurityGroup, SecurityGroupRule, Subnet,
+    Vpc, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,31 @@ pub enum OrgRequest {
         nic: Option<String>,
     },
 
+    // -- SG Rules --
+    SgAddRule {
+        sg: String,
+        direction: String,
+        protocol: String,
+        port: Option<String>,
+        source: Option<String>,
+        source_sg: Option<String>,
+        description: String,
+        priority: u32,
+    },
+    SgRemoveRule {
+        sg: String,
+        rule_id: String,
+    },
+    SgListRules {
+        sg: String,
+    },
+    SgCheck {
+        vm: String,
+        port: u16,
+        protocol: String,
+        source: Option<String>,
+    },
+
     // -- Subnet resolution (used by compute layer) --
     SubnetResolve {
         subnet_name: Option<String>,
@@ -191,6 +218,17 @@ pub enum OrgResponse {
     Sg(SecurityGroup),
     SgList(Vec<SecurityGroup>),
     Nic(NetworkInterface),
+    SgRule(SecurityGroupRule),
+    SgRuleList(Vec<SecurityGroupRule>),
+    SgDetail {
+        sg: SecurityGroup,
+        rules: Vec<SecurityGroupRule>,
+        attached_vms: Vec<String>,
+    },
+    SgCheckResult {
+        verdict: String,
+        reason: String,
+    },
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
     Ok,
@@ -213,11 +251,20 @@ pub struct ResolvedSubnet {
 
 pub struct OrgLayerHandler {
     store: Arc<OrgStore>,
+    sg_rule_store: Option<Arc<SgRuleStore>>,
 }
 
 impl OrgLayerHandler {
     pub fn new(store: Arc<OrgStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            sg_rule_store: None,
+        }
+    }
+
+    pub fn with_sg_rule_store(mut self, sg_rule_store: Arc<SgRuleStore>) -> Self {
+        self.sg_rule_store = Some(sg_rule_store);
+        self
     }
 }
 
@@ -232,7 +279,7 @@ impl LayerHandler for OrgLayerHandler {
             }
         };
 
-        let resp = handle_org_request(&self.store, req);
+        let resp = handle_org_request(&self.store, self.sg_rule_store.as_deref(), req);
         serde_json::to_vec(&resp).unwrap_or_default()
     }
 }
@@ -240,7 +287,11 @@ impl LayerHandler for OrgLayerHandler {
 const DEFAULT_PROJECT_CIDR: &str = "10.1.0.0/16";
 const DEFAULT_SHARED_CIDR: &str = "10.100.0.0/16";
 
-fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
+fn handle_org_request(
+    store: &OrgStore,
+    sg_rule_store: Option<&SgRuleStore>,
+    req: OrgRequest,
+) -> OrgResponse {
     match req {
         // -- Org --
         OrgRequest::OrgCreate { name } => match store.create(&name) {
@@ -549,7 +600,26 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
             Err(e) => OrgResponse::Error(e.to_string()),
         },
         OrgRequest::SgShow { name, vpc } => match store.get_security_group(&name, vpc.as_deref()) {
-            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            Ok(Some(sg)) => {
+                // Fetch rules if the rule store is available.
+                let rules = sg_rule_store
+                    .and_then(|rs| rs.list_rules_by_sg(&sg.id).ok())
+                    .unwrap_or_default();
+
+                // Find attached VMs by scanning NICs with this SG.
+                let attached_vms = store
+                    .list_nics_by_sg(&sg.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|nic| nic.vm_id)
+                    .collect();
+
+                OrgResponse::SgDetail {
+                    sg,
+                    rules,
+                    attached_vms,
+                }
+            }
             Ok(None) => OrgResponse::Error(format!("security group '{name}' not found")),
             Err(e) => OrgResponse::Error(e.to_string()),
         },
@@ -604,6 +674,192 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
                 Ok(sgs) => OrgResponse::SgList(sgs),
                 Err(e) => OrgResponse::Error(e.to_string()),
             }
+        }
+
+        // -- SG Rules --
+        OrgRequest::SgAddRule {
+            sg,
+            direction,
+            protocol,
+            port,
+            source,
+            source_sg,
+            description,
+            priority,
+        } => {
+            let rule_store = match sg_rule_store {
+                Some(s) => s,
+                None => return OrgResponse::Error("SG rule store not available".to_string()),
+            };
+
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            let dir = match direction.as_str() {
+                "ingress" => Direction::Ingress,
+                "egress" => Direction::Egress,
+                other => {
+                    return OrgResponse::Error(format!(
+                        "invalid direction: '{other}' (expected ingress or egress)"
+                    ))
+                }
+            };
+
+            let proto = match protocol.as_str() {
+                "tcp" => Protocol::Tcp,
+                "udp" => Protocol::Udp,
+                "icmp" => Protocol::Icmp,
+                "all" => Protocol::All,
+                other => {
+                    return OrgResponse::Error(format!(
+                        "invalid protocol: '{other}' (expected tcp, udp, icmp, or all)"
+                    ))
+                }
+            };
+
+            let port_range = match port {
+                Some(ref p) => match parse_port_range(p) {
+                    Ok(pr) => Some(pr),
+                    Err(e) => return OrgResponse::Error(e),
+                },
+                None => None,
+            };
+
+            let rule_source = match (source, source_sg) {
+                (Some(cidr), None) => RuleSource::Cidr(cidr),
+                (None, Some(sg_name)) => {
+                    let sg_ref = match store.find_sg_by_name(&sg_name) {
+                        Ok(Some(s)) => s,
+                        Ok(None) => {
+                            return OrgResponse::Error(format!(
+                                "source security group not found: {sg_name}"
+                            ))
+                        }
+                        Err(e) => return OrgResponse::Error(e.to_string()),
+                    };
+                    RuleSource::SecurityGroup(sg_ref.id)
+                }
+                (None, None) => RuleSource::Cidr("0.0.0.0/0".to_string()),
+                (Some(_), Some(_)) => {
+                    return OrgResponse::Error(
+                        "cannot specify both --source and --source-sg".to_string(),
+                    )
+                }
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let rule_id = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                now.hash(&mut hasher);
+                sg_record.id.0.hash(&mut hasher);
+                description.hash(&mut hasher);
+                RuleId(format!("rule-{:016x}", hasher.finish()))
+            };
+
+            let rule = SecurityGroupRule {
+                id: rule_id,
+                sg_id: sg_record.id.clone(),
+                direction: dir,
+                protocol: proto,
+                port_range,
+                source: rule_source,
+                priority,
+                description: Some(description),
+            };
+
+            match rule_store.add_rule(&rule) {
+                Ok(()) => OrgResponse::SgRule(rule),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        OrgRequest::SgRemoveRule { sg, rule_id } => {
+            let rule_store = match sg_rule_store {
+                Some(s) => s,
+                None => return OrgResponse::Error("SG rule store not available".to_string()),
+            };
+
+            // Verify the SG exists
+            match store.find_sg_by_name(&sg) {
+                Ok(Some(_)) => {}
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            match rule_store.remove_rule(&rule_id) {
+                Ok(()) => OrgResponse::Ok,
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        OrgRequest::SgListRules { sg } => {
+            let rule_store = match sg_rule_store {
+                Some(s) => s,
+                None => return OrgResponse::Error("SG rule store not available".to_string()),
+            };
+
+            let sg_record = match store.find_sg_by_name(&sg) {
+                Ok(Some(s)) => s,
+                Ok(None) => return OrgResponse::Error(format!("security group not found: {sg}")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            match rule_store.list_rules_by_sg(&sg_record.id) {
+                Ok(rules) => OrgResponse::SgRuleList(rules),
+                Err(e) => OrgResponse::Error(e.to_string()),
+            }
+        }
+
+        OrgRequest::SgCheck {
+            vm,
+            port,
+            protocol,
+            source,
+        } => {
+            let rule_store = match sg_rule_store {
+                Some(s) => s,
+                None => return OrgResponse::Error("SG rule store not available".to_string()),
+            };
+
+            let proto = match protocol.as_str() {
+                "tcp" => Protocol::Tcp,
+                "udp" => Protocol::Udp,
+                "icmp" => Protocol::Icmp,
+                "all" => Protocol::All,
+                other => {
+                    return OrgResponse::Error(format!(
+                        "invalid protocol: '{other}' (expected tcp, udp, icmp, or all)"
+                    ))
+                }
+            };
+
+            // Resolve VM -> NIC -> SGs -> rules
+            let nic = match store.find_nic_by_vm(&vm) {
+                Ok(Some(n)) => n,
+                Ok(None) => return OrgResponse::Error(format!("VM '{vm}' has no NIC")),
+                Err(e) => return OrgResponse::Error(e.to_string()),
+            };
+
+            let mut all_rules = Vec::new();
+            for sg_id in &nic.security_groups {
+                match rule_store.list_rules_by_sg(sg_id) {
+                    Ok(rules) => all_rules.extend(rules),
+                    Err(e) => return OrgResponse::Error(e.to_string()),
+                }
+            }
+
+            let source_ip = source.as_deref().unwrap_or("0.0.0.0");
+            let (verdict, reason) = evaluate_rules(&all_rules, port, proto, source_ip);
+
+            OrgResponse::SgCheckResult { verdict, reason }
         }
 
         // -- Subnet resolution (for compute layer) --
@@ -705,6 +961,120 @@ pub async fn send_org_request(
     }
 }
 
+/// Parse a port range string like "443" or "8000-9000".
+fn parse_port_range(s: &str) -> std::result::Result<PortRange, String> {
+    if let Some((from_s, to_s)) = s.split_once('-') {
+        let from: u16 = from_s
+            .parse()
+            .map_err(|_| format!("invalid port range: {s}"))?;
+        let to: u16 = to_s
+            .parse()
+            .map_err(|_| format!("invalid port range: {s}"))?;
+        if from > to {
+            return Err(format!("from port ({from}) must be <= to port ({to})"));
+        }
+        Ok(PortRange { from, to })
+    } else {
+        let port: u16 = s.parse().map_err(|_| format!("invalid port: {s}"))?;
+        Ok(PortRange {
+            from: port,
+            to: port,
+        })
+    }
+}
+
+/// Evaluate security group rules to determine if traffic is allowed.
+///
+/// Returns `(verdict, reason)` where verdict is "ALLOWED" or "DENIED".
+fn evaluate_rules(
+    rules: &[SecurityGroupRule],
+    port: u16,
+    protocol: Protocol,
+    source_ip: &str,
+) -> (String, String) {
+    let mut ingress: Vec<&SecurityGroupRule> = rules
+        .iter()
+        .filter(|r| r.direction == Direction::Ingress)
+        .collect();
+    ingress.sort_by_key(|r| r.priority);
+
+    for rule in &ingress {
+        if rule_matches(rule, port, &protocol, source_ip) {
+            let desc = rule.description.as_deref().unwrap_or("").to_string();
+            let reason = if desc.is_empty() {
+                format!("rule {} (priority {})", rule.id, rule.priority)
+            } else {
+                format!("rule {} — {} (priority {})", rule.id, desc, rule.priority)
+            };
+            return ("ALLOWED".to_string(), reason);
+        }
+    }
+
+    ("DENIED".to_string(), "no matching ingress rule".to_string())
+}
+
+/// Check if a single rule matches the given traffic.
+fn rule_matches(rule: &SecurityGroupRule, port: u16, protocol: &Protocol, source_ip: &str) -> bool {
+    // Protocol match.
+    if rule.protocol != Protocol::All && rule.protocol != *protocol {
+        return false;
+    }
+
+    // Port match.
+    if let Some(ref pr) = rule.port_range {
+        if port < pr.from || port > pr.to {
+            return false;
+        }
+    }
+
+    // Source match.
+    match &rule.source {
+        RuleSource::Cidr(cidr) if cidr == "0.0.0.0/0" => {}
+        RuleSource::Cidr(cidr) => {
+            if !cidr_contains(cidr, source_ip) {
+                return false;
+            }
+        }
+        RuleSource::SecurityGroup(_) => {
+            // SG-ref source requires membership check; skip for CLI check.
+        }
+    }
+
+    true
+}
+
+/// Simple CIDR containment check.
+fn cidr_contains(cidr: &str, ip: &str) -> bool {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let net: std::net::Ipv4Addr = match parts[0].parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let prefix_len: u32 = match parts[1].parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let check: std::net::Ipv4Addr = match ip.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 32 {
+        return false;
+    }
+
+    let mask = !0u32 << (32 - prefix_len);
+    let net_bits = u32::from(net) & mask;
+    let check_bits = u32::from(check) & mask;
+    net_bits == check_bits
+}
+
 /// Resolve a NIC ID from either a VM name or a direct NIC ID.
 fn resolve_nic(
     store: &OrgStore,
@@ -728,6 +1098,7 @@ fn resolve_nic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SecurityGroupId;
 
     fn temp_store() -> (tempfile::TempDir, Arc<OrgStore>) {
         let dir = tempfile::tempdir().unwrap();
@@ -762,5 +1133,82 @@ mod tests {
             OrgResponse::Org(org) => assert_eq!(org.name, "acme"),
             other => panic!("expected Org, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn evaluate_rules_allows_matching_tcp() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 443, to: 443 }),
+            source: RuleSource::Cidr("0.0.0.0/0".to_string()),
+            priority: 100,
+            description: Some("HTTPS".to_string()),
+        };
+        let (verdict, _) = evaluate_rules(&[rule], 443, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "ALLOWED");
+    }
+
+    #[test]
+    fn evaluate_rules_denies_wrong_port() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 443, to: 443 }),
+            source: RuleSource::Cidr("0.0.0.0/0".to_string()),
+            priority: 100,
+            description: None,
+        };
+        let (verdict, _) = evaluate_rules(&[rule], 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+    }
+
+    #[test]
+    fn evaluate_rules_denies_no_rules() {
+        let (verdict, reason) = evaluate_rules(&[], 80, Protocol::Tcp, "10.0.0.1");
+        assert_eq!(verdict, "DENIED");
+        assert!(reason.contains("no matching"));
+    }
+
+    #[test]
+    fn evaluate_rules_cidr_source_match() {
+        let rule = SecurityGroupRule {
+            id: RuleId("rule-1".to_string()),
+            sg_id: SecurityGroupId("sg-1".to_string()),
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            port_range: Some(PortRange { from: 22, to: 22 }),
+            source: RuleSource::Cidr("10.0.0.0/8".to_string()),
+            priority: 100,
+            description: None,
+        };
+        let (v1, _) = evaluate_rules(&[rule.clone()], 22, Protocol::Tcp, "10.1.2.3");
+        assert_eq!(v1, "ALLOWED");
+        let (v2, _) = evaluate_rules(&[rule], 22, Protocol::Tcp, "192.168.1.1");
+        assert_eq!(v2, "DENIED");
+    }
+
+    #[test]
+    fn parse_port_range_single() {
+        let pr = parse_port_range("443").unwrap();
+        assert_eq!(pr.from, 443);
+        assert_eq!(pr.to, 443);
+    }
+
+    #[test]
+    fn parse_port_range_range() {
+        let pr = parse_port_range("8000-9000").unwrap();
+        assert_eq!(pr.from, 8000);
+        assert_eq!(pr.to, 9000);
+    }
+
+    #[test]
+    fn parse_port_range_invalid() {
+        assert!(parse_port_range("abc").is_err());
+        assert!(parse_port_range("9000-8000").is_err());
     }
 }

@@ -108,7 +108,11 @@ pub async fn run_show(name: &str, vpc: Option<&str>) -> Result<()> {
         .map_err(daemon_err)?;
 
     match resp {
-        OrgResponse::Sg(sg) => {
+        OrgResponse::SgDetail {
+            sg,
+            rules,
+            attached_vms,
+        } => {
             println!("Security Group: {}", sg.name);
             println!("  ID:           {}", sg.id);
             println!("  VPC:          {}", sg.vpc_id);
@@ -120,6 +124,42 @@ pub async fn run_show(name: &str, vpc: Option<&str>) -> Result<()> {
             println!("  Default:      {default_str}");
             println!("  State:        {}", sg.state);
             println!("  Created:      {}", format_timestamp(sg.created_at));
+
+            // -- Rules section --
+            println!();
+            if rules.is_empty() {
+                println!("  Rules:        (none)");
+            } else {
+                println!("  Rules:");
+                println!(
+                    "    {:<20} {:<10} {:<8} {:<12} {:<20} DESCRIPTION",
+                    "ID", "DIRECTION", "PROTO", "PORTS", "SOURCE"
+                );
+                println!("    {}", "-".repeat(80));
+                for r in &rules {
+                    let ports = r
+                        .port_range
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let desc = r.description.as_deref().unwrap_or("");
+                    println!(
+                        "    {:<20} {:<10} {:<8} {:<12} {:<20} {}",
+                        r.id, r.direction, r.protocol, ports, r.source, desc,
+                    );
+                }
+            }
+
+            // -- Attached VMs section --
+            println!();
+            if attached_vms.is_empty() {
+                println!("  Attached VMs: (none)");
+            } else {
+                println!("  Attached VMs:");
+                for vm in &attached_vms {
+                    println!("    - {vm}");
+                }
+            }
 
             Ok(())
         }
@@ -255,6 +295,140 @@ pub async fn run_list_attached(vm: Option<&str>, nic: Option<&str>, json: bool) 
                 );
             }
 
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_add_rule(
+    sg: &str,
+    direction: &str,
+    protocol: &str,
+    port: Option<&str>,
+    source: Option<&str>,
+    source_sg: Option<&str>,
+    description: Option<&str>,
+    priority: Option<u32>,
+) -> Result<()> {
+    let req = OrgRequest::SgAddRule {
+        sg: sg.to_string(),
+        direction: direction.to_string(),
+        protocol: protocol.to_string(),
+        port: port.map(String::from),
+        source: source.map(String::from),
+        source_sg: source_sg.map(String::from),
+        description: description.unwrap_or("").to_string(),
+        priority: priority.unwrap_or(100),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::SgRule(rule) => {
+            println!("Rule added to security group '{sg}':");
+            println!("  Rule ID:     {}", rule.id);
+            println!("  Direction:   {}", rule.direction);
+            println!("  Protocol:    {}", rule.protocol);
+            if let Some(ref pr) = rule.port_range {
+                println!("  Ports:       {pr}");
+            } else {
+                println!("  Ports:       -");
+            }
+            println!("  Source:      {}", rule.source);
+            println!("  Priority:    {}", rule.priority);
+            if let Some(ref desc) = rule.description {
+                if !desc.is_empty() {
+                    println!("  Description: {desc}");
+                }
+            }
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_remove_rule(sg: &str, rule_id: &str) -> Result<()> {
+    let req = OrgRequest::SgRemoveRule {
+        sg: sg.to_string(),
+        rule_id: rule_id.to_string(),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::Ok => {
+            println!("Rule '{rule_id}' removed from security group '{sg}'.");
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_rules(sg: &str, json: bool) -> Result<()> {
+    let req = OrgRequest::SgListRules { sg: sg.to_string() };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::SgRuleList(rules) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rules)?);
+                return Ok(());
+            }
+
+            if rules.is_empty() {
+                println!("No rules in security group '{sg}'.");
+                return Ok(());
+            }
+
+            println!("Rules for security group '{sg}':");
+            println!();
+            println!(
+                "  {:<20} {:<10} {:<8} {:<12} {:<20} DESCRIPTION",
+                "ID", "DIRECTION", "PROTO", "PORTS", "SOURCE"
+            );
+            println!("  {}", "-".repeat(80));
+            for r in &rules {
+                let ports = r
+                    .port_range
+                    .as_ref()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let desc = r.description.as_deref().unwrap_or("");
+                println!(
+                    "  {:<20} {:<10} {:<8} {:<12} {:<20} {}",
+                    r.id, r.direction, r.protocol, ports, r.source, desc,
+                );
+            }
+            Ok(())
+        }
+        OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_check(vm: &str, port: u16, protocol: &str, source: Option<&str>) -> Result<()> {
+    let req = OrgRequest::SgCheck {
+        vm: vm.to_string(),
+        port,
+        protocol: protocol.to_string(),
+        source: source.map(String::from),
+    };
+    let resp = send_org_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_err)?;
+
+    match resp {
+        OrgResponse::SgCheckResult { verdict, reason } => {
+            println!("{verdict}: {reason}");
             Ok(())
         }
         OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
