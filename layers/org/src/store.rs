@@ -6,9 +6,9 @@ use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{
-    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringId, PeeringStatus,
-    Project, ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc,
-    VpcAttachment, VpcId, VpcOwner, VpcPeering,
+    Environment, EnvironmentId, NetworkInterface, Org, OrgId, PeeringId, PeeringStatus, Project,
+    ProjectId, ResourceState, SecurityGroup, SecurityGroupId, Subnet, SubnetId, Vpc, VpcAttachment,
+    VpcId, VpcOwner, VpcPeering,
 };
 use crate::validation::validate_name;
 use crate::vpc::{cidrs_overlap, parse_and_validate_cidr};
@@ -1022,6 +1022,79 @@ impl OrgStore {
         Ok(())
     }
 
+    // ── Security Group CLI helpers (VPC-name based) ────────────────
+
+    /// Create a security group by VPC name (CLI convenience wrapper).
+    pub fn create_security_group(
+        &self,
+        name: &str,
+        vpc_name: &str,
+        description: &str,
+    ) -> Result<SecurityGroup> {
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Err(OrgError::NotFound(format!("VPC '{vpc_name}'"))),
+        };
+        self.create_sg(name, &vpc.id, Some(description))
+    }
+
+    /// List security groups, optionally filtered by VPC name.
+    pub fn list_security_groups(&self, vpc_name: Option<&str>) -> Result<Vec<SecurityGroup>> {
+        if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            self.list_sgs_by_vpc(&vpc.id)
+        } else {
+            self.list_sgs()
+        }
+    }
+
+    /// Get a security group by name. Searches all VPCs or a specific one.
+    pub fn get_security_group(
+        &self,
+        name: &str,
+        vpc_name: Option<&str>,
+    ) -> Result<Option<SecurityGroup>> {
+        if let Some(vname) = vpc_name {
+            let vpc = match self.get_vpc(vname)? {
+                Some(v) => v,
+                None => return Err(OrgError::NotFound(format!("VPC '{vname}'"))),
+            };
+            self.get_sg(&vpc.id, name)
+        } else {
+            let all = self.list_sgs()?;
+            let matches: Vec<SecurityGroup> =
+                all.into_iter().filter(|sg| sg.name == name).collect();
+            match matches.len() {
+                0 => Ok(None),
+                1 => Ok(Some(matches.into_iter().next().unwrap())),
+                _ => Err(OrgError::Ambiguous(format!(
+                    "security group '{name}' exists in multiple VPCs — specify --vpc"
+                ))),
+            }
+        }
+    }
+
+    /// Delete a security group by name.
+    pub fn delete_security_group(&self, name: &str, vpc_name: Option<&str>) -> Result<()> {
+        let sg = match self.get_security_group(name, vpc_name)? {
+            Some(sg) => sg,
+            None => {
+                return Err(OrgError::NotFound(format!("security group '{name}'")));
+            }
+        };
+
+        if sg.is_default {
+            return Err(OrgError::CannotDelete(
+                "cannot delete the default security group".to_string(),
+            ));
+        }
+
+        self.delete_sg(&sg.vpc_id, name)
+    }
+
     // ── NIC operations (convenience wrappers for attach/detach) ────
 
     /// Create a NIC in the store.
@@ -1053,14 +1126,12 @@ impl OrgStore {
         let matches: Vec<SecurityGroup> = all.into_iter().filter(|sg| sg.name == name).collect();
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(matches.into_iter().next().unwrap())),
             _ => Ok(Some(matches.into_iter().next().unwrap())),
         }
     }
 
     /// Attach a security group to a NIC. Validates VPC match.
     pub fn attach_sg_to_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
-        // Look up SG — sg_key is the full redb key "vpc_id/name"
         let sg: SecurityGroup = self
             .db
             .get(SECURITY_GROUPS_TABLE, sg_key)?
@@ -1071,7 +1142,6 @@ impl OrgStore {
             .get(NICS_TABLE, nic_id)?
             .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
 
-        // VPC match check
         if sg.vpc_id.0 != nic.vpc_id {
             return Err(OrgError::SgVpcMismatch {
                 sg: sg.name.clone(),

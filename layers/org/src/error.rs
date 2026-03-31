@@ -163,6 +163,12 @@ pub enum OrgError {
     #[error("security group '{sg}' is not attached to nic '{nic}'")]
     SgNotAttached { nic: String, sg: String },
 
+    #[error("{0}")]
+    Ambiguous(String),
+
+    #[error("{0}")]
+    CannotDelete(String),
+
     #[error("VM not found: {0}")]
     VmNotFound(String),
 

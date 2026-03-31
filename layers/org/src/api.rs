@@ -134,7 +134,7 @@ pub enum OrgRequest {
         vpc: Option<String>,
     },
 
-    // -- Security Groups --
+    // -- Security Group --
     SgCreate {
         name: String,
         vpc: String,
@@ -143,9 +143,13 @@ pub enum OrgRequest {
     SgList {
         vpc: Option<String>,
     },
+    SgShow {
+        name: String,
+        vpc: Option<String>,
+    },
     SgDelete {
         name: String,
-        vpc: String,
+        vpc: Option<String>,
     },
     SgAttach {
         sg: String,
@@ -531,44 +535,26 @@ fn handle_org_request(store: &OrgStore, req: OrgRequest) -> OrgResponse {
             }
         }
 
-        // -- Security Groups --
+        // -- Security Group --
         OrgRequest::SgCreate {
             name,
             vpc,
             description,
-        } => {
-            let vpc_obj = match store.get_vpc(&vpc) {
-                Ok(Some(v)) => v,
-                Ok(None) => return OrgResponse::Error(format!("VPC not found: {vpc}")),
-                Err(e) => return OrgResponse::Error(e.to_string()),
-            };
-            match store.create_sg(&name, &vpc_obj.id, Some(&description)) {
-                Ok(sg) => OrgResponse::Sg(sg),
-                Err(e) => OrgResponse::Error(e.to_string()),
-            }
-        }
-        OrgRequest::SgList { vpc } => {
-            let result = if let Some(vname) = vpc {
-                match store.get_vpc(&vname) {
-                    Ok(Some(v)) => store.list_sgs_by_vpc(&v.id),
-                    Ok(None) => return OrgResponse::Error(format!("VPC not found: {vname}")),
-                    Err(e) => return OrgResponse::Error(e.to_string()),
-                }
-            } else {
-                store.list_sgs()
-            };
-            match result {
-                Ok(sgs) => OrgResponse::SgList(sgs),
-                Err(e) => OrgResponse::Error(e.to_string()),
-            }
-        }
+        } => match store.create_security_group(&name, &vpc, &description) {
+            Ok(sg) => OrgResponse::Sg(sg),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgList { vpc } => match store.list_security_groups(vpc.as_deref()) {
+            Ok(sgs) => OrgResponse::SgList(sgs),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
+        OrgRequest::SgShow { name, vpc } => match store.get_security_group(&name, vpc.as_deref()) {
+            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            Ok(None) => OrgResponse::Error(format!("security group '{name}' not found")),
+            Err(e) => OrgResponse::Error(e.to_string()),
+        },
         OrgRequest::SgDelete { name, vpc } => {
-            let vpc_obj = match store.get_vpc(&vpc) {
-                Ok(Some(v)) => v,
-                Ok(None) => return OrgResponse::Error(format!("VPC not found: {vpc}")),
-                Err(e) => return OrgResponse::Error(e.to_string()),
-            };
-            match store.delete_sg(&vpc_obj.id, &name) {
+            match store.delete_security_group(&name, vpc.as_deref()) {
                 Ok(()) => OrgResponse::Ok,
                 Err(e) => OrgResponse::Error(e.to_string()),
             }

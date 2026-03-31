@@ -2334,6 +2334,7 @@ dependencies = [
  "syfrah-core",
  "syfrah-fabric",
  "syfrah-org",
+ "syfrah-overlay",
  "syfrah-state",
  "tar",
  "tokio",
@@ -2478,11 +2479,16 @@ dependencies = [
 name = "syfrah-overlay"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "clap",
+ "console",
+ "dirs",
  "serde",
  "serde_json",
  "syfrah-api",
  "syfrah-core",
+ "terminal_size",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

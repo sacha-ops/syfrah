@@ -1,4 +1,4 @@
-//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, `syfrah subnet ...`, and `syfrah sg ...`.
+//! CLI commands for `syfrah org ...`, `syfrah project ...`, `syfrah env ...`, `syfrah vpc ...`, and `syfrah subnet ...`.
 
 pub mod env;
 pub mod org;
@@ -332,31 +332,49 @@ pub enum SgCommand {
         /// Security group name (lowercase alphanumeric and hyphens, 3-63 chars)
         #[arg(allow_hyphen_values = true)]
         name: String,
-        /// VPC this security group belongs to
+        /// VPC the security group belongs to
         #[arg(long)]
         vpc: String,
-        /// Description
-        #[arg(long, default_value = "")]
-        description: String,
+        /// Description of the security group
+        #[arg(long)]
+        description: Option<String>,
     },
     /// List security groups
-    #[command(after_help = "Examples:\n  syfrah sg list\n  syfrah sg list --vpc my-vpc --json")]
+    #[command(
+        after_help = "Examples:\n  syfrah sg list --vpc my-vpc\n  syfrah sg list --vpc my-vpc --json"
+    )]
     List {
-        /// Filter by VPC
+        /// Filter by VPC name
         #[arg(long)]
         vpc: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Show security group details (rules + attached VMs)
+    #[command(
+        after_help = "Examples:\n  syfrah sg show web-sg\n  syfrah sg show web-sg --vpc my-vpc"
+    )]
+    Show {
+        /// Security group name
+        name: String,
+        /// VPC the security group belongs to (auto-detected if name is unique)
+        #[arg(long)]
+        vpc: Option<String>,
+    },
     /// Delete a security group
-    #[command(after_help = "Examples:\n  syfrah sg delete web-sg --vpc my-vpc")]
+    #[command(
+        after_help = "Examples:\n  syfrah sg delete web-sg --yes\n  syfrah sg delete web-sg --vpc my-vpc --yes"
+    )]
     Delete {
         /// Security group name
         name: String,
-        /// VPC the security group belongs to
+        /// VPC the security group belongs to (auto-detected if name is unique)
         #[arg(long)]
-        vpc: String,
+        vpc: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Attach a security group to a VM (via its primary NIC)
     #[command(
@@ -388,7 +406,8 @@ pub enum SgCommand {
     },
     /// List security groups attached to a VM or NIC
     #[command(
-        after_help = "Examples:\n  syfrah sg list-attached --vm web-1\n  syfrah sg list-attached --nic nic-web-1 --json"
+        name = "list-attached",
+        after_help = "Examples:\n  syfrah sg list-attached --vm web-1\n  syfrah sg list-attached --nic nic-web-1"
     )]
     ListAttached {
         /// VM name (resolves to primary NIC)
@@ -401,37 +420,6 @@ pub enum SgCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-/// Execute an SG CLI command.
-pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
-    match cmd {
-        SgCommand::Create {
-            name,
-            vpc,
-            description,
-        } => sg::run_create(&name, &vpc, &description).await,
-        SgCommand::List { vpc, json } => sg::run_list(vpc.as_deref(), json).await,
-        SgCommand::Delete { name, vpc } => sg::run_delete(&name, &vpc).await,
-        SgCommand::Attach { sg, vm, nic } => {
-            if vm.is_none() && nic.is_none() {
-                anyhow::bail!("specify either --vm or --nic");
-            }
-            sg::run_attach(&sg, vm.as_deref(), nic.as_deref()).await
-        }
-        SgCommand::Detach { sg, vm, nic } => {
-            if vm.is_none() && nic.is_none() {
-                anyhow::bail!("specify either --vm or --nic");
-            }
-            sg::run_detach(&sg, vm.as_deref(), nic.as_deref()).await
-        }
-        SgCommand::ListAttached { vm, nic, json } => {
-            if vm.is_none() && nic.is_none() {
-                anyhow::bail!("specify either --vm or --nic");
-            }
-            sg::run_list_attached(vm.as_deref(), nic.as_deref(), json).await
-        }
-    }
 }
 
 /// Execute an org CLI command.
@@ -558,6 +546,29 @@ pub async fn run_subnet(cmd: SubnetCommand) -> anyhow::Result<()> {
         }
         SubnetCommand::Delete { name, vpc, yes } => {
             subnet::run_delete(&name, vpc.as_deref(), yes).await
+        }
+    }
+}
+
+/// Execute a security group CLI command.
+pub async fn run_sg(cmd: SgCommand) -> anyhow::Result<()> {
+    match cmd {
+        SgCommand::Create {
+            name,
+            vpc,
+            description,
+        } => sg::run_create(&name, &vpc, description.as_deref().unwrap_or("")).await,
+        SgCommand::List { vpc, json } => sg::run_list(vpc.as_deref(), json).await,
+        SgCommand::Show { name, vpc } => sg::run_show(&name, vpc.as_deref()).await,
+        SgCommand::Delete { name, vpc, yes } => sg::run_delete(&name, vpc.as_deref(), yes).await,
+        SgCommand::Attach { sg, vm, nic } => {
+            sg::run_attach(&sg, vm.as_deref(), nic.as_deref()).await
+        }
+        SgCommand::Detach { sg, vm, nic } => {
+            sg::run_detach(&sg, vm.as_deref(), nic.as_deref()).await
+        }
+        SgCommand::ListAttached { vm, nic, json } => {
+            sg::run_list_attached(vm.as_deref(), nic.as_deref(), json).await
         }
     }
 }
