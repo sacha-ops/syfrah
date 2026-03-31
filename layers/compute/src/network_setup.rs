@@ -349,11 +349,21 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
                 .map_err(|e| ComputeError::NetworkSetup(format!("nftables rules failed: {e}")))?;
         }
 
-        // -- 7. Apply NAT -----------------------------------------------------
-        self.backend
-            .apply_nat(&bridge_name, subnet_cidr)
-            .await
-            .map_err(|e| ComputeError::NetworkSetup(format!("NAT setup failed: {e}")))?;
+        // -- 7. Apply NAT (only if an active NAT Gateway exists) ---------------
+        // Check if the VPC has an active NAT Gateway with a route pointing to it.
+        // If no NAT GW: VMs have private networking only (no internet egress).
+        let has_nat_gw = self.has_active_nat_gw(vpc_id);
+        if has_nat_gw {
+            self.backend
+                .apply_nat(&bridge_name, subnet_cidr)
+                .await
+                .map_err(|e| ComputeError::NetworkSetup(format!("NAT setup failed: {e}")))?;
+        } else {
+            warn!(
+                vm_id,
+                vpc_id, "no NAT gateway — VMs will not have internet egress"
+            );
+        }
 
         // -- 8. Store placement -----------------------------------------------
         let now = std::time::SystemTime::now()
@@ -450,6 +460,20 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             cloud_init_network,
             placement,
         })
+    }
+
+    /// Check if the VPC has an active NAT Gateway with a route targeting it.
+    fn has_active_nat_gw(&self, vpc_id: &str) -> bool {
+        let vpc_id_typed = syfrah_org::types::VpcId(vpc_id.to_string());
+
+        // Check for any active NAT GWs in this VPC.
+        let gws = match self.org_store.list_nat_gws_by_vpc(&vpc_id_typed) {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+
+        gws.iter()
+            .any(|gw| gw.state == syfrah_org::types::ResourceState::Active)
     }
 
     /// Resolve a subnet name to its `Subnet` and parent `Vpc`.
@@ -731,7 +755,12 @@ mod tests {
             call_names.contains(&"apply_vm_rules"),
             "nftables must be applied"
         );
-        assert!(call_names.contains(&"apply_nat"), "NAT must be applied");
+        // NAT is only applied when an active NAT Gateway exists in the VPC.
+        // In this test there is no NAT GW, so apply_nat should NOT be called.
+        assert!(
+            !call_names.contains(&"apply_nat"),
+            "NAT must NOT be applied without a NAT Gateway"
+        );
     }
 
     #[tokio::test]
