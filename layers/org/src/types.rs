@@ -240,7 +240,7 @@ impl fmt::Display for RuleId {
 }
 
 /// Traffic direction for a security group rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Ingress,
     Egress,
@@ -256,7 +256,7 @@ impl fmt::Display for Direction {
 }
 
 /// Network protocol for a security group rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -276,7 +276,7 @@ impl fmt::Display for Protocol {
 }
 
 /// A port range (inclusive). Single port: from == to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
     pub from: u16,
     pub to: u16,
@@ -293,7 +293,7 @@ impl fmt::Display for PortRange {
 }
 
 /// The source (for ingress) or destination (for egress) of traffic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleSource {
     Cidr(String),
     SecurityGroup(SecurityGroupId),

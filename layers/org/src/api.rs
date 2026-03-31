@@ -758,9 +758,13 @@ fn handle_org_request(
             let rule_id = {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                now.hash(&mut hasher);
                 sg_record.id.0.hash(&mut hasher);
+                dir.hash(&mut hasher);
+                proto.hash(&mut hasher);
+                port_range.hash(&mut hasher);
+                rule_source.hash(&mut hasher);
                 description.hash(&mut hasher);
+                now.hash(&mut hasher);
                 RuleId(format!("rule-{:016x}", hasher.finish()))
             };
 
