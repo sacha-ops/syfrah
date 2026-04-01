@@ -39,6 +39,18 @@ pub enum ComputeRequest {
         /// Security group names to attach. Defaults to `["default"]`.
         #[serde(default)]
         security_groups: Vec<String>,
+        /// Preferred zone for placement (e.g. "az-2").
+        #[serde(default)]
+        zone: Option<String>,
+        /// Node selector labels (key=value). All must match.
+        #[serde(default)]
+        node_selector: Vec<String>,
+        /// Anti-affinity group name.
+        #[serde(default)]
+        anti_affinity: Option<String>,
+        /// Spread topology key (e.g. "zone").
+        #[serde(default)]
+        spread_topology: Option<String>,
     },
     ListVms,
     GetVm {
@@ -181,6 +193,10 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
             disk_size_mb,
             subnet,
             security_groups,
+            zone: _zone,
+            node_selector: _node_selector,
+            anti_affinity: _anti_affinity,
+            spread_topology: _spread_topology,
         } => {
             let gpu = match gpu_bdf {
                 Some(bdf) => GpuMode::Passthrough { bdf },
