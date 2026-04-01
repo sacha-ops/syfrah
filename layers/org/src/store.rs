@@ -42,6 +42,31 @@ impl OrgStore {
         Self { db }
     }
 
+    /// Get a reference to the underlying database for export/import operations.
+    pub fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
+    /// All table names used by this store (for snapshot export/import).
+    pub fn table_names() -> &'static [&'static str] {
+        &[
+            TABLE,
+            PROJECTS_TABLE,
+            ENVIRONMENTS_TABLE,
+            VPCS_TABLE,
+            VPC_ATTACHMENTS_TABLE,
+            SUBNETS_TABLE,
+            PEERINGS_TABLE,
+            SECURITY_GROUPS_TABLE,
+            NICS_TABLE,
+            ROUTE_TABLES_TABLE,
+            ROUTES_TABLE,
+            SUBNET_ROUTE_ASSOC_TABLE,
+            NAT_GATEWAYS_TABLE,
+            VNI_COUNTER_TABLE,
+        ]
+    }
+
     // ── Org operations ───────────────────────────────────────────────
 
     /// Create a new organization. Validates the name, checks for duplicates.
