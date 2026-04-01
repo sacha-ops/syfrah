@@ -8,13 +8,7 @@ pub async fn run(json: bool) -> Result<()> {
     let fabric_state =
         syfrah_fabric::store::load().map_err(|_| anyhow::anyhow!("Fabric not initialized."))?;
 
-    let my_record = fabric_state
-        .peers
-        .iter()
-        .find(|p| p.name == fabric_state.node_name)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find own peer record"))?;
-
-    let fabric_ipv6 = my_record.mesh_ipv6;
+    let fabric_ipv6 = fabric_state.mesh_ipv6;
     let url = format!("http://[{fabric_ipv6}]:7200/raft/status");
 
     let client = reqwest::Client::builder()
