@@ -42,11 +42,18 @@ pub async fn run() -> Result<()> {
     println!("  Node ID:  {node_id}");
     println!("  Address:  {node_addr}");
 
-    // Create storage and state machine.
+    // Create storage with a temporary org store (just for initialization).
+    // The daemon will create the real org store connection on startup.
     let log_store = Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
 
-    let org_db = syfrah_state::LayerDb::open("org").context("Failed to open org database")?;
-    let org_store = Arc::new(syfrah_org::OrgStore::new(org_db));
+    // Use a temporary in-memory org store for initialization only.
+    // The real org store is locked by the daemon. Raft init only needs
+    // the log store and state machine to track membership — no org commands
+    // are applied during bootstrap.
+    let tmp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let tmp_org_db = syfrah_state::LayerDb::open_at(&tmp_dir.path().join("tmp_org.redb"))
+        .context("Failed to create temp org database")?;
+    let org_store = Arc::new(syfrah_org::OrgStore::new(tmp_org_db));
     let sm = Arc::new(syfrah_controlplane::RedbStateMachine::new(org_store));
 
     let network = syfrah_controlplane::SyfrahNetworkFactory::new();
