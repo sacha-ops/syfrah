@@ -182,17 +182,13 @@ impl GossipCluster {
     /// Update a hypervisor report (called when gossip delivers new data).
     pub fn update_report(&self, report: HypervisorGossipReport) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .reports
-            .insert(report.node_name.clone(), report);
+        inner.reports.insert(report.node_name.clone(), report);
     }
 
     /// Set a member's state (Alive/Suspect/Down).
     pub fn set_member_state(&self, addr: &str, state: MemberState) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .member_states
-            .insert(addr.to_string(), state);
+        inner.member_states.insert(addr.to_string(), state);
     }
 
     /// Get all current hypervisor reports (snapshot).
@@ -283,10 +279,7 @@ pub async fn start_gossip_agent(
 ) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(std::net::SocketAddr::V6(config.bind_addr)).await?;
     let socket = Arc::new(socket);
-    info!(
-        "gossip agent started on {}",
-        config.bind_addr
-    );
+    info!("gossip agent started on {}", config.bind_addr);
 
     let my_id = GossipNodeId::new(config.bind_addr);
     let foca_config = foca::Config::simple();
@@ -470,10 +463,7 @@ async fn drain_runtime(
                 info!("gossip: rejoined cluster as {}", new_id.addr);
             }
             foca::OwnedNotification::Rename(old, new) => {
-                info!(
-                    "gossip: member renamed {} -> {}",
-                    old.addr, new.addr
-                );
+                info!("gossip: member renamed {} -> {}", old.addr, new.addr);
             }
         }
     }
