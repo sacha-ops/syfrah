@@ -206,7 +206,7 @@ const SG_TABLE: &str = "syfrah_sg";
 /// Build a complete nftables ruleset for a VM's security groups.
 ///
 /// The ruleset includes:
-/// 1. Table creation (`create table inet syfrah_sg` -- idempotent)
+/// 1. Table creation (`add table inet syfrah_sg` -- idempotent)
 /// 2. Named sets for any SG references
 /// 3. Ingress chain (`vm_{hash}_in`)
 /// 4. Egress chain (`vm_{hash}_out`)
@@ -220,7 +220,7 @@ pub fn build_sg_ruleset(
     let mut buf = String::new();
 
     // Idempotent table creation.
-    writeln!(buf, "create table inet {SG_TABLE}").unwrap();
+    writeln!(buf, "add table inet {SG_TABLE}").unwrap();
 
     // Named sets for SG references.
     for (sg_name, ips) in sg_ip_map {
@@ -904,7 +904,7 @@ mod tests {
         )];
         let sg_map = std::collections::HashMap::new();
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
-        assert!(ruleset.contains("create table inet syfrah_sg"));
+        assert!(ruleset.contains("add table inet syfrah_sg"));
     }
 
     #[test]
