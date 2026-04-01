@@ -148,10 +148,28 @@ pub struct FourCategoryHealth {
     pub workload_health: HealthCheckResult,
     /// Control health: control plane reachable (always OK in bootstrap mode).
     pub control_health: HealthCheckResult,
+    /// Raft state (populated when control plane is initialized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raft: Option<RaftHealthInfo>,
     /// Uptime in seconds.
     pub uptime_secs: u64,
     /// VM count.
     pub vm_count: u32,
+}
+
+/// Raft cluster health information included in the Forge health response.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RaftHealthInfo {
+    /// Whether Raft is initialized.
+    pub initialized: bool,
+    /// Current Raft state (Leader, Follower, Candidate, Learner).
+    pub state: String,
+    /// Whether this node is the leader.
+    pub is_leader: bool,
+    /// Current Raft term.
+    pub term: u64,
+    /// Current leader ID (if known).
+    pub leader_id: Option<u64>,
 }
 
 impl FourCategoryHealth {
@@ -177,6 +195,7 @@ impl FourCategoryHealth {
             node_health: node,
             workload_health: workload,
             control_health: control,
+            raft: None,
             uptime_secs,
             vm_count,
         }
