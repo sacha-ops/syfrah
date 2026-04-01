@@ -9,6 +9,7 @@ pub mod gossip;
 pub mod idempotency;
 pub mod log_storage;
 pub mod network;
+pub mod scheduler;
 pub mod server;
 pub mod state_machine;
 pub mod types;
@@ -19,6 +20,7 @@ pub use gossip::{GossipCluster, GossipConfig, GossipNodeId, HypervisorGossipRepo
 pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
+pub use scheduler::{PlacementConstraints, PlacementDecision, Scheduler, SchedulerError};
 pub use server::RaftServer;
 pub use state_machine::{PlacementEvent, RedbStateMachine};
 pub use types::{SyfrahNode, SyfrahRaftConfig};
