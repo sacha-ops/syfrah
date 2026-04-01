@@ -237,6 +237,10 @@ pub struct VmManager {
     local_node: Option<String>,
     /// SG rule store for applying SG-based nftables rules during network setup.
     sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
+    /// Hypervisor store for looking up local hypervisor metadata (region, zone).
+    hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
+    /// Name of this node (used to look up the local hypervisor record).
+    local_node_name: Option<String>,
 }
 
 impl VmManager {
@@ -326,6 +330,8 @@ impl VmManager {
             placement_store: None,
             local_node: None,
             sg_rule_store: None,
+            hypervisor_store: None,
+            local_node_name: None,
         })
     }
 
@@ -371,6 +377,17 @@ impl VmManager {
     /// during VM network setup.
     pub fn set_sg_rule_store(&mut self, store: Arc<syfrah_org::SgRuleStore>) {
         self.sg_rule_store = Some(store);
+    }
+
+    /// Set the hypervisor store and local node name for populating
+    /// hypervisor_id, region, and zone on created VMs.
+    pub fn set_hypervisor_store(
+        &mut self,
+        store: Arc<syfrah_org::HypervisorStore>,
+        node_name: String,
+    ) {
+        self.hypervisor_store = Some(store);
+        self.local_node_name = Some(node_name);
     }
 
     /// Set the image catalog (e.g., after fetching from a remote endpoint).
@@ -894,7 +911,7 @@ impl VmManager {
             (None, None, None, None)
         };
 
-        let state = crate::runtime::VmRuntimeState {
+        let mut state = crate::runtime::VmRuntimeState {
             vm_id: spec.id.clone(),
             pid: handle.pid,
             socket_path: handle.runtime_dir.join("api.sock"),
@@ -923,7 +940,19 @@ impl VmManager {
             vpc: vm_vpc,
             security_groups: spec.security_groups.clone(),
             network_info: net_info,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
+
+        // Populate hypervisor metadata from the local hypervisor record.
+        if let (Some(hv_store), Some(node_name)) = (&self.hypervisor_store, &self.local_node_name) {
+            if let Ok(Some(hv)) = hv_store.get(node_name) {
+                state.hypervisor_id = Some(hv.name.clone());
+                state.region = Some(hv.region.clone());
+                state.zone = Some(hv.zone.clone());
+            }
+        }
 
         let status = state.to_status(now);
         let image_name = spec.image.clone();
@@ -1290,6 +1319,9 @@ impl VmManager {
                     vpc: None,
                     security_groups: vec![],
                     network_info: None,
+                    hypervisor_id: None,
+                    region: None,
+                    zone: None,
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;

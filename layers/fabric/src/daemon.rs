@@ -1151,6 +1151,14 @@ pub async fn run_daemon(
                 };
                 let _ = net_ok;
 
+                // Wire the hypervisor store so VMs get hypervisor/region/zone
+                // metadata at creation time.
+                if let Ok(hv_db) = syfrah_state::LayerDb::open("hypervisor") {
+                    let hv_store = Arc::new(syfrah_org::HypervisorStore::new(hv_db));
+                    vm_manager.set_hypervisor_store(hv_store, my_record.name.clone());
+                    info!("compute: hypervisor store wired (region/zone in vm get)");
+                }
+
                 let vm_manager = Arc::new(vm_manager);
 
                 // Reconnect VMs that survived a daemon restart.
