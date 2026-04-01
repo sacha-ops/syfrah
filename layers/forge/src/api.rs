@@ -51,6 +51,9 @@ pub struct ForgeState {
     /// Wrapped in RwLock because it's injected after Forge starts (Raft
     /// initialization happens later in the daemon startup sequence).
     pub raft_client: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::RaftClient>>>,
+    /// Gossip cluster state for metrics export.
+    /// Injected after Raft init (alongside raft_client).
+    pub gossip_cluster: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::GossipCluster>>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -651,7 +654,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<ForgeState>>) -> imp
         None => (0.0, 0.0),
     };
 
-    let body = match state.metrics_collector.as_ref() {
+    let mut body = match state.metrics_collector.as_ref() {
         Some(collector) => collector.render(vm_count, running, stopped, cpu_ratio, mem_ratio),
         None => {
             // Render basic metrics without collector
@@ -660,11 +663,90 @@ async fn prometheus_metrics_handler(State(state): State<Arc<ForgeState>>) -> imp
         }
     };
 
+    // Append Raft metrics if the control plane is initialized.
+    {
+        let raft_guard = state.raft_client.read().await;
+        if let Some(ref client) = *raft_guard {
+            body.push_str(&render_raft_metrics(client));
+        }
+    }
+
+    // Append gossip metrics if the gossip cluster is initialized.
+    {
+        let gossip_guard = state.gossip_cluster.read().await;
+        if let Some(ref cluster) = *gossip_guard {
+            body.push_str(&render_gossip_metrics(cluster));
+        }
+    }
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+/// Render Raft-specific metrics in Prometheus text exposition format.
+fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
+    use std::fmt::Write;
+
+    let snapshot = client.metrics_snapshot();
+    let mut out = String::with_capacity(1024);
+
+    let _ = writeln!(out, "# HELP raft_state Current Raft state (0=follower, 1=candidate, 2=leader)");
+    let _ = writeln!(out, "# TYPE raft_state gauge");
+    let _ = writeln!(out, "raft_state {}", snapshot.state);
+
+    let _ = writeln!(out, "# HELP raft_term Current Raft term");
+    let _ = writeln!(out, "# TYPE raft_term gauge");
+    let _ = writeln!(out, "raft_term {}", snapshot.term);
+
+    let _ = writeln!(out, "# HELP raft_commit_index Raft commit index");
+    let _ = writeln!(out, "# TYPE raft_commit_index gauge");
+    let _ = writeln!(out, "raft_commit_index {}", snapshot.commit_index);
+
+    let _ = writeln!(out, "# HELP raft_last_applied Index of last applied log entry");
+    let _ = writeln!(out, "# TYPE raft_last_applied gauge");
+    let _ = writeln!(out, "raft_last_applied {}", snapshot.last_applied);
+
+    let _ = writeln!(out, "# HELP raft_log_entries Current number of log entries");
+    let _ = writeln!(out, "# TYPE raft_log_entries gauge");
+    let _ = writeln!(out, "raft_log_entries {}", snapshot.log_entries);
+
+    let _ = writeln!(out, "# HELP raft_snapshot_count Number of snapshots taken");
+    let _ = writeln!(out, "# TYPE raft_snapshot_count counter");
+    let _ = writeln!(out, "raft_snapshot_count {}", snapshot.snapshot_count);
+
+    out
+}
+
+/// Render gossip-specific metrics in Prometheus text exposition format.
+///
+/// Metrics:
+/// - gossip_members_total{state} gauge — member count by state
+/// - gossip_messages_sent_total counter — total messages sent
+/// - gossip_messages_received_total counter — total messages received
+fn render_gossip_metrics(cluster: &syfrah_controlplane::GossipCluster) -> String {
+    use std::fmt::Write;
+
+    let snapshot = cluster.metrics_snapshot();
+    let mut out = String::with_capacity(512);
+
+    let _ = writeln!(out, "# HELP gossip_members_total Number of gossip members by state");
+    let _ = writeln!(out, "# TYPE gossip_members_total gauge");
+    let _ = writeln!(out, "gossip_members_total{{state=\"alive\"}} {}", snapshot.members_alive);
+    let _ = writeln!(out, "gossip_members_total{{state=\"suspect\"}} {}", snapshot.members_suspect);
+    let _ = writeln!(out, "gossip_members_total{{state=\"down\"}} {}", snapshot.members_down);
+
+    let _ = writeln!(out, "# HELP gossip_messages_sent_total Total gossip messages sent");
+    let _ = writeln!(out, "# TYPE gossip_messages_sent_total counter");
+    let _ = writeln!(out, "gossip_messages_sent_total {}", snapshot.messages_sent);
+
+    let _ = writeln!(out, "# HELP gossip_messages_received_total Total gossip messages received");
+    let _ = writeln!(out, "# TYPE gossip_messages_received_total counter");
+    let _ = writeln!(out, "gossip_messages_received_total {}", snapshot.messages_received);
+
+    out
 }
 
 /// GET /v1/hypervisor/resources (alias: /v1/node/resources)
@@ -2287,6 +2369,7 @@ mod tests {
             drain_controller: None,
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
+            gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -2312,6 +2395,7 @@ mod tests {
             drain_controller: None,
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
+            gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
         });
         (dir, state)
     }
@@ -2540,6 +2624,7 @@ mod tests {
             drain_controller: None,
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
+            gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let app = forge_router(state);
 
@@ -2578,6 +2663,7 @@ mod tests {
             drain_controller: None,
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
+            gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 

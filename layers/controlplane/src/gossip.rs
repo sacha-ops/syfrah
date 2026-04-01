@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddrV6;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,9 +157,28 @@ impl HypervisorGossipReport {
 /// The scheduler reads from this to get hypervisor reports for placement
 /// decisions. The gossip agent writes to it when reports are received
 /// or member states change.
+/// Snapshot of gossip metrics for Prometheus export.
+#[derive(Debug, Clone, Default)]
+pub struct GossipMetricsSnapshot {
+    /// Members in Alive state.
+    pub members_alive: u64,
+    /// Members in Suspect state.
+    pub members_suspect: u64,
+    /// Members in Down state.
+    pub members_down: u64,
+    /// Total gossip messages sent.
+    pub messages_sent: u64,
+    /// Total gossip messages received.
+    pub messages_received: u64,
+}
+
 #[derive(Clone)]
 pub struct GossipCluster {
     inner: Arc<Mutex<GossipClusterInner>>,
+    /// Total messages sent counter.
+    messages_sent: Arc<AtomicU64>,
+    /// Total messages received counter.
+    messages_received: Arc<AtomicU64>,
 }
 
 struct GossipClusterInner {
@@ -176,6 +196,40 @@ impl GossipCluster {
                 reports: HashMap::new(),
                 member_states: HashMap::new(),
             })),
+            messages_sent: Arc::new(AtomicU64::new(0)),
+            messages_received: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Increment the messages sent counter.
+    pub fn inc_messages_sent(&self) {
+        self.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the messages received counter.
+    pub fn inc_messages_received(&self) {
+        self.messages_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get a snapshot of gossip metrics for Prometheus export.
+    pub fn metrics_snapshot(&self) -> GossipMetricsSnapshot {
+        let inner = self.inner.lock().unwrap();
+        let mut alive = 0u64;
+        let mut suspect = 0u64;
+        let mut down = 0u64;
+        for state in inner.member_states.values() {
+            match state {
+                MemberState::Alive => alive += 1,
+                MemberState::Suspect => suspect += 1,
+                MemberState::Down => down += 1,
+            }
+        }
+        GossipMetricsSnapshot {
+            members_alive: alive,
+            members_suspect: suspect,
+            members_down: down,
+            messages_sent: self.messages_sent.load(Ordering::Relaxed),
+            messages_received: self.messages_received.load(Ordering::Relaxed),
         }
     }
 
@@ -345,6 +399,7 @@ pub async fn start_gossip_agent(
             match recv_result {
                 Ok((len, src)) => {
                     debug!("gossip: received {len} bytes from {src}");
+                    recv_cluster.inc_messages_received();
                     let mut runtime = foca::AccumulatingRuntime::new();
                     {
                         let mut f = recv_foca.lock().unwrap();
@@ -437,6 +492,7 @@ async fn drain_runtime(
         if let Err(e) = socket.send_to(&data, addr).await {
             warn!("gossip: send to {addr} failed: {e}");
         }
+        cluster.inc_messages_sent();
     }
 
     // Process notifications.

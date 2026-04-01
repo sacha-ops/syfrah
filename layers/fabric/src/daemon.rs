@@ -1390,6 +1390,8 @@ pub async fn run_daemon(
     // the Forge HTTP API can forward mutations to the Raft leader.
     let forge_raft_client: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::RaftClient>>> =
         Arc::new(tokio::sync::RwLock::new(None));
+    let forge_gossip_cluster: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::GossipCluster>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
 
     // -- Forge HTTP API server -----------------------------------------------
     //
@@ -1447,6 +1449,7 @@ pub async fn run_daemon(
                 syfrah_forge::metrics::MetricsCollector::new(),
             )),
             raft_client: Arc::clone(&forge_raft_client),
+            gossip_cluster: Arc::clone(&forge_gossip_cluster),
         });
 
         let bind_addr: std::net::SocketAddr =
@@ -1583,6 +1586,17 @@ pub async fn run_daemon(
                 } else {
                     syfrah_controlplane::GossipCluster::new()
                 };
+
+                // Inject gossip cluster into Forge API for metrics export.
+                {
+                    let holder = Arc::clone(&forge_gossip_cluster);
+                    let gc = gossip_cluster.clone();
+                    tokio::spawn(async move {
+                        let mut guard = holder.write().await;
+                        *guard = Some(gc);
+                        info!("gossip: injected gossip cluster into Forge API for metrics");
+                    });
+                }
 
                 let region = my_record.region.as_deref().unwrap_or("default").to_string();
                 let zone = my_record.zone.as_deref().unwrap_or("default").to_string();

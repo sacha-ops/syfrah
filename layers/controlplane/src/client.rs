@@ -12,6 +12,25 @@ use tracing::{debug, info, warn};
 use crate::commands::{StateMachineCommand, StateMachineResponse};
 use crate::SyfrahRaft;
 
+/// Plain Raft metrics snapshot for Prometheus export.
+///
+/// This avoids requiring downstream crates to depend on openraft types.
+#[derive(Debug, Clone)]
+pub struct RaftMetricsSnapshot {
+    /// Raft state: 0=follower, 1=candidate, 2=leader.
+    pub state: u8,
+    /// Current Raft term.
+    pub term: u64,
+    /// Commit index.
+    pub commit_index: u64,
+    /// Last applied log index.
+    pub last_applied: u64,
+    /// Current number of log entries.
+    pub log_entries: u64,
+    /// Number of snapshots (1 if snapshot exists, 0 otherwise).
+    pub snapshot_count: u64,
+}
+
 /// A handle for submitting commands to the Raft cluster.
 ///
 /// Cloneable and cheaply shareable across threads.
@@ -120,6 +139,33 @@ impl RaftClient {
     /// Get a reference to the underlying Raft node.
     pub fn raft(&self) -> &SyfrahRaft {
         &self.raft
+    }
+
+    /// Get a snapshot of Raft metrics for Prometheus export.
+    pub fn metrics_snapshot(&self) -> RaftMetricsSnapshot {
+        use openraft::rt::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+
+        let state = match format!("{:?}", metrics.state).as_str() {
+            "Follower" => 0,
+            "Candidate" => 1,
+            "Leader" => 2,
+            _ => 0,
+        };
+
+        let last_applied = metrics
+            .last_applied
+            .map(|l: openraft::alias::LogIdOf<crate::types::SyfrahRaftConfig>| l.index())
+            .unwrap_or(0);
+
+        RaftMetricsSnapshot {
+            state,
+            term: metrics.current_term,
+            commit_index: last_applied,
+            last_applied,
+            log_entries: metrics.last_log_index.unwrap_or(0),
+            snapshot_count: if metrics.snapshot.is_some() { 1 } else { 0 },
+        }
     }
 
     /// Check if this node is the Raft leader.
