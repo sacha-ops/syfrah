@@ -18,7 +18,10 @@ pub mod types;
 
 pub use client::{RaftClient, RaftMetricsSnapshot};
 pub use commands::{StateMachineCommand, StateMachineResponse};
-pub use gossip::{GossipCluster, GossipConfig, GossipNodeId, HypervisorGossipReport, MemberState};
+pub use gossip::{
+    GossipCluster, GossipConfig, GossipMetricsSnapshot, GossipNodeId, HypervisorGossipReport,
+    MemberState,
+};
 pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
