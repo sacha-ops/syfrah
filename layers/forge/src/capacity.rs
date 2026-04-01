@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Reservation expiry duration (60 seconds).
 const RESERVATION_EXPIRY: Duration = Duration::from_secs(60);
 
-/// Node capacity snapshot.
+/// Node capacity snapshot with full breakdown.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeCapacity {
     /// Total vCPUs on this node.
@@ -24,6 +24,53 @@ pub struct NodeCapacity {
     pub used_vcpus: u32,
     /// Memory currently allocated to VMs in MB.
     pub used_memory_mb: u64,
+    /// Physical CPU count (from /proc or sysconf).
+    #[serde(default)]
+    pub physical_vcpus: u32,
+    /// Physical memory in MB (from /proc/meminfo).
+    #[serde(default)]
+    pub physical_memory_mb: u64,
+    /// Reserved vCPUs for host (default 1).
+    #[serde(default)]
+    pub reserved_vcpus: u32,
+    /// Reserved memory in MB for host (default 1024).
+    #[serde(default)]
+    pub reserved_memory_mb: u64,
+    /// CPU overcommit ratio (default 2.0).
+    #[serde(default = "default_cpu_overcommit")]
+    pub overcommit_cpu: f64,
+    /// Memory overcommit ratio (default 1.0).
+    #[serde(default = "default_mem_overcommit")]
+    pub overcommit_memory: f64,
+    /// Allocatable vCPUs = (physical - reserved) * overcommit.
+    #[serde(default)]
+    pub allocatable_vcpus: u32,
+    /// Allocatable memory in MB = (physical - reserved) * overcommit.
+    #[serde(default)]
+    pub allocatable_memory_mb: u64,
+    /// Available vCPUs = allocatable - used - pending reservations.
+    #[serde(default)]
+    pub available_vcpus: u32,
+    /// Available memory in MB = allocatable - used - pending reservations.
+    #[serde(default)]
+    pub available_memory_mb: u64,
+    /// Total disk in GB.
+    #[serde(default)]
+    pub disk_total_gb: u64,
+    /// Used disk in GB.
+    #[serde(default)]
+    pub disk_used_gb: u64,
+    /// Available disk in GB.
+    #[serde(default)]
+    pub disk_available_gb: u64,
+}
+
+fn default_cpu_overcommit() -> f64 {
+    2.0
+}
+
+fn default_mem_overcommit() -> f64 {
+    1.0
 }
 
 /// A resource reservation with expiry.
@@ -36,30 +83,61 @@ pub struct Reservation {
 
 /// Capacity tracker for admission control.
 pub struct CapacityTracker {
+    /// Allocatable vCPUs (after reserved + overcommit).
     total_vcpus: u32,
+    /// Allocatable memory in MB (after reserved).
     total_memory_mb: u64,
+    /// Physical CPU count from sysconf.
+    physical_vcpus: u32,
+    /// Physical memory in MB from /proc/meminfo.
+    physical_memory_mb: u64,
+    /// Reserved vCPUs for host.
+    reserved_vcpus: u32,
+    /// Reserved memory in MB for host.
+    reserved_memory_mb: u64,
+    /// CPU overcommit ratio.
+    overcommit_cpu: f64,
+    /// Memory overcommit ratio.
+    overcommit_memory: f64,
     used_vcpus: Mutex<u32>,
     used_memory_mb: Mutex<u64>,
     reservations: Mutex<HashMap<String, Reservation>>,
 }
 
 impl CapacityTracker {
-    /// Create a new capacity tracker.
+    /// Create a new capacity tracker from system info.
     ///
-    /// Allocatable is computed as:
-    /// - vCPUs: (total_cpus - 1) * 2
-    /// - memory: total_memory - 1GB
+    /// Host reserved: 1 vCPU, 1 GB RAM.
+    /// Overcommit: CPU 2:1, memory 1:1.
+    /// Allocatable = (physical - reserved) * overcommit.
     pub fn new() -> Self {
         let sys_cpus = num_cpus();
         let sys_mem = total_memory_mb();
+        let reserved_v: u32 = 1;
+        let reserved_m: u64 = 1024;
+        let overcommit_c: f64 = 2.0;
+        let overcommit_m: f64 = 1.0;
+
+        let alloc_v = if sys_cpus > reserved_v {
+            ((sys_cpus - reserved_v) as f64 * overcommit_c) as u32
+        } else {
+            1
+        };
+        let alloc_m = if sys_mem > reserved_m {
+            ((sys_mem - reserved_m) as f64 * overcommit_m) as u64
+        } else {
+            sys_mem
+        };
 
         Self {
-            total_vcpus: if sys_cpus > 1 { (sys_cpus - 1) * 2 } else { 1 },
-            total_memory_mb: if sys_mem > 1024 {
-                sys_mem - 1024
-            } else {
-                sys_mem
-            },
+            total_vcpus: alloc_v,
+            total_memory_mb: alloc_m,
+            physical_vcpus: sys_cpus,
+            physical_memory_mb: sys_mem,
+            reserved_vcpus: reserved_v,
+            reserved_memory_mb: reserved_m,
+            overcommit_cpu: overcommit_c,
+            overcommit_memory: overcommit_m,
             used_vcpus: Mutex::new(0),
             used_memory_mb: Mutex::new(0),
             reservations: Mutex::new(HashMap::new()),
@@ -71,6 +149,12 @@ impl CapacityTracker {
         Self {
             total_vcpus,
             total_memory_mb,
+            physical_vcpus: total_vcpus,
+            physical_memory_mb: total_memory_mb,
+            reserved_vcpus: 0,
+            reserved_memory_mb: 0,
+            overcommit_cpu: 1.0,
+            overcommit_memory: 1.0,
             used_vcpus: Mutex::new(0),
             used_memory_mb: Mutex::new(0),
             reservations: Mutex::new(HashMap::new()),
@@ -169,13 +253,50 @@ impl CapacityTracker {
         *self.used_memory_mb.lock().unwrap() = memory_mb;
     }
 
-    /// Get a snapshot of current capacity.
+    /// Get the physical CPU count.
+    pub fn physical_vcpus(&self) -> u32 {
+        self.physical_vcpus
+    }
+
+    /// Get the physical memory in MB.
+    pub fn physical_memory_mb(&self) -> u64 {
+        self.physical_memory_mb
+    }
+
+    /// Get the used vCPUs.
+    pub fn used_vcpus(&self) -> u32 {
+        *self.used_vcpus.lock().unwrap()
+    }
+
+    /// Get the used memory in MB.
+    pub fn used_memory_mb(&self) -> u64 {
+        *self.used_memory_mb.lock().unwrap()
+    }
+
+    /// Get a full breakdown snapshot of current capacity.
     pub fn snapshot(&self) -> NodeCapacity {
+        let used_v = *self.used_vcpus.lock().unwrap();
+        let used_m = *self.used_memory_mb.lock().unwrap();
+        let (disk_total, disk_used, disk_avail) = disk_usage_gb();
+
         NodeCapacity {
             total_vcpus: self.total_vcpus,
             total_memory_mb: self.total_memory_mb,
-            used_vcpus: *self.used_vcpus.lock().unwrap(),
-            used_memory_mb: *self.used_memory_mb.lock().unwrap(),
+            used_vcpus: used_v,
+            used_memory_mb: used_m,
+            physical_vcpus: self.physical_vcpus,
+            physical_memory_mb: self.physical_memory_mb,
+            reserved_vcpus: self.reserved_vcpus,
+            reserved_memory_mb: self.reserved_memory_mb,
+            overcommit_cpu: self.overcommit_cpu,
+            overcommit_memory: self.overcommit_memory,
+            allocatable_vcpus: self.total_vcpus,
+            allocatable_memory_mb: self.total_memory_mb,
+            available_vcpus: self.available_vcpus(),
+            available_memory_mb: self.available_memory_mb(),
+            disk_total_gb: disk_total,
+            disk_used_gb: disk_used,
+            disk_available_gb: disk_avail,
         }
     }
 }
@@ -191,6 +312,31 @@ fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1)
+}
+
+/// Read disk usage for the root filesystem.
+/// Returns (total_gb, used_gb, available_gb).
+fn disk_usage_gb() -> (u64, u64, u64) {
+    // Use statvfs on the root filesystem
+    let output = std::process::Command::new("df")
+        .args(["-B1", "/"])
+        .output()
+        .ok();
+
+    if let Some(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Skip header line, parse second line
+        if let Some(line) = stdout.lines().nth(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let total = parts[1].parse::<u64>().unwrap_or(0) / (1024 * 1024 * 1024);
+                let used = parts[2].parse::<u64>().unwrap_or(0) / (1024 * 1024 * 1024);
+                let avail = parts[3].parse::<u64>().unwrap_or(0) / (1024 * 1024 * 1024);
+                return (total, used, avail);
+            }
+        }
+    }
+    (0, 0, 0)
 }
 
 /// Read total memory from /proc/meminfo.
@@ -326,5 +472,43 @@ mod tests {
         tracker.sync_used(4, 8192);
         assert_eq!(tracker.available_vcpus(), 4);
         assert_eq!(tracker.available_memory_mb(), 8192);
+    }
+
+    #[test]
+    fn snapshot_includes_full_breakdown() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
+        tracker.commit("vm-1", 2, 4096);
+
+        let snap = tracker.snapshot();
+        // Basic fields
+        assert_eq!(snap.total_vcpus, 8);
+        assert_eq!(snap.total_memory_mb, 16384);
+        assert_eq!(snap.used_vcpus, 2);
+        assert_eq!(snap.used_memory_mb, 4096);
+        // Allocatable = total (in test mode, no reserved/overcommit)
+        assert_eq!(snap.allocatable_vcpus, 8);
+        assert_eq!(snap.allocatable_memory_mb, 16384);
+        // Available = allocatable - used
+        assert_eq!(snap.available_vcpus, 6);
+        assert_eq!(snap.available_memory_mb, 12288);
+        // Physical = total (in test mode with_capacity)
+        assert_eq!(snap.physical_vcpus, 8);
+        assert_eq!(snap.physical_memory_mb, 16384);
+        // No reserved or overcommit in test mode
+        assert_eq!(snap.reserved_vcpus, 0);
+        assert_eq!(snap.reserved_memory_mb, 0);
+    }
+
+    #[test]
+    fn physical_accessors() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+        assert_eq!(tracker.physical_vcpus(), 4);
+        assert_eq!(tracker.physical_memory_mb(), 8192);
+        assert_eq!(tracker.used_vcpus(), 0);
+        assert_eq!(tracker.used_memory_mb(), 0);
+
+        tracker.commit("vm-1", 1, 2048);
+        assert_eq!(tracker.used_vcpus(), 1);
+        assert_eq!(tracker.used_memory_mb(), 2048);
     }
 }
