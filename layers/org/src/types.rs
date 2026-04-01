@@ -476,6 +476,10 @@ pub struct VmPlacement {
     pub hypervisor_id: String,
     pub action: PlacementAction,
     pub created_at: u64,
+    /// Monotonically increasing generation for fencing.
+    /// Each new placement (or reschedule) increments this.
+    #[serde(default)]
+    pub placement_generation: u64,
 }
 
 // ---------------------------------------------------------------------------

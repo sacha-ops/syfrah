@@ -151,6 +151,7 @@ fn make_placement(vpc: &str, vm: &str, node: &str, subnet: &str) -> VmPlacement 
         hypervisor_id: node.to_string(),
         action: PlacementAction::Add,
         created_at: 1700000000,
+        placement_generation: 1,
     }
 }
 
