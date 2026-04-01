@@ -197,8 +197,9 @@ type PlacementRemover = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sy
 
 pub struct VmManager {
     config: ComputeConfig,
-    /// Resolved cloud-hypervisor binary path (validated at construction).
-    ch_binary: PathBuf,
+    /// Resolved cloud-hypervisor binary path (None if CH is unavailable but
+    /// a container runtime was selected instead).
+    ch_binary: Option<PathBuf>,
     /// Runtime backend (Cloud Hypervisor, or future container runtime).
     /// Selected automatically based on system capabilities at construction.
     runtime: Box<dyn ComputeRuntime>,
@@ -244,8 +245,24 @@ impl VmManager {
     /// Resolves the cloud-hypervisor binary at construction time so that
     /// misconfiguration is caught early (before any VM operations).
     pub fn new(config: ComputeConfig) -> Result<Self, ComputeError> {
-        let ch_binary = resolve_ch_binary(config.ch_binary.as_deref())?;
-        info!(ch_binary = %ch_binary.display(), "VmManager: resolved cloud-hypervisor binary");
+        // Try to resolve CH binary, but don't fail yet — a container runtime
+        // may be available as a fallback.
+        let ch_binary = match resolve_ch_binary(config.ch_binary.as_deref()) {
+            Ok(path) => {
+                info!(ch_binary = %path.display(), "VmManager: resolved cloud-hypervisor binary");
+                Some(path)
+            }
+            Err(e) => {
+                // If a container runtime is available, CH is optional.
+                if crate::runtime_container::container_binaries_available() {
+                    warn!("cloud-hypervisor binary not found ({e}), but container runtime (crun/runsc) is available");
+                    None
+                } else {
+                    // Neither CH nor container runtime — fail.
+                    return Err(e);
+                }
+            }
+        };
 
         // Ensure data directories exist even if install.sh was not run.
         // base_dir lives under /run (tmpfs) so it vanishes on reboot — always recreate.
@@ -270,7 +287,9 @@ impl VmManager {
 
         // Auto-select runtime backend based on system capabilities.
         let runtime = runtime_ch::select_runtime(
-            ch_binary.clone(),
+            ch_binary
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent/cloud-hypervisor")),
             config.base_dir.clone(),
             config.kernel_path.clone(),
         )?;
@@ -880,8 +899,14 @@ impl VmManager {
             pid: handle.pid,
             socket_path: handle.runtime_dir.join("api.sock"),
             cgroup_path: None,
-            ch_binary_path: self.ch_binary.clone(),
-            ch_binary_version: process::get_ch_version(&self.ch_binary)
+            ch_binary_path: self
+                .ch_binary
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("n/a")),
+            ch_binary_version: self
+                .ch_binary
+                .as_ref()
+                .and_then(|p| process::get_ch_version(p))
                 .unwrap_or_else(|| "unknown".to_string()),
             vcpus: spec.vcpus,
             memory_mb: spec.memory_mb,
@@ -1340,7 +1365,9 @@ impl VmManager {
             vm_versions.push((id, guard.ch_binary_version.clone()));
         }
 
-        crate::binary::build_version_report(&self.ch_binary, &vm_versions)
+        let fallback_path = PathBuf::from("n/a");
+        let binary_path = self.ch_binary.as_ref().unwrap_or(&fallback_path);
+        crate::binary::build_version_report(binary_path, &vm_versions)
     }
 
     // -- Internal helpers -----------------------------------------------------
