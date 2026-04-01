@@ -1311,6 +1311,9 @@ pub async fn run_daemon(
             nic_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            nat_gw_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
 
         let bind_addr: std::net::SocketAddr =
