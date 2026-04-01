@@ -651,7 +651,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<ForgeState>>) -> imp
         None => (0.0, 0.0),
     };
 
-    let body = match state.metrics_collector.as_ref() {
+    let mut body = match state.metrics_collector.as_ref() {
         Some(collector) => collector.render(vm_count, running, stopped, cpu_ratio, mem_ratio),
         None => {
             // Render basic metrics without collector
@@ -660,11 +660,82 @@ async fn prometheus_metrics_handler(State(state): State<Arc<ForgeState>>) -> imp
         }
     };
 
+    // Append Raft metrics if the control plane is initialized.
+    {
+        let raft_guard = state.raft_client.read().await;
+        if let Some(ref client) = *raft_guard {
+            body.push_str(&render_raft_metrics(client));
+        }
+    }
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+/// Render Raft-specific metrics in Prometheus text exposition format.
+///
+/// Collected from the RaftClient's metrics snapshot:
+/// - raft_state gauge (0=follower, 1=candidate, 2=leader)
+/// - raft_term gauge
+/// - raft_commit_index gauge
+/// - raft_last_applied gauge
+/// - raft_log_entries gauge (current log size)
+/// - raft_snapshot_count counter
+fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
+    use std::fmt::Write;
+
+    let snapshot = client.metrics_snapshot();
+    let mut out = String::with_capacity(1024);
+
+    // raft_state: 0=follower, 1=candidate, 2=leader
+    let _ = writeln!(
+        out,
+        "# HELP raft_state Current Raft state (0=follower, 1=candidate, 2=leader)"
+    );
+    let _ = writeln!(out, "# TYPE raft_state gauge");
+    let _ = writeln!(out, "raft_state {}", snapshot.state);
+
+    // raft_term
+    let _ = writeln!(out, "# HELP raft_term Current Raft term");
+    let _ = writeln!(out, "# TYPE raft_term gauge");
+    let _ = writeln!(out, "raft_term {}", snapshot.term);
+
+    // raft_commit_index
+    let _ = writeln!(
+        out,
+        "# HELP raft_commit_index Raft commit index"
+    );
+    let _ = writeln!(out, "# TYPE raft_commit_index gauge");
+    let _ = writeln!(out, "raft_commit_index {}", snapshot.commit_index);
+
+    // raft_last_applied
+    let _ = writeln!(
+        out,
+        "# HELP raft_last_applied Index of last applied log entry"
+    );
+    let _ = writeln!(out, "# TYPE raft_last_applied gauge");
+    let _ = writeln!(out, "raft_last_applied {}", snapshot.last_applied);
+
+    // raft_log_entries (current log size)
+    let _ = writeln!(
+        out,
+        "# HELP raft_log_entries Current number of log entries"
+    );
+    let _ = writeln!(out, "# TYPE raft_log_entries gauge");
+    let _ = writeln!(out, "raft_log_entries {}", snapshot.log_entries);
+
+    // raft_snapshot_count
+    let _ = writeln!(
+        out,
+        "# HELP raft_snapshot_count Number of snapshots taken"
+    );
+    let _ = writeln!(out, "# TYPE raft_snapshot_count counter");
+    let _ = writeln!(out, "raft_snapshot_count {}", snapshot.snapshot_count);
+
+    out
 }
 
 /// GET /v1/hypervisor/resources (alias: /v1/node/resources)
