@@ -36,6 +36,8 @@ pub struct ForgeState {
     pub generation_tracker: Option<Arc<GenerationTracker>>,
     /// In-memory NIC registry (resource_id -> NicRecord).
     pub nic_registry: Arc<Mutex<HashMap<String, NicRecord>>>,
+    /// In-memory NAT gateway registry (id -> NatGwRecord).
+    pub nat_gw_registry: Arc<Mutex<HashMap<String, NatGwRecord>>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -209,6 +211,32 @@ fn default_priority() -> u32 {
 pub struct RemoveSgRequest {
     /// VM identifier whose chains should be flushed.
     pub vm_id: String,
+}
+
+/// NAT gateway state.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum NatGwState {
+    Pending,
+    Active,
+    Deleting,
+}
+
+/// Request body for creating a NAT gateway.
+#[derive(Deserialize, Debug)]
+pub struct CreateNatGwRequest {
+    /// Bridge name to apply masquerade on.
+    pub bridge: String,
+    /// Subnet CIDR for NAT (e.g., "10.1.0.0/24").
+    pub subnet_cidr: String,
+}
+
+/// Stored NAT gateway record.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NatGwRecord {
+    pub id: String,
+    pub bridge: String,
+    pub subnet_cidr: String,
+    pub state: NatGwState,
 }
 
 /// Response for NIC operations.
@@ -1265,6 +1293,150 @@ async fn remove_sg_handler(
     )
 }
 
+// ---------------------------------------------------------------------------
+// NAT Gateway handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/networks/nat-gw — create NAT GW, apply masquerade.
+async fn create_nat_gw_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<CreateNatGwRequest>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let id = format!("nat-{}-{}", req.bridge, req.subnet_cidr.replace('/', "_"));
+
+    // Register as Pending.
+    {
+        let mut registry = state.nat_gw_registry.lock().unwrap();
+        registry.insert(
+            id.clone(),
+            NatGwRecord {
+                id: id.clone(),
+                bridge: req.bridge.clone(),
+                subnet_cidr: req.subnet_cidr.clone(),
+                state: NatGwState::Pending,
+            },
+        );
+    }
+
+    // Apply masquerade.
+    if let Err(e) = backend.apply_nat(&req.bridge, &req.subnet_cidr).await {
+        warn!(bridge = %req.bridge, subnet = %req.subnet_cidr, error = %e, "failed to apply NAT");
+        state.nat_gw_registry.lock().unwrap().remove(&id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_NAT_CREATE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    // Transition to Active.
+    {
+        let mut registry = state.nat_gw_registry.lock().unwrap();
+        if let Some(record) = registry.get_mut(&id) {
+            record.state = NatGwState::Active;
+        }
+    }
+
+    let gen = state.generation_tracker.as_ref().map(|gt| gt.register(&id));
+
+    info!(id = %id, bridge = %req.bridge, subnet = %req.subnet_cidr, "NAT GW created");
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": id,
+            "bridge": req.bridge,
+            "subnet_cidr": req.subnet_cidr,
+            "state": "Active",
+            "generation": gen,
+        })),
+    )
+}
+
+/// DELETE /v1/networks/nat-gw/:id — remove masquerade.
+async fn delete_nat_gw_handler(
+    State(state): State<Arc<ForgeState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    // Look up record.
+    let record = {
+        let mut registry = state.nat_gw_registry.lock().unwrap();
+        if let Some(r) = registry.get_mut(&id) {
+            r.state = NatGwState::Deleting;
+            Some(r.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(record) = record else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "FORGE_NAT_NOT_FOUND",
+                "message": format!("NAT GW '{}' not found", id)
+            })),
+        );
+    };
+
+    if let Err(e) = backend
+        .remove_nat(&record.bridge, &record.subnet_cidr)
+        .await
+    {
+        warn!(id = %id, error = %e, "failed to remove NAT");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_NAT_DELETE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    state.nat_gw_registry.lock().unwrap().remove(&id);
+
+    if let Some(ref gt) = state.generation_tracker {
+        gt.remove(&id);
+    }
+
+    info!(id = %id, "NAT GW deleted");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_NAT_DELETED",
+            "message": format!("NAT GW '{}' deleted", id)
+        })),
+    )
+}
+
+/// GET /v1/networks/nat-gw — list all NAT gateways.
+async fn list_nat_gw_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let registry = state.nat_gw_registry.lock().unwrap();
+    let gws: Vec<&NatGwRecord> = registry.values().collect();
+    (StatusCode::OK, Json(serde_json::to_value(gws).unwrap()))
+}
+
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
@@ -1295,6 +1467,12 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         // -- Networks: Security Groups --
         .route("/v1/networks/sg/apply", post(apply_sg_handler))
         .route("/v1/networks/sg/remove", post(remove_sg_handler))
+        // -- Networks: NAT Gateways --
+        .route(
+            "/v1/networks/nat-gw",
+            get(list_nat_gw_handler).post(create_nat_gw_handler),
+        )
+        .route("/v1/networks/nat-gw/{id}", delete(delete_nat_gw_handler))
         // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
@@ -1376,6 +1554,7 @@ mod tests {
             network_backend: None,
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
+            nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1396,6 +1575,7 @@ mod tests {
             network_backend: None,
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
+            nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         (dir, state)
     }
@@ -1615,6 +1795,7 @@ mod tests {
             network_backend: None,
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
+            nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = forge_router(state);
 
@@ -1648,6 +1829,7 @@ mod tests {
             network_backend: Some(backend),
             generation_tracker: Some(gen_tracker),
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
+            nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1921,5 +2103,96 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(err["code"], "FORGE_INVALID_IP");
+    }
+
+    #[tokio::test]
+    async fn create_nat_gw_endpoint() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/nat-gw")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"bridge":"syfb-12345678","subnet_cidr":"10.1.0.0/24"}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["state"], "Active");
+        assert!(result["id"].as_str().unwrap().starts_with("nat-"));
+    }
+
+    #[tokio::test]
+    async fn delete_nat_gw_not_found() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/networks/nat-gw/nat-nonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn nat_gw_lifecycle() {
+        let state = test_state_with_network();
+
+        // Create.
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/nat-gw")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"bridge":"syfb-aabbccdd","subnet_cidr":"10.2.0.0/24"}"#,
+            ))
+            .unwrap();
+        let resp1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), 201);
+        let body = resp1.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nat_id = result["id"].as_str().unwrap().to_string();
+
+        // List — should have 1 entry.
+        let app2 = forge_router(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .uri("/v1/networks/nat-gw")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        let body = resp2.into_body().collect().await.unwrap().to_bytes();
+        let gws: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(gws.len(), 1);
+
+        // Delete.
+        let app3 = forge_router(Arc::clone(&state));
+        let req3 = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/networks/nat-gw/{}", nat_id))
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), 200);
+
+        // List — should be empty.
+        let app4 = forge_router(state);
+        let req4 = axum::http::Request::builder()
+            .uri("/v1/networks/nat-gw")
+            .body(Body::empty())
+            .unwrap();
+        let resp4 = app4.oneshot(req4).await.unwrap();
+        let body = resp4.into_body().collect().await.unwrap().to_bytes();
+        let gws: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(gws.is_empty());
     }
 }
