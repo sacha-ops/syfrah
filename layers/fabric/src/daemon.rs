@@ -1337,6 +1337,76 @@ pub async fn run_daemon(
         })
     };
 
+    // -- Raft HTTP server (Control Plane) -----------------------------------
+    //
+    // The Raft server handles inter-node consensus RPCs on syfrah0:7200.
+    // It is started alongside Forge but only active after `syfrah controlplane init`.
+    let (raft_shutdown_tx, raft_shutdown_rx) = tokio::sync::watch::channel(false);
+    let raft_task = {
+        let raft_bind_addr: std::net::SocketAddr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(my_record.mesh_ipv6), 7200);
+
+        // Check if Raft has been initialized (raft_meta.redb exists and has state).
+        let raft_db = syfrah_state::LayerDb::open("raft_log").ok();
+        let raft_initialized = raft_db.is_some();
+
+        if raft_initialized {
+            let log_db = syfrah_state::LayerDb::open("raft_log").unwrap();
+            let log_store = std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
+
+            let sm = std::sync::Arc::new(syfrah_controlplane::RedbStateMachine::new(
+                shared_org_store.clone().unwrap_or_else(|| {
+                    let db = syfrah_state::LayerDb::open("org").unwrap();
+                    std::sync::Arc::new(syfrah_org::OrgStore::new(db))
+                }),
+            ));
+
+            let network = syfrah_controlplane::SyfrahNetworkFactory::new();
+
+            // Derive node ID from fabric node identity hash.
+            let node_id = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                my_record.name.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            let config = std::sync::Arc::new(openraft::Config {
+                cluster_name: "syfrah-raft".to_string(),
+                ..Default::default()
+            });
+
+            let raft = openraft::Raft::new(node_id, config, network, log_store, sm)
+                .await
+                .expect("failed to create Raft node");
+
+            let raft_state = syfrah_controlplane::server::RaftServerState { raft };
+
+            info!("raft: control plane server starting on {raft_bind_addr} (node_id={node_id})");
+
+            tokio::spawn(async move {
+                if let Err(e) = syfrah_controlplane::RaftServer::serve(
+                    raft_bind_addr,
+                    raft_state,
+                    raft_shutdown_rx,
+                )
+                .await
+                {
+                    warn!("Raft HTTP server error: {e}");
+                }
+            })
+        } else {
+            info!(
+                "raft: control plane not initialized. Run 'syfrah controlplane init' to bootstrap."
+            );
+            tokio::spawn(async move {
+                // Placeholder: Raft not yet initialized. Listen for init signal.
+                let _ = raft_shutdown_rx.clone();
+                std::future::pending::<()>().await;
+            })
+        }
+    };
+
     // Bounded retry queue for announces that cannot be processed immediately.
     let (announce_queue_tx, announce_queue_rx) =
         tokio::sync::mpsc::channel::<PeerRecord>(tuning.announce_queue_size);
@@ -2248,6 +2318,7 @@ pub async fn run_daemon(
         _ = api_task => {}
         _ = grpc_task => {}
         _ = forge_task => {}
+        _ = raft_task => {}
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
         }
@@ -2290,6 +2361,9 @@ pub async fn run_daemon(
 
     // Signal Forge HTTP API server to shut down gracefully.
     let _ = forge_shutdown_tx.send(true);
+
+    // Signal Raft HTTP server to shut down gracefully.
+    let _ = raft_shutdown_tx.send(true);
 
     // Tell systemd we are shutting down gracefully.
     sd_watchdog::notify_stopping();

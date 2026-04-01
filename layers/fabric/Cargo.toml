@@ -16,6 +16,8 @@ syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
 syfrah-api = { path = "../api" }
 syfrah-forge = { path = "../forge" }
+syfrah-controlplane = { path = "../controlplane" }
+openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 wireguard-control = "1.7"
 tokio.workspace = true
 tracing.workspace = true
