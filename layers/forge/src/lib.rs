@@ -31,6 +31,7 @@ pub mod cleanup;
 pub mod degraded;
 pub mod drain;
 pub mod drift;
+pub mod fencing;
 pub mod generation;
 pub mod health;
 pub mod logging;
