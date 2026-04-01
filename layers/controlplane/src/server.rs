@@ -55,8 +55,27 @@ pub fn raft_router(state: Arc<RaftServerState>) -> Router {
         .route("/raft/append_entries", post(append_entries_handler))
         .route("/raft/vote", post(vote_handler))
         .route("/raft/install_snapshot", post(install_snapshot_handler))
+        .route("/raft/write", post(client_write_handler))
         .route("/raft/status", get(status_handler))
         .with_state(state)
+}
+
+/// Handle a forwarded client write from a follower node.
+///
+/// The leader applies the command via Raft and returns the state machine response.
+async fn client_write_handler(
+    State(state): State<Arc<RaftServerState>>,
+    Json(cmd): Json<crate::commands::StateMachineCommand>,
+) -> Result<Json<crate::commands::StateMachineResponse>, StatusCode> {
+    use tracing::debug;
+    debug!("raft server: received forwarded write: {cmd}");
+
+    let resp = state.raft.client_write(cmd).await.map_err(|e| {
+        warn!("client_write error: {e:?}");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    Ok(Json(resp.response().clone()))
 }
 
 async fn append_entries_handler(

@@ -1002,6 +1002,10 @@ pub async fn run_daemon(
     // that previously prevented CLI commands from accessing org.redb while the
     // daemon was running.
     let mut shared_sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>> = None;
+    // We hold a reference to the Raft-aware org handler so we can inject
+    // the Raft client later when the control plane is initialized.
+    let raft_org_handler: Option<Arc<crate::raft_handler::RaftOrgHandler>>;
+
     let shared_org_store: Option<Arc<syfrah_org::OrgStore>> =
         match syfrah_state::LayerDb::open("org") {
             Ok(org_db) => {
@@ -1019,13 +1023,21 @@ pub async fn run_daemon(
                     info!("sg_rules store initialised");
                 }
 
-                router.register("org", Arc::new(org_handler));
+                // Wrap the org handler in a Raft-aware handler that routes
+                // mutations through Raft when the control plane is active.
+                let inner_handler: Arc<dyn syfrah_api::handler::LayerHandler> =
+                    Arc::new(org_handler);
+                let raft_handler =
+                    Arc::new(crate::raft_handler::RaftOrgHandler::new(inner_handler));
+                raft_org_handler = Some(Arc::clone(&raft_handler));
+                router.register("org", raft_handler);
 
-                info!("org layer initialised");
+                info!("org layer initialised (Raft-aware)");
                 Some(store)
             }
             Err(e) => {
                 warn!("org layer init failed (non-fatal): {e}");
+                raft_org_handler = None;
                 None
             }
         };
@@ -1383,6 +1395,19 @@ pub async fn run_daemon(
             let raft = openraft::Raft::new(node_id, config, network, log_store, sm)
                 .await
                 .expect("failed to create Raft node");
+
+            // Create a Raft client for routing mutations through the cluster.
+            let raft_client = syfrah_controlplane::RaftClient::new(raft.clone());
+
+            // Inject the Raft client into the org handler so mutations go through Raft.
+            if let Some(ref handler) = raft_org_handler {
+                let handler = Arc::clone(handler);
+                let client = raft_client.clone();
+                tokio::spawn(async move {
+                    handler.set_raft_client(client).await;
+                    info!("raft: injected Raft client into org handler");
+                });
+            }
 
             let raft_state = syfrah_controlplane::server::RaftServerState { raft };
 
