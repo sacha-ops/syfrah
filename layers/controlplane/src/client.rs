@@ -167,11 +167,7 @@ impl RaftClient {
             commit_index: last_applied,
             last_applied,
             log_entries: metrics.last_log_index.unwrap_or(0),
-            snapshot_count: if metrics.snapshot.is_some() {
-                1
-            } else {
-                0
-            },
+            snapshot_count: if metrics.snapshot.is_some() { 1 } else { 0 },
         }
     }
 

@@ -704,10 +704,7 @@ fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
     let _ = writeln!(out, "raft_term {}", snapshot.term);
 
     // raft_commit_index
-    let _ = writeln!(
-        out,
-        "# HELP raft_commit_index Raft commit index"
-    );
+    let _ = writeln!(out, "# HELP raft_commit_index Raft commit index");
     let _ = writeln!(out, "# TYPE raft_commit_index gauge");
     let _ = writeln!(out, "raft_commit_index {}", snapshot.commit_index);
 
@@ -720,18 +717,12 @@ fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
     let _ = writeln!(out, "raft_last_applied {}", snapshot.last_applied);
 
     // raft_log_entries (current log size)
-    let _ = writeln!(
-        out,
-        "# HELP raft_log_entries Current number of log entries"
-    );
+    let _ = writeln!(out, "# HELP raft_log_entries Current number of log entries");
     let _ = writeln!(out, "# TYPE raft_log_entries gauge");
     let _ = writeln!(out, "raft_log_entries {}", snapshot.log_entries);
 
     // raft_snapshot_count
-    let _ = writeln!(
-        out,
-        "# HELP raft_snapshot_count Number of snapshots taken"
-    );
+    let _ = writeln!(out, "# HELP raft_snapshot_count Number of snapshots taken");
     let _ = writeln!(out, "# TYPE raft_snapshot_count counter");
     let _ = writeln!(out, "raft_snapshot_count {}", snapshot.snapshot_count);
 
