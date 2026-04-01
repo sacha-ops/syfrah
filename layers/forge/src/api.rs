@@ -38,6 +38,8 @@ pub struct ForgeState {
     pub nic_registry: Arc<Mutex<HashMap<String, NicRecord>>>,
     /// In-memory NAT gateway registry (id -> NatGwRecord).
     pub nat_gw_registry: Arc<Mutex<HashMap<String, NatGwRecord>>>,
+    /// In-memory FDB entry registry (key -> FdbEntry).
+    pub fdb_registry: Arc<Mutex<HashMap<String, FdbEntry>>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -256,6 +258,35 @@ pub struct RouteEntry {
     /// Target ID (NAT GW id or peering id). Ignored for blackhole.
     #[serde(default)]
     pub target_id: Option<String>,
+}
+
+/// Request body for FDB add/remove operations.
+#[derive(Deserialize, Debug)]
+pub struct FdbRequest {
+    /// "add" or "remove".
+    pub action: String,
+    /// VPC identifier — used to derive bridge name.
+    pub vpc_id: String,
+    /// VM MAC address.
+    pub mac: String,
+    /// Remote VTEP IP address (for FDB entries).
+    pub vtep: String,
+    /// VM IP address (for ARP proxy).
+    #[serde(default)]
+    pub vm_ip: Option<String>,
+    /// VXLAN interface name (for ARP proxy). Derived from vpc_id if not provided.
+    #[serde(default)]
+    pub vxlan_name: Option<String>,
+}
+
+/// Stored FDB entry for the in-memory registry.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FdbEntry {
+    pub vpc_id: String,
+    pub bridge_name: String,
+    pub mac: String,
+    pub vtep: String,
+    pub vm_ip: Option<String>,
 }
 
 /// Response for NIC operations.
@@ -1457,6 +1488,129 @@ async fn list_nat_gw_handler(State(state): State<Arc<ForgeState>>) -> impl IntoR
 }
 
 // ---------------------------------------------------------------------------
+// FDB management handlers
+// ---------------------------------------------------------------------------
+
+/// GET /v1/networks/fdb — list all FDB entries.
+async fn list_fdb_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let registry = state.fdb_registry.lock().unwrap();
+    let entries: Vec<&FdbEntry> = registry.values().collect();
+    (StatusCode::OK, Json(serde_json::to_value(entries).unwrap()))
+}
+
+/// POST /v1/networks/fdb — add or remove FDB + ARP proxy entries.
+async fn manage_fdb_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<FdbRequest>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let bridge_name = syfrah_overlay::naming::bridge_name(&req.vpc_id);
+    let vxlan_name = req
+        .vxlan_name
+        .clone()
+        .unwrap_or_else(|| syfrah_overlay::naming::vxlan_name(&req.vpc_id));
+    let key = format!("fdb-{}-{}", req.vpc_id, req.mac);
+
+    match req.action.as_str() {
+        "add" => {
+            // Add FDB entry.
+            if let Err(e) = backend
+                .add_fdb_entry(&bridge_name, &req.mac, &req.vtep)
+                .await
+            {
+                warn!(vpc = %req.vpc_id, mac = %req.mac, error = %e, "failed to add FDB entry");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "code": "FORGE_FDB_ADD_FAILED",
+                        "message": e.to_string()
+                    })),
+                );
+            }
+
+            // Add ARP proxy if vm_ip provided.
+            if let Some(ref vm_ip) = req.vm_ip {
+                if let Err(e) = backend.add_arp_proxy(&vxlan_name, vm_ip, &req.mac).await {
+                    warn!(vpc = %req.vpc_id, ip = %vm_ip, error = %e, "failed to add ARP proxy");
+                    // Non-fatal: FDB entry was added, ARP proxy can be retried.
+                }
+            }
+
+            // Register in fdb_registry.
+            state.fdb_registry.lock().unwrap().insert(
+                key.clone(),
+                FdbEntry {
+                    vpc_id: req.vpc_id.clone(),
+                    bridge_name: bridge_name.clone(),
+                    mac: req.mac.clone(),
+                    vtep: req.vtep.clone(),
+                    vm_ip: req.vm_ip.clone(),
+                },
+            );
+
+            info!(vpc = %req.vpc_id, mac = %req.mac, vtep = %req.vtep, "FDB entry added");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "code": "FORGE_FDB_ADDED",
+                    "key": key,
+                    "bridge": bridge_name,
+                    "mac": req.mac,
+                    "vtep": req.vtep,
+                })),
+            )
+        }
+        "remove" => {
+            // Remove FDB entry.
+            if let Err(e) = backend.remove_fdb_entry(&bridge_name, &req.mac).await {
+                warn!(vpc = %req.vpc_id, mac = %req.mac, error = %e, "failed to remove FDB entry");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "code": "FORGE_FDB_REMOVE_FAILED",
+                        "message": e.to_string()
+                    })),
+                );
+            }
+
+            // Remove ARP proxy if vm_ip provided.
+            if let Some(ref vm_ip) = req.vm_ip {
+                if let Err(e) = backend.remove_arp_proxy(&vxlan_name, vm_ip).await {
+                    warn!(vpc = %req.vpc_id, ip = %vm_ip, error = %e, "failed to remove ARP proxy");
+                }
+            }
+
+            state.fdb_registry.lock().unwrap().remove(&key);
+
+            info!(vpc = %req.vpc_id, mac = %req.mac, "FDB entry removed");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "code": "FORGE_FDB_REMOVED",
+                    "key": key,
+                })),
+            )
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "FORGE_FDB_INVALID_ACTION",
+                "message": format!("invalid action '{}': expected 'add' or 'remove'", other)
+            })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Route enforcement handler
 // ---------------------------------------------------------------------------
 
@@ -1603,6 +1757,11 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
             get(list_nat_gw_handler).post(create_nat_gw_handler),
         )
         .route("/v1/networks/nat-gw/{id}", delete(delete_nat_gw_handler))
+        // -- Networks: FDB --
+        .route(
+            "/v1/networks/fdb",
+            get(list_fdb_handler).post(manage_fdb_handler),
+        )
         // -- Networks: Routes --
         .route("/v1/networks/routes/enforce", post(enforce_routes_handler))
         // -- Tasks --
@@ -1687,6 +1846,7 @@ mod tests {
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
+            fdb_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1708,6 +1868,7 @@ mod tests {
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
+            fdb_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         (dir, state)
     }
@@ -1928,6 +2089,7 @@ mod tests {
             generation_tracker: None,
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
+            fdb_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = forge_router(state);
 
@@ -1962,6 +2124,7 @@ mod tests {
             generation_tracker: Some(gen_tracker),
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
+            fdb_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2501,5 +2664,93 @@ mod tests {
             err_msg.contains("not Active"),
             "error should mention inactive state: {err_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn fdb_add_and_list() {
+        let state = test_state_with_network();
+
+        // Add FDB entry.
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/fdb")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"action":"add","vpc_id":"vpc-fdb","mac":"02:00:0a:01:00:03","vtep":"10.0.0.2","vm_ip":"10.1.0.3"}"#,
+            ))
+            .unwrap();
+        let resp1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), 200);
+
+        // List FDB entries.
+        let app2 = forge_router(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .uri("/v1/networks/fdb")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        let body = resp2.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["mac"], "02:00:0a:01:00:03");
+    }
+
+    #[tokio::test]
+    async fn fdb_remove() {
+        let state = test_state_with_network();
+
+        // Add then remove.
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/fdb")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"action":"add","vpc_id":"vpc-fdb","mac":"02:00:0a:01:00:04","vtep":"10.0.0.3"}"#,
+            ))
+            .unwrap();
+        app1.oneshot(req1).await.unwrap();
+
+        let app2 = forge_router(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/fdb")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"action":"remove","vpc_id":"vpc-fdb","mac":"02:00:0a:01:00:04","vtep":"10.0.0.3"}"#,
+            ))
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), 200);
+
+        // List should be empty (only the entry we removed).
+        let app3 = forge_router(state);
+        let req3 = axum::http::Request::builder()
+            .uri("/v1/networks/fdb")
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        let body = resp3.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fdb_invalid_action() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/fdb")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"action":"invalid","vpc_id":"vpc-1","mac":"02:00:00:00:00:01","vtep":"10.0.0.1"}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }
