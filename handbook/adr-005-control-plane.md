@@ -67,7 +67,7 @@ Two complementary protocols divide the work:
 
 | Protocol | Crate | What it handles | Consistency | Transport |
 |----------|-------|-----------------|-------------|-----------|
-| **Raft** | `openraft` | IP allocation, VM scheduling, VPC config, SGs, routes, NAT GWs, org/project/env, hypervisor records | Strong (linearizable writes, sequentially consistent reads) | HTTP/JSON over syfrah0 (WireGuard) |
+| **Raft** | `openraft` | IP allocation, VM scheduling, VPC config, SGs, routes, NAT GWs, org/project/env, hypervisor records | Linearizable writes; reads vary by tier (see §14) | HTTP/JSON over syfrah0 (WireGuard) |
 | **Gossip** | `foca` | Node liveness, capacity telemetry, hypervisor status hints, drain status | Eventual (~1-5 seconds) | UDP over syfrah0 (WireGuard) |
 
 Raft state is **prescriptive** — what should exist. Gossip state is **descriptive** — what is actually happening. Forge reconciles the two.
@@ -613,6 +613,22 @@ The scheduler is also invoked when:
 - **A hypervisor enters draining state** (operator-initiated). The scheduler migrates VMs to other hypervisors one at a time (stop, reschedule, start).
 - **A placement is rejected by admission control**. The scheduler retries with the next best candidate.
 
+### Reschedule safety for stateful workloads
+
+Automatic rescheduling is gated by the VM's storage profile:
+
+| Storage type | Auto-reschedule | Reason |
+|-------------|----------------|--------|
+| Stateless (no volumes) | Yes | Nothing to lose |
+| Remote volumes only (ZeroFS/S3) | Yes | Volumes detach from old HV, reattach on new HV |
+| Local ephemeral disk | Yes (with data loss acknowledged) | Ephemeral data is expected to be lost |
+| Local persistent volume | **No** | Data is physically on the old hypervisor — cannot move without storage migration |
+| Exclusive-write volume (attached) | **No** until fenced | Must confirm old HV has released the volume before reattaching |
+
+`restart_on_failure: true` alone is NOT sufficient for automatic reschedule of VMs with exclusive-write volumes. The state machine must verify that the volume attachment is safe before committing the reschedule.
+
+If a VM has `restart_on_failure: true` AND a local persistent volume, it is restarted on the SAME hypervisor only (if the hypervisor recovers). Cross-hypervisor reschedule requires explicit operator action or a future storage migration capability.
+
 ## 9. Placement Fencing
 
 Every VM placement carries a monotonically increasing `placement_generation` (u64), assigned by the Raft state machine at commit time.
@@ -677,11 +693,14 @@ Operator → POST /v1/instances to Node C (a follower)
 
 | Request type | Routing | Consistency |
 |-------------|---------|-------------|
-| **Write** (POST, PUT, DELETE) | Always forwarded to Raft leader | Strongly consistent (committed to quorum) |
-| **Read** (GET) — default | Served locally from redb | Eventually consistent (bounded by replication lag, typically <100ms) |
-| **Read** (GET) with `?consistent=true` | Forwarded to leader, leader confirms it is still leader before responding | Strongly consistent (linearizable) |
+| **Write** (POST, PUT, DELETE) | Always forwarded to Raft leader | Linearizable (committed to quorum) |
+| **Read** (GET) — default | Served locally from redb (follower read) | Eventually consistent (may lag leader by 1-2 Raft rounds, <100ms typical) |
+| **Read** (GET) from leader | Served from leader's redb | Up-to-date committed state (not formally linearizable — no quorum confirmation) |
+| **Read** (GET) with `?consistency=strong` | Leader confirms it is still leader (ReadIndex/quorum read) before responding | Linearizable (highest latency) |
 
 Most reads are served locally. This scales horizontally — adding nodes adds read capacity. Writes always go through the leader, which is the bottleneck, but write throughput is sufficient for control plane operations (not data plane).
+
+See §14 for the full read consistency contract.
 
 ### Leader discovery
 
@@ -851,11 +870,22 @@ Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet fronte
 
 ## 14. Consistency guarantees
 
-| Operation | Guarantee | Mechanism |
+### Read consistency contract
+
+| Read type | Consistency | How | Use case |
+|-----------|------------|-----|----------|
+| Follower read (default) | Eventually consistent | Read from local state machine. May lag leader by 1-2 Raft rounds (<100ms typical). | List VMs, show status, capacity checks. Acceptable for most operations. |
+| Leader read (default) | Up-to-date committed state | Read from leader's state machine. Reflects all committed writes. Not formally linearizable (no quorum confirmation). | CLI reads after a write on the same node. |
+| Strong read (`?consistency=strong`) | Linearizable | Leader confirms it is still leader (ReadIndex or quorum read) before responding. Highest latency. | Billing snapshots, audit queries, cross-client coordination. |
+
+**Writes are always linearizable** (committed by Raft majority before response).
+
+For the initial implementation (Phase 1-3): all reads are follower/local reads. Strong reads are a Phase 5+ optimization.
+
+### Other consistency boundaries
+
+| Subsystem | Guarantee | Mechanism |
 |-----------|-----------|-----------|
-| **Writes** (create/update/delete any resource) | Strongly consistent (linearizable) | Raft quorum commit. A write is acknowledged only after a majority of nodes have persisted the log entry. |
-| **Reads from leader** | Strongly consistent (when using `?consistent=true`) | Leader confirms it still holds the lease before responding. Without the flag, reads are sequentially consistent (served from the leader's latest committed state). |
-| **Reads from followers** | Eventually consistent | Served from local redb, which may lag behind the leader by the replication delay (typically <100ms under normal conditions, up to seconds during high load or network issues). |
 | **Gossip data** | Eventually consistent | SWIM dissemination in O(log N) rounds. Full convergence in 1-5 seconds for clusters up to 100 nodes. |
 | **Forge reconciliation** | Eventual convergence | Within 1-3 reconciliation cycles (30-90 seconds) after state change. Faster when triggered by Raft apply notification (near-instant). |
 | **FDB propagation** | Eventual | Derived from Raft state during reconciliation. New entries appear within 1-30 seconds. |
@@ -1131,6 +1161,21 @@ On every command application:
 - Idempotency keys are scoped per-client (identified by the key itself)
 - Keys are stored in the Raft state machine (replicated, survives leader failover)
 - The journal is compacted during Raft snapshots (expired entries removed)
+
+### Key reuse with different payload
+
+If a client sends a request with the same idempotency key but a different payload (different VM name, different parameters, etc.), the state machine returns:
+
+`409 Conflict — idempotency key 'abc-123' was already used for a different operation`
+
+The original result is NOT returned in this case — returning a cached result for a different request would be misleading.
+
+Contract:
+- Same key + same logical operation → cached result (safe retry)
+- Same key + different operation → 409 Conflict (key reuse error)
+- Different key + same operation → new execution (not a retry)
+
+"Same logical operation" is determined by comparing the command type and primary identifiers (e.g., CreateVm with the same name), not by deep payload comparison.
 
 ### CLI behavior
 
