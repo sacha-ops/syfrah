@@ -1053,6 +1053,17 @@ pub async fn run_daemon(
             }
         }
 
+        // Warn about missing runtime prerequisites (non-fatal).
+        if !syfrah_compute::runtime_container::container_binaries_available() {
+            warn!("warning: no container runtime found (crun, runsc). Install crun for container VM support.");
+        }
+        if std::path::Path::new("/dev/kvm").exists() {
+            // KVM is available — check for cloud-hypervisor.
+            if syfrah_compute::binary::resolve_binary(None).is_err() {
+                warn!("warning: cloud-hypervisor binary not found. Install it for KVM VM support.");
+            }
+        }
+
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
             Ok(mut vm_manager) => {
