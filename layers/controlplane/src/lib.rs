@@ -9,6 +9,7 @@ pub mod gossip;
 pub mod idempotency;
 pub mod log_storage;
 pub mod network;
+pub mod remote_create;
 pub mod scheduler;
 pub mod server;
 pub mod state_machine;
@@ -20,6 +21,9 @@ pub use gossip::{GossipCluster, GossipConfig, GossipNodeId, HypervisorGossipRepo
 pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
+pub use remote_create::{
+    create_vm_on_remote, forge_addr_from_fabric_ipv6, RemoteCreateVmRequest, RemoteCreateVmResponse,
+};
 pub use scheduler::{
     AdmissionResult, PlacementConstraints, PlacementDecision, Scheduler, SchedulerError,
     MAX_ADMISSION_RETRIES,
