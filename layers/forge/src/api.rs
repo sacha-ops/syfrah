@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use syfrah_api::handler::LayerHandler;
@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::capacity::CapacityTracker;
+use crate::generation::GenerationTracker;
 use crate::task::TaskStore;
 
 /// Shared application state for all Forge HTTP handlers.
@@ -28,6 +29,10 @@ pub struct ForgeState {
     pub capacity: Option<Arc<CapacityTracker>>,
     /// Org store for subnet/VPC resolution.
     pub org_store: Option<Arc<syfrah_org::OrgStore>>,
+    /// Network backend for bridge/VXLAN/TAP/nftables operations.
+    pub network_backend: Option<Arc<dyn syfrah_overlay::NetworkBackend>>,
+    /// Generation tracker for resource drift detection.
+    pub generation_tracker: Option<Arc<GenerationTracker>>,
 }
 
 /// Standard error response with FORGE_ prefix codes.
@@ -84,6 +89,50 @@ fn default_memory() -> u32 {
 #[derive(Deserialize, Debug)]
 pub struct InstanceActionRequest {
     pub action: Option<String>,
+}
+
+/// Request body for creating/ensuring a bridge.
+#[derive(Deserialize, Debug)]
+pub struct CreateBridgeRequest {
+    /// VPC identifier — used to derive the bridge name via naming conventions.
+    pub vpc_id: String,
+}
+
+/// Response for bridge operations.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BridgeResponse {
+    pub id: String,
+    pub bridge_name: String,
+    pub vpc_id: String,
+    pub generation: Option<crate::generation::ResourceGeneration>,
+}
+
+/// Request body for creating/ensuring a VXLAN.
+#[derive(Deserialize, Debug)]
+pub struct CreateVxlanRequest {
+    /// VPC identifier — used to derive the VXLAN name via naming conventions.
+    pub vpc_id: String,
+    /// VXLAN Network Identifier.
+    pub vni: u32,
+    /// Local VTEP IP address.
+    pub local_ip: String,
+    /// VXLAN UDP port (default 4789).
+    #[serde(default = "default_vxlan_port")]
+    pub port: u16,
+}
+
+fn default_vxlan_port() -> u16 {
+    4789
+}
+
+/// Response for VXLAN operations.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VxlanResponse {
+    pub id: String,
+    pub vxlan_name: String,
+    pub vpc_id: String,
+    pub vni: u32,
+    pub generation: Option<crate::generation::ResourceGeneration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +654,206 @@ async fn reboot_instance_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bridge / VXLAN handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/networks/bridges — ensure a bridge exists for a VPC.
+async fn create_bridge_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<CreateBridgeRequest>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let bridge_name = syfrah_overlay::naming::bridge_name(&req.vpc_id);
+    let resource_id = format!("br-{}", req.vpc_id);
+
+    if let Err(e) = backend.create_bridge(&bridge_name).await {
+        warn!(vpc_id = %req.vpc_id, error = %e, "failed to create bridge");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_BRIDGE_CREATE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    let gen = state
+        .generation_tracker
+        .as_ref()
+        .map(|gt| gt.register(&resource_id));
+
+    info!(vpc_id = %req.vpc_id, bridge = %bridge_name, "bridge ensured");
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(BridgeResponse {
+                id: resource_id,
+                bridge_name,
+                vpc_id: req.vpc_id,
+                generation: gen,
+            })
+            .unwrap(),
+        ),
+    )
+}
+
+/// DELETE /v1/networks/bridges/:id — remove a bridge.
+async fn delete_bridge_handler(
+    State(state): State<Arc<ForgeState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    // The id is the bridge kernel name (e.g. syfb-XXXXXXXX).
+    if let Err(e) = backend.delete_bridge(&id).await {
+        warn!(bridge = %id, error = %e, "failed to delete bridge");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_BRIDGE_DELETE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    if let Some(ref gt) = state.generation_tracker {
+        gt.remove(&id);
+    }
+
+    info!(bridge = %id, "bridge deleted");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_BRIDGE_DELETED",
+            "message": format!("bridge '{}' deleted", id)
+        })),
+    )
+}
+
+/// POST /v1/networks/vxlans — ensure a VXLAN exists for a VPC.
+async fn create_vxlan_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<CreateVxlanRequest>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let vxlan_name = syfrah_overlay::naming::vxlan_name(&req.vpc_id);
+    let resource_id = format!("vx-{}", req.vpc_id);
+
+    if let Err(e) = backend
+        .create_vxlan(&vxlan_name, req.vni, &req.local_ip, req.port)
+        .await
+    {
+        warn!(vpc_id = %req.vpc_id, error = %e, "failed to create VXLAN");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_VXLAN_CREATE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    // Attach VXLAN to its bridge.
+    let bridge_name = syfrah_overlay::naming::bridge_name(&req.vpc_id);
+    if let Err(e) = backend.attach_to_bridge(&vxlan_name, &bridge_name).await {
+        warn!(
+            vpc_id = %req.vpc_id,
+            vxlan = %vxlan_name,
+            bridge = %bridge_name,
+            error = %e,
+            "failed to attach VXLAN to bridge (bridge may not exist yet)"
+        );
+        // Non-fatal: the bridge may be created separately.
+    }
+
+    let gen = state
+        .generation_tracker
+        .as_ref()
+        .map(|gt| gt.register(&resource_id));
+
+    info!(vpc_id = %req.vpc_id, vxlan = %vxlan_name, vni = req.vni, "VXLAN ensured");
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(VxlanResponse {
+                id: resource_id,
+                vxlan_name,
+                vpc_id: req.vpc_id,
+                vni: req.vni,
+                generation: gen,
+            })
+            .unwrap(),
+        ),
+    )
+}
+
+/// DELETE /v1/networks/vxlans/:id — remove a VXLAN.
+async fn delete_vxlan_handler(
+    State(state): State<Arc<ForgeState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    if let Err(e) = backend.delete_vxlan(&id).await {
+        warn!(vxlan = %id, error = %e, "failed to delete VXLAN");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_VXLAN_DELETE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    if let Some(ref gt) = state.generation_tracker {
+        gt.remove(&id);
+    }
+
+    info!(vxlan = %id, "VXLAN deleted");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_VXLAN_DELETED",
+            "message": format!("VXLAN '{}' deleted", id)
+        })),
+    )
+}
+
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
@@ -620,6 +869,12 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         .route("/v1/node/capacity", get(capacity_handler))
         .route("/v1/node/metrics", get(metrics_handler))
         .route("/v1/node/resources", get(resources_handler))
+        // -- Networks: bridges --
+        .route("/v1/networks/bridges", post(create_bridge_handler))
+        .route("/v1/networks/bridges/{id}", delete(delete_bridge_handler))
+        // -- Networks: VXLANs --
+        .route("/v1/networks/vxlans", post(create_vxlan_handler))
+        .route("/v1/networks/vxlans/{id}", delete(delete_vxlan_handler))
         // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
@@ -698,6 +953,8 @@ mod tests {
             vm_manager: None,
             capacity: None,
             org_store: None,
+            network_backend: None,
+            generation_tracker: None,
         })
     }
 
@@ -715,6 +972,8 @@ mod tests {
             vm_manager: None,
             capacity: None,
             org_store: None,
+            network_backend: None,
+            generation_tracker: None,
         });
         (dir, state)
     }
@@ -931,6 +1190,8 @@ mod tests {
             vm_manager: None,
             capacity: Some(cap),
             org_store: None,
+            network_backend: None,
+            generation_tracker: None,
         });
         let app = forge_router(state);
 
@@ -949,5 +1210,127 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(err["code"], "FORGE_INSUFFICIENT_CAPACITY");
+    }
+
+    fn test_state_with_network() -> Arc<ForgeState> {
+        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+            Arc::new(syfrah_overlay::MockBackend::new());
+        let gen_tracker = Arc::new(crate::generation::GenerationTracker::new());
+        Arc::new(ForgeState {
+            started_at: Instant::now(),
+            task_store: None,
+            vm_manager: None,
+            capacity: None,
+            org_store: None,
+            network_backend: Some(backend),
+            generation_tracker: Some(gen_tracker),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_bridge_endpoint() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/bridges")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"vpc_id":"vpc-prod"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["vpc_id"], "vpc-prod");
+        assert!(result["bridge_name"].as_str().unwrap().starts_with("syfb-"));
+        assert!(result["generation"].is_object());
+    }
+
+    #[tokio::test]
+    async fn delete_bridge_endpoint() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/networks/bridges/syfb-12345678")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "FORGE_BRIDGE_DELETED");
+    }
+
+    #[tokio::test]
+    async fn create_vxlan_endpoint() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/vxlans")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vpc_id":"vpc-prod","vni":100,"local_ip":"10.0.0.1"}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["vpc_id"], "vpc-prod");
+        assert_eq!(result["vni"], 100);
+        assert!(result["vxlan_name"].as_str().unwrap().starts_with("syfx-"));
+    }
+
+    #[tokio::test]
+    async fn idempotent_create() {
+        // Creating the same bridge twice should succeed (idempotent).
+        let state = test_state_with_network();
+
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/bridges")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"vpc_id":"vpc-test"}"#))
+            .unwrap();
+        let resp1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), 200);
+
+        let app2 = forge_router(state);
+        let req2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/bridges")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"vpc_id":"vpc-test"}"#))
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn bridge_unavailable_without_network() {
+        let state = test_state(); // no network backend
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/bridges")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"vpc_id":"vpc-test"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 503);
     }
 }
