@@ -25,6 +25,7 @@
 //! - `reconciler::ReconcileTarget` / `DriftDetector` — reconciliation traits
 
 pub mod api;
+pub mod auth;
 pub mod capacity;
 pub mod cleanup;
 pub mod degraded;

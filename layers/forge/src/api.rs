@@ -1890,6 +1890,7 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         .route("/v1/instances/{id}/start", post(start_instance_handler))
         .route("/v1/instances/{id}/stop", post(stop_instance_handler))
         .route("/v1/instances/{id}/reboot", post(reboot_instance_handler))
+        .layer(axum::middleware::from_fn(crate::auth::auth_middleware))
         .with_state(state)
 }
 
