@@ -257,4 +257,177 @@ mod tests {
         };
         assert_eq!(format!("{cmd}"), "CreateOrg(acme)");
     }
+
+    #[test]
+    fn all_command_variants_serialize() {
+        // Ensure every variant can be serialized and deserialized.
+        let commands = vec![
+            StateMachineCommand::CreateOrg { name: "a".into() },
+            StateMachineCommand::DeleteOrg { name: "a".into() },
+            StateMachineCommand::CreateProject {
+                name: "b".into(),
+                org: "a".into(),
+            },
+            StateMachineCommand::DeleteProject {
+                name: "b".into(),
+                org: "a".into(),
+            },
+            StateMachineCommand::CreateEnv {
+                name: "dev".into(),
+                project: "b".into(),
+                org: "a".into(),
+                ttl: Some(3600),
+                deletion_protection: true,
+                labels: HashMap::from([("env".into(), "dev".into())]),
+            },
+            StateMachineCommand::DeleteEnv {
+                name: "dev".into(),
+                project: "b".into(),
+                org: "a".into(),
+            },
+            StateMachineCommand::CreateVpc {
+                name: "v".into(),
+                cidr: "10.0.0.0/16".into(),
+                owner: "a".into(),
+                shared: false,
+            },
+            StateMachineCommand::DeleteVpc { name: "v".into() },
+            StateMachineCommand::PeerVpc {
+                vpc_a: "v1".into(),
+                vpc_b: "v2".into(),
+            },
+            StateMachineCommand::UnpeerVpc {
+                vpc_a: "v1".into(),
+                vpc_b: "v2".into(),
+            },
+            StateMachineCommand::CreateSubnet {
+                name: "s".into(),
+                vpc: "v".into(),
+                env_id: "e".into(),
+                cidr: Some("10.0.1.0/24".into()),
+            },
+            StateMachineCommand::DeleteSubnet {
+                name: "s".into(),
+                vpc: "v".into(),
+            },
+            StateMachineCommand::AllocateIp {
+                subnet_id: "s1".into(),
+            },
+            StateMachineCommand::ReleaseIp {
+                subnet_id: "s1".into(),
+                ip: "10.0.0.1".into(),
+            },
+            StateMachineCommand::CreateSg {
+                name: "sg".into(),
+                vpc: "v".into(),
+            },
+            StateMachineCommand::DeleteSg { name: "sg".into() },
+            StateMachineCommand::AddSgRule {
+                sg: "sg".into(),
+                direction: "ingress".into(),
+                protocol: "tcp".into(),
+                port: Some("443".into()),
+                source: "0.0.0.0/0".into(),
+            },
+            StateMachineCommand::RemoveSgRule {
+                sg: "sg".into(),
+                rule_id: "r1".into(),
+            },
+            StateMachineCommand::AttachSg {
+                sg: "sg".into(),
+                nic_id: "nic1".into(),
+            },
+            StateMachineCommand::DetachSg {
+                sg: "sg".into(),
+                nic_id: "nic1".into(),
+            },
+            StateMachineCommand::CreateNatGw {
+                name: "nat".into(),
+                vpc: "v".into(),
+                subnet: "s".into(),
+            },
+            StateMachineCommand::DeleteNatGw { name: "nat".into() },
+            StateMachineCommand::AddRoute {
+                vpc: "v".into(),
+                destination: "0.0.0.0/0".into(),
+                target: "nat".into(),
+            },
+            StateMachineCommand::DeleteRoute {
+                vpc: "v".into(),
+                destination: "0.0.0.0/0".into(),
+            },
+            StateMachineCommand::PlaceVm {
+                vm_id: "vm1".into(),
+                hypervisor_id: "hv1".into(),
+                subnet_id: "s1".into(),
+                ip: "10.0.0.2".into(),
+                mac: "02:00:00:00:00:01".into(),
+                generation: 1,
+            },
+            StateMachineCommand::RemoveVm {
+                vm_id: "vm1".into(),
+            },
+            StateMachineCommand::RescheduleVm {
+                vm_id: "vm1".into(),
+                from: "hv1".into(),
+                to: "hv2".into(),
+                generation: 2,
+            },
+            StateMachineCommand::RegisterHypervisor {
+                name: "hv1".into(),
+                region: "eu".into(),
+                zone: "az1".into(),
+            },
+            StateMachineCommand::EnableHypervisor { name: "hv1".into() },
+            StateMachineCommand::DrainHypervisor { name: "hv1".into() },
+            StateMachineCommand::DecommissionHypervisor { name: "hv1".into() },
+            StateMachineCommand::UpdateHypervisorLabels {
+                name: "hv1".into(),
+                labels: HashMap::new(),
+            },
+            StateMachineCommand::UpdateHypervisorTaints {
+                name: "hv1".into(),
+                taints: vec!["gpu=true:NoSchedule".into()],
+            },
+            StateMachineCommand::CreateNic {
+                vm_id: "vm1".into(),
+                subnet_id: "s1".into(),
+                ip: "10.0.0.2".into(),
+                mac: "02:00:00:00:00:01".into(),
+            },
+            StateMachineCommand::DeleteNic {
+                nic_id: "nic1".into(),
+            },
+        ];
+
+        for cmd in &commands {
+            let json = serde_json::to_string(cmd).expect("serialize failed");
+            let _: StateMachineCommand = serde_json::from_str(&json).expect("deserialize failed");
+        }
+    }
+
+    #[test]
+    fn all_response_variants_serialize() {
+        let responses = vec![
+            StateMachineResponse::Ok,
+            StateMachineResponse::Created("id-1".into()),
+            StateMachineResponse::Error("something failed".into()),
+            StateMachineResponse::AllocatedIp {
+                ip: "10.0.0.1".into(),
+                mac: "02:00:00:00:00:01".into(),
+            },
+        ];
+        for resp in &responses {
+            let json = serde_json::to_string(resp).expect("serialize failed");
+            let _: StateMachineResponse = serde_json::from_str(&json).expect("deserialize failed");
+        }
+    }
+
+    #[test]
+    fn default_response_is_ok() {
+        assert!(matches!(
+            StateMachineResponse::default(),
+            StateMachineResponse::Ok
+        ));
+    }
 }
