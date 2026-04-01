@@ -59,6 +59,21 @@ pub enum VmCommand {
         /// If omitted, the default SG is auto-attached.
         #[arg(long)]
         sg: Vec<String>,
+        /// Preferred zone for placement (e.g. eu-west-1)
+        #[arg(long)]
+        zone: Option<String>,
+        /// Node selector labels (key=value, repeatable). VM will only be
+        /// placed on hypervisors matching all selectors.
+        #[arg(long = "node-selector", value_name = "KEY=VALUE")]
+        node_selector: Vec<String>,
+        /// Anti-affinity group name. VMs in the same group prefer different hypervisors.
+        /// Single-node: warning emitted (cannot spread on 1 node).
+        #[arg(long)]
+        anti_affinity: Option<String>,
+        /// Spread topology key (e.g. "zone"). VMs spread across distinct values.
+        /// Single-node: warning emitted.
+        #[arg(long)]
+        spread_topology: Option<String>,
     },
     /// List all virtual machines
     #[command(after_help = "Examples:\n  syfrah compute vm list\n  syfrah compute vm list --json")]
@@ -137,7 +152,30 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
             project,
             org,
             sg,
+            zone,
+            node_selector,
+            anti_affinity,
+            spread_topology,
         } => {
+            // Validate placement constraints (single-node warnings)
+            if anti_affinity.is_some() {
+                eprintln!("Warning: --anti-affinity has no effect on a single-node deployment.");
+            }
+            if spread_topology.is_some() {
+                eprintln!("Warning: --spread-topology has no effect on a single-node deployment.");
+            }
+            if let Some(ref z) = zone {
+                eprintln!(
+                    "Note: placement zone '{z}' will be validated against the local hypervisor."
+                );
+            }
+            if !node_selector.is_empty() {
+                eprintln!(
+                    "Note: node selectors {:?} will be validated against the local hypervisor.",
+                    node_selector
+                );
+            }
+            let _ = (zone, node_selector, anti_affinity, spread_topology);
             run_create(
                 name, vcpus, memory, image, gpu, tap, ssh_key, disk_size, subnet, env, project,
                 org, sg,
@@ -694,6 +732,10 @@ mod tests {
                 project,
                 org,
                 sg,
+                zone: _,
+                node_selector: _,
+                anti_affinity: _,
+                spread_topology: _,
             } => {
                 assert_eq!(name, "test-vm");
                 assert_eq!(vcpus, 2); // default

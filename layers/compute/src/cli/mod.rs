@@ -42,6 +42,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 
 /// Top-level compute CLI command.
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum ComputeCommand {
     /// Manage virtual machines
     Vm {
