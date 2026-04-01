@@ -15,7 +15,8 @@ use std::sync::Arc;
 use syfrah_api::handler::LayerHandler;
 use syfrah_compute::control::{ComputeRequest, ComputeResponse};
 use syfrah_controlplane::{
-    GossipCluster, PlacementConstraints, RaftClient, RemoteCreateVmRequest, Scheduler,
+    GossipCluster, HypervisorGossipReport, PlacementConstraints, RaftClient, RemoteCreateVmRequest,
+    Scheduler,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -32,6 +33,9 @@ pub struct RaftComputeHandler {
     scheduler: RwLock<Option<Scheduler>>,
     /// Local node name (for determining if scheduler picked us).
     local_node_name: String,
+    /// Hypervisor store — used to populate scheduler candidates from
+    /// registered hypervisors when gossip reports are not yet available.
+    hypervisor_store: RwLock<Option<Arc<syfrah_org::HypervisorStore>>>,
 }
 
 impl RaftComputeHandler {
@@ -43,6 +47,7 @@ impl RaftComputeHandler {
             gossip_cluster: GossipCluster::new(),
             scheduler: RwLock::new(None),
             local_node_name,
+            hypervisor_store: RwLock::new(None),
         }
     }
 
@@ -58,10 +63,66 @@ impl RaftComputeHandler {
         *guard = Some(scheduler);
     }
 
+    /// Set the hypervisor store (called during daemon init).
+    pub async fn set_hypervisor_store(&self, store: Arc<syfrah_org::HypervisorStore>) {
+        let mut guard = self.hypervisor_store.write().await;
+        *guard = Some(store);
+    }
+
     /// Get a reference to the gossip cluster state.
     /// The daemon wires this into the gossip agent.
     pub fn gossip_cluster(&self) -> &GossipCluster {
         &self.gossip_cluster
+    }
+
+    /// Ensure the gossip cluster has reports from all registered hypervisors.
+    async fn populate_cluster_from_hypervisor_store(&self) {
+        let store_guard = self.hypervisor_store.read().await;
+        let Some(ref store) = *store_guard else {
+            return;
+        };
+
+        let hypervisors = match store.list() {
+            Ok(hvs) => hvs,
+            Err(e) => {
+                warn!("failed to list hypervisors for scheduler: {e}");
+                return;
+            }
+        };
+
+        for hv in &hypervisors {
+            if !matches!(hv.state, syfrah_org::types::HypervisorState::Available) {
+                continue;
+            }
+            if self.gossip_cluster.get_report(&hv.name).is_some() {
+                continue;
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let report = HypervisorGossipReport {
+                hypervisor_id: hv.fabric_ipv6.clone(),
+                node_name: hv.name.clone(),
+                region: hv.region.clone(),
+                zone: hv.zone.clone(),
+                state: "Available".to_string(),
+                allocatable_vcpus: 64,
+                allocatable_memory_mb: 128 * 1024,
+                used_vcpus: 0,
+                used_memory_mb: 0,
+                instance_count: 0,
+                drain_status: false,
+                timestamp: now,
+            };
+            debug!(
+                "populated scheduler candidate from hypervisor store: {} (zone={})",
+                hv.name, hv.zone
+            );
+            self.gossip_cluster.update_report(report);
+        }
     }
 
     /// Handle a CreateVm request with scheduler integration.
@@ -112,7 +173,11 @@ impl RaftComputeHandler {
                 .await;
         }
 
-        // We are the leader. Run the scheduler.
+        // We are the leader. Populate gossip cluster from hypervisor store
+        // so the scheduler has candidate data even if gossip hasn't converged yet.
+        self.populate_cluster_from_hypervisor_store().await;
+
+        // Run the scheduler.
         let constraints = PlacementConstraints::from_cli(
             zone.clone(),
             &node_selector,
