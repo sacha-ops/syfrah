@@ -317,12 +317,16 @@ pub struct NicListQuery {
 // ---------------------------------------------------------------------------
 
 /// GET /v1/hypervisor/health (alias: /v1/node/health)
-async fn health_handler(State(state): State<Arc<ForgeState>>) -> Json<HealthResponse> {
+/// Returns the 4-category health model.
+async fn health_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        uptime,
-    })
+    let vm_count = match state.vm_manager.as_ref() {
+        Some(m) => m.list().await.len() as u32,
+        None => 0,
+    };
+
+    let health = crate::health::FourCategoryHealth::evaluate(uptime, vm_count);
+    (StatusCode::OK, Json(serde_json::to_value(health).unwrap()))
 }
 
 /// GET /v1/hypervisor/status (alias: /v1/node/status)
@@ -2045,7 +2049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_endpoint_returns_healthy() {
+    async fn health_endpoint_returns_four_categories() {
         let state = test_state();
         let app = forge_router(state);
 
@@ -2058,8 +2062,12 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(health.status, "healthy");
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["status"], "healthy");
+        assert!(health["agent_health"].is_object());
+        assert!(health["node_health"].is_object());
+        assert!(health["workload_health"].is_object());
+        assert!(health["control_health"].is_object());
     }
 
     #[tokio::test]
