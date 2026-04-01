@@ -37,7 +37,10 @@ pub async fn create_vm_on_remote(
     target_addr: &str,
     request: &RemoteCreateVmRequest,
 ) -> Result<RemoteCreateVmResponse, String> {
-    let url = format!("http://{target_addr}/v1/forge/instances");
+    // The ?direct=true parameter tells the target Forge to skip leader
+    // forwarding and create the VM locally. Without it, the target would
+    // forward the request back to the leader (since it's not the leader).
+    let url = format!("http://{target_addr}/v1/instances?direct=true");
     info!(
         "remote_create: sending VM '{}' to Forge at {}",
         request.name, target_addr
