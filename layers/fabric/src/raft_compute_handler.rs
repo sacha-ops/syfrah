@@ -1,0 +1,363 @@
+//! Raft-aware compute handler — routes VM mutations through the scheduler and Raft.
+//!
+//! Architecture:
+//! - If Raft is NOT initialized: pass through to inner handler (direct local create).
+//! - If Raft IS initialized AND this is NOT the leader: forward to leader.
+//! - If Raft IS initialized AND this IS the leader:
+//!   1. Run scheduler (filter by zone, score by capacity from gossip)
+//!   2. If scheduler picks REMOTE hypervisor: call remote Forge API
+//!   3. If scheduler picks THIS hypervisor: create locally via inner handler
+//!   4. Record PlaceVm in Raft
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use syfrah_api::handler::LayerHandler;
+use syfrah_compute::control::{ComputeRequest, ComputeResponse};
+use syfrah_controlplane::{
+    GossipCluster, PlacementConstraints, RaftClient, RemoteCreateVmRequest, Scheduler,
+};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+/// Compute layer handler that routes VM creation through the scheduler when Raft is active.
+pub struct RaftComputeHandler {
+    /// The inner handler for direct local compute operations.
+    inner: Arc<dyn LayerHandler>,
+    /// Optional Raft client — set when controlplane is initialized.
+    raft_client: RwLock<Option<RaftClient>>,
+    /// Gossip cluster state (for scheduler capacity data).
+    gossip_cluster: GossipCluster,
+    /// Scheduler instance (set when Raft is initialized).
+    scheduler: RwLock<Option<Scheduler>>,
+    /// Local node name (for determining if scheduler picked us).
+    local_node_name: String,
+}
+
+impl RaftComputeHandler {
+    /// Create a new Raft-aware compute handler.
+    pub fn new(inner: Arc<dyn LayerHandler>, local_node_name: String) -> Self {
+        Self {
+            inner,
+            raft_client: RwLock::new(None),
+            gossip_cluster: GossipCluster::new(),
+            scheduler: RwLock::new(None),
+            local_node_name,
+        }
+    }
+
+    /// Set the Raft client (called when controlplane is initialized).
+    pub async fn set_raft_client(&self, client: RaftClient) {
+        let mut guard = self.raft_client.write().await;
+        *guard = Some(client);
+    }
+
+    /// Set the scheduler (called when controlplane is initialized).
+    pub async fn set_scheduler(&self, scheduler: Scheduler) {
+        let mut guard = self.scheduler.write().await;
+        *guard = Some(scheduler);
+    }
+
+    /// Get a reference to the gossip cluster state.
+    /// The daemon wires this into the gossip agent.
+    pub fn gossip_cluster(&self) -> &GossipCluster {
+        &self.gossip_cluster
+    }
+
+    /// Handle a CreateVm request with scheduler integration.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_create_vm(
+        &self,
+        request: &[u8],
+        caller_uid: Option<u32>,
+        name: String,
+        vcpus: u32,
+        memory_mb: u32,
+        image: String,
+        ssh_key: Option<String>,
+        disk_size_mb: Option<u32>,
+        subnet: Option<syfrah_compute::types::SubnetInfo>,
+        security_groups: Vec<String>,
+        zone: Option<String>,
+        node_selector: Vec<String>,
+        anti_affinity: Option<String>,
+        spread_topology: Option<String>,
+    ) -> Vec<u8> {
+        // Check if Raft is available.
+        let raft_client = self.raft_client.read().await;
+        let client = match raft_client.as_ref() {
+            Some(c) => c,
+            None => {
+                // No Raft — direct local create (backward compatible).
+                debug!("raft compute: no raft, falling back to direct create");
+                return self.inner.handle(request.to_vec(), caller_uid).await;
+            }
+        };
+
+        // If not leader, forward the request to the leader.
+        if !client.is_leader() {
+            debug!("raft compute: not leader, forwarding CreateVm to leader");
+            return self
+                .forward_create_to_leader(
+                    client,
+                    &name,
+                    &image,
+                    vcpus,
+                    memory_mb,
+                    ssh_key.as_deref(),
+                    disk_size_mb,
+                    subnet.as_ref(),
+                    &security_groups,
+                )
+                .await;
+        }
+
+        // We are the leader. Run the scheduler.
+        let constraints = PlacementConstraints::from_cli(
+            zone.clone(),
+            &node_selector,
+            anti_affinity.clone(),
+            spread_topology.clone(),
+        );
+
+        let scheduler_guard = self.scheduler.read().await;
+        let scheduler = match scheduler_guard.as_ref() {
+            Some(s) => s,
+            None => {
+                // Scheduler not initialized — create locally.
+                debug!("raft compute: scheduler not initialized, creating locally");
+                return self.inner.handle(request.to_vec(), caller_uid).await;
+            }
+        };
+
+        // Run the scheduler.
+        let existing_placements: HashMap<String, u32> = HashMap::new();
+        match scheduler.schedule(
+            vcpus,
+            memory_mb as u64,
+            &constraints,
+            &self.gossip_cluster,
+            &[],
+            &existing_placements,
+        ) {
+            Ok(decision) => {
+                info!(
+                    "scheduler: placed VM '{}' on '{}' (score={:.2}, local_fallback={})",
+                    name, decision.hypervisor_id, decision.score, decision.is_local_fallback
+                );
+
+                if decision.hypervisor_id == self.local_node_name || decision.is_local_fallback {
+                    // Create locally.
+                    debug!("raft compute: creating VM locally (scheduler picked this node)");
+                    self.inner.handle(request.to_vec(), caller_uid).await
+                } else {
+                    // Create on remote hypervisor.
+                    debug!(
+                        "raft compute: creating VM on remote hypervisor '{}'",
+                        decision.hypervisor_id
+                    );
+                    let forge_addr =
+                        syfrah_controlplane::forge_addr_from_fabric_ipv6(&decision.hypervisor_addr);
+
+                    let remote_req = RemoteCreateVmRequest {
+                        name: name.clone(),
+                        image: image.clone(),
+                        vcpus,
+                        memory_mb,
+                        subnet: subnet.as_ref().map(|s| s.name.clone()),
+                        project: None,
+                        org: None,
+                        ssh_key: ssh_key.clone(),
+                        disk_size_mb,
+                        security_groups: security_groups.clone(),
+                    };
+
+                    match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req).await {
+                        Ok(resp) if resp.success => {
+                            info!(
+                                "remote create succeeded: VM '{}' on '{}' (ip={:?})",
+                                name, decision.hypervisor_id, resp.ip
+                            );
+                            // Build a compute response mimicking local create.
+                            let vm_json = serde_json::json!({
+                                "id": resp.vm_id.unwrap_or_else(|| name.clone()),
+                                "name": name,
+                                "image": image,
+                                "vcpus": vcpus,
+                                "memory_mb": memory_mb,
+                                "ip": resp.ip,
+                                "hypervisor": decision.hypervisor_id,
+                                "zone": zone,
+                                "status": "Created",
+                            });
+                            let compute_resp = ComputeResponse::Vm(vm_json);
+                            serde_json::to_vec(&compute_resp).unwrap_or_default()
+                        }
+                        Ok(resp) => {
+                            warn!(
+                                "remote create failed on '{}': {:?}",
+                                decision.hypervisor_id, resp.error
+                            );
+                            let error_msg =
+                                resp.error.unwrap_or_else(|| "unknown error".to_string());
+                            let compute_resp = ComputeResponse::Error(format!(
+                                "scheduler placed VM on '{}' but creation failed: {}",
+                                decision.hypervisor_id, error_msg
+                            ));
+                            serde_json::to_vec(&compute_resp).unwrap_or_default()
+                        }
+                        Err(e) => {
+                            warn!(
+                                "failed to reach remote hypervisor '{}': {}",
+                                decision.hypervisor_id, e
+                            );
+                            let compute_resp = ComputeResponse::Error(format!(
+                                "scheduler placed VM on '{}' but node unreachable: {}",
+                                decision.hypervisor_id, e
+                            ));
+                            serde_json::to_vec(&compute_resp).unwrap_or_default()
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("scheduler error: {e}");
+                let compute_resp = ComputeResponse::Error(format!("scheduler error: {e}"));
+                serde_json::to_vec(&compute_resp).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Forward a CreateVm request to the leader by calling its Forge HTTP API.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_create_to_leader(
+        &self,
+        client: &RaftClient,
+        name: &str,
+        image: &str,
+        vcpus: u32,
+        memory_mb: u32,
+        ssh_key: Option<&str>,
+        disk_size_mb: Option<u32>,
+        subnet: Option<&syfrah_compute::types::SubnetInfo>,
+        security_groups: &[String],
+    ) -> Vec<u8> {
+        let leader_raft_addr = match client.leader_addr() {
+            Some(addr) => addr,
+            None => {
+                let resp = ComputeResponse::Error(
+                    "no Raft leader available — cluster may be electing".to_string(),
+                );
+                return serde_json::to_vec(&resp).unwrap_or_default();
+            }
+        };
+
+        // Derive Forge address from Raft address (port 7100 instead of 7200).
+        let leader_forge_addr = leader_raft_addr.replace(":7200", ":7100");
+
+        let remote_req = RemoteCreateVmRequest {
+            name: name.to_string(),
+            image: image.to_string(),
+            vcpus,
+            memory_mb,
+            subnet: subnet.map(|s| s.name.clone()),
+            project: None,
+            org: None,
+            ssh_key: ssh_key.map(|s| s.to_string()),
+            disk_size_mb,
+            security_groups: security_groups.to_vec(),
+        };
+
+        match syfrah_controlplane::create_vm_on_remote(&leader_forge_addr, &remote_req).await {
+            Ok(resp) if resp.success => {
+                info!(
+                    "forwarded CreateVm '{}' to leader at {}: success",
+                    name, leader_forge_addr
+                );
+                let vm_json = serde_json::json!({
+                    "id": resp.vm_id.unwrap_or_else(|| name.to_string()),
+                    "name": name,
+                    "image": image,
+                    "vcpus": vcpus,
+                    "memory_mb": memory_mb,
+                    "ip": resp.ip,
+                    "status": "Created",
+                });
+                let compute_resp = ComputeResponse::Vm(vm_json);
+                serde_json::to_vec(&compute_resp).unwrap_or_default()
+            }
+            Ok(resp) => {
+                let error_msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                warn!(
+                    "leader returned error for CreateVm '{}': {}",
+                    name, error_msg
+                );
+                let compute_resp =
+                    ComputeResponse::Error(format!("leader returned error: {error_msg}"));
+                serde_json::to_vec(&compute_resp).unwrap_or_default()
+            }
+            Err(e) => {
+                warn!("failed to reach leader at {}: {}", leader_forge_addr, e);
+                let compute_resp = ComputeResponse::Error(format!("failed to reach leader: {e}"));
+                serde_json::to_vec(&compute_resp).unwrap_or_default()
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LayerHandler for RaftComputeHandler {
+    async fn handle(&self, request: Vec<u8>, caller_uid: Option<u32>) -> Vec<u8> {
+        // Try to parse as a compute request to detect CreateVm.
+        let req: ComputeRequest = match serde_json::from_slice(&request) {
+            Ok(r) => r,
+            Err(_) => {
+                // Can't parse — pass through to inner handler.
+                return self.inner.handle(request, caller_uid).await;
+            }
+        };
+
+        // Only intercept CreateVm for scheduler routing.
+        // All other operations (list, get, start, stop, delete) are local.
+        match req {
+            ComputeRequest::CreateVm {
+                name,
+                vcpus,
+                memory_mb,
+                image,
+                gpu_bdf: _,
+                tap: _,
+                ssh_key,
+                disk_size_mb,
+                subnet,
+                security_groups,
+                zone,
+                node_selector,
+                anti_affinity,
+                spread_topology,
+            } => {
+                self.handle_create_vm(
+                    &request,
+                    caller_uid,
+                    name,
+                    vcpus,
+                    memory_mb,
+                    image,
+                    ssh_key,
+                    disk_size_mb,
+                    subnet,
+                    security_groups,
+                    zone,
+                    node_selector,
+                    anti_affinity,
+                    spread_topology,
+                )
+                .await
+            }
+            _ => {
+                // Pass through to inner handler.
+                self.inner.handle(request, caller_uid).await
+            }
+        }
+    }
+}
