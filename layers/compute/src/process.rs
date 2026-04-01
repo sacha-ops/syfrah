@@ -728,6 +728,9 @@ pub(crate) async fn spawn_vm_inner(
         vpc: None,
         security_groups: vec![],
         network_info: None,
+        hypervisor_id: None,
+        region: None,
+        zone: None,
     })
 }
 
@@ -1311,6 +1314,9 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         events::emit(
@@ -1703,6 +1709,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1740,6 +1749,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1777,6 +1789,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1816,6 +1831,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2031,6 +2049,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));
@@ -2174,6 +2195,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -2231,6 +2255,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2353,6 +2380,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
 
         let vm_arc = Arc::new(Mutex::new(state));

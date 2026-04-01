@@ -149,6 +149,15 @@ pub struct VmStatus {
     /// Security groups attached to the VM's NIC.
     #[serde(default)]
     pub security_groups: Vec<String>,
+    /// Hypervisor this VM is running on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_id: Option<String>,
+    /// Region of the hypervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Availability zone of the hypervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
 }
 
 /// Observable events emitted to forge via a broadcast channel.
@@ -327,6 +336,9 @@ mod tests {
             subnet: None,
             vpc: None,
             security_groups: vec![],
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: VmStatus = serde_json::from_str(&json).unwrap();
@@ -435,6 +447,9 @@ mod tests {
             subnet: Some("frontend".to_string()),
             vpc: Some("default".to_string()),
             security_groups: vec![],
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["ip"].as_str(), Some("10.1.1.3"));
@@ -455,6 +470,9 @@ mod tests {
             subnet: Some("database".to_string()),
             vpc: Some("default".to_string()),
             security_groups: vec![],
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["subnet"].as_str(), Some("database"));
@@ -475,6 +493,9 @@ mod tests {
             subnet: Some("frontend".to_string()),
             vpc: Some("prod-vpc".to_string()),
             security_groups: vec![],
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         };
         let json_str = serde_json::to_string(&status).unwrap();
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();

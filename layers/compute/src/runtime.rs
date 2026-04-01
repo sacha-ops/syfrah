@@ -57,6 +57,12 @@ pub(crate) struct VmRuntimeState {
     pub(crate) security_groups: Vec<String>,
     /// Network metadata for teardown on delete. None if VM has no networking.
     pub(crate) network_info: Option<NetworkInfo>,
+    /// Hypervisor name/id this VM is running on.
+    pub(crate) hypervisor_id: Option<String>,
+    /// Region of the hypervisor.
+    pub(crate) region: Option<String>,
+    /// Zone of the hypervisor.
+    pub(crate) zone: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -103,6 +109,9 @@ impl VmRuntimeState {
             subnet: self.subnet.clone(),
             vpc: self.vpc.clone(),
             security_groups: self.security_groups.clone(),
+            hypervisor_id: self.hypervisor_id.clone(),
+            region: self.region.clone(),
+            zone: self.zone.clone(),
         }
     }
 }
@@ -134,6 +143,9 @@ mod tests {
             vpc: None,
             security_groups: vec![],
             network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
         }
     }
 
