@@ -38,6 +38,7 @@ pub mod metrics;
 pub mod ownership;
 pub mod reconciler;
 pub mod runtime;
+pub mod shutdown;
 pub mod task;
 pub mod tracing_otel;
 
