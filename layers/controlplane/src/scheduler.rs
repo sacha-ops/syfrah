@@ -36,6 +36,46 @@ pub struct PlacementConstraints {
     pub spread_topology: Option<String>,
 }
 
+impl PlacementConstraints {
+    /// Build constraints from CLI-style arguments.
+    pub fn from_cli(
+        zone: Option<String>,
+        node_selector: &[String],
+        anti_affinity: Option<String>,
+        spread_topology: Option<String>,
+    ) -> Self {
+        let mut labels = HashMap::new();
+        for sel in node_selector {
+            if let Some((key, value)) = sel.split_once('=') {
+                labels.insert(key.to_string(), value.to_string());
+            }
+        }
+        Self {
+            zone,
+            node_selector: labels,
+            tolerations: Vec::new(),
+            anti_affinity_group: anti_affinity,
+            spread_topology,
+        }
+    }
+
+    /// Summary string for error messages.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref z) = self.zone {
+            parts.push(format!("zone={z}"));
+        }
+        for (k, v) in &self.node_selector {
+            parts.push(format!("{k}={v}"));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Placement result
 // ---------------------------------------------------------------------------

@@ -157,28 +157,24 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
             anti_affinity,
             spread_topology,
         } => {
-            // Validate placement constraints (single-node warnings)
-            if anti_affinity.is_some() {
-                eprintln!("Warning: --anti-affinity has no effect on a single-node deployment.");
-            }
-            if spread_topology.is_some() {
-                eprintln!("Warning: --spread-topology has no effect on a single-node deployment.");
-            }
-            if let Some(ref z) = zone {
-                eprintln!(
-                    "Note: placement zone '{z}' will be validated against the local hypervisor."
-                );
-            }
-            if !node_selector.is_empty() {
-                eprintln!(
-                    "Note: node selectors {:?} will be validated against the local hypervisor.",
-                    node_selector
-                );
-            }
-            let _ = (zone, node_selector, anti_affinity, spread_topology);
             run_create(
-                name, vcpus, memory, image, gpu, tap, ssh_key, disk_size, subnet, env, project,
-                org, sg,
+                name,
+                vcpus,
+                memory,
+                image,
+                gpu,
+                tap,
+                ssh_key,
+                disk_size,
+                subnet,
+                env,
+                project,
+                org,
+                sg,
+                zone,
+                node_selector,
+                anti_affinity,
+                spread_topology,
             )
             .await
         }
@@ -301,6 +297,10 @@ async fn run_create(
     project: Option<String>,
     org: Option<String>,
     sg: Vec<String>,
+    zone: Option<String>,
+    node_selector: Vec<String>,
+    anti_affinity: Option<String>,
+    spread_topology: Option<String>,
 ) -> anyhow::Result<()> {
     let ssh_key = match ssh_key_path {
         Some(ref path) => Some(read_ssh_key(path)?),
@@ -329,6 +329,10 @@ async fn run_create(
         disk_size_mb,
         subnet,
         security_groups,
+        zone,
+        node_selector,
+        anti_affinity,
+        spread_topology,
     };
     let resp = send_compute_request(&control_socket_path(), &req)
         .await
