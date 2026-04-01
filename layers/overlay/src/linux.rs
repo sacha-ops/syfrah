@@ -154,10 +154,20 @@ impl NetworkBackend for LinuxBackend {
                 "dstport",
                 &port.to_string(),
                 "nolearning",
+                "proxy",
             ],
         )
         .await?;
         Self::run("ip", &["link", "set", name, "up"]).await?;
+        // Enable ARP proxy on the VXLAN interface so the kernel responds to
+        // ARP requests using entries from the neighbor table (populated by
+        // `ip neigh replace`). Without this, remote VM ARPs go unanswered.
+        Self::run(
+            "sysctl",
+            &["-w", &format!("net.ipv4.conf.{name}.proxy_arp=1")],
+        )
+        .await
+        .ok();
         Ok(())
     }
 
