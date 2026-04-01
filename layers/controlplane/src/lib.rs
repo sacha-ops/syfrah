@@ -16,7 +16,7 @@ pub mod server;
 pub mod state_machine;
 pub mod types;
 
-pub use client::RaftClient;
+pub use client::{RaftClient, RaftMetricsSnapshot};
 pub use commands::{StateMachineCommand, StateMachineResponse};
 pub use gossip::{GossipCluster, GossipConfig, GossipNodeId, HypervisorGossipReport, MemberState};
 pub use idempotency::IdempotencyJournal;
@@ -31,7 +31,9 @@ pub use scheduler::{
     MAX_ADMISSION_RETRIES,
 };
 pub use server::RaftServer;
-pub use state_machine::{PlacementEvent, RedbStateMachine};
+pub use state_machine::{
+    FullSnapshotData, PlacementEvent, RedbStateMachine, DEFAULT_SNAPSHOT_THRESHOLD,
+};
 pub use types::{SyfrahNode, SyfrahRaftConfig};
 
 /// The concrete Raft type for Syfrah.
