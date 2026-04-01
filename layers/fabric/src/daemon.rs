@@ -1359,6 +1359,18 @@ pub async fn run_daemon(
         let hv_handler =
             syfrah_org::HypervisorLayerHandler::new(Arc::clone(hv_store), my_record.name.clone());
         router.register("hypervisor", Arc::new(hv_handler));
+
+        // Wire the hypervisor store into the Raft compute handler so the
+        // scheduler can populate candidates from registered hypervisors.
+        if let Some(ref handler) = raft_compute_handler_ref {
+            let handler = Arc::clone(handler);
+            let store = Arc::clone(hv_store);
+            tokio::spawn(async move {
+                handler.set_hypervisor_store(store).await;
+                info!("compute: hypervisor store wired into scheduler");
+            });
+        }
+
         info!("hypervisor layer initialised");
     }
 
