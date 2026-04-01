@@ -1317,6 +1317,9 @@ pub async fn run_daemon(
             fdb_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            drain_controller: Some(std::sync::Arc::new(
+                syfrah_forge::drain::DrainController::new(),
+            )),
         });
 
         let bind_addr: std::net::SocketAddr =
