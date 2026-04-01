@@ -39,6 +39,7 @@ pub mod ownership;
 pub mod reconciler;
 pub mod runtime;
 pub mod task;
+pub mod tracing_otel;
 
 pub use api::{ForgeHandler, ForgeServer};
 
