@@ -18,7 +18,7 @@ pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
 pub use server::RaftServer;
-pub use state_machine::RedbStateMachine;
+pub use state_machine::{PlacementEvent, RedbStateMachine};
 pub use types::{SyfrahNode, SyfrahRaftConfig};
 
 /// The concrete Raft type for Syfrah.

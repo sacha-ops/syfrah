@@ -15,6 +15,31 @@ use tracing::{info, warn};
 use crate::commands::{StateMachineCommand, StateMachineResponse};
 use crate::types::SyfrahRaftConfig;
 
+/// Event emitted by the state machine when a VM placement changes.
+///
+/// The daemon subscribes to these events to update FDB + ARP proxy
+/// entries incrementally (O(1) per placement change).
+#[derive(Debug, Clone)]
+pub enum PlacementEvent {
+    /// A VM was placed on a hypervisor.
+    Added {
+        vpc_id: String,
+        vm_id: String,
+        vm_mac: String,
+        vm_ip: String,
+        subnet_id: String,
+        hypervisor_id: String,
+    },
+    /// A VM was removed from a hypervisor.
+    Removed {
+        vpc_id: String,
+        vm_id: String,
+        vm_mac: String,
+        vm_ip: String,
+        hypervisor_id: String,
+    },
+}
+
 /// Snapshot of the state machine — serialized state for transfer.
 #[derive(Debug)]
 pub struct SmSnapshot {
@@ -41,11 +66,15 @@ pub struct RedbStateMachine {
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
+    /// Broadcast channel for placement events (FDB incremental updates).
+    /// Subscribers receive events when PlaceVm/RemoveVm commands are applied.
+    placement_tx: tokio::sync::broadcast::Sender<PlacementEvent>,
 }
 
 impl RedbStateMachine {
     /// Create a new state machine wrapping the given OrgStore.
     pub fn new(org_store: Arc<syfrah_org::OrgStore>) -> Self {
+        let (placement_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             org_store,
             ipam_store: None,
@@ -53,7 +82,16 @@ impl RedbStateMachine {
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
+            placement_tx,
         }
+    }
+
+    /// Subscribe to placement events for incremental FDB updates.
+    ///
+    /// Returns a broadcast receiver that yields `PlacementEvent`s whenever
+    /// the state machine applies a PlaceVm or RemoveVm command.
+    pub fn subscribe_placement_events(&self) -> tokio::sync::broadcast::Receiver<PlacementEvent> {
+        self.placement_tx.subscribe()
     }
 
     /// Set the IPAM store for distributed IP allocation.
@@ -357,7 +395,18 @@ impl RedbStateMachine {
                     placement_generation: *generation,
                 };
                 match placement_store.add_placement(&placement) {
-                    Ok(()) => StateMachineResponse::Ok,
+                    Ok(()) => {
+                        // Emit placement event for incremental FDB update.
+                        let _ = self.placement_tx.send(PlacementEvent::Added {
+                            vpc_id: placement.vpc_id,
+                            vm_id: placement.vm_id,
+                            vm_mac: placement.vm_mac,
+                            vm_ip: placement.vm_ip,
+                            subnet_id: placement.subnet_id,
+                            hypervisor_id: placement.hypervisor_id,
+                        });
+                        StateMachineResponse::Ok
+                    }
                     Err(e) => StateMachineResponse::Error(e.to_string()),
                 }
             }
@@ -375,7 +424,16 @@ impl RedbStateMachine {
                     Ok(placements) => {
                         for p in &placements {
                             if p.vm_id == *vm_id {
+                                // Capture info before removal for the event.
+                                let event = PlacementEvent::Removed {
+                                    vpc_id: p.vpc_id.clone(),
+                                    vm_id: p.vm_id.clone(),
+                                    vm_mac: p.vm_mac.clone(),
+                                    vm_ip: p.vm_ip.clone(),
+                                    hypervisor_id: p.hypervisor_id.clone(),
+                                };
                                 let _ = placement_store.remove_placement(&p.vpc_id, vm_id);
+                                let _ = self.placement_tx.send(event);
                                 return StateMachineResponse::Ok;
                             }
                         }
