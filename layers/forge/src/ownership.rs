@@ -123,6 +123,11 @@ impl OwnershipRegistry {
     }
 
     /// Classify a kernel resource against the registry.
+    ///
+    /// 3-tier orphan handling:
+    /// - Tier 1 (Known): in ownership registry -> manage normally
+    /// - Tier 2 (Suspected): matches Syfrah naming but not in registry -> quarantine (log, don't delete)
+    /// - Tier 3 (Unknown): no match -> ignore completely
     pub fn classify(&self, kernel_name: &str) -> Result<OrphanPolicy, syfrah_state::StateError> {
         let all: Vec<(String, OwnershipRecord)> = self.db.list(TABLE)?;
 
@@ -132,8 +137,15 @@ impl OwnershipRegistry {
             }
         }
 
-        // Check if the name looks like a Syfrah resource.
-        if kernel_name.starts_with("br-")
+        // Check if the name matches Syfrah naming conventions.
+        if kernel_name.starts_with("syfb-")
+            || kernel_name.starts_with("syft-")
+            || kernel_name.starts_with("syfx-")
+            || kernel_name.starts_with("syfvh")
+            || kernel_name.starts_with("syfvc")
+            || kernel_name.starts_with("syfp")
+            // Also match legacy prefixes.
+            || kernel_name.starts_with("br-")
             || kernel_name.starts_with("tap-")
             || kernel_name.starts_with("vx-")
         {
@@ -142,6 +154,72 @@ impl OwnershipRegistry {
 
         Ok(OrphanPolicy::Unknown)
     }
+
+    /// Handle an orphaned resource according to its tier.
+    ///
+    /// Returns the action taken:
+    /// - Known: "manage" — resource is under active management
+    /// - Suspected: "quarantine" — log for review, do NOT delete
+    /// - Unknown: "ignore" — not our resource, leave it alone
+    pub fn handle_orphan(
+        &self,
+        kernel_name: &str,
+    ) -> Result<OrphanAction, syfrah_state::StateError> {
+        let policy = self.classify(kernel_name)?;
+        match policy {
+            OrphanPolicy::Known => Ok(OrphanAction::Manage),
+            OrphanPolicy::Suspected => {
+                // Tier 2: Log but don't delete. The operator should review.
+                Ok(OrphanAction::Quarantine {
+                    reason: format!(
+                        "interface '{}' matches Syfrah naming convention but is not in ownership registry",
+                        kernel_name
+                    ),
+                })
+            }
+            OrphanPolicy::Unknown => Ok(OrphanAction::Ignore),
+        }
+    }
+
+    /// Scan a list of kernel interfaces and classify each one.
+    pub fn scan_interfaces(
+        &self,
+        interfaces: &[String],
+    ) -> Result<OrphanScanResult, syfrah_state::StateError> {
+        let mut result = OrphanScanResult::default();
+
+        for iface in interfaces {
+            match self.classify(iface)? {
+                OrphanPolicy::Known => result.known.push(iface.clone()),
+                OrphanPolicy::Suspected => result.suspected.push(iface.clone()),
+                OrphanPolicy::Unknown => result.unknown.push(iface.clone()),
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Action to take on an orphaned resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrphanAction {
+    /// Tier 1: Resource is known and managed.
+    Manage,
+    /// Tier 2: Resource is suspected — quarantine for review.
+    Quarantine { reason: String },
+    /// Tier 3: Resource is unknown — ignore completely.
+    Ignore,
+}
+
+/// Result of scanning kernel interfaces for orphans.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrphanScanResult {
+    /// Tier 1: Known resources in the registry.
+    pub known: Vec<String>,
+    /// Tier 2: Suspected Syfrah resources not in registry.
+    pub suspected: Vec<String>,
+    /// Tier 3: Unknown resources (not ours).
+    pub unknown: Vec<String>,
 }
 
 #[cfg(test)]
@@ -185,9 +263,65 @@ mod tests {
         let (_dir, reg) = temp_registry();
         reg.register("vm-1", "vm", "ch-vm-1").unwrap();
 
+        // Tier 1: Known (in registry).
         assert_eq!(reg.classify("ch-vm-1").unwrap(), OrphanPolicy::Known);
+        // Tier 2: Suspected (matches naming conventions).
+        assert_eq!(
+            reg.classify("syfb-12345678").unwrap(),
+            OrphanPolicy::Suspected
+        );
+        assert_eq!(
+            reg.classify("syft-abcdef01").unwrap(),
+            OrphanPolicy::Suspected
+        );
+        assert_eq!(
+            reg.classify("syfx-11223344").unwrap(),
+            OrphanPolicy::Suspected
+        );
         assert_eq!(reg.classify("br-unknown").unwrap(), OrphanPolicy::Suspected);
+        // Tier 3: Unknown (not ours).
         assert_eq!(reg.classify("eth0").unwrap(), OrphanPolicy::Unknown);
+        assert_eq!(reg.classify("docker0").unwrap(), OrphanPolicy::Unknown);
+        assert_eq!(reg.classify("lo").unwrap(), OrphanPolicy::Unknown);
+    }
+
+    #[test]
+    fn handle_orphan_tiers() {
+        let (_dir, reg) = temp_registry();
+        reg.register("vm-1", "vm", "ch-vm-1").unwrap();
+
+        // Tier 1: Manage.
+        assert_eq!(reg.handle_orphan("ch-vm-1").unwrap(), OrphanAction::Manage);
+
+        // Tier 2: Quarantine.
+        match reg.handle_orphan("syfb-orphan").unwrap() {
+            OrphanAction::Quarantine { reason } => {
+                assert!(reason.contains("not in ownership registry"));
+            }
+            other => panic!("expected Quarantine, got {:?}", other),
+        }
+
+        // Tier 3: Ignore.
+        assert_eq!(reg.handle_orphan("eth0").unwrap(), OrphanAction::Ignore);
+    }
+
+    #[test]
+    fn scan_interfaces_classifies_all() {
+        let (_dir, reg) = temp_registry();
+        reg.register("br-1", "bridge", "syfb-11111111").unwrap();
+
+        let interfaces = vec![
+            "syfb-11111111".to_string(), // Known (in registry).
+            "syfb-orphan00".to_string(), // Suspected (matches naming, not in registry).
+            "syft-orphan00".to_string(), // Suspected.
+            "eth0".to_string(),          // Unknown.
+            "docker0".to_string(),       // Unknown.
+        ];
+
+        let result = reg.scan_interfaces(&interfaces).unwrap();
+        assert_eq!(result.known.len(), 1);
+        assert_eq!(result.suspected.len(), 2);
+        assert_eq!(result.unknown.len(), 2);
     }
 
     #[test]
