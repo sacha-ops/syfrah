@@ -1519,6 +1519,13 @@ pub async fn run_daemon(
 
             let config = std::sync::Arc::new(openraft::Config {
                 cluster_name: "syfrah-raft".to_string(),
+                // Trigger a snapshot every N log entries for compaction.
+                // New members joining get the snapshot for fast catch-up.
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                    syfrah_controlplane::state_machine::DEFAULT_SNAPSHOT_THRESHOLD,
+                ),
+                // After snapshot, purge log entries older than the snapshot.
+                max_in_snapshot_log_to_keep: 100,
                 ..Default::default()
             });
 

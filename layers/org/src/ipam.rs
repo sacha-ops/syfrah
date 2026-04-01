@@ -228,6 +228,16 @@ impl IpamStore {
         Self { db }
     }
 
+    /// Get a reference to the underlying database for export/import operations.
+    pub fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
+    /// All table names used by this store (for snapshot export/import).
+    pub fn table_names() -> &'static [&'static str] {
+        &[IPAM_BITMAPS_TABLE, IP_ALLOCATIONS_TABLE]
+    }
+
     /// Build the allocation table key: "subnet_id/ip".
     fn allocation_key(subnet_id: &str, ip: &str) -> String {
         format!("{subnet_id}/{ip}")
