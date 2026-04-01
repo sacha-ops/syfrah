@@ -1346,12 +1346,16 @@ pub async fn run_daemon(
         let raft_bind_addr: std::net::SocketAddr =
             std::net::SocketAddr::new(std::net::IpAddr::V6(my_record.mesh_ipv6), 7200);
 
-        // Check if Raft has been initialized (raft_meta.redb exists and has state).
-        let raft_db = syfrah_state::LayerDb::open("raft_log").ok();
-        let raft_initialized = raft_db.is_some();
+        // Check if Raft has been initialized.
+        // The controlplane init command creates a sentinel file when done.
+        let syfrah_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".syfrah");
+        let raft_initialized = syfrah_dir.join("raft_initialized").exists();
 
         if raft_initialized {
-            let log_db = syfrah_state::LayerDb::open("raft_log").unwrap();
+            let log_db =
+                syfrah_state::LayerDb::open("raft_log").expect("failed to open raft_log database");
             let log_store = std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
 
             let sm = std::sync::Arc::new(syfrah_controlplane::RedbStateMachine::new(

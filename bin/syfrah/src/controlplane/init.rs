@@ -31,17 +31,18 @@ pub async fn run() -> Result<()> {
 
     let node_addr = format!("[{fabric_ipv6}]:7200");
 
-    // Check if already initialized.
-    let log_db =
-        syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
-
-    // Check for existing vote (indicates prior initialization).
-    let existing_vote: Option<serde_json::Value> =
-        log_db.get("raft_vote", "current_vote").unwrap_or(None);
-    if existing_vote.is_some() {
+    // Check if already initialized via sentinel file.
+    let syfrah_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".syfrah");
+    let sentinel = syfrah_dir.join("raft_initialized");
+    if sentinel.exists() {
         println!("Control plane already initialized. Restart the daemon to activate.");
         return Ok(());
     }
+
+    let log_db =
+        syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
 
     println!("Initializing control plane...");
     println!("  Node ID:  {node_id}");
@@ -97,6 +98,10 @@ pub async fn run() -> Result<()> {
     raft.shutdown()
         .await
         .map_err(|e| anyhow::anyhow!("Raft shutdown error: {e}"))?;
+
+    // Write sentinel file so the daemon knows to start Raft on next boot.
+    std::fs::write(&sentinel, format!("{node_id}"))
+        .context("Failed to write raft_initialized sentinel")?;
 
     println!();
     println!("Control plane initialized. Restart the daemon to activate:");
