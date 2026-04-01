@@ -172,10 +172,7 @@ pub async fn run(verify: bool) -> Result<()> {
                     if orgs.len() == org_count {
                         println!("  [OK] Orgs: {} readable", orgs.len());
                     } else {
-                        println!(
-                            "  [WARN] Orgs: expected {org_count}, found {}",
-                            orgs.len()
-                        );
+                        println!("  [WARN] Orgs: expected {org_count}, found {}", orgs.len());
                         errors += 1;
                     }
                 }
@@ -191,10 +188,7 @@ pub async fn run(verify: bool) -> Result<()> {
                     if vpcs.len() == vpc_count {
                         println!("  [OK] VPCs: {} readable", vpcs.len());
                     } else {
-                        println!(
-                            "  [WARN] VPCs: expected {vpc_count}, found {}",
-                            vpcs.len()
-                        );
+                        println!("  [WARN] VPCs: expected {vpc_count}, found {}", vpcs.len());
                         errors += 1;
                     }
                 }
