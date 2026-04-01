@@ -1417,6 +1417,10 @@ pub async fn run_daemon(
 
             let sm = std::sync::Arc::new(sm_builder);
 
+            // Subscribe to placement events for incremental FDB updates.
+            // Must subscribe before starting Raft so we don't miss events.
+            let placement_event_rx = sm.subscribe_placement_events();
+
             let network = syfrah_controlplane::SyfrahNetworkFactory::new();
 
             // Derive node ID from fabric node identity hash.
@@ -1502,6 +1506,89 @@ pub async fn run_daemon(
                         warn!("FDB cold rebuild: failed to list placements: {e}");
                     }
                 }
+            }
+
+            // -- FDB incremental update task ------------------------------------------
+            //
+            // Listen for PlaceVm/RemoveVm events from the Raft state machine and
+            // apply incremental FDB + ARP proxy updates. This is O(1) per event.
+            {
+                let local_node = my_record.mesh_ipv6.to_string();
+                let mut rx = placement_event_rx;
+                tokio::spawn(async move {
+                    let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                        Arc::new(syfrah_overlay::LinuxBackend::new());
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                let placement = match &event {
+                                    syfrah_controlplane::PlacementEvent::Added {
+                                        vpc_id,
+                                        vm_id,
+                                        vm_mac,
+                                        vm_ip,
+                                        subnet_id,
+                                        hypervisor_id,
+                                    } => syfrah_overlay::VmPlacement {
+                                        vpc_id: vpc_id.clone(),
+                                        vm_id: vm_id.clone(),
+                                        vm_mac: vm_mac.clone(),
+                                        vm_ip: vm_ip.clone(),
+                                        subnet_id: subnet_id.clone(),
+                                        hypervisor_id: hypervisor_id.clone(),
+                                        action: syfrah_overlay::PlacementAction::Add,
+                                        placement_generation: 0,
+                                    },
+                                    syfrah_controlplane::PlacementEvent::Removed {
+                                        vpc_id,
+                                        vm_id,
+                                        vm_mac,
+                                        vm_ip,
+                                        hypervisor_id,
+                                    } => syfrah_overlay::VmPlacement {
+                                        vpc_id: vpc_id.clone(),
+                                        vm_id: vm_id.clone(),
+                                        vm_mac: vm_mac.clone(),
+                                        vm_ip: vm_ip.clone(),
+                                        subnet_id: String::new(),
+                                        hypervisor_id: hypervisor_id.clone(),
+                                        action: syfrah_overlay::PlacementAction::Remove,
+                                        placement_generation: 0,
+                                    },
+                                };
+                                if let Err(e) = syfrah_overlay::sync_placement(
+                                    backend.as_ref(),
+                                    &placement,
+                                    &local_node,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        vm_id = %placement.vm_id,
+                                        "FDB incremental update failed: {e}"
+                                    );
+                                } else {
+                                    debug!(
+                                        vm_id = %placement.vm_id,
+                                        action = ?placement.action,
+                                        "FDB incremental update applied"
+                                    );
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(
+                                    skipped = n,
+                                    "FDB incremental update lagged — missed {n} events, \
+                                     next reconcile pass will catch up"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                info!("FDB incremental update channel closed, stopping");
+                                break;
+                            }
+                        }
+                    }
+                });
             }
 
             info!("raft: control plane server starting on {raft_bind_addr} (node_id={node_id})");
