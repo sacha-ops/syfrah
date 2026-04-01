@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod commands;
+pub mod idempotency;
 pub mod log_storage;
 pub mod network;
 pub mod server;
@@ -13,6 +14,7 @@ pub mod types;
 
 pub use client::RaftClient;
 pub use commands::{StateMachineCommand, StateMachineResponse};
+pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
 pub use server::RaftServer;
