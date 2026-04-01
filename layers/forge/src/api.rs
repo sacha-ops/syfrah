@@ -14,6 +14,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::capacity::CapacityTracker;
+use crate::drain::DrainController;
 use crate::generation::GenerationTracker;
 use crate::task::TaskStore;
 
@@ -40,6 +41,8 @@ pub struct ForgeState {
     pub nat_gw_registry: Arc<Mutex<HashMap<String, NatGwRecord>>>,
     /// In-memory FDB entry registry (key -> FdbEntry).
     pub fdb_registry: Arc<Mutex<HashMap<String, FdbEntry>>>,
+    /// Drain controller for node drain/undrain protocol.
+    pub drain_controller: Option<Arc<DrainController>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -421,6 +424,70 @@ async fn resources_handler(State(state): State<Arc<ForgeState>>) -> impl IntoRes
     )
 }
 
+/// POST /v1/hypervisor/drain — start draining this node.
+async fn drain_handler(
+    State(state): State<Arc<ForgeState>>,
+    body: Option<Json<crate::drain::DrainRequest>>,
+) -> impl IntoResponse {
+    let Some(ref ctrl) = state.drain_controller else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_DRAIN_UNAVAILABLE", "message": "drain controller not initialized"}),
+            ),
+        );
+    };
+
+    let (force, _timeout) = match body {
+        Some(Json(req)) => (
+            req.force,
+            req.timeout_secs.map(std::time::Duration::from_secs),
+        ),
+        None => (false, None),
+    };
+
+    ctrl.start_drain(force, _timeout);
+    info!(force = force, "node drain started");
+
+    let status = ctrl.status();
+    (StatusCode::OK, Json(serde_json::to_value(status).unwrap()))
+}
+
+/// POST /v1/hypervisor/activate — stop draining and return to Available.
+async fn activate_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let Some(ref ctrl) = state.drain_controller else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_DRAIN_UNAVAILABLE", "message": "drain controller not initialized"}),
+            ),
+        );
+    };
+
+    ctrl.activate();
+    info!("node activated (drain stopped)");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "available", "draining": false})),
+    )
+}
+
+/// GET /v1/hypervisor/drain — get drain status.
+async fn drain_status_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let Some(ref ctrl) = state.drain_controller else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_DRAIN_UNAVAILABLE", "message": "drain controller not initialized"}),
+            ),
+        );
+    };
+
+    let status = ctrl.status();
+    (StatusCode::OK, Json(serde_json::to_value(status).unwrap()))
+}
+
 /// GET /v1/tasks/:id
 async fn get_task_handler(
     State(state): State<Arc<ForgeState>>,
@@ -478,6 +545,19 @@ async fn create_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> impl IntoResponse {
+    // Drain check: reject new creates when draining.
+    if let Some(ref drain) = state.drain_controller {
+        if drain.is_draining() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "code": "FORGE_NODE_DRAINING",
+                    "message": "node is draining — new VM creation denied"
+                })),
+            );
+        }
+    }
+
     // Admission control: atomic check-and-reserve to prevent double-booking
     // under concurrent creates. The reservation expires after 60s if creation
     // doesn't complete. On success, reservation is converted to allocation.
@@ -1756,6 +1836,11 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         .route("/v1/hypervisor/reservations", get(reservations_handler))
         .route("/v1/hypervisor/metrics", get(metrics_handler))
         .route("/v1/hypervisor/resources", get(resources_handler))
+        .route(
+            "/v1/hypervisor/drain",
+            get(drain_status_handler).post(drain_handler),
+        )
+        .route("/v1/hypervisor/activate", post(activate_handler))
         // -- Deprecated /v1/node/* aliases --
         .route("/v1/node/health", get(health_handler))
         .route("/v1/node/status", get(status_handler))
@@ -1873,6 +1958,7 @@ mod tests {
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
+            drain_controller: None,
         })
     }
 
@@ -1895,6 +1981,7 @@ mod tests {
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
+            drain_controller: None,
         });
         (dir, state)
     }
@@ -2116,6 +2203,7 @@ mod tests {
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
+            drain_controller: None,
         });
         let app = forge_router(state);
 
@@ -2151,6 +2239,7 @@ mod tests {
             nic_registry: Arc::new(Mutex::new(HashMap::new())),
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
+            drain_controller: None,
         })
     }
 
