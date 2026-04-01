@@ -363,6 +363,55 @@ impl LayerDb {
         Ok(current)
     }
 
+    /// Export all key-value pairs from a table as raw JSON bytes.
+    ///
+    /// Returns `Vec<(key, json_bytes)>` — useful for snapshot serialization
+    /// where we don't need to deserialize the values.
+    pub fn export_table_raw(&self, table_name: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
+        let read_txn = self.db.begin_read()?;
+
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+
+        let mut results = Vec::new();
+        for entry in table.iter().map_err(StateError::Storage)? {
+            let (key, value) = entry.map_err(StateError::Storage)?;
+            results.push((key.value().to_string(), value.value().to_vec()));
+        }
+        Ok(results)
+    }
+
+    /// Import raw key-value pairs into a table, replacing all existing data.
+    ///
+    /// Used during snapshot installation to restore state machine state.
+    pub fn import_table_raw(&self, table_name: &str, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
+        let write_txn = self.db.begin_write()?;
+        {
+            // Clear existing data by draining the table.
+            let mut table = write_txn.open_table(table_def)?;
+            // Collect keys to delete first.
+            let keys: Vec<String> = table
+                .iter()
+                .map_err(StateError::Storage)?
+                .filter_map(|e| e.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for key in &keys {
+                table.remove(key.as_str())?;
+            }
+            // Insert new data.
+            for (key, value) in entries {
+                table.insert(key.as_str(), value.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Delete the entire database file for this layer.
     pub fn destroy(layer: &str) -> Result<()> {
         let path = db_path(layer);

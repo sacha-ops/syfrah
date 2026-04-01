@@ -1,7 +1,13 @@
 //! Raft state machine backed by the existing OrgStore (redb).
+//!
+//! Snapshots serialize the full redb state (all org/ipam/placement tables)
+//! so new members joining the cluster get the complete state without
+//! replaying the entire Raft log.
 
+use std::collections::HashMap;
 use std::io;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
@@ -14,6 +20,9 @@ use tracing::{info, warn};
 
 use crate::commands::{StateMachineCommand, StateMachineResponse};
 use crate::types::SyfrahRaftConfig;
+
+/// Default number of log entries between snapshots.
+pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
 
 /// Event emitted by the state machine when a VM placement changes.
 ///
@@ -54,6 +63,19 @@ pub struct SmState {
     pub last_membership: StoredMembershipOf<SyfrahRaftConfig>,
 }
 
+/// Full snapshot data including store tables for new member catch-up.
+///
+/// When serialized, this contains the complete redb state so a joining
+/// node can restore without replaying the entire Raft log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FullSnapshotData {
+    /// Raft metadata (last applied log, membership).
+    pub sm_state: SmState,
+    /// Raw table data: table_name -> Vec<(key, json_bytes)>.
+    /// Uses base64-encoded bytes for JSON compatibility.
+    pub tables: HashMap<String, Vec<(String, Vec<u8>)>>,
+}
+
 /// Raft state machine that dispatches commands to the OrgStore.
 ///
 /// On apply, each `StateMachineCommand` is deserialized and dispatched
@@ -69,6 +91,12 @@ pub struct RedbStateMachine {
     /// Broadcast channel for placement events (FDB incremental updates).
     /// Subscribers receive events when PlaceVm/RemoveVm commands are applied.
     placement_tx: tokio::sync::broadcast::Sender<PlacementEvent>,
+    /// Counter for total snapshots built (for metrics).
+    pub snapshot_count: AtomicU64,
+    /// Counter tracking entries applied since last snapshot.
+    pub entries_since_snapshot: AtomicU64,
+    /// Configurable snapshot threshold (default: 10,000 log entries).
+    pub snapshot_threshold: u64,
 }
 
 impl RedbStateMachine {
@@ -83,6 +111,102 @@ impl RedbStateMachine {
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
             placement_tx,
+            snapshot_count: AtomicU64::new(0),
+            entries_since_snapshot: AtomicU64::new(0),
+            snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+        }
+    }
+
+    /// Create a new state machine with a custom snapshot threshold.
+    pub fn with_snapshot_threshold(mut self, threshold: u64) -> Self {
+        self.snapshot_threshold = threshold;
+        self
+    }
+
+    /// Export all store tables as raw data for snapshot serialization.
+    ///
+    /// Collects data from org, IPAM, and placement stores into a
+    /// HashMap of table_name -> entries.
+    fn export_store_tables(&self) -> HashMap<String, Vec<(String, Vec<u8>)>> {
+        let mut tables = HashMap::new();
+
+        // Export org store tables.
+        for table_name in syfrah_org::OrgStore::table_names() {
+            match self.org_store.db().export_table_raw(table_name) {
+                Ok(entries) if !entries.is_empty() => {
+                    tables.insert(table_name.to_string(), entries);
+                }
+                Ok(_) => {} // empty table, skip
+                Err(e) => {
+                    warn!("snapshot: failed to export org table {table_name}: {e}");
+                }
+            }
+        }
+
+        // Export IPAM store tables.
+        if let Some(ref ipam) = self.ipam_store {
+            for table_name in syfrah_org::IpamStore::table_names() {
+                match ipam.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export IPAM table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Export placement store tables.
+        if let Some(ref placement) = self.placement_store {
+            for table_name in syfrah_org::PlacementStore::table_names() {
+                match placement.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export placement table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
+        tables
+    }
+
+    /// Import store tables from snapshot data, replacing existing state.
+    fn import_store_tables(&self, tables: &HashMap<String, Vec<(String, Vec<u8>)>>) {
+        // Import org store tables.
+        for table_name in syfrah_org::OrgStore::table_names() {
+            if let Some(entries) = tables.get(*table_name) {
+                if let Err(e) = self.org_store.db().import_table_raw(table_name, entries) {
+                    warn!("snapshot: failed to import org table {table_name}: {e}");
+                }
+            }
+        }
+
+        // Import IPAM store tables.
+        if let Some(ref ipam) = self.ipam_store {
+            for table_name in syfrah_org::IpamStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = ipam.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import IPAM table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Import placement store tables.
+        if let Some(ref placement) = self.placement_store {
+            for table_name in syfrah_org::PlacementStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = placement.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import placement table {table_name}: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -514,7 +638,17 @@ impl RedbStateMachine {
 impl RaftSnapshotBuilder<SyfrahRaftConfig> for Arc<RedbStateMachine> {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<SyfrahRaftConfig>, io::Error> {
         let sm_state = self.sm_state.read().await;
-        let data = serde_json::to_vec(&*sm_state)
+
+        // Export all store tables for the full snapshot.
+        let tables = self.export_store_tables();
+        let table_count: usize = tables.values().map(|v| v.len()).sum();
+
+        let full_data = FullSnapshotData {
+            sm_state: (*sm_state).clone(),
+            tables,
+        };
+
+        let data = serde_json::to_vec(&full_data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let snapshot_idx = {
@@ -550,7 +684,15 @@ impl RaftSnapshotBuilder<SyfrahRaftConfig> for Arc<RedbStateMachine> {
             *current = Some(snapshot);
         }
 
-        info!(snapshot_size = data.len(), "snapshot built");
+        // Update counters.
+        self.snapshot_count.fetch_add(1, Ordering::Relaxed);
+        self.entries_since_snapshot.store(0, Ordering::Relaxed);
+
+        info!(
+            snapshot_size = data.len(),
+            table_entries = table_count,
+            "snapshot built (full store export)"
+        );
 
         Ok(SnapshotOf::<SyfrahRaftConfig> {
             meta,
@@ -598,6 +740,9 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                 }
             };
 
+            // Track entries applied since last snapshot.
+            self.entries_since_snapshot.fetch_add(1, Ordering::Relaxed);
+
             if let Some(responder) = responder {
                 responder.send(response);
             }
@@ -621,8 +766,23 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         snapshot: SnapshotDataOf<SyfrahRaftConfig>,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
-        let new_sm: SmState = serde_json::from_slice(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        // Try to deserialize as FullSnapshotData first (new format),
+        // fall back to SmState-only (legacy format) for compatibility.
+        let new_sm = if let Ok(full) = serde_json::from_slice::<FullSnapshotData>(&data) {
+            // Restore all store tables from the snapshot.
+            let table_count: usize = full.tables.values().map(|v| v.len()).sum();
+            self.import_store_tables(&full.tables);
+            info!(
+                table_entries = table_count,
+                "snapshot: restored store tables from full snapshot"
+            );
+            full.sm_state
+        } else {
+            // Legacy format: SmState only (no store data).
+            serde_json::from_slice::<SmState>(&data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        };
 
         {
             let mut sm = self.sm_state.write().await;
@@ -635,6 +795,9 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         };
         let mut current = self.current_snapshot.write().await;
         *current = Some(snap);
+
+        // Reset entries counter since we just installed a snapshot.
+        self.entries_since_snapshot.store(0, Ordering::Relaxed);
 
         info!("snapshot installed");
         Ok(())
