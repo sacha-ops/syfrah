@@ -354,6 +354,38 @@ async fn capacity_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResp
     }
 }
 
+/// GET /v1/hypervisor/reservations — list active resource reservations.
+async fn reservations_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    if let Some(ref cap) = state.capacity {
+        let active = cap.list_reservations();
+        let entries: Vec<serde_json::Value> = active
+            .iter()
+            .map(|(id, r)| {
+                serde_json::json!({
+                    "id": id,
+                    "vcpus": r.vcpus,
+                    "memory_mb": r.memory_mb,
+                    "age_secs": r.created_at.elapsed().as_secs(),
+                })
+            })
+            .collect();
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "reservations": entries,
+                "count": entries.len(),
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"code": "FORGE_CAPACITY_UNAVAILABLE", "message": "capacity tracker not initialized"}),
+            ),
+        )
+    }
+}
+
 /// GET /v1/hypervisor/metrics (alias: /v1/node/metrics)
 async fn metrics_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
@@ -446,9 +478,11 @@ async fn create_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> impl IntoResponse {
-    // Admission control: check capacity before anything else.
+    // Admission control: atomic check-and-reserve to prevent double-booking
+    // under concurrent creates. The reservation expires after 60s if creation
+    // doesn't complete. On success, reservation is converted to allocation.
     if let Some(ref capacity) = state.capacity {
-        if !capacity.can_admit(req.vcpus, req.memory_mb as u64) {
+        if !capacity.try_reserve(&req.name, req.vcpus, req.memory_mb as u64) {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -460,7 +494,6 @@ async fn create_instance_handler(
                 })),
             );
         }
-        capacity.reserve(&req.name, req.vcpus, req.memory_mb as u64);
     }
 
     let Some(ref vm_manager) = state.vm_manager else {
@@ -1720,6 +1753,7 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         .route("/v1/hypervisor/health", get(health_handler))
         .route("/v1/hypervisor/status", get(status_handler))
         .route("/v1/hypervisor/capacity", get(capacity_handler))
+        .route("/v1/hypervisor/reservations", get(reservations_handler))
         .route("/v1/hypervisor/metrics", get(metrics_handler))
         .route("/v1/hypervisor/resources", get(resources_handler))
         // -- Deprecated /v1/node/* aliases --
