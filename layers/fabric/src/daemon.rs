@@ -2477,6 +2477,7 @@ impl FabricHandler for DaemonFabricHandler {
                             region: Some(region),
                             zone: Some(zone),
                             topology,
+                            hypervisor_report: None,
                         };
                         events::emit(
                             EventType::JoinManuallyAccepted,
@@ -2860,6 +2861,7 @@ fn build_record(
         region: region.map(|s| s.to_string()),
         zone: zone.map(|s| s.to_string()),
         topology,
+        hypervisor_report: None,
     }
 }
 
@@ -2987,6 +2989,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         }
     }
 
@@ -3363,6 +3366,7 @@ mod tests {
             region: Some("default".into()),
             zone: Some("zone-1".into()),
             topology: None,
+            hypervisor_report: None,
         }];
         let (region, zone) = super::resolve_region_zone(None, None, &peers);
         assert_eq!(region, "default");

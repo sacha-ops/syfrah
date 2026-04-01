@@ -656,6 +656,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         }
     }
 
@@ -1025,6 +1026,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         };
 
         apply_peers(&kp.public, &[peer], 25).unwrap();
@@ -1061,6 +1063,7 @@ mod tests {
             region: topo.as_ref().map(|t| t.region.as_str().to_owned()),
             zone: topo.as_ref().map(|t| t.zone.as_str().to_owned()),
             topology: topo,
+            hypervisor_report: None,
         }
     }
 

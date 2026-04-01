@@ -14,6 +14,7 @@ fn make_peer(name: &str, region: Option<&str>, zone: Option<&str>) -> PeerRecord
         region: region.map(|s| s.to_string()),
         zone: zone.map(|s| s.to_string()),
         topology: None,
+        hypervisor_report: None,
     }
 }
 

@@ -275,6 +275,7 @@ mod tests {
                     region: None,
                     zone: None,
                     topology: None,
+                    hypervisor_report: None,
                 },
                 syfrah_core::mesh::PeerRecord {
                     name: "peer-removed".into(),
@@ -286,6 +287,7 @@ mod tests {
                     region: None,
                     zone: None,
                     topology: None,
+                    hypervisor_report: None,
                 },
             ],
             region: None,

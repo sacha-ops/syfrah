@@ -1005,6 +1005,7 @@ fn build_auto_accept_response(
         region: Some(region),
         zone: Some(zone),
         topology: None,
+        hypervisor_report: None,
     };
 
     let response = JoinResponse {
@@ -1719,6 +1720,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         };
 
         let enc_key = [0xABu8; 32];
@@ -1779,6 +1781,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         }
     }
 

@@ -197,6 +197,38 @@ pub struct PeerRecord {
     /// string fields during the migration period.
     #[serde(default)]
     pub topology: Option<Topology>,
+    /// Hypervisor capacity report (advisory telemetry, not source of truth).
+    /// Populated every ~10s when a hypervisor is registered on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_report: Option<HypervisorReport>,
+}
+
+/// Advisory hypervisor capacity report carried in gossip announcements.
+/// This is telemetry only — not the source of truth for scheduling decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HypervisorReport {
+    /// Hypervisor ID.
+    pub hypervisor_id: String,
+    /// Region.
+    pub region: String,
+    /// Zone.
+    pub zone: String,
+    /// Hypervisor state (e.g. "Available", "Draining").
+    pub state: String,
+    /// Allocatable vCPUs.
+    pub allocatable_vcpus: u32,
+    /// Used vCPUs.
+    pub used_vcpus: u32,
+    /// Allocatable memory in MB.
+    pub allocatable_memory_mb: u64,
+    /// Used memory in MB.
+    pub used_memory_mb: u64,
+    /// Number of running instances.
+    pub instance_count: u32,
+    /// Whether the node is draining.
+    pub drain_status: bool,
+    /// Unix timestamp of this report.
+    pub reported_at: u64,
 }
 
 impl PeerRecord {
@@ -681,6 +713,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         }
     }
 
@@ -755,6 +788,7 @@ mod tests {
             region: Some("us-east-1".into()),
             zone: Some("zone-a".into()),
             topology: None,
+            hypervisor_report: None,
         }
     }
 

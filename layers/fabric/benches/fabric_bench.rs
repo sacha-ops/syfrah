@@ -32,6 +32,7 @@ fn make_peer(i: usize, region: &str, zone: &str) -> PeerRecord {
             region: Region::new(region).unwrap(),
             zone: Zone::new(zone).unwrap(),
         }),
+        hypervisor_report: None,
     }
 }
 

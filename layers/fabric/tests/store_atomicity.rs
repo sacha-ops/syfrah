@@ -36,6 +36,7 @@ fn make_test_peer(name: &str, index: usize) -> PeerRecord {
         region: Some("us-east-1".into()),
         zone: Some(format!("us-east-1-zone-{index}")),
         topology: None,
+        hypervisor_report: None,
     }
 }
 
