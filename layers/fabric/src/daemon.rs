@@ -1034,8 +1034,25 @@ pub async fn run_daemon(
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
     // and register the compute handler in the router.
+    //
+    // This block runs unconditionally on ALL daemon startup paths (init, join,
+    // AND start) so that `syfrah compute` commands are always available.
+    info!("compute layer: starting initialisation");
     let shared_vm_manager: Option<Arc<syfrah_compute::VmManager>>;
     {
+        // Pre-create prerequisite directories so VmManager::new() succeeds
+        // even on a fresh node (join path) where install.sh was not run.
+        for dir in &[
+            "/opt/syfrah/images",
+            "/opt/syfrah/kernels",
+            "/opt/syfrah/instances",
+            "/run/syfrah/vms",
+        ] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!("compute layer: failed to create {dir}: {e}");
+            }
+        }
+
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
             Ok(mut vm_manager) => {
