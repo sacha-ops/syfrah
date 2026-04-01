@@ -13,13 +13,7 @@ pub async fn run() -> Result<()> {
     let fabric_state = syfrah_fabric::store::load()
         .map_err(|_| anyhow::anyhow!("Fabric not initialized. Run 'syfrah fabric init' first."))?;
 
-    let my_record = fabric_state
-        .peers
-        .iter()
-        .find(|p| p.name == fabric_state.node_name)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find own peer record in fabric state"))?;
-
-    let fabric_ipv6 = my_record.mesh_ipv6;
+    let fabric_ipv6 = fabric_state.mesh_ipv6;
 
     // Derive node ID from fabric node name hash.
     let node_id = {
