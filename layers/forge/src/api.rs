@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
@@ -33,6 +34,19 @@ pub struct ForgeState {
     pub network_backend: Option<Arc<dyn syfrah_overlay::NetworkBackend>>,
     /// Generation tracker for resource drift detection.
     pub generation_tracker: Option<Arc<GenerationTracker>>,
+    /// In-memory NIC registry (resource_id -> NicRecord).
+    pub nic_registry: Arc<Mutex<HashMap<String, NicRecord>>>,
+}
+
+/// Stored NIC record for the in-memory registry.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NicRecord {
+    pub id: String,
+    pub tap_name: String,
+    pub vm_id: String,
+    pub vpc_id: String,
+    pub ip: String,
+    pub mac: String,
 }
 
 /// Standard error response with FORGE_ prefix codes.
@@ -133,6 +147,40 @@ pub struct VxlanResponse {
     pub vpc_id: String,
     pub vni: u32,
     pub generation: Option<crate::generation::ResourceGeneration>,
+}
+
+/// Request body for creating a NIC (TAP/veth).
+#[derive(Deserialize, Debug)]
+pub struct CreateNicRequest {
+    /// VM identifier this NIC is attached to.
+    pub vm_id: String,
+    /// VPC identifier — used to derive bridge name for attachment.
+    pub vpc_id: String,
+    /// IP address assigned to this NIC.
+    pub ip: String,
+    /// MAC address for this NIC.
+    pub mac: String,
+    /// Security groups attached to this NIC.
+    #[serde(default)]
+    pub security_groups: Vec<String>,
+}
+
+/// Response for NIC operations.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NicResponse {
+    pub id: String,
+    pub tap_name: String,
+    pub vm_id: String,
+    pub vpc_id: String,
+    pub ip: String,
+    pub mac: String,
+    pub generation: Option<crate::generation::ResourceGeneration>,
+}
+
+/// Query parameters for listing NICs.
+#[derive(Deserialize, Debug)]
+pub struct NicListQuery {
+    pub vm_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +902,176 @@ async fn delete_vxlan_handler(
     )
 }
 
+// ---------------------------------------------------------------------------
+// NIC handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/networks/interfaces — create a TAP device, attach to bridge, register NIC.
+async fn create_nic_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<CreateNicRequest>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let tap_name = syfrah_overlay::naming::tap_name(&req.vm_id);
+    let bridge_name = syfrah_overlay::naming::bridge_name(&req.vpc_id);
+    let resource_id = format!("nic-{}", req.vm_id);
+
+    // Create TAP device.
+    if let Err(e) = backend.create_tap(&tap_name).await {
+        warn!(vm_id = %req.vm_id, error = %e, "failed to create TAP");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_NIC_CREATE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    // Attach TAP to bridge.
+    if let Err(e) = backend.attach_to_bridge(&tap_name, &bridge_name).await {
+        warn!(
+            vm_id = %req.vm_id,
+            tap = %tap_name,
+            bridge = %bridge_name,
+            error = %e,
+            "failed to attach TAP to bridge"
+        );
+        // Best-effort: clean up TAP on bridge attach failure.
+        let _ = backend.delete_tap(&tap_name).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_NIC_ATTACH_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    // Apply anti-spoofing + default firewall rules.
+    if let Err(e) = backend.apply_vm_rules(&tap_name, &req.mac, &req.ip).await {
+        warn!(vm_id = %req.vm_id, error = %e, "failed to apply VM firewall rules");
+        // Non-fatal: NIC is created, rules can be re-applied by reconciler.
+    }
+
+    // Register in NIC registry.
+    let record = NicRecord {
+        id: resource_id.clone(),
+        tap_name: tap_name.clone(),
+        vm_id: req.vm_id.clone(),
+        vpc_id: req.vpc_id.clone(),
+        ip: req.ip.clone(),
+        mac: req.mac.clone(),
+    };
+    state
+        .nic_registry
+        .lock()
+        .unwrap()
+        .insert(resource_id.clone(), record);
+
+    let gen = state
+        .generation_tracker
+        .as_ref()
+        .map(|gt| gt.register(&resource_id));
+
+    info!(vm_id = %req.vm_id, tap = %tap_name, "NIC created and attached");
+    (
+        StatusCode::CREATED,
+        Json(
+            serde_json::to_value(NicResponse {
+                id: resource_id,
+                tap_name,
+                vm_id: req.vm_id,
+                vpc_id: req.vpc_id,
+                ip: req.ip,
+                mac: req.mac,
+                generation: gen,
+            })
+            .unwrap(),
+        ),
+    )
+}
+
+/// DELETE /v1/networks/interfaces/:id — remove a NIC.
+async fn delete_nic_handler(
+    State(state): State<Arc<ForgeState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    // Look up NIC in registry.
+    let record = state.nic_registry.lock().unwrap().remove(&id);
+    let tap_name = match record {
+        Some(ref r) => r.tap_name.clone(),
+        None => {
+            // If not in registry, treat id as the TAP name directly.
+            id.clone()
+        }
+    };
+
+    // Remove firewall rules first.
+    if let Err(e) = backend.remove_vm_rules(&tap_name).await {
+        warn!(tap = %tap_name, error = %e, "failed to remove VM firewall rules");
+    }
+
+    // Delete TAP device.
+    if let Err(e) = backend.delete_tap(&tap_name).await {
+        warn!(tap = %tap_name, error = %e, "failed to delete TAP");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_NIC_DELETE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    if let Some(ref gt) = state.generation_tracker {
+        gt.remove(&id);
+    }
+
+    info!(nic = %id, tap = %tap_name, "NIC deleted");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_NIC_DELETED",
+            "message": format!("NIC '{}' deleted", id)
+        })),
+    )
+}
+
+/// GET /v1/networks/interfaces?vm_id=X — list NICs, optionally filtered by VM.
+async fn list_nics_handler(
+    State(state): State<Arc<ForgeState>>,
+    Query(query): Query<NicListQuery>,
+) -> impl IntoResponse {
+    let registry = state.nic_registry.lock().unwrap();
+    let nics: Vec<&NicRecord> = if let Some(ref vm_id) = query.vm_id {
+        registry.values().filter(|r| r.vm_id == *vm_id).collect()
+    } else {
+        registry.values().collect()
+    };
+
+    (StatusCode::OK, Json(serde_json::to_value(nics).unwrap()))
+}
+
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
@@ -875,6 +1093,12 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
         // -- Networks: VXLANs --
         .route("/v1/networks/vxlans", post(create_vxlan_handler))
         .route("/v1/networks/vxlans/{id}", delete(delete_vxlan_handler))
+        // -- Networks: NICs --
+        .route(
+            "/v1/networks/interfaces",
+            get(list_nics_handler).post(create_nic_handler),
+        )
+        .route("/v1/networks/interfaces/{id}", delete(delete_nic_handler))
         // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
@@ -955,6 +1179,7 @@ mod tests {
             org_store: None,
             network_backend: None,
             generation_tracker: None,
+            nic_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -974,6 +1199,7 @@ mod tests {
             org_store: None,
             network_backend: None,
             generation_tracker: None,
+            nic_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         (dir, state)
     }
@@ -1192,6 +1418,7 @@ mod tests {
             org_store: None,
             network_backend: None,
             generation_tracker: None,
+            nic_registry: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = forge_router(state);
 
@@ -1224,6 +1451,7 @@ mod tests {
             org_store: None,
             network_backend: Some(backend),
             generation_tracker: Some(gen_tracker),
+            nic_registry: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1332,5 +1560,114 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn create_nic_endpoint() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/interfaces")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-1","vpc_id":"vpc-prod","ip":"10.1.0.3","mac":"02:00:0a:01:00:03"}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["vm_id"], "vm-1");
+        assert!(result["tap_name"].as_str().unwrap().starts_with("syft-"));
+        assert!(result["generation"].is_object());
+    }
+
+    #[tokio::test]
+    async fn delete_nic_endpoint() {
+        let state = test_state_with_network();
+
+        // First create a NIC.
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/interfaces")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-del","vpc_id":"vpc-1","ip":"10.1.0.5","mac":"02:00:0a:01:00:05"}"#,
+            ))
+            .unwrap();
+        let resp1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), 201);
+
+        // Now delete it.
+        let app2 = forge_router(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/v1/networks/interfaces/nic-vm-del")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), 200);
+
+        let body = resp2.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "FORGE_NIC_DELETED");
+    }
+
+    #[tokio::test]
+    async fn list_nics_by_vm() {
+        let state = test_state_with_network();
+
+        // Create two NICs for different VMs.
+        let app1 = forge_router(Arc::clone(&state));
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/interfaces")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-a","vpc_id":"vpc-1","ip":"10.1.0.1","mac":"02:00:0a:01:00:01"}"#,
+            ))
+            .unwrap();
+        app1.oneshot(req1).await.unwrap();
+
+        let app2 = forge_router(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/interfaces")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-b","vpc_id":"vpc-1","ip":"10.1.0.2","mac":"02:00:0a:01:00:02"}"#,
+            ))
+            .unwrap();
+        app2.oneshot(req2).await.unwrap();
+
+        // List all NICs.
+        let app3 = forge_router(Arc::clone(&state));
+        let req3 = axum::http::Request::builder()
+            .uri("/v1/networks/interfaces")
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), 200);
+        let body = resp3.into_body().collect().await.unwrap().to_bytes();
+        let nics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nics.len(), 2);
+
+        // List NICs for vm-a only.
+        let app4 = forge_router(state);
+        let req4 = axum::http::Request::builder()
+            .uri("/v1/networks/interfaces?vm_id=vm-a")
+            .body(Body::empty())
+            .unwrap();
+        let resp4 = app4.oneshot(req4).await.unwrap();
+        assert_eq!(resp4.status(), 200);
+        let body = resp4.into_body().collect().await.unwrap().to_bytes();
+        let nics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nics.len(), 1);
+        assert_eq!(nics[0]["vm_id"], "vm-a");
     }
 }
