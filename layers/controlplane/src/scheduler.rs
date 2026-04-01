@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::gossip::{GossipCluster, HypervisorGossipReport};
 
@@ -396,6 +396,92 @@ impl Scheduler {
 
         score
     }
+
+    /// Schedule with retry: pick a hypervisor, let the caller perform an
+    /// admission recheck on the target Forge. If rejected, retry with
+    /// the rejected hypervisor excluded. Up to `max_retries` attempts.
+    ///
+    /// The `admission_check` closure receives a `PlacementDecision` and
+    /// returns `Ok(())` if admitted, or `Err(reason)` if rejected.
+    pub fn schedule_with_retry<F>(
+        &self,
+        vcpus: u32,
+        memory_mb: u64,
+        constraints: &PlacementConstraints,
+        cluster: &GossipCluster,
+        existing_placements: &HashMap<String, u32>,
+        max_retries: usize,
+        mut admission_check: F,
+    ) -> Result<PlacementDecision, SchedulerError>
+    where
+        F: FnMut(&PlacementDecision) -> Result<(), String>,
+    {
+        let mut excluded: Vec<String> = Vec::new();
+
+        for attempt in 0..=max_retries {
+            let decision = self.schedule(
+                vcpus,
+                memory_mb,
+                constraints,
+                cluster,
+                &excluded,
+                existing_placements,
+            )?;
+
+            // Local fallback skips admission recheck.
+            if decision.is_local_fallback {
+                return Ok(decision);
+            }
+
+            match admission_check(&decision) {
+                Ok(()) => {
+                    info!(
+                        "scheduler: admission accepted on attempt {} for '{}'",
+                        attempt + 1,
+                        decision.hypervisor_id
+                    );
+                    return Ok(decision);
+                }
+                Err(reason) => {
+                    warn!(
+                        "scheduler: admission rejected on '{}' (attempt {}): {}",
+                        decision.hypervisor_id,
+                        attempt + 1,
+                        reason
+                    );
+                    excluded.push(decision.hypervisor_id.clone());
+                }
+            }
+        }
+
+        Err(SchedulerError {
+            message: format!(
+                "all {} hypervisors rejected admission after {} retries",
+                excluded.len(),
+                max_retries + 1
+            ),
+            constraints_summary: constraints.summary(),
+        })
+    }
+}
+
+/// Maximum number of admission recheck retries.
+pub const MAX_ADMISSION_RETRIES: usize = 3;
+
+/// Result of a Forge admission recheck.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdmissionResult {
+    /// Admission accepted — proceed with VM creation.
+    Accepted,
+    /// Admission rejected — stale data, capacity changed.
+    Rejected { reason: String },
+}
+
+impl AdmissionResult {
+    /// Check if admission was accepted.
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
 }
 
 #[cfg(test)]
@@ -602,5 +688,107 @@ mod tests {
         assert!((c.memory_utilization() - 0.5).abs() < f64::EPSILON);
         assert_eq!(c.available_vcpus(), 5);
         assert_eq!(c.available_memory_mb(), 10240);
+    }
+
+    #[test]
+    fn retry_on_first_rejection_picks_second() {
+        let cluster = GossipCluster::new();
+        cluster.update_report(make_report("hv-1", "az-1", 8, 0, 16384, 0));
+        cluster.update_report(make_report("hv-2", "az-2", 8, 0, 16384, 0));
+
+        let scheduler = Scheduler::new("hv-1".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints::default();
+        let mut call_count = 0;
+
+        let result = scheduler
+            .schedule_with_retry(
+                1,
+                1024,
+                &constraints,
+                &cluster,
+                &HashMap::new(),
+                3,
+                |decision| {
+                    call_count += 1;
+                    if call_count == 1 {
+                        // Reject the first pick
+                        Err("capacity stale".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(call_count, 2);
+        // The second hypervisor should have been picked
+        assert!(!result.is_local_fallback);
+    }
+
+    #[test]
+    fn retry_exhaustion_fails() {
+        let cluster = GossipCluster::new();
+        cluster.update_report(make_report("hv-1", "az-1", 8, 0, 16384, 0));
+        cluster.update_report(make_report("hv-2", "az-2", 8, 0, 16384, 0));
+
+        let scheduler = Scheduler::new("hv-1".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints::default();
+
+        // All admission checks fail
+        let result = scheduler.schedule_with_retry(
+            1,
+            1024,
+            &constraints,
+            &cluster,
+            &HashMap::new(),
+            1, // max 1 retry = 2 attempts total (but only 2 hypervisors)
+            |_| Err("always reject".to_string()),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("rejected admission"));
+    }
+
+    #[test]
+    fn retry_local_fallback_skips_check() {
+        let cluster = GossipCluster::new(); // empty = fallback
+
+        let scheduler = Scheduler::new("hv-local".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints::default();
+        let mut called = false;
+
+        let result = scheduler
+            .schedule_with_retry(1, 1024, &constraints, &cluster, &HashMap::new(), 3, |_| {
+                called = true;
+                Err("should not be called".to_string())
+            })
+            .unwrap();
+
+        assert!(!called);
+        assert!(result.is_local_fallback);
+    }
+
+    #[test]
+    fn admission_result_accepted() {
+        let r = AdmissionResult::Accepted;
+        assert!(r.is_accepted());
+        let r2 = AdmissionResult::Rejected {
+            reason: "full".to_string(),
+        };
+        assert!(!r2.is_accepted());
+    }
+
+    #[test]
+    fn from_cli_parses_node_selector() {
+        let c = PlacementConstraints::from_cli(
+            Some("az-2".to_string()),
+            &["gpu=a100".to_string(), "tier=premium".to_string()],
+            None,
+            None,
+        );
+        assert_eq!(c.zone, Some("az-2".to_string()));
+        assert_eq!(c.node_selector.get("gpu"), Some(&"a100".to_string()));
+        assert_eq!(c.node_selector.get("tier"), Some(&"premium".to_string()));
     }
 }

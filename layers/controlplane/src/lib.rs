@@ -20,7 +20,10 @@ pub use gossip::{GossipCluster, GossipConfig, GossipNodeId, HypervisorGossipRepo
 pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
-pub use scheduler::{PlacementConstraints, PlacementDecision, Scheduler, SchedulerError};
+pub use scheduler::{
+    AdmissionResult, PlacementConstraints, PlacementDecision, Scheduler, SchedulerError,
+    MAX_ADMISSION_RETRIES,
+};
 pub use server::RaftServer;
 pub use state_machine::{PlacementEvent, RedbStateMachine};
 pub use types::{SyfrahNode, SyfrahRaftConfig};
