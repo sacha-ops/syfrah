@@ -1,1421 +1,1212 @@
-# ADR-005: Control Plane — Distributed Coordination
+# ADR-005: Control Plane — Distributed Consensus, Gossip, and Scheduling
 
 **Status**: Proposed
 **Date**: 2026-04-01
 **Decided by**: Sacha + team
-**Depends on**: ADR-001 (networking), ADR-002 (security groups/routes), ADR-003 (Forge), ADR-004 (hypervisor model)
+**Depends on**: ADR-001 (networking), ADR-002 (security groups + route tables), ADR-003 (Forge), ADR-004 (hypervisor model)
 
-## Context
+## 1. Context and motivation
 
-Today each hypervisor is independent. IPAM allocates IPs from a local bitmap. FDB entries are distributed via fabric peer announcements. Placement is "whichever server you happen to SSH into." There is no coordination across nodes for any mutation: no global IPAM, no cross-node scheduling, no unified resource registry.
+The data plane is designed. Fabric provides encrypted node-to-node connectivity (implemented). Forge is the per-node resource orchestrator that reconciles local reality against desired state (ADR-003). The hypervisor model formalizes the compute host resource and its placement in the Region → Zone → Hypervisor → VM hierarchy (ADR-004). The overlay delivers VPCs with VXLAN isolation, security groups, route tables, and NAT gateways (ADR-001, ADR-002).
 
-The result:
+What is missing is the **distributed brain** — the component that turns a collection of independent nodes into a single coherent platform. Today, each node operates in isolation:
 
-- Two hypervisors can allocate the same IP if they both process `vm create` concurrently against the same subnet.
-- An operator must SSH into a specific hypervisor to create a VM there. There is no "create a VM in zone eu-west-1" command that picks the right machine.
-- FDB distribution relies on fabric peer announcements — a broadcast mechanism with no consistency guarantees. If a node misses an announcement, it has no way to recover except by restarting.
-- There is no single view of "what VMs exist in the cluster." Each node only knows about its own VMs.
+- **No shared IPAM.** Two nodes can allocate the same IP address to different VMs. There is no cluster-wide uniqueness guarantee.
+- **No FDB distribution.** A node has no knowledge of VMs on other nodes. VXLAN forwarding between nodes is impossible without manually populated FDB entries.
+- **No cross-node scheduling.** There is no scheduler to decide which hypervisor should host a given VM. The operator must manually target a node.
+- **No single API.** The operator must know which node to talk to for which resource. There is no unified entry point.
+- **No coordinated security groups.** A security group change must be manually applied to every node hosting VMs with that SG.
+- **No automated failure recovery.** If a node dies, its VMs are lost. There is no mechanism to detect the failure and reschedule workloads.
 
-After this ADR is implemented: an operator types `syfrah compute vm create --zone eu-west-1` on ANY node. The system places the VM on the best hypervisor in that zone, allocates a globally unique IP through Raft consensus, commits the placement, the target node's Forge reconciles (creates the VM, wires networking), and FDB entries are derived from the authoritative placement map on every relevant node. The VM boots with connectivity to all other VMs in its VPC across all hypervisors.
+Without the control plane, Syfrah is a local VM manager that happens to have encrypted tunnels between nodes. With it, Syfrah becomes a distributed cloud platform where the operator manages resources at the cluster level and the platform handles placement, networking, and resilience.
 
-This is what turns a collection of independent hypervisors into a unified cloud.
+This ADR defines the control plane completely: Raft consensus via openraft, SWIM gossip via foca, the distributed scheduler, the API gateway with transparent leader forwarding, distributed IPAM, FDB derivation from Raft state, cluster health monitoring, failure modes, migration strategy, and implementation phases.
 
-### What this ADR covers
+### Why now
 
-- The two-layer architecture (Raft consensus + SWIM gossip)
-- Distributed IPAM via Raft
-- The scheduler (placement algorithm, scoring, admission)
-- FDB distribution derived from Raft state
-- Tenant API routing (any-node access)
-- CLI routing (transparent leader forwarding)
-- Bootstrap-to-distributed migration
-- The full state machine command set
-- Failure scenarios and consistency model
-- Implementation phases
+Forge (ADR-003) is designed to consume a local materialized view of desired state from redb — the output of the Raft state machine. The overlay (ADR-001, ADR-002) defines FDB entries, IPAM bitmaps, and security group rules that need cluster-wide consistency. The hypervisor model (ADR-004) defines the schedulable compute host that the scheduler places VMs onto. All of these depend on the control plane's state distribution and coordination. Defining the control plane now closes the loop: the full path from operator request to running VM across multiple nodes is specified.
 
-### What this ADR does NOT cover
+### Relationship to existing decisions
 
-- Product-level orchestration (managed databases, load balancers) — future ADR
-- IAM role enforcement on API endpoints — covered by api-architecture.md
-- Forge internals (reconciliation loop, capacity management, health checks) — ADR-003
-- Hypervisor registration and lifecycle — ADR-004
-- Security group rule evaluation and nftables generation — ADR-002
-- Overlay networking primitives (VXLAN, bridges, TAPs) — ADR-001
+- **ARCHITECTURE.md** — The control plane sits between Forge and the tenant API in the stack diagram. This ADR specifies its internals.
+- **ADR-001** — IPAM, FDB, VPC/subnet definitions become Raft state. FDB entries are derived from Raft placements, not gossip announcements.
+- **ADR-002** — Security groups, route tables, NAT gateways, and NICs are Raft state. Forge derives nftables rules from the Raft materialized view.
+- **ADR-003 (Forge)** — Forge consumes the local redb materialized view produced by the Raft state machine. Forge never reads the Raft log directly. The "desired state projection" defined in ADR-003 is produced by the state machine defined here.
+- **ADR-004 (Hypervisor)** — Hypervisor records are Raft state. The scheduler places VMs onto hypervisors. Gossip carries capacity telemetry for scheduling hints.
+- **state-and-reconciliation.md** — The reconciliation philosophy (Raft = desired, gossip = observed, Forge reconciles) is the operating model. This ADR defines the Raft and gossip layers that produce the inputs to that model.
 
-## What the Control Plane IS
-
-The control plane is the distributed coordination layer that makes the cluster behave as a single system. It runs on **every node** — there are no dedicated controller machines. Internally, one node is elected Raft leader for write operations. This election is automatic and invisible to operators.
-
-Two protocols, two purposes:
-
-1. **Raft consensus (openraft)** — strongly consistent state for everything that must never conflict: resource definitions, IP allocations, VM placements, hypervisor registry, VPC/subnet/SG configuration, org/project/env hierarchy.
-
-2. **SWIM gossip (foca)** — eventually consistent state for everything that describes what is happening right now: hypervisor capacity reports, node health/heartbeat, drain status, VM runtime status, node reachability.
-
-The control plane does NOT execute anything. It decides what should exist and where. Forge (ADR-003) executes those decisions locally on each node.
-
-## What the Control Plane is NOT
-
-- **Not a separate process.** The control plane is embedded in the syfrah daemon, alongside Forge, the fabric, and the API server. One binary, one process.
-- **Not a separate cluster.** There is no etcd cluster, no Consul deployment, no external coordination service. The Raft cluster IS the syfrah cluster.
-- **Not the execution layer.** The control plane commits "VM web-1 should run on hv-002." Forge on hv-002 actually creates the VM. The control plane never calls `cloud-hypervisor` or `ip link`.
-- **Not an event bus.** Gossip carries advisory state, not commands. The reconciliation loop on each Forge reads Raft state (the materialized view in redb) and acts on it. There is no event-driven dispatch from the control plane to Forge.
-- **Not a central API gateway.** Every node can accept API requests. The control plane handles forwarding writes to the Raft leader transparently. There is no single point of entry.
-
-## Design Principles
-
-1. **Embedded, not external.** The control plane ships inside the syfrah binary. No additional infrastructure to deploy, monitor, or maintain. A single node running syfrah has a fully functional control plane (single-node Raft, instant commits, zero overhead).
-
-2. **Raft for consistency, gossip for liveness.** These two protocols solve different problems. Never mix them. Gossip tells you "what's happening now." Raft tells you "what should exist." If losing or duplicating a piece of state would violate a user-facing invariant (double IP, orphan VM, unauthorized access), it goes in Raft. If staleness just means slightly degraded scheduling decisions, it goes in gossip.
-
-3. **Reads are local, writes go through the leader.** Every node has a local copy of the full Raft state machine (redb). Reads are served instantly from local state. Writes are forwarded to the Raft leader, committed with majority quorum, then applied to every node's local redb.
-
-4. **The scheduler runs on the leader.** Only the leader has the most up-to-date committed state. The scheduler consumes gossip for capacity hints, but the placement decision is a Raft write — atomic, replicated, authoritative.
-
-5. **Derived state is recomputed, not distributed.** FDB entries, nftables rules, ARP proxy tables — all are computed locally by each Forge from the Raft state machine. There is no separate distribution protocol for derived state.
-
-6. **The CLI does not change.** The operator types the same commands on any node. Forge transparently routes mutations to the Raft leader. The CLI has no concept of Raft, leader, or consensus.
-
-7. **Migration is incremental.** Bootstrap mode (local redb) already works. Adding openraft means writes go through the Raft log before reaching redb. The read path (Forge reads redb) is unchanged. The migration is adding a write path, not rewriting the system.
-
-## Two-Layer Architecture: Raft + Gossip
+## 2. Architecture overview
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Raft Consensus (openraft)                                       │
-│  Strongly consistent — linearizable writes, sequential reads     │
-│                                                                  │
-│  What goes here:                                                 │
-│  - Org / Project / Environment definitions                       │
-│  - VPC / Subnet / VNI allocations                                │
-│  - Security Group definitions and rules                          │
-│  - Route Table definitions and routes                            │
-│  - NAT Gateway definitions                                       │
-│  - IPAM bitmaps (IP allocations per subnet)                      │
-│  - VM definitions (desired spec)                                 │
-│  - VM placement decisions (VM → hypervisor mapping)              │
-│  - Volume definitions and attachments                            │
-│  - Hypervisor registry (static config, state, labels, taints)    │
-│  - VPC peering relationships                                     │
-│  - Cluster membership (which nodes are in the Raft group)        │
-│                                                                  │
-│  Protocol: leader-based. Writes → leader → replicate to          │
-│  majority → commit → apply to each node's redb state machine.    │
-├──────────────────────────────────────────────────────────────────┤
-│  SWIM Gossip (foca)                                              │
-│  Eventually consistent — converges in O(log N) rounds            │
-│                                                                  │
-│  What goes here:                                                 │
-│  - HypervisorReport (capacity, utilization, VM count, health)    │
-│  - NodeReport (basic health for non-hypervisor nodes)            │
-│  - Drain status                                                  │
-│  - Forge version, uptime                                         │
-│  - Node reachability                                             │
-│                                                                  │
-│  Protocol: decentralized. Each node probes peers, piggybacks     │
-│  state updates on protocol messages. No leader, no quorum.       │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Source of truth table
-
-Every piece of state has exactly one authoritative source. This table is the definitive reference.
-
-| State | Source of truth | Stored in | Consistency | Notes |
-|---|---|---|---|---|
-| Org/Project/Env definitions | Tenant API → Raft | Raft log → redb | Strong | Authoritative hierarchy |
-| VPC definition (VNI, CIDR) | Tenant API → Raft | Raft log → redb | Strong | VNI allocated by Raft (uniqueness) |
-| Subnet definition (CIDR, gateway) | Tenant API → Raft | Raft log → redb | Strong | Within VPC CIDR |
-| IP allocations (bitmap + records) | Raft (leader processes sequentially) | Raft log → redb | Strong | Must never double-allocate |
-| MAC addresses | Derived from IP | Computed (`02:00:{ip_hex}`) | N/A | Deterministic, not stored |
-| Security group definitions + rules | Tenant API → Raft | Raft log → redb | Strong | Authoritative |
-| Route table definitions + routes | Tenant API → Raft | Raft log → redb | Strong | Authoritative |
-| NAT Gateway definitions | Tenant API → Raft | Raft log → redb | Strong | Authoritative |
-| VM desired spec (vCPU, memory, image, network) | Tenant API → Raft | Raft log → redb | Strong | What the user asked for |
-| VM placement (VM → hypervisor) | Scheduler → Raft | Raft log → redb | Strong | One hypervisor per VM |
-| Volume definitions + attachments | Tenant API → Raft | Raft log → redb | Strong | Must be consistent (one VM at a time) |
-| Hypervisor registry (specs, state, labels, taints) | Registration → Raft | Raft log → redb | Strong | Authoritative canonical record |
-| VPC peering relationships | Tenant API → Raft | Raft log → redb | Strong | Authoritative |
-| Cluster membership | Raft internal | Raft log | Strong | Who is in the Raft group |
-| Hypervisor capacity (allocatable) | Forge (local redb) → gossip | Gossip (in-memory) | Eventual | Advisory for scheduler |
-| Hypervisor health/heartbeat | Forge → gossip | Gossip (in-memory) | Eventual | Advisory |
-| Hypervisor utilization (CPU/mem %) | Forge → gossip | Gossip (in-memory) | Eventual | Scheduling hint |
-| VM runtime status (running/stopped/error) | Forge → gossip | Gossip (in-memory) | Eventual | Observed reality |
-| Drain status | Forge → gossip | Gossip (in-memory) | Eventual | Scheduling exclusion |
-| VXLAN bridges (per node) | Derived from Raft (VPC + VM placement) | Forge creates locally | Derived | Exists only if node has VMs in VPC |
-| FDB entries (MAC → VTEP) | Derived from Raft (IP allocation + VM placement) | Forge populates locally | Derived | Recomputed from Raft state |
-| ARP proxy entries | Derived from Raft (IP allocation) | Forge populates locally | Derived | Recomputed from Raft state |
-| nftables rules | Derived from Raft (SG rules + VM/NIC mapping) | Forge applies locally | Derived | Recomputed from Raft state |
-| DNS records | Derived from Raft (IP allocation + VM name) | CoreDNS zone files (local) | Derived | Generated by Forge from Raft state |
-
-**The invariant**: Raft is truth. Derived state is recomputed from Raft. Gossip is advisory. If derived state and observed state disagree, Forge reconciles.
-
-## Raft Consensus (openraft)
-
-### Why Raft
-
-The control plane needs a consensus algorithm that provides:
-
-- **Linearizable writes.** Two concurrent IP allocations against the same subnet must be serialized. Two concurrent VM placements must not double-book a hypervisor's last available slot.
-- **Automatic leader election.** When the leader fails, a new leader must be elected without operator intervention.
-- **Log replication.** Every committed mutation must be replicated to a majority of nodes before being acknowledged.
-- **Embedded operation.** No external service dependency. The consensus algorithm runs inside the syfrah binary.
-- **Single-node degeneracy.** With one node, Raft must work with zero overhead — the node is its own leader, commits are instant.
-
-openraft satisfies all of these. It is a Rust, async, tokio-native Raft implementation used in production by Databend. It supports 1-N nodes, provides the three-trait abstraction (`RaftLogStorage`, `RaftStateMachine`, `RaftNetwork`), and handles leader election, log replication, snapshots, and cluster membership changes.
-
-Alternatives considered are documented in "Rejected Alternatives."
-
-### What goes into Raft
-
-Every mutation that changes the desired state of the cluster. Specifically:
-
-- Resource CRUD: orgs, projects, environments, VPCs, subnets, security groups, rules, route tables, routes, NAT gateways, VMs, volumes, volume attachments, VPC peerings
-- IPAM: IP allocation and release (bitmap mutations)
-- Scheduling: VM placement decisions (VM → hypervisor mapping)
-- Hypervisor lifecycle: registration, activation, draining, decommissioning, label/taint updates
-- Cluster membership: adding/removing Raft voters and learners
-
-Nothing else. Gossip data never enters the Raft log. Derived state (FDB, nftables, ARP proxy) is never stored in Raft — it is computed from Raft state by each Forge.
-
-### State Machine
-
-The Raft state machine is the function that takes a committed log entry and applies it to produce updated state. In Syfrah, the state machine backend is **redb** — the same embedded key-value store used in bootstrap mode.
-
-```
-Committed Raft log entry
-    │
-    ▼
-State machine apply function
-    │
-    ├── Validates the command (idempotency check, precondition check)
-    ├── Applies mutations to redb tables (atomic transaction)
-    ├── Returns the result (success/failure + any allocated values)
-    └── Optionally triggers immediate Forge reconciliation
-```
-
-The state machine is deterministic: given the same log entries in the same order, every node produces the same redb state. This is the foundation of Raft's consistency guarantee.
-
-**redb tables managed by the state machine:**
-
-| Table | Key | Value | Purpose |
-|---|---|---|---|
-| `orgs` | `OrgId` | `Org` | Organization definitions |
-| `projects` | `ProjectId` | `Project` | Project definitions |
-| `environments` | `EnvironmentId` | `Environment` | Environment definitions |
-| `vpcs` | `VpcId` | `Vpc` | VPC definitions (VNI, CIDR) |
-| `subnets` | `SubnetId` | `Subnet` | Subnet definitions |
-| `ipam_bitmaps` | `SubnetId` | `Bitmap` | IP allocation bitmaps |
-| `ip_allocations` | `(SubnetId, Ipv4Addr)` | `IpAllocation` | IP allocation records |
-| `security_groups` | `SecurityGroupId` | `SecurityGroup` | SG definitions |
-| `sg_rules` | `RuleId` | `SecurityGroupRule` | SG rules |
-| `route_tables` | `RouteTableId` | `RouteTable` | Route table definitions |
-| `routes` | `RouteId` | `Route` | Route entries |
-| `nat_gateways` | `NatGatewayId` | `NatGateway` | NAT GW definitions |
-| `network_interfaces` | `NicId` | `NetworkInterface` | NIC records |
-| `vms` | `VmId` | `Vm` | VM desired state |
-| `vm_placements` | `VmId` | `VmPlacement` | VM → hypervisor mapping |
-| `volumes` | `VolumeId` | `Volume` | Volume definitions |
-| `volume_attachments` | `VolumeId` | `VolumeAttachment` | Volume → VM mapping |
-| `hypervisors` | `HypervisorId` | `Hypervisor` | Hypervisor registry |
-| `vpc_peerings` | `PeeringId` | `VpcPeering` | VPC peering relationships |
-| `vni_counter` | `()` | `u32` | Next available VNI |
-
-These are the same tables Forge reads during reconciliation (ADR-003). In bootstrap mode, Forge reads and writes them directly. In distributed mode, Forge reads them (the state machine output), but writes go through Raft.
-
-### Log Storage
-
-openraft requires a durable log of all uncommitted and recently committed entries. Our implementation:
-
-- **Backend**: dedicated redb table (`raft_log`) or a separate file-backed append-only log.
-- **Durability**: every append is fsync'd before acknowledging. A crash between append and apply is safe — Raft replays uncommitted entries on restart.
-- **Compaction**: after a snapshot is taken, log entries before the snapshot index are discarded. This bounds log growth.
-
-The log storage is separate from the state machine storage. The log contains raw commands; the state machine (redb tables above) contains the applied result.
-
-### Snapshots
-
-Snapshots are periodic captures of the full state machine. They serve two purposes:
-
-1. **Log compaction.** Without snapshots, the Raft log grows unboundedly. After a snapshot at index N, log entries 1..N can be discarded.
-2. **Fast node recovery.** A new or rejoining node receives the latest snapshot instead of replaying the entire log from the beginning.
-
-**Snapshot strategy:**
-
-- Trigger: every 10,000 committed entries, or when a new node joins and needs catch-up.
-- Format: a redb database file serialized to bytes (or a structured export of all tables).
-- Transfer: the leader sends the snapshot to the joining node over the fabric (HTTP on `syfrah0`).
-- Application: the receiving node replaces its local redb with the snapshot, then replays any log entries after the snapshot index.
-
-Snapshots are not incremental in Phase 1. For clusters with moderate state (thousands of VMs, not millions), a full snapshot is small enough (single-digit megabytes) to transfer quickly.
-
-### Leader Election
-
-openraft handles leader election automatically. The key parameters:
-
-| Parameter | Default | Rationale |
-|---|---|---|
-| Election timeout | 1000-2000ms (randomized) | Must be > heartbeat interval to avoid spurious elections |
-| Heartbeat interval | 300ms | Keeps followers aware the leader is alive |
-| Election timeout randomization | 1000ms range | Prevents split votes from synchronized timeouts |
-
-**What happens during election:**
-
-1. The current leader stops sending heartbeats (crash, network issue, or graceful shutdown).
-2. After the election timeout expires, a follower transitions to candidate state and requests votes.
-3. The candidate with the most up-to-date log wins (Raft's log-completeness property).
-4. The new leader begins accepting writes and sending heartbeats.
-5. Total failover time: 1-3 seconds in normal conditions.
-
-During election, **writes are blocked** (no leader to process them). Reads from local state machines continue uninterrupted — they may be slightly stale (last committed state before the leader failed), but this staleness is bounded and safe.
-
-### Cluster Membership (adding/removing nodes)
-
-Raft cluster membership changes (adding a voter, removing a voter, converting voter to learner) are themselves Raft log entries. openraft supports joint consensus for safe membership transitions.
-
-**Adding a node:**
-
-1. New node joins the WireGuard mesh (fabric layer).
-2. Operator (or auto-discovery) triggers `AddLearner(node_id)` — the new node replicates the log but does not vote.
-3. The learner catches up to the leader's log.
-4. Once caught up, the leader promotes the learner to voter via `ChangeMembership`.
-5. The new node now participates in elections and quorum.
-
-**Removing a node:**
-
-1. Operator triggers `ChangeMembership` removing the node from the voter set.
-2. The node becomes a learner (still replicates, doesn't vote).
-3. Optionally, the node is fully removed from the Raft group.
-4. Quorum requirement adjusts automatically.
-
-**Safety:** Raft guarantees that membership changes are committed with the old configuration's quorum before the new configuration takes effect. Split-brain during membership change is impossible.
-
-### Read vs Write Paths
-
-**Write path (linearizable):**
-
-```
-Client request (e.g., "create VM")
-    │
-    ▼
-Any node receives the request
-    │
-    ├── This node IS the leader → process locally
-    └── This node is NOT the leader → forward to leader
-                                         │
-                                         ▼
-Leader validates the command
-    │
-    ▼
-Leader appends to local log
-    │
-    ▼
-Leader replicates to followers
-    │
-    ▼
-Majority acknowledge → entry is committed
-    │
-    ▼
-State machine applies the entry to redb (on all nodes)
-    │
-    ▼
-Leader returns result to client
-```
-
-**Read path (default: eventually consistent):**
-
-```
-Client request (e.g., "list VMs")
-    │
-    ▼
-Any node receives the request
-    │
-    ▼
-Read directly from local redb (state machine output)
-    │
-    ▼
-Return result
-```
-
-The local redb may be one or two heartbeats behind the leader. For most reads (listing VMs, showing VPC config, displaying hypervisor status), this staleness is imperceptible and acceptable.
-
-**Read path (linearizable, on request):**
-
-For reads that must reflect the latest committed state (rare — e.g., "did my IP allocation succeed?"), the client can request a linearizable read:
-
-1. The request is forwarded to the leader.
-2. The leader confirms it is still the leader (by checking that a majority of followers are responsive).
-3. The leader reads from its local state machine (which is guaranteed to be up-to-date).
-4. The leader returns the result.
-
-This adds one round-trip to the leader. Most clients never need it — the write path already returns the result of the mutation.
-
-### Consistency Guarantees
-
-| Operation | Guarantee | Mechanism |
-|---|---|---|
-| Writes (create, update, delete) | Linearizable | Raft leader processes sequentially, commits with majority |
-| Default reads | Eventually consistent | Local state machine, bounded staleness (1-2 heartbeats) |
-| Linearizable reads (explicit) | Linearizable | Leader read with quorum confirmation |
-| Gossip reads | Best-effort eventual | SWIM protocol, O(log N) convergence |
-
-## SWIM Gossip
-
-### What goes into Gossip
-
-Gossip carries **advisory, non-authoritative** state. It is consumed by the scheduler for placement hints and by dashboards for operational visibility. It is never the source of truth for mutations.
-
-| Data | Producer | Consumer | Staleness tolerance |
-|---|---|---|---|
-| `HypervisorReport` (capacity, utilization, VM count, health, labels, taints, state) | Forge on each hypervisor | Scheduler, dashboards | 2-10 seconds |
-| `NodeReport` (basic health for non-hypervisor nodes) | Forge on each node | Dashboards | 2-10 seconds |
-| Drain status | Forge (from Raft state) | Scheduler | 2-10 seconds |
-| Forge version, uptime | Forge | Dashboards | Minutes |
-| Node reachability | SWIM protocol | Scheduler, failure detector | Seconds |
-
-### Protocol (SWIM with suspicion)
-
-The gossip layer uses **SWIM (Scalable Weakly-consistent Infection-style Membership)** via the `foca` crate. The protocol operates over the WireGuard fabric — all gossip messages are encrypted in transit.
-
-**Protocol messages:**
-
-1. **Ping**: direct probe to a random peer. Expects an Ack.
-2. **Ping-req**: if Ping times out, ask K random peers to probe the target indirectly.
-3. **Ack**: response to Ping/Ping-req.
-
-**Failure detection sequence:**
-
-```
-Node A probes Node C (Ping)
-    │
-    ├── Ack received within timeout → Node C is alive
-    │
-    └── No Ack → Node A asks Node B to probe Node C (Ping-req)
-         │
-         ├── Node B gets Ack from C → C is alive (reported to A)
-         │
-         └── No Ack → Node C is marked as Suspect
-              │
-              ├── Suspect timeout expires, no refutation → Node C is Dead
-              │
-              └── Node C sends any message → Suspect cleared, C is Alive
-```
-
-**Tuning parameters:**
-
-| Parameter | Default | Effect |
-|---|---|---|
-| Protocol period | 1 second | How often each node probes a random peer |
-| Ping timeout | 500ms | Time to wait for a direct Ack |
-| Suspicion timeout | 5 seconds | How long a node stays Suspect before being declared Dead |
-| Indirect probes (K) | 3 | Number of peers asked for indirect probe |
-
-With these defaults, failure detection takes 5-10 seconds. This is fast enough for scheduling exclusion but not so aggressive that network jitter causes false positives.
-
-### Dissemination (piggyback on protocol messages)
-
-Gossip updates (HypervisorReport, health changes, member events) are **piggybacked on protocol messages** rather than sent as separate packets. When Node A sends a Ping to Node B, it includes any pending state updates. This provides:
-
-- **Zero extra network overhead** — updates ride on messages that would be sent anyway.
-- **O(log N) convergence** — each update reaches all N nodes in O(log N) protocol rounds (~2-5 seconds for clusters of 10-100 nodes).
-- **Bounded bandwidth** — the number of piggybacked updates per message is capped. High-priority updates (member events) take precedence over low-priority updates (capacity reports).
-
-### Failure Detection
-
-Gossip-based failure detection is the first line of defense. It is fast but advisory — it does not trigger authoritative state changes on its own.
-
-| Event | Detection time | Action |
-|---|---|---|
-| Node stops responding | 5-10 seconds | Gossip marks node as Dead. Scheduler stops placing VMs. |
-| Node recovers | Next protocol round (1 second) | Gossip marks node as Alive. Scheduler resumes placing VMs. |
-| Intermittent failures | Suspicion period (5 seconds) | Node is Suspect — scheduler may still place VMs (with lower score). |
-
-### Relationship to Raft
-
-Gossip and Raft are complementary but independent:
-
-- **Gossip does not participate in Raft.** Gossip membership is not the same as Raft membership. A node can be in the gossip pool (receiving health updates) without being a Raft voter.
-- **Raft does not depend on gossip.** If gossip fails entirely, Raft continues operating — writes still commit, reads still work. The scheduler loses capacity hints and falls back to Raft-only data (hypervisor records).
-- **Gossip informs Raft decisions.** The Raft leader runs a failure detector that reads gossip state. When gossip reports a node as Dead for >60 seconds, the leader MAY commit a `MarkHypervisorUnreachable` entry to Raft. This is a policy decision by the leader, not an automatic gossip-to-Raft bridge.
-
-```
-SWIM Gossip                          Raft Consensus
-    │                                     │
-    │  "Node C hasn't responded           │
-    │   for 15 seconds"                   │
-    │          │                          │
-    │          ▼                          │
-    │  Scheduler stops placing            │
-    │  VMs on Node C                      │
-    │          │                          │
-    │          │  (60 seconds pass)        │
-    │          ▼                          │
-    │  Leader's failure detector           │
-    │  reads gossip state                 │
-    │          │                          │
-    │          └──────────────────────────▶│
-    │                                     │  Leader commits:
-    │                                     │  MarkHypervisorUnreachable(C)
-    │                                     │
-    │                                     │  If HA VMs on C:
-    │                                     │  Leader commits:
-    │                                     │  RescheduleVm(vm_id, new_hv)
-```
-
-## Scheduler
-
-### What the Scheduler Does
-
-The scheduler is the component that decides **where** a new VM runs. It takes a VM creation request with optional placement constraints (zone, labels, anti-affinity) and selects the best hypervisor from the available pool.
-
-The scheduler runs on the **Raft leader only**. This is not an arbitrary choice — the leader has the most up-to-date committed state (VM placements, hypervisor records, IPAM). Running the scheduler on a follower would require forwarding the placement decision to the leader anyway, adding latency without benefit.
-
-The scheduler is invoked on:
-
-- `PlaceVm` — new VM needs a hypervisor
-- `RescheduleVm` — existing VM needs to move (node failure, drain)
-
-### Placement Algorithm (scoring model)
-
-The scheduler uses a **filter-then-score** model, consistent with the placement evaluation order defined in ADR-004.
-
-```
-VM creation request
-    │
-    ▼
-┌─────────────────────────────────┐
-│  Phase 1: Filter                │
-│                                 │
-│  Start with all hypervisors     │
-│  from Raft state                │
-│                                 │
-│  1. State == Available          │
-│  2. Zone constraint (if any)    │
-│  3. Label selector match        │
-│  4. Taint/toleration match      │
-│  5. Capacity >= requested       │
-│                                 │
-│  Result: candidate set          │
-└────────────┬────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────┐
-│  Phase 2: Score                 │
-│                                 │
-│  For each candidate:            │
-│  6. Anti-affinity penalty       │
-│  7. Spread-topology bonus       │
-│  8. Utilization score (gossip)  │
-│                                 │
-│  Result: ranked candidates      │
-└────────────┬────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────┐
-│  Phase 3: Commit                │
-│                                 │
-│  Select top candidate           │
-│  Commit PlaceVm to Raft         │
-│  Return hypervisor_id to caller │
-└─────────────────────────────────┘
-```
-
-### Constraint Evaluation Order
-
-The order matters — more restrictive constraints are evaluated first to prune the candidate set early.
-
-1. **State filter**: only hypervisors in `Available` state (from Raft). Excludes `Draining`, `Maintenance`, `Decommissioned`, `Disabled`.
-2. **Zone filter**: if `--zone` specified, only hypervisors in that zone (from Raft).
-3. **Node-selector filter**: if `--node-selector` specified, only hypervisors whose labels match all selectors (from Raft).
-4. **Taint filter**: exclude hypervisors with taints not tolerated by the VM spec (from Raft).
-5. **Capacity filter**: exclude hypervisors without enough allocatable vCPUs, memory, and local disk. Capacity is read from gossip (`HypervisorReport`). If gossip data is unavailable for a hypervisor, it is excluded (fail-safe).
-
-If no candidates remain after filtering, the scheduler returns an error: `COMPUTE_INSUFFICIENT_RESOURCES` with a message indicating which constraint eliminated all candidates.
-
-### Anti-affinity and Spread
-
-6. **Anti-affinity**: if `--anti-affinity-group` specified, penalize hypervisors that already host VMs in that group (from Raft's VM placement records). Hard anti-affinity fails if no separate hypervisor is available; soft anti-affinity (default) applies a scoring penalty.
-7. **Spread-topology**: if `--spread-topology zone` specified, prefer zones with fewer VMs from this group (from Raft). This distributes replicas across failure domains.
-
-### Resource Scoring (gossip-based)
-
-8. **Utilization score**: from gossip `HypervisorReport`, prefer hypervisors with lower actual utilization (`host_cpu_percent`, `host_memory_percent`). The default strategy is **spreading** (distribute load evenly for resilience). Bin-packing (fill one node before using the next, for cost efficiency) is configurable per-org.
-
-Scoring formula (spreading):
-```
-score = (1.0 - cpu_utilization) * 0.5 + (1.0 - memory_utilization) * 0.5
-```
-
-Gossip staleness: the utilization data may be 2-10 seconds old. This is acceptable for scoring — the scheduler picks the best-known candidate, and Forge's admission control (below) provides the hard guarantee.
-
-### Placement Commit (Raft write)
-
-9. **Select** the highest-scoring hypervisor.
-10. **Commit** a `PlaceVm { vm_id, hypervisor_id, ... }` entry to the Raft log.
-11. Once committed, the placement is authoritative. Every node's state machine applies it to the `vm_placements` table.
-12. The target hypervisor's Forge sees the new VM in its materialized view and begins reconciliation.
-
-### Forge Admission Recheck
-
-Even after the scheduler selects a hypervisor, Forge performs **local admission control** before creating the VM. This guards against race conditions where:
-
-- The gossip capacity was stale (another VM was placed concurrently).
-- The hypervisor's actual available resources changed between scheduling and execution.
-
-Forge checks: does this hypervisor have enough allocatable vCPUs, memory, and local disk for this VM? If yes, proceed. If no, reject.
-
-### Retry on Rejection
-
-If Forge rejects the placement:
-
-1. Forge reports the rejection via gossip (capacity updated).
-2. The control plane detects the rejection (Forge sets VM phase to `Failed` with reason `AdmissionRejected`).
-3. The leader's reconciler observes the failed VM and re-invokes the scheduler.
-4. The scheduler excludes the rejected hypervisor (its gossip capacity is now updated) and picks a new one.
-5. A new `PlaceVm` is committed to Raft.
-6. Maximum retries: 3. After 3 rejections, the VM transitions to `Failed` with `COMPUTE_INSUFFICIENT_RESOURCES`.
-
-### Future: In-flight Reservations
-
-The current design has a TOCTOU gap: between the scheduler reading gossip capacity and Forge checking actual capacity, another placement may consume the resources. The admission recheck + retry mitigates this.
-
-A future optimization is **in-flight reservations**: the scheduler temporarily reserves capacity on the target hypervisor (via a Raft write) before committing the full placement. Forge honors reservations when checking admission. Reservations expire after a configurable timeout (default: 60 seconds, as specified in ADR-003's `reservation_expiry_secs`). This is deferred to Phase 4 to avoid premature complexity.
-
-## Distributed IPAM
-
-### Global Uniqueness via Raft
-
-IP allocation is the canonical example of why distributed consensus exists. Without Raft:
-
-- Node A allocates `10.0.1.5` for VM-1 from its local bitmap.
-- Concurrently, Node B allocates `10.0.1.5` for VM-2 from its local bitmap.
-- Both succeed locally. Conflict.
-
-With Raft, all IP allocations go through the leader. The leader processes them sequentially. No conflicts are possible.
-
-### Allocation: Raft Write
-
-```
-AllocateIp { subnet_id, vm_id }
-    │
-    ▼
-Leader's state machine:
-    │
-    1. Read bitmap for subnet_id from redb
-    2. Find first available bit (scanning from .3)
-    3. Set the bit
-    4. Create IpAllocation record { ip, subnet_id, vm_id, mac, state: Reserved }
-    5. Write updated bitmap + allocation record to redb
-    6. Return allocated IP + MAC to caller
-```
-
-The entire operation is atomic (single redb transaction within the state machine apply). The bitmap and allocation record are updated together. No partial state.
-
-### Release: Raft Write
-
-```
-ReleaseIp { subnet_id, ip }
-    │
-    ▼
-Leader's state machine:
-    │
-    1. Read bitmap for subnet_id from redb
-    2. Clear the bit for the given IP
-    3. Delete or update IpAllocation record (state → Released or delete)
-    4. Write updated bitmap to redb
-```
-
-### No More Per-Node IPAM
-
-In the distributed control plane, there is **no per-node IPAM**. The bitmap lives in the Raft state machine. Every node has a local copy (redb), but only the leader mutates it. This is the critical change from ADR-001's design, which assumed a per-node bitmap.
-
-The per-node bitmap was necessary in bootstrap mode (single node, no coordination). With Raft, the bitmap is globally consistent. A VM on hypervisor A and a VM on hypervisor B in the same subnet will always get unique IPs.
-
-### Migration from Local IPAM
-
-1. **Bootstrap mode (today)**: per-node bitmap in local redb. Works for single-node deployments.
-2. **Control plane migration**: the local redb IS the Raft state machine. When openraft is introduced, the existing bitmap becomes the initial Raft state (via snapshot import). No data migration needed — the table structure is unchanged.
-3. **Multi-node**: once Raft is running, all IP allocations go through the leader. The local bitmap on each node is updated by the state machine apply (replicated from the leader's committed log entries).
-
-## FDB Distribution
-
-### Derived from Raft State
-
-FDB entries tell each VXLAN bridge where to send frames destined for a given MAC address. In the current design (ADR-001), FDB entries are distributed via fabric peer announcements — a fire-and-forget broadcast mechanism.
-
-With the control plane, FDB entries are **derived from Raft state**. The authoritative data is:
-
-- `vm_placements` table: which VM (and its MAC/IP) is on which hypervisor
-- `vpcs` table: which VPCs exist and their VNIs
-- `hypervisors` table: each hypervisor's fabric IPv6 (VTEP address)
-
-From these three tables, each Forge can compute the complete FDB table for every VPC that has VMs on its node.
-
-### On Raft Commit of New VM Placement
-
-When a `PlaceVm` entry is committed:
-
-1. Every node's state machine applies it to the `vm_placements` table.
-2. Every Forge that manages VMs in the same VPC detects the new placement during reconciliation.
-3. Each Forge computes the FDB entry: `MAC → remote hypervisor's fabric IPv6`.
-4. Each Forge applies the FDB entry to the local VXLAN bridge: `bridge fdb add {mac} dev syfvx-{vpc_id} dst {hypervisor_fabric_ipv6}`.
-5. Each Forge adds the ARP proxy entry: `ip neigh add {vm_ip} lladdr {mac} dev syfvx-{vpc_id} nud permanent`.
-
-### On Raft Commit of VM Deletion
-
-When a `RemoveVm` entry is committed:
-
-1. Every node's state machine removes the entry from `vm_placements`.
-2. Every Forge in the same VPC detects the removal during reconciliation.
-3. Each Forge removes the FDB entry and ARP proxy entry for that VM.
-
-### Forge Reconciliation Rebuilds FDB from Raft State on Restart
-
-If a node restarts, its Forge rebuilds the entire FDB table from scratch:
-
-1. Read all `vm_placements` for VPCs that have VMs on this node.
-2. For each remote VM in those VPCs, compute the FDB entry.
-3. Apply all FDB entries to the local VXLAN bridges.
-
-No gossip replay needed. No fabric announcement catch-up needed. The Raft state machine (local redb) has the complete, authoritative placement map. FDB is always rebuildable.
-
-### No Gossip for FDB
-
-This is a deliberate design decision. In the pre-control-plane design (ADR-001), FDB entries are distributed via gossip-like fabric announcements. With the control plane, this is replaced entirely:
-
-- **Before**: Forge creates VM → broadcasts `VmPlacement` announcement to all peers → peers update FDB.
-- **After**: Scheduler commits `PlaceVm` to Raft → all nodes apply it to redb → each Forge derives FDB from redb.
-
-The gossip path is eliminated for FDB. This is more reliable (no missed announcements), more consistent (every node derives from the same authoritative state), and simpler (one source of truth instead of two).
-
-## Tenant API
-
-### Where It Runs
-
-The tenant-facing API runs on **every node**, served by axum on the fabric IPv6 address. External access is through designated gateway nodes (see api-architecture.md) that terminate TLS and validate API keys. Internal access (server CLI, node-to-node) uses HTTP/JSON over the WireGuard fabric.
-
-### Request Flow
-
-```
-External client (laptop CLI, Terraform, SDK)
-    │
-    ▼
-Gateway node (TLS termination, API key validation, rate limiting)
-    │
-    ▼
-Internal fabric (HTTP/JSON over syfrah0)
-    │
-    ▼
-Any node receives the request
-    │
-    ├── Read operation → serve from local redb (eventually consistent)
-    │
-    └── Write operation → forward to Raft leader
+Operator / Terraform / API client
          │
          ▼
-    Leader validates, appends to Raft log, replicates to majority
+   Any node (Raft follower or leader)
+         │
+         ▼ forward to leader (if write)
+   Raft Leader (one node, auto-elected)
+         │
+         ├── Validate command
+         ├── Append to Raft log
+         ├── Replicate to majority
+         ├── Commit on quorum acknowledgment
          │
          ▼
-    Committed → state machine applies to redb on all nodes
+   State Machine (apply committed entries)
          │
          ▼
-    Leader returns result → forwarded back to client
-```
-
-### Read Path
-
-Reads are served from the local node's redb. This includes:
-
-- `GET /v1/vms` — list VMs
-- `GET /v1/vpcs` — list VPCs
-- `GET /v1/hypervisors` — list hypervisors
-- `GET /v1/subnets/{id}` — get subnet details
-
-The data may be up to one Raft heartbeat behind the leader (300ms in normal operation). For API responses, this staleness is imperceptible.
-
-### Write Path
-
-Writes are forwarded to the Raft leader. This includes:
-
-- `POST /v1/vms` — create VM (scheduler + IPAM + placement)
-- `DELETE /v1/vms/{id}` — delete VM
-- `POST /v1/vpcs` — create VPC
-- `POST /v1/security-groups/{id}/rules` — add SG rule
-
-The forwarding is transparent — the client receives the response as if the local node processed it.
-
-### Optimistic Reads vs Linearizable Reads
-
-By default, reads are optimistic (local state machine). This is the right choice for 99% of use cases. The client that just created a VM can see it immediately on the same node (the leader returned the result, which includes the committed state).
-
-For the rare case where a client needs to read state that was just written by a different client on a different node, a query parameter `?consistency=strong` forces a linearizable read through the leader. This is never needed in normal operation and is provided only for debugging and testing.
-
-## CLI Routing
-
-### Today: CLI → Local Forge Control Socket
-
-```
-syfrah compute vm create --name web-1 ...
-    │
-    ▼
-Unix domain socket (~/.syfrah/control.sock)
-    │
-    ▼
-Daemon (proto-Forge) handles locally
-```
-
-### Tomorrow: CLI → Local Forge → Raft Leader (if mutation)
-
-```
-syfrah compute vm create --name web-1 ...
-    │
-    ▼
-Unix domain socket (~/.syfrah/control.sock)
-    │
-    ▼
-Forge receives the request
-    │
-    ├── Read operation → serve from local redb
-    │
-    └── Write operation → forward over fabric to Raft leader
+   Local redb on EACH node (materialized view)
          │
          ▼
-    Leader processes (scheduler, IPAM, placement commit)
-         │
-         ▼
-    Result returned to Forge → returned to CLI
+   Forge on each node reads local redb → reconciles local reality
 ```
 
-**The CLI does not know about Raft.** It sends the same request to the same Unix socket. Forge handles routing transparently. Whether the local node is the leader or a follower is invisible to the operator.
+The control plane is embedded in every node. There is no dedicated controller. One node is elected Raft leader — this is automatic and invisible to the operator. The operator talks to any node; the platform routes the request correctly.
 
-**Latency impact:** A write on the leader node: ~1ms (local Raft commit with single-node quorum). A write forwarded to a remote leader: ~1-50ms depending on WireGuard latency between nodes. Both are well within acceptable CLI response times.
+Two complementary protocols divide the work:
 
-## Bootstrap to Distributed Migration
+| Protocol | Crate | What it handles | Consistency | Transport |
+|----------|-------|-----------------|-------------|-----------|
+| **Raft** | `openraft` | IP allocation, VM scheduling, VPC config, SGs, routes, NAT GWs, org/project/env, hypervisor records | Strong (linearizable writes, sequentially consistent reads) | HTTP/JSON over syfrah0 (WireGuard) |
+| **Gossip** | `foca` | Node liveness, capacity telemetry, hypervisor status hints, drain status | Eventual (~1-5 seconds) | UDP over syfrah0 (WireGuard) |
 
-### Phase 1 (today): Local redb, Single-Node Authoritative
+Raft state is **prescriptive** — what should exist. Gossip state is **descriptive** — what is actually happening. Forge reconciles the two.
 
-Forge reads and writes redb directly. redb is both the desired state store and the execution state store. There is no Raft, no log, no replication. This is bootstrap mode from ADR-003.
+## 3. openraft integration
 
-```
-CLI → Forge → redb (local read + write)
-                │
-                ▼
-         Reconciliation loop reads redb, acts locally
-```
+### The crate
 
-### Phase 2 (control plane): openraft Wraps Writes
+[openraft](https://github.com/databendlabs/openraft) is a Rust Raft implementation built on Tokio. It is async, embeddable, supports single-node through multi-node operation, and is used in production by Databend. It provides the consensus algorithm; we provide three trait implementations that connect it to our storage and network layers.
 
-openraft is introduced. The Raft state machine uses redb as its backend. Reads stay the same (Forge reads redb). Writes go through Raft.
+### Three traits to implement
 
-```
-CLI → Forge → Raft leader → log replication → commit
-                                                │
-                                                ▼
-                             State machine applies to redb
-                                                │
-                                                ▼
-                             Reconciliation loop reads redb, acts locally
-```
+**`RaftLogStorage`** — The append-only Raft log.
 
-### Migration Steps
+Stores uncommitted and committed log entries. Entries are appended during replication and truncated during compaction. Backed by a dedicated redb database file (`~/.syfrah/raft-log.redb`) separate from the state machine database. This separation ensures that log compaction and state machine operations do not contend on the same file.
 
-These are the concrete steps from ADR-003 v4:
+Key operations:
+- `append` — write entries to the log (called during replication)
+- `truncate` — remove entries after a given index (called during conflict resolution)
+- `get_log_state` — return the last log index and term
+- `read_log_entry` — read a single entry by index
+- `purge` — remove entries up to a given index (called after snapshot)
 
-1. **Control plane starts.** Import the existing local redb state as the initial Raft snapshot. This is the "genesis" of the Raft log — everything that existed in local redb becomes the starting state of the Raft state machine.
+**`RaftStateMachine`** — The state machine that applies committed entries.
 
-2. **openraft wraps redb writes.** Forge reads redb as before. Mutations are routed through the Raft log: client → Raft leader → log replication → commit → state machine apply → redb.
+When Raft commits an entry (quorum acknowledged), the state machine applies it to the local redb database (`~/.syfrah/state.redb`). This is the materialized view that Forge reads. Every node applies the same entries in the same order, producing identical state on all nodes.
 
-3. **CLI reroutes.** The control socket handler detects that the control plane is active and forwards mutations to the Raft leader instead of writing to local redb directly.
+Key operations:
+- `apply` — apply a batch of committed entries to redb (single transaction per batch)
+- `snapshot` — produce a snapshot of the current state for new node catch-up
+- `install_snapshot` — install a snapshot received from the leader (full state transfer)
+- `get_snapshot_builder` — return a builder that can produce a snapshot asynchronously
 
-4. **Add more nodes.** Each new node joins the Raft cluster as a learner, receives the snapshot, catches up, and is promoted to voter. From this point, all mutations are replicated.
+The apply function is the heart of the system. It receives a `RaftCommand` (defined in section 5), validates it against the current state, and mutates redb tables within a single ACID transaction. If validation fails (e.g., duplicate IP allocation), the command is applied as a no-op with an error result stored in the response.
 
-### No Downtime During Migration
+**`RaftNetwork`** — Network transport between Raft nodes.
 
-- Existing VMs continue running throughout the migration. Cloud Hypervisor processes are independent of the daemon.
-- The redb tables are unchanged. The same tables, same keys, same values. The only change is how writes reach them (Raft log instead of direct write).
-- There is no "migration window." Bootstrap mode works. Distributed mode works. The transition is: start the control plane, import the snapshot, and done.
+Implements point-to-point communication between Raft members. Uses HTTP/JSON over the WireGuard fabric interface (syfrah0). Each node exposes Raft RPC endpoints on a dedicated port (default 7200, configurable).
 
-## Network: openraft over WireGuard
+Endpoints:
+- `POST /raft/vote` — RequestVote RPC
+- `POST /raft/append` — AppendEntries RPC
+- `POST /raft/snapshot` — InstallSnapshot RPC
 
-### Raft RPC Transport
+All traffic is encrypted by WireGuard. No additional TLS layer is needed.
 
-Raft messages (vote requests, append entries, install snapshot) are sent as **HTTP/JSON over the WireGuard fabric** (`syfrah0`). This is the same transport used by the Forge API — no new networking layer needed.
+### Raft group membership
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/raft/vote` | POST | Request vote during election |
-| `/raft/append` | POST | Append entries (leader → follower) |
-| `/raft/snapshot` | POST | Install snapshot (leader → learner) |
-| `/raft/metrics` | GET | Raft metrics (leader, term, commit index) |
+Every node that joins the fabric becomes a Raft member. The membership model:
 
-### Same Network as Forge API
+- **Voter nodes**: participate in leader election and quorum. Default for the first 5 nodes.
+- **Non-voter (learner) nodes**: replicate the full Raft log and maintain an identical redb, but do not vote. Used for clusters larger than 5-7 nodes to keep quorum fast while still distributing state everywhere.
 
-The Raft RPC server runs alongside the Forge API on the same `syfrah0` bind address. Raft listens on a separate port:
+The Raft group is the full set of nodes. Every hypervisor and every non-hypervisor node participates. Non-hypervisor nodes (routers, monitoring boxes) still need the Raft state for FDB population, SG enforcement, and API serving.
 
-| Service | Port | Transport |
-|---|---|---|
-| Forge API | 7100 | HTTP/JSON over syfrah0 |
-| Raft RPC | 7200 | HTTP/JSON over syfrah0 |
+### Leader election
 
-Both are bound exclusively to the fabric IPv6 address. Neither is reachable from the public internet.
+openraft handles leader election automatically. Configuration:
 
-### WireGuard Provides Encryption
+- **Heartbeat interval**: 500ms
+- **Election timeout**: 1000-2000ms (randomized to prevent split votes)
+- **Minimum election timeout**: 1000ms
 
-All Raft messages are encrypted by WireGuard. No additional TLS is needed for Raft RPC in Phase 1. The WireGuard mesh is the trust boundary — only nodes in the mesh can participate in Raft.
+When the leader stops sending heartbeats (crash, network issue), followers wait for the election timeout to expire, then start an election. A new leader is typically elected within 1-2 seconds.
 
-In Phase 2 (future), Raft messages may additionally be signed per-request to guard against a compromised mesh member injecting Raft messages. This is defense-in-depth, not a current requirement.
+### Log replication
 
-## Failure Scenarios
+The leader appends entries to its local log, then replicates to all followers in parallel. Once a majority of voters acknowledge, the entry is committed. The leader then responds to the client.
 
-### Leader Failure → Automatic Re-election
+Replication is pipelined — the leader does not wait for one batch to be acknowledged before sending the next. This keeps throughput high even with cross-datacenter latency.
 
-**Scenario:** The Raft leader crashes or loses network connectivity.
+### Snapshot and compaction
 
-**Detection:** Followers notice missing heartbeats after the election timeout (1-2 seconds).
+Over time, the Raft log grows unboundedly. Snapshots solve this:
 
-**Recovery:**
-1. A follower with the most up-to-date log transitions to candidate.
-2. It requests votes from other nodes.
-3. If it receives a majority of votes, it becomes the new leader.
-4. Total failover: 1-3 seconds.
+1. Periodically (every 10,000 entries or 1 hour, whichever comes first), the leader creates a snapshot of the current redb state.
+2. The snapshot is a compressed copy of the redb database file.
+3. Log entries up to the snapshot's last applied index are purged.
+4. When a new node joins (or a node falls far behind), the leader sends the snapshot instead of replaying the entire log.
 
-**Impact during failover:**
-- Writes are blocked for 1-3 seconds (no leader to process them).
-- Reads continue from local state machines (slightly stale but available).
-- Existing VMs are unaffected (Cloud Hypervisor processes are independent).
-- In-flight writes that were not committed are retried by the client.
+Snapshot transfer uses the same HTTP transport, streamed in chunks to avoid memory pressure.
 
-### Network Partition → Minority Side Read-only
+### Transport: HTTP over WireGuard fabric
 
-**Scenario:** A network partition splits the cluster into two groups.
+All Raft traffic travels over the WireGuard mesh interface (syfrah0). This provides:
 
-**Majority side (has quorum):**
-- Elects a leader (or keeps the existing one).
-- Continues accepting writes.
-- Gossip propagates within the majority group.
-- VMs keep running. New VMs can be created.
+- **Encryption**: ChaCha20-Poly1305 (WireGuard)
+- **Authentication**: only mesh members can participate
+- **WAN tolerance**: WireGuard handles NAT traversal, keepalives, and roaming
+- **IPv6 addressing**: each node is reachable at its deterministic fabric IPv6 address
 
-**Minority side (no quorum):**
-- Cannot elect a leader. Writes are blocked.
-- Local reads continue from stale state machines.
-- Gossip propagates within the minority group.
-- Existing VMs keep running. No new VMs, no IP allocation, no config changes.
+The Raft network implementation maps each Raft node ID to its fabric IPv6 address. Address resolution uses the fabric peer list, which is already maintained by the fabric layer.
 
-**Healing:**
-- When connectivity is restored, Raft replays missed log entries to the minority side.
-- Gossip converges within seconds.
-- No split-brain: the minority side never made conflicting writes.
-
-### Node Crash → Raft Log Replayed on Restart
-
-**Scenario:** A node crashes (power failure, kernel panic).
-
-**Recovery:**
-1. Node restarts, daemon starts.
-2. Raft loads the latest snapshot from disk.
-3. Raft replays any committed log entries after the snapshot.
-4. redb is restored to the last committed state.
-5. Forge begins reconciliation against the restored state.
-6. If the node was the leader, a new leader was already elected during downtime.
-
-**Data durability:** Every committed log entry was fsync'd to disk before being acknowledged. No committed state is lost.
-
-### Split Brain → Impossible with Raft
-
-Raft's majority quorum requirement prevents split brain by construction. For a cluster of N nodes:
-
-- Quorum = floor(N/2) + 1
-- Any two quorums overlap by at least one node
-- Two leaders cannot exist simultaneously (the overlapping node would have voted for only one)
-
-| Cluster size | Quorum | Max failures | Split brain possible? |
-|---|---|---|---|
-| 1 | 1 | 0 | No (single node) |
-| 2 | 2 | 0 | No (both needed for any write) |
-| 3 | 2 | 1 | No |
-| 5 | 3 | 2 | No |
-| 7 | 4 | 3 | No |
-
-### Stale Reads → Acceptable for Capacity/Health, Not for Mutations
-
-Gossip data is inherently stale (2-10 seconds). This is acceptable because gossip is advisory:
-
-- A stale capacity report may cause the scheduler to pick a slightly suboptimal hypervisor. Forge's admission recheck catches actual overcommit.
-- A stale health report may cause the scheduler to attempt placing a VM on a failing node. The placement will fail, and the scheduler retries.
-
-Mutations always go through Raft, which is linearizable. Stale reads of committed state (from local redb) are bounded by Raft heartbeat interval.
-
-### Gossip Partition → Nodes May Appear Unreachable
-
-**Scenario:** Gossip loses connectivity to some nodes, but Raft can still reach them (different network path or timing).
-
-**Impact:** The scheduler sees some hypervisors as unreachable via gossip and excludes them from placement. The failure detector may incorrectly mark them for rescheduling.
-
-**Mitigation:** The Raft leader's failure detector uses gossip as a signal but waits 60 seconds before committing authoritative state changes (`MarkHypervisorUnreachable`). This gives gossip time to converge. Additionally, the leader can verify node reachability via Raft heartbeats — if Raft can reach a follower but gossip cannot, the node is not dead.
-
-## Consistency Model
-
-| Layer | Guarantee | Mechanism | Implication |
-|---|---|---|---|
-| Writes | Linearizable | Raft consensus (leader + majority quorum) | Two concurrent writes are serialized. Results reflect a total order. |
-| Default reads | Eventually consistent | Local redb (state machine output) | May be up to 1 Raft heartbeat behind leader. Safe for all display/list operations. |
-| Linearizable reads | Linearizable | Read through leader with quorum confirmation | Reflects the latest committed state. Adds 1 round-trip. Rarely needed. |
-| Gossip | Best-effort eventual | SWIM protocol, O(log N) convergence | 2-10 seconds stale. Used for hints, never for decisions that must be correct. |
-| Forge reconciliation | Convergent (eventual consistency) | Periodic loop comparing desired (redb) vs actual (kernel/processes) | Forge always converges toward Raft state. Multiple runs produce the same result. |
-
-## Quorum and Cluster Size
-
-| Nodes | Voters | Quorum | Failures tolerated | Notes |
-|---|---|---|---|---|
-| 1 | 1 | 1 | 0 | Bootstrap mode. Leader of itself. Writes are instant. Zero overhead. |
-| 2 | 2 | 2 | 0 | Both must agree. Fragile — either failing blocks writes. Not recommended. |
-| 3 | 3 | 2 | 1 | Minimum for fault tolerance. Recommended starting point. |
-| 5 | 5 | 3 | 2 | Recommended for production. |
-| 7 | 5-7 | 3-4 | 2-3 | Cap voters at 5-7 for latency. Extra nodes are learners. |
-| 10+ | 5-7 | 3-4 | 2-3 | Additional nodes are learners (replicate data, don't vote). |
-
-### Single Node
-
-With 1 node, Raft is degenerate. The node is automatically leader, writes are committed instantly (quorum of 1), and there is zero replication overhead. It behaves exactly like a local database — which is exactly what bootstrap mode is. Most operators start here. When they add nodes 2 and 3, Raft begins replicating automatically.
-
-### Even-Number Nodes
-
-Even-number clusters (2, 4, 6) are allowed but not recommended. The split-vote risk is higher:
-
-- 4 nodes, quorum = 3: tolerates 1 failure (same as 3 nodes, but more hardware).
-- 6 nodes, quorum = 4: tolerates 2 failures (same as 5 nodes, but more hardware).
-
-Odd-number clusters get the same fault tolerance with one fewer node.
-
-### Non-Voter Nodes (Learners)
-
-For clusters with more than 7 nodes, not every node should be a Raft voter. Voters participate in leader election and quorum — more voters means higher commit latency (the leader must wait for more acknowledgments).
-
-**Learners** replicate the Raft log and maintain a local state machine (redb) but do not vote. They have the same data as voters — they can serve reads and run Forge reconciliation — but they don't affect quorum or election timing.
-
-A typical large deployment:
-
-```
-Voters (5-7 nodes):
-    - Participate in elections and quorum
-    - Process writes (when leader)
-    - Full Raft participation
-    - Spread across zones for fault tolerance
-
-Learners (remaining nodes):
-    - Replicate log, maintain local state machine
-    - Serve reads from local redb
-    - Run Forge reconciliation
-    - Can be promoted to voter if a voter fails
-    - No impact on write latency
-```
-
-The operator controls voter/learner designation via:
-```bash
-syfrah controlplane voter add <node_id>
-syfrah controlplane voter remove <node_id>
-syfrah controlplane learner add <node_id>
-```
-
-## Implementation with openraft
-
-### openraft Crate Overview
-
-`openraft` is an async Raft implementation in Rust. It provides the Raft algorithm (leader election, log replication, snapshots, membership changes) and requires the user to implement three traits for storage and networking.
-
-**Key properties:**
-- Async/tokio-native — fits naturally into the syfrah async runtime.
-- Supports single-node through multi-node — no code changes needed to scale from 1 to N.
-- Snapshot support for log compaction and fast node recovery.
-- Joint consensus for safe membership changes.
-- Used in production by Databend (cloud data warehouse).
-
-### Three Traits to Implement
-
-#### `RaftLogStorage` — where log entries are stored
+## 4. State machine — what goes into Raft
+
+The state machine owns **everything that must be consistent across the cluster**. The guiding rule: if losing or duplicating a piece of state would violate a user-facing invariant (double IP, orphan VM, unauthorized access, inconsistent security policy), it goes into Raft.
+
+### Authoritative state (stored in Raft, replicated to all nodes via redb)
+
+| Category | Resources | Why Raft |
+|----------|-----------|----------|
+| **Organization** | Orgs, Projects, Environments (name, TTL, deletion protection, labels) | Hierarchy must be consistent for validation and cost tracking |
+| **VPC** | VPC definitions (name, CIDR, VNI, owner, shared flag) | VNI uniqueness must be guaranteed cluster-wide |
+| **Subnet** | Subnet definitions (name, VPC, env, CIDR, gateway) | CIDRs must not overlap within a VPC |
+| **IPAM** | IP allocations (subnet → bitmap), allocation records (IP → VM, MAC, state) | **Double allocation is catastrophic.** Single-threaded log application guarantees uniqueness. |
+| **Security Groups** | SG definitions, rules (direction, protocol, port range, source/dest), SG-to-NIC attachments | Must be consistent — a stale SG rule is a security hole |
+| **Route Tables** | Route table definitions, routes (destination CIDR, target type + ID), subnet associations | Routing inconsistency causes packet loss or misrouting |
+| **NAT Gateways** | NAT GW definitions (subnet, public IP, state) | Must be consistent for internet egress to work |
+| **Hypervisor records** | Registration, hardware spec, state, labels, taints | Scheduler needs consistent view of available hosts |
+| **VM placement** | PlaceVm decisions (vm_id, hypervisor_id, subnet_id, IP, MAC) | The authoritative answer to "where does this VM run?" |
+| **Instance definitions** | VM spec (vCPU, memory, image, volumes, network, placement constraints) | The authoritative desired state for each VM |
+| **NIC records** | Network interface definitions (VM, subnet, VPC, IP, MAC, SG attachments) | SG enforcement requires knowing which SGs apply to which NIC |
+| **VPC Peering** | Peering records (vpc_a, vpc_b, status) | Cross-VPC routing must be consistent |
+| **Volume definitions** | Volume spec (size, env), attachment (volume → VM) | Attachment must be exclusive (one VM at a time) |
+
+### Derived state (NOT stored in Raft — computed by each Forge from Raft state)
+
+| Derived state | Computed from | Where it lives |
+|---------------|---------------|----------------|
+| FDB entries (MAC → VTEP) | VM placements in Raft | `bridge fdb` on each node's kernel |
+| ARP proxy entries | IP allocations in Raft | `ip neigh` on each node |
+| nftables rules | SG rules + NIC attachments in Raft | nftables ruleset on each node |
+| Linux bridges | VPC definitions + VM placements in Raft | kernel interfaces on each node |
+| VXLAN interfaces | VPC VNI + VM placements in Raft | kernel interfaces on each node |
+| TAP/veth devices | Instance definitions + placements in Raft | kernel interfaces on each node |
+| NAT/masquerade rules | NAT GW + route table associations in Raft | nftables on each node |
+| DNS zone files | Instance names + IP allocations in Raft | CoreDNS config on each node |
+| MAC addresses | Deterministic from IP (`02:00:{ip_hex}`) | Computed, not stored |
+
+### Observed state (NOT stored in Raft — reported via gossip)
+
+| Observed state | Source | Used by |
+|----------------|--------|---------|
+| VM runtime status (running, stopped, error) | Forge on the hosting hypervisor | Dashboards, health alerts |
+| Node capacity (free vCPU, memory, disk) | Forge capacity tracker | Scheduler (as hints) |
+| Node liveness (up, suspect, dead) | SWIM protocol | Scheduler (avoid dead nodes) |
+| Hypervisor status (reachable, forge version, uptime) | Forge health check | Operational awareness |
+| Drain status | Forge (operator-initiated) | Scheduler (stop placing new VMs) |
+
+**The rule**: Raft is truth. Derived state is recomputed from Raft. Observed state is reported upward. If derived state and observed state disagree, Forge reconciles.
+
+## 5. State machine operations
+
+Every mutation to the cluster's desired state is encoded as a `RaftCommand` and appended to the Raft log. When committed, the state machine applies it to redb within a single ACID transaction. All nodes apply the same commands in the same order, producing identical state.
 
 ```rust
-// Our implementation: redb table for log entries
-//
-// Table: raft_log
-// Key: u64 (log index)
-// Value: LogEntry (serialized command + metadata)
-//
-// Operations:
-// - append_to_log: insert entries at sequential indices
-// - delete_conflict_logs_since: truncate log on leader change
-// - purge_logs_upto: discard entries before snapshot
-// - get_log_state: return last log index + term
-```
+/// Every command that mutates cluster state.
+/// Serialized with serde, appended to the Raft log.
+enum RaftCommand {
+    // ── Organization ────────────────────────────────────────
+    CreateOrg { name: String },
+    DeleteOrg { org_id: OrgId },
 
-Durability: every append calls fsync before returning. A crash between append and commit is safe — Raft replays on restart.
+    // ── Project ─────────────────────────────────────────────
+    CreateProject { name: String, org_id: OrgId },
+    DeleteProject { project_id: ProjectId },
 
-Alternative: a separate append-only file instead of a redb table. Redb is simpler (single database file) but append-only files have slightly better sequential write performance. Decision deferred to implementation — the trait abstraction allows swapping backends.
+    // ── Environment ─────────────────────────────────────────
+    CreateEnv {
+        name: String,
+        project_id: ProjectId,
+        ttl: Option<Duration>,
+        deletion_protection: bool,
+        labels: HashMap<String, String>,
+    },
+    DeleteEnv { env_id: EnvironmentId },
 
-#### `RaftStateMachine` — how committed entries are applied
+    // ── VPC ─────────────────────────────────────────────────
+    CreateVpc {
+        name: String,
+        cidr: Ipv4Net,
+        owner: VpcOwner,         // Project(id) | Org(id)
+        shared: bool,
+    },
+    DeleteVpc { vpc_id: VpcId },
+    AttachVpc { vpc_id: VpcId, project_id: ProjectId },
+    DetachVpc { vpc_id: VpcId, project_id: ProjectId },
 
-```rust
-// Our implementation: redb tables (same tables as today)
-//
-// apply(entries) → for each entry:
-//     match entry.command {
-//         CreateVpc { .. } => insert into vpcs table,
-//         AllocateIp { .. } => update ipam_bitmaps + ip_allocations,
-//         PlaceVm { .. } => insert into vm_placements,
-//         // ... all state machine commands
-//     }
-//
-// snapshot() → serialize all redb tables to a byte buffer
-// install_snapshot(data) → replace redb contents with snapshot data
-```
+    // ── Subnet ──────────────────────────────────────────────
+    CreateSubnet {
+        name: String,
+        vpc_id: VpcId,
+        env_id: EnvironmentId,
+        cidr: Ipv4Net,
+    },
+    DeleteSubnet { subnet_id: SubnetId },
 
-The state machine is deterministic. Given the same log entries in the same order, every node produces identical redb state. This is verified by comparing state machine checksums during snapshot transfer.
+    // ── IPAM ────────────────────────────────────────────────
+    AllocateIp {
+        subnet_id: SubnetId,
+        vm_id: VmId,
+    },
+    ReleaseIp {
+        subnet_id: SubnetId,
+        ip: Ipv4Addr,
+    },
 
-#### `RaftNetwork` — how nodes communicate
+    // ── Network Interface ───────────────────────────────────
+    CreateNic {
+        vm_id: VmId,
+        subnet_id: SubnetId,
+        vpc_id: VpcId,
+        ip: Ipv4Addr,
+        mac: MacAddr,
+    },
+    DeleteNic { nic_id: NicId },
 
-```rust
-// Our implementation: HTTP client over syfrah0
-//
-// send_vote(target, vote_request) → POST http://[target_ipv6]:7200/raft/vote
-// send_append_entries(target, entries) → POST http://[target_ipv6]:7200/raft/append
-// send_install_snapshot(target, snapshot) → POST http://[target_ipv6]:7200/raft/snapshot
-```
+    // ── Security Group ──────────────────────────────────────
+    CreateSg {
+        name: String,
+        vpc_id: VpcId,
+        description: String,
+    },
+    DeleteSg { sg_id: SecurityGroupId },
+    AddSgRule {
+        sg_id: SecurityGroupId,
+        direction: Direction,     // Ingress | Egress
+        protocol: Protocol,       // Tcp | Udp | Icmp | All
+        port_range: Option<PortRange>,
+        source: RuleTarget,       // Cidr(Ipv4Net) | Sg(SecurityGroupId) | Any
+    },
+    RemoveSgRule { sg_id: SecurityGroupId, rule_id: RuleId },
+    AttachSg { sg_id: SecurityGroupId, nic_id: NicId },
+    DetachSg { sg_id: SecurityGroupId, nic_id: NicId },
 
-The target address is the node's fabric IPv6 (from the hypervisor/node registry). The transport is HTTP/JSON over WireGuard — encrypted, authenticated by mesh membership.
+    // ── Route Table ─────────────────────────────────────────
+    CreateRouteTable { name: String, vpc_id: VpcId },
+    DeleteRouteTable { route_table_id: RouteTableId },
+    AddRoute {
+        route_table_id: RouteTableId,
+        destination: Ipv4Net,
+        target: RouteTarget,      // NatGateway(id) | VpcPeering(id) | Local | Blackhole
+    },
+    RemoveRoute { route_table_id: RouteTableId, route_id: RouteId },
+    AssociateSubnet { route_table_id: RouteTableId, subnet_id: SubnetId },
+    DisassociateSubnet { route_table_id: RouteTableId, subnet_id: SubnetId },
 
-### State Machine Commands
+    // ── NAT Gateway ─────────────────────────────────────────
+    CreateNatGw {
+        name: String,
+        subnet_id: SubnetId,
+        public_ip: Ipv4Addr,
+    },
+    DeleteNatGw { nat_gw_id: NatGatewayId },
 
-Every mutation that goes through Raft is encoded as a command in the log entry. The state machine's `apply` function pattern-matches on the command and updates the corresponding redb tables.
+    // ── VPC Peering ─────────────────────────────────────────
+    CreatePeering { vpc_a: VpcId, vpc_b: VpcId },
+    DeletePeering { peering_id: PeeringId },
 
-```rust
-enum StateMachineCommand {
-    // Organization hierarchy
-    CreateOrg { id: OrgId, name: String },
-    DeleteOrg { id: OrgId },
-    CreateProject { id: ProjectId, name: String, org_id: OrgId },
-    DeleteProject { id: ProjectId },
-    CreateEnv { id: EnvironmentId, name: String, project_id: ProjectId, ttl: Option<Duration>, deletion_protection: bool },
-    DeleteEnv { id: EnvironmentId },
+    // ── Hypervisor ──────────────────────────────────────────
+    RegisterHypervisor {
+        name: String,
+        fabric_node_id: NodeId,
+        region: String,
+        zone: String,
+        public_ip: String,
+        fabric_ipv6: String,
+        hardware: HardwareSpec,
+    },
+    DeregisterHypervisor { hypervisor_id: HypervisorId },
+    UpdateHypervisorState {
+        hypervisor_id: HypervisorId,
+        state: HypervisorState,
+    },
+    UpdateHypervisorLabels {
+        hypervisor_id: HypervisorId,
+        labels: HashMap<String, String>,
+    },
+    UpdateHypervisorTaints {
+        hypervisor_id: HypervisorId,
+        taints: Vec<Taint>,
+    },
 
-    // VPC and networking
-    CreateVpc { id: VpcId, name: String, cidr: Ipv4Net, vni: u32, owner: VpcOwner },
-    DeleteVpc { id: VpcId },
-    PeerVpc { id: PeeringId, vpc_a: VpcId, vpc_b: VpcId },
-    UnpeerVpc { id: PeeringId },
+    // ── VM Placement ────────────────────────────────────────
+    PlaceVm {
+        vm_id: VmId,
+        hypervisor_id: HypervisorId,
+        subnet_id: SubnetId,
+        ip: Ipv4Addr,
+        mac: MacAddr,
+    },
+    RemovePlacement { vm_id: VmId },
 
-    // Subnets
-    CreateSubnet { id: SubnetId, name: String, vpc_id: VpcId, env_id: EnvironmentId, cidr: Ipv4Net },
-    DeleteSubnet { id: SubnetId },
+    // ── Instance Lifecycle ──────────────────────────────────
+    CreateInstance {
+        spec: InstanceSpec,       // vCPU, memory, image, volumes, network, constraints
+    },
+    DeleteInstance { vm_id: VmId },
+    StartInstance { vm_id: VmId },
+    StopInstance { vm_id: VmId },
 
-    // IPAM
-    AllocateIp { subnet_id: SubnetId, vm_id: VmId },
-    ReleaseIp { subnet_id: SubnetId, ip: Ipv4Addr },
-
-    // Security groups
-    CreateSg { id: SecurityGroupId, name: String, vpc_id: VpcId },
-    DeleteSg { id: SecurityGroupId },
-    AddSgRule { id: RuleId, sg_id: SecurityGroupId, rule: SecurityGroupRule },
-    RemoveSgRule { id: RuleId },
-    AttachSg { nic_id: NicId, sg_id: SecurityGroupId },
-    DetachSg { nic_id: NicId, sg_id: SecurityGroupId },
-
-    // Route tables
-    CreateRouteTable { id: RouteTableId, vpc_id: VpcId },
-    DeleteRouteTable { id: RouteTableId },
-    CreateRoute { id: RouteId, table_id: RouteTableId, destination: Ipv4Net, target: RouteTarget },
-    DeleteRoute { id: RouteId },
-
-    // NAT gateways
-    CreateNatGw { id: NatGatewayId, name: String, vpc_id: VpcId, subnet_id: SubnetId },
-    DeleteNatGw { id: NatGatewayId },
-
-    // VM lifecycle
-    CreateVm { id: VmId, spec: VmSpec },
-    PlaceVm { vm_id: VmId, hypervisor_id: HypervisorId },
-    StopVm { vm_id: VmId },
-    StartVm { vm_id: VmId },
-    DeleteVm { vm_id: VmId },
-    RemoveVm { vm_id: VmId },
-    RescheduleVm { vm_id: VmId, reason: RescheduleReason },
-
-    // Volume lifecycle
-    CreateVolume { id: VolumeId, spec: VolumeSpec },
+    // ── Volume ──────────────────────────────────────────────
+    CreateVolume {
+        name: String,
+        size_gb: u32,
+        env_id: EnvironmentId,
+    },
+    DeleteVolume { volume_id: VolumeId },
     AttachVolume { volume_id: VolumeId, vm_id: VmId },
     DetachVolume { volume_id: VolumeId },
-    DeleteVolume { id: VolumeId },
 
-    // Hypervisor lifecycle
-    RegisterHypervisor { id: HypervisorId, spec: HypervisorSpec },
-    EnableHypervisor { id: HypervisorId },
-    DrainHypervisor { id: HypervisorId },
-    DecommissionHypervisor { id: HypervisorId },
-    DisableHypervisor { id: HypervisorId },
-    UpdateHypervisorLabels { id: HypervisorId, labels: HashMap<String, String> },
-    UpdateHypervisorTaints { id: HypervisorId, taints: Vec<Taint> },
-    MarkHypervisorUnreachable { id: HypervisorId },
-    MarkHypervisorAvailable { id: HypervisorId },
-
-    // Network interfaces
-    CreateNic { id: NicId, vm_id: VmId, subnet_id: SubnetId },
-    DeleteNic { id: NicId },
-
-    // Cluster membership
-    AddLearner { node_id: NodeId },
-    AddVoter { node_id: NodeId },
-    RemoveNode { node_id: NodeId },
+    // ── Cluster Membership ──────────────────────────────────
+    AddRaftMember { node_id: NodeId, fabric_ipv6: String, voter: bool },
+    RemoveRaftMember { node_id: NodeId },
+    PromoteToVoter { node_id: NodeId },
+    DemoteToLearner { node_id: NodeId },
 }
 ```
 
-Every command must be **idempotent**. Applying the same command twice (e.g., due to a Raft replay after crash) must produce the same state. The state machine checks preconditions before applying:
+### Command processing pipeline
 
-- `CreateVpc` with an ID that already exists → no-op (return existing VPC).
-- `DeleteVm` for a VM that is already `Deleted` → no-op.
-- `AllocateIp` for a VM that already has an IP in this subnet → return existing allocation.
+1. **Receive**: API handler on any node receives the command.
+2. **Forward**: if this node is not the leader, forward to the leader via HTTP.
+3. **Validate**: the leader validates the command against current state (e.g., check that the subnet has free IPs, the hypervisor exists, the VPC is not being deleted).
+4. **Propose**: the leader proposes the command to openraft.
+5. **Replicate**: openraft replicates the entry to followers.
+6. **Commit**: once a majority acknowledges, the entry is committed.
+7. **Apply**: the state machine on EVERY node applies the committed entry to its local redb within a single transaction.
+8. **Respond**: the leader returns the result to the client.
 
-### Snapshot Strategy
+Validation happens twice: once on the leader before proposal (fast rejection of invalid commands) and once during apply (definitive check, because state may have changed between proposal and commit). The apply-time validation is authoritative.
 
-- **Trigger**: every 10,000 committed log entries OR on demand (new node joining).
-- **Format**: serialized redb database (all tables exported to a structured binary format).
-- **Size**: proportional to cluster state. 1,000 VMs + 100 VPCs + associated resources ≈ 1-5 MB.
-- **Transfer**: HTTP POST to `/raft/snapshot` on the receiving node. Streamed for large snapshots.
-- **Application**: receiving node deserializes the snapshot into its local redb, replacing all tables. Then replays any log entries after the snapshot index.
-- **Retention**: keep the latest 2 snapshots. Older snapshots are deleted.
+### Idempotency
 
-## Observability
+Commands include a client-generated request ID. The state machine maintains a deduplication table mapping recent request IDs to their results. If the same request ID is applied twice (e.g., client retry after timeout), the state machine returns the cached result without re-executing.
 
-### Raft Metrics
+## 6. Materialized views per hypervisor
 
-Exposed at `GET /raft/metrics` on port 7200 and via Prometheus at `/metrics` on the internal HTTP port.
+Every committed Raft entry is applied to the local redb on every node. This means every node has the **complete cluster state**. Forge on each node reads the full state but only reconciles resources relevant to its node.
 
-| Metric | Description |
-|---|---|
-| `syfrah_raft_state` | Current Raft state: leader, follower, candidate, learner |
-| `syfrah_raft_current_term` | Current Raft term (monotonically increasing) |
-| `syfrah_raft_commit_index` | Index of the last committed log entry |
-| `syfrah_raft_last_applied` | Index of the last applied log entry |
-| `syfrah_raft_log_entries` | Number of entries in the Raft log (between last snapshot and latest) |
-| `syfrah_raft_snapshot_index` | Index of the last snapshot |
-| `syfrah_raft_leader_id` | Node ID of the current leader (empty if unknown) |
-| `syfrah_raft_proposals_committed_total` | Counter: total committed proposals |
-| `syfrah_raft_proposals_failed_total` | Counter: total failed proposals (validation, timeout) |
-| `syfrah_raft_append_entries_latency_ms` | Histogram: time to replicate entries to followers |
-| `syfrah_raft_apply_latency_ms` | Histogram: time to apply committed entries to state machine |
+### What each Forge needs
 
-### Gossip Metrics
+| Data | Why |
+|------|-----|
+| Resources where `hypervisor_id == this_node` | Forge manages local VMs, NICs, TAPs, bridges |
+| VPC/subnet/SG/route definitions for VMs on this node | Forge derives nftables rules, bridge configs, gateway IPs |
+| Remote VM placements for VPCs present locally | Forge populates FDB entries for cross-node VXLAN forwarding |
+| Remote VTEP addresses (fabric IPv6 of nodes hosting VMs in local VPCs) | Forge configures VXLAN remote endpoints |
+| Global org/project/env hierarchy | Forge validates requests and displays context |
 
-| Metric | Description |
-|---|---|
-| `syfrah_gossip_members_total` | Number of known members in the gossip pool |
-| `syfrah_gossip_members_alive` | Members in Alive state |
-| `syfrah_gossip_members_suspect` | Members in Suspect state |
-| `syfrah_gossip_members_dead` | Members in Dead state |
-| `syfrah_gossip_messages_sent_total` | Counter: total protocol messages sent |
-| `syfrah_gossip_messages_received_total` | Counter: total protocol messages received |
-| `syfrah_gossip_updates_piggybacked_total` | Counter: state updates piggybacked on protocol messages |
+### Index structure
 
-### Scheduler Metrics
+The state machine maintains secondary indexes in redb for efficient Forge queries:
 
-| Metric | Description |
-|---|---|
-| `syfrah_scheduler_placements_total` | Counter: total placement decisions |
-| `syfrah_scheduler_placements_retried_total` | Counter: placements retried (Forge rejection) |
-| `syfrah_scheduler_placements_failed_total` | Counter: placements that exhausted retries |
-| `syfrah_scheduler_placement_latency_ms` | Histogram: time from request to Raft commit |
-| `syfrah_scheduler_candidates_evaluated` | Histogram: number of candidates evaluated per placement |
-| `syfrah_scheduler_no_candidates_total` | Counter: placements with zero candidates after filtering |
+```
+hypervisor_placements    hypervisor_id → [vm_id]
+vpc_placements           vpc_id → [(vm_id, hypervisor_id, ip, mac)]
+subnet_nics              subnet_id → [nic_id]
+sg_nics                  sg_id → [nic_id]
+vpc_hypervisors          vpc_id → [hypervisor_id]  (which nodes have VMs in this VPC)
+```
 
-## Security
+When Forge runs its reconciliation loop, it:
 
-### Raft RPC: WireGuard-Only (Phase 1)
+1. Reads `hypervisor_placements[this_node]` to get local VM IDs.
+2. For each local VM, reads the full instance spec, NIC, SG rules, subnet, VPC.
+3. Reads `vpc_placements[vpc_id]` for each local VPC to get remote VM placements (for FDB).
+4. Reads `vpc_hypervisors[vpc_id]` for each local VPC to get remote VTEP addresses (for VXLAN).
+5. Reconciles: creates missing resources, removes stale ones, updates drifted ones.
 
-Raft RPC (port 7200) is bound to the fabric IPv6 address (`syfrah0`). Only nodes in the WireGuard mesh can reach it. This provides:
+### Why full state on every node
 
-- **Encryption**: WireGuard encrypts all traffic (ChaCha20-Poly1305).
-- **Authentication**: only nodes with the mesh secret can join the WireGuard mesh and participate in Raft.
-- **No external attack surface**: port 7200 is not reachable from the public internet.
+An alternative design would replicate only relevant subsets to each node. We rejected this because:
 
-### Signed Requests (Phase 2, future)
+- openraft replicates the full log to all members — there is no per-node filtering at the Raft level.
+- Full state allows any node to serve read requests for any resource (API gateway).
+- Full state makes leader transfer seamless — the new leader already has everything.
+- The total state size for a 10,000-VM cluster is estimated at ~50-100 MB in redb. This is negligible for dedicated servers with 32-256 GB RAM.
+
+Forge reads selectively (via indexes), but every node stores everything.
+
+## 7. SWIM gossip protocol
+
+### Purpose
+
+Gossip is the fast, decentralized health and telemetry layer. It runs alongside Raft but serves a fundamentally different purpose: Raft provides consistency, gossip provides speed and failure detection.
+
+### What gossip carries
+
+| Data | Update frequency | Consumer |
+|------|-----------------|----------|
+| Node liveness (alive, suspect, dead) | Continuous (SWIM probing) | Scheduler, Raft leader (for node failure handling) |
+| CPU/memory/disk capacity hints | Every 10 seconds | Scheduler (for placement decisions) |
+| Hypervisor state hints (draining, maintenance) | On change | Scheduler (to avoid placing new VMs) |
+| VM count per hypervisor | Every 10 seconds | Scheduler (spread scoring) |
+
+### What gossip does NOT carry
+
+- **VM placements** — authoritative in Raft, not gossip
+- **FDB entries** — derived from Raft state, not gossip
+- **Security group rules** — Raft state
+- **IP allocations** — Raft state
+- **Any correctness-critical data** — gossip is a hint, never a contract
+
+### Implementation
+
+The gossip layer uses the `foca` crate, a transport-agnostic SWIM (Scalable Weakly-consistent Infection-style Membership) implementation in Rust.
+
+**Transport**: UDP datagrams over the WireGuard fabric (syfrah0 IPv6 addresses). Port 7300 (configurable). Encrypted by WireGuard — no additional encryption needed.
+
+**Protocol mechanics**:
+
+1. **Ping**: each node probes a random subset of known members every 1 second.
+2. **Ping-req** (indirect probe): if a direct ping fails, the node asks K other members to probe the suspect on its behalf. K = 3 by default.
+3. **Suspect**: if both direct and indirect probes fail, the member is marked suspect. Suspicion is disseminated via piggybacked protocol messages.
+4. **Confirm dead**: if a suspect member does not refute the suspicion within the suspicion timeout (default 5 seconds), it is declared dead.
+5. **Refute**: a suspected node that is actually alive broadcasts a refutation (protocol message with higher incarnation number).
+
+**Failure detection timing**:
+
+| Event | Timing |
+|-------|--------|
+| Direct ping | Every 1 second |
+| Suspect declared | After 1 failed direct + 3 failed indirect probes (~2-3 seconds) |
+| Dead declared | Suspect timeout (5 seconds) after suspicion |
+| Total detection time | ~5-10 seconds (best case) to ~15 seconds (worst case) |
+
+**Custom metadata**: each node piggybacks a `NodeReport` on its protocol messages:
+
+```rust
+struct NodeReport {
+    hypervisor_id: Option<HypervisorId>,   // None if not a hypervisor
+    available_vcpus: u32,
+    available_memory_gb: u32,
+    available_disk_gb: u32,
+    vm_count: u32,
+    state_hint: NodeStateHint,             // Available | Draining | Maintenance
+    forge_version: String,
+}
+```
+
+This metadata is updated locally every 10 seconds and disseminated passively via SWIM protocol messages. No dedicated telemetry broadcast — the data travels on the same protocol messages used for failure detection.
+
+**Membership list**: foca maintains the membership list automatically. When a new node joins the Raft cluster, the gossip layer is informed and adds it to the membership list. When a node is removed from Raft, it is removed from gossip.
+
+## 8. Scheduler
+
+The scheduler runs on the Raft leader only. It is invoked when a `CreateInstance` command arrives and a placement decision is needed.
+
+### Scheduling pipeline
+
+```
+CreateInstance arrives at the leader
+         │
+         ▼
+1. Parse placement constraints from the instance spec
+   - region/zone affinity (--region eu-west, --zone eu-west-1)
+   - node selector labels (--node-selector gpu=a100)
+   - anti-affinity rules (--anti-affinity app=web spread across zones)
+   - toleration for taints
+         │
+         ▼
+2. Query gossip for hypervisor capacity hints
+   - available vCPU, memory, disk per hypervisor
+   - node liveness (alive only — exclude suspect and dead)
+         │
+         ▼
+3. Filter: build candidate list
+   a. State filter: hypervisor state == Available (from Raft)
+   b. Liveness filter: gossip reports node as alive
+   c. Region/zone filter: match requested region/zone
+   d. Label filter: node labels satisfy node-selector
+   e. Taint filter: node taints must be tolerated by VM spec
+   f. Capacity filter: gossip-reported capacity >= requested resources
+         │
+         ▼
+4. Score: rank candidates
+   a. Available capacity score (higher = more room = better spread)
+   b. Zone spread score (prefer zones with fewer VMs of this type)
+   c. Anti-affinity score (penalize colocation with conflicting VMs)
+   d. Data locality score (prefer nodes that already have the VM image cached)
+         │
+         ▼
+5. Select: pick the highest-scoring hypervisor
+         │
+         ▼
+6. Commit to Raft:
+   - AllocateIp { subnet_id, vm_id }
+   - CreateNic { vm_id, subnet_id, vpc_id, ip, mac }
+   - PlaceVm { vm_id, hypervisor_id, subnet_id, ip, mac }
+   All three are committed atomically in a single Raft log batch.
+         │
+         ▼
+7. Forge on the selected hypervisor reads the placement from redb
+   → creates bridge, VXLAN, TAP, nftables rules, boots VM
+
+8. Forge on EVERY node with VMs in the same VPC reads the new placement
+   → adds FDB entry pointing the new VM's MAC to the selected hypervisor's VTEP
+```
+
+### Admission control
+
+After the scheduler selects a hypervisor, Forge on that node performs admission control before actually provisioning the VM. This is the definitive capacity check — gossip hints may be stale. If the hypervisor no longer has capacity (another VM was placed between scheduling and admission), Forge rejects the placement and the scheduler retries with a different hypervisor.
+
+This two-phase approach (gossip hints for fast filtering, Forge admission for correctness) avoids both false rejections and overbooking.
+
+### Scheduler policy
+
+The default scheduler is **spread-first with bin-packing tiebreak**:
+
+1. Prefer spreading VMs across zones (resilience).
+2. Within a zone, prefer the hypervisor with the most available resources (room for growth).
+3. If all else is equal, prefer the hypervisor with fewer total VMs (bin-packing balance).
+
+The scheduler is implemented as a trait, allowing future custom policies:
+
+```rust
+trait Scheduler: Send + Sync {
+    fn select_hypervisor(
+        &self,
+        spec: &InstanceSpec,
+        candidates: &[HypervisorCandidate],
+    ) -> Result<HypervisorId>;
+}
+```
+
+### Rescheduling
+
+The scheduler is also invoked when:
+
+- **A hypervisor is declared dead** (gossip dead for >60 seconds, Raft leader commits hypervisor state change). VMs on the dead hypervisor with `restart_on_failure: true` are rescheduled to healthy hypervisors.
+- **A hypervisor enters draining state** (operator-initiated). The scheduler migrates VMs to other hypervisors one at a time (stop, reschedule, start).
+- **A placement is rejected by admission control**. The scheduler retries with the next best candidate.
+
+## 9. API gateway — single entry point
+
+Every node runs an axum HTTP server on its fabric IPv6 address, port 7100 (the Forge API port, as defined in ADR-003). The operator, Terraform provider, or any API client talks to ANY node.
+
+### Request routing
+
+```
+Operator → POST /v1/instances to Node C (a follower)
+         │
+         ▼
+   Node C checks: am I the Raft leader?
+   ├── No → forward the request to the leader (Node A)
+   │        Node C acts as a reverse proxy:
+   │        - Copies all headers and body
+   │        - Sends to http://[Node-A-fabric-ipv6]:7100/v1/instances
+   │        - Streams the response back to the operator
+   │        - The forwarding is transparent to the operator
+   │
+   └── Yes → process the request locally
+              (validate, propose to Raft, wait for commit, respond)
+```
+
+### Read vs. write routing
+
+| Request type | Routing | Consistency |
+|-------------|---------|-------------|
+| **Write** (POST, PUT, DELETE) | Always forwarded to Raft leader | Strongly consistent (committed to quorum) |
+| **Read** (GET) — default | Served locally from redb | Eventually consistent (bounded by replication lag, typically <100ms) |
+| **Read** (GET) with `?consistent=true` | Forwarded to leader, leader confirms it is still leader before responding | Strongly consistent (linearizable) |
 
-In Phase 2, Raft messages will additionally carry a signature (Ed25519, derived from the node's identity key). This guards against a compromised mesh member injecting forged Raft messages. The Raft RPC server validates the signature before processing any message.
+Most reads are served locally. This scales horizontally — adding nodes adds read capacity. Writes always go through the leader, which is the bottleneck, but write throughput is sufficient for control plane operations (not data plane).
+
+### Leader discovery
+
+Each node tracks the current Raft leader via openraft's notifications. When a follower needs to forward a request:
+
+1. Check the locally known leader ID (from the last Raft message).
+2. If the leader is known, forward immediately.
+3. If the leader is unknown (e.g., election in progress), return `503 Service Unavailable` with a `Retry-After: 1` header.
+4. If the forward fails (leader crashed), return `502 Bad Gateway` — the client retries to any node.
+
+### External API (future)
+
+The fabric-internal API (HTTP on syfrah0) is the foundation. A future external API (gRPC or HTTPS on a public interface) will proxy to the internal API. This ADR does not define the external API — it is a separate concern.
+
+## 10. IPAM becomes distributed
+
+### The problem today
+
+Each node maintains its own IPAM bitmap in its local redb. Two nodes can independently allocate the same IP address to different VMs in the same subnet. There is no coordination.
+
+### The solution
+
+IPAM is a Raft command. The full flow:
+
+```
+1. CreateInstance arrives at the leader
+2. Scheduler selects a hypervisor
+3. Leader proposes AllocateIp { subnet_id, vm_id }
+4. State machine checks the IPAM bitmap for the subnet:
+   a. Find the next free IP (scan bitmap for first zero bit)
+   b. Set the bit
+   c. Create an IpAllocation record { ip, subnet_id, vm_id, mac, state: Reserved }
+   d. Return the allocated IP
+5. The AllocateIp entry is committed to all nodes
+6. ALL nodes' state machines update their local bitmap and allocation table
+7. No other node can allocate the same IP — the bitmap on every node is identical
+```
+
+The IPAM bitmap is part of the Raft state machine. Only the leader modifies it (via committed log entries). All nodes see the same bitmap. Double allocation is structurally impossible.
+
+### Allocation lifecycle
+
+```
+Reserved → Assigned → Released
+    │                    │
+    └── Orphaned ────────┘
+         (reclaimed)
+```
+
+- **Reserved**: IP allocated by `AllocateIp`, VM not yet running.
+- **Assigned**: VM is running, NIC is active.
+- **Orphaned**: IP was reserved but VM creation failed. Detected by the reconciliation loop (reservation older than 5 minutes with no corresponding running VM). Reclaimed via `ReleaseIp` command.
+- **Released**: IP returned to the pool via `ReleaseIp`.
+
+### MAC derivation
+
+MAC addresses are deterministically derived from IPs: `02:00:{IP octets in hex}`. For example, `10.1.0.5` produces `02:00:0a:01:00:05`. This eliminates the need for a MAC allocation service. The MAC is computed, never stored as authoritative state (though it appears in placement records for convenience).
+
+## 11. FDB becomes derived from Raft state
+
+### The problem today
+
+FDB entries are not distributed. A node has no knowledge of VMs on other nodes. VXLAN forwarding between nodes is impossible.
+
+### The solution
+
+FDB entries are **derived from VM placement records in Raft**. Every `PlaceVm` entry contains the VM's MAC, IP, and hosting hypervisor. Each Forge reads the global placement state and populates its local FDB table.
+
+### Derivation logic
+
+On each reconciliation cycle, Forge on node N:
+
+1. Reads all VPCs that have VMs on node N (from `vpc_hypervisors` index).
+2. For each such VPC, reads all VM placements (from `vpc_placements` index).
+3. For each remote placement (hypervisor_id != node N):
+   - Looks up the remote hypervisor's fabric IPv6 address.
+   - Adds a static FDB entry: `bridge fdb add {mac} dev syfvx-{vpc_id} dst {remote_fabric_ipv6}`.
+   - Adds an ARP proxy entry: `ip neigh add {ip} lladdr {mac} dev syfvx-{vpc_id} nud permanent`.
+4. For each local placement (hypervisor_id == node N):
+   - The MAC resolves locally via the bridge — no FDB entry needed.
+5. Removes stale FDB entries for VMs that no longer exist or have moved.
+
+This is a full reconciliation — no incremental updates to track, no events to replay. The Raft state is the source of truth; FDB is recomputed from it. If a node restarts, the next reconciliation cycle rebuilds FDB from scratch.
+
+### Consistency
+
+FDB entries are eventually consistent with Raft state. The delay is bounded by the reconciliation interval (default 30 seconds) or the Raft apply notification (near-instant). In practice, FDB is updated within 1-2 seconds of a new VM placement being committed.
+
+During this window, packets destined for a newly placed VM may be dropped. This is acceptable — the VM is still booting during this window anyway.
+
+## 12. Cross-node VM networking flow (the endgame)
+
+This is the complete flow that demonstrates every component working together.
+
+```
+Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet frontend \
+          --project backend --org acme --vcpus 2 --memory 2048
+
+                                    │
+                                    ▼
+1. Request arrives at Node C's Forge API (Node C is a follower)
+   Node C forwards to the Raft leader (Node A)
+
+                                    │
+                                    ▼
+2. Leader validates:
+   - Org "acme" exists
+   - Project "backend" exists in org "acme"
+   - Subnet "frontend" exists, belongs to the right VPC
+   - No naming conflict
+
+                                    │
+                                    ▼
+3. Scheduler selects hypervisor:
+   - Filter: zone == eu-west-2, state == Available, alive in gossip
+   - Filter: capacity sufficient (2 vCPU, 2048 MB available)
+   - Score: hv-eu-2 has the most headroom
+   - Selected: hv-eu-2
 
-This is defense-in-depth. In Phase 1, WireGuard mesh membership is sufficient — a node in the mesh is trusted by definition (the operator approved its join).
+                                    │
+                                    ▼
+4. Leader commits a batch of Raft commands:
+   a. CreateInstance { spec: web-3, 2 vCPU, 2048 MB, image: ... }
+   b. AllocateIp { subnet: frontend, vm: web-3 } → 10.1.0.5
+   c. CreateNic { vm: web-3, subnet: frontend, vpc: prod, ip: 10.1.0.5,
+                  mac: 02:00:0a:01:00:05 }
+   d. PlaceVm { vm: web-3, hv: hv-eu-2, subnet: frontend,
+                ip: 10.1.0.5, mac: 02:00:0a:01:00:05 }
 
-### Only Mesh Members Can Participate in Raft
+                                    │
+                                    ▼
+5. ALL nodes apply the committed entries to their local redb.
 
-The Raft cluster membership is a subset of the WireGuard mesh membership. A node must first join the mesh (fabric layer, with operator approval) before it can be added to the Raft cluster. There is no way to participate in Raft without being in the mesh.
+                                    │
+                      ┌─────────────┴──────────────┐
+                      ▼                            ▼
+   hv-eu-2 (selected hypervisor)         hv-eu-1 (other node with VMs in VPC prod)
 
-### Leader Cannot Be Forced Externally
+   Forge sees PlaceVm for this node:     Forge sees PlaceVm for remote node:
+   a. Ensure bridge syfbr-{vpc} exists   a. Add FDB entry:
+   b. Ensure VXLAN syfvx-{vpc} exists       bridge fdb add 02:00:0a:01:00:05
+   c. Add subnet gateway IP to bridge          dev syfvx-{vpc}
+   d. Create TAP syftap-{web-3}                dst [hv-eu-2 fabric IPv6]
+   e. Attach TAP to bridge               b. Add ARP proxy:
+   f. Apply nftables rules (SGs)            ip neigh add 10.1.0.5
+   g. Generate config-drive (IP, GW,          lladdr 02:00:0a:01:00:05
+      DNS, MTU=1350)                          dev syfvx-{vpc} nud permanent
+   h. Create ZeroFS volume
+   i. Boot Cloud Hypervisor process
 
-The Raft leader is elected by majority vote among cluster members. There is no API to "set the leader" or "force election." An external attacker who compromises the API gateway cannot influence leader election — it is an internal Raft protocol operation that happens only between Raft members over the fabric.
+                                    │
+                                    ▼
+6. web-3 boots on hv-eu-2 with IP 10.1.0.5, MAC 02:00:0a:01:00:05
+   Config-drive injects: IP 10.1.0.5/24, gateway 10.1.0.1, MTU 1350
 
-An operator can influence elections indirectly by removing a voter (which may trigger a new election) or by draining a node (which does not affect Raft voting — drain is a compute-layer concept, not a consensus concept).
+                                    │
+                                    ▼
+7. Cross-node connectivity is live:
+   web-1 on hv-eu-1 pings 10.1.0.5:
+     → TAP → bridge → FDB lookup → VXLAN encap → syfrah0 (WireGuard)
+     → internet → hv-eu-2 → WireGuard decrypt → VXLAN decap
+     → bridge → TAP → web-3 receives
 
-## Implementation Phases
+                                    │
+                                    ▼
+8. Leader responds to operator: VM web-3 created, IP 10.1.0.5, hypervisor hv-eu-2
+```
 
-### Phase 1: Raft Scaffold + State Machine + Leader Election
+## 13. Consistency guarantees
 
-**Goal:** openraft running on every node. Leader election works. The state machine applies commands to redb. Single-node clusters work identically to bootstrap mode.
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| **Writes** (create/update/delete any resource) | Strongly consistent (linearizable) | Raft quorum commit. A write is acknowledged only after a majority of nodes have persisted the log entry. |
+| **Reads from leader** | Strongly consistent (when using `?consistent=true`) | Leader confirms it still holds the lease before responding. Without the flag, reads are sequentially consistent (served from the leader's latest committed state). |
+| **Reads from followers** | Eventually consistent | Served from local redb, which may lag behind the leader by the replication delay (typically <100ms under normal conditions, up to seconds during high load or network issues). |
+| **Gossip data** | Eventually consistent | SWIM dissemination in O(log N) rounds. Full convergence in 1-5 seconds for clusters up to 100 nodes. |
+| **Forge reconciliation** | Eventual convergence | Within 1-3 reconciliation cycles (30-90 seconds) after state change. Faster when triggered by Raft apply notification (near-instant). |
+| **FDB propagation** | Eventual | Derived from Raft state during reconciliation. New entries appear within 1-30 seconds. |
 
-**Deliverables:**
-- Implement `RaftLogStorage` (redb table for log entries)
-- Implement `RaftStateMachine` (apply commands to redb tables)
-- Implement `RaftNetwork` (HTTP/JSON over syfrah0, port 7200)
-- Basic state machine commands: `CreateOrg`, `CreateProject`, `CreateEnv`, `CreateVpc`, `CreateSubnet`
-- Leader election and automatic failover
-- Raft metrics endpoint
-- CLI: `syfrah controlplane status` (show leader, term, commit index)
-- CLI: `syfrah controlplane voter add/remove`, `syfrah controlplane learner add`
+### Ordering guarantees
 
-**Estimated: 8-10 issues**
+- All Raft commands are totally ordered. Every node sees the same sequence.
+- Within a single Raft transaction (batch), all commands are applied atomically.
+- Gossip provides no ordering guarantees. Observations may arrive out of order.
+- Forge reconciliation is idempotent — ordering of reconciliation cycles does not matter.
 
-### Phase 2: Distributed IPAM + VM Placement through Raft
+## 14. Failure modes
 
-**Goal:** IP allocation and VM placement go through Raft. No more per-node IPAM. The scheduler exists (basic version).
+### Leader crash
 
-**Deliverables:**
-- `AllocateIp` / `ReleaseIp` commands through Raft state machine
-- `CreateVm` / `PlaceVm` / `DeleteVm` commands through Raft
-- Basic scheduler: filter by zone + capacity, score by utilization
-- Forge reads VM placements from redb (Raft state machine output)
-- Migration: import existing local redb state as initial Raft snapshot
-- Write forwarding from non-leader nodes to leader
+**Detection**: followers stop receiving heartbeats. After the election timeout (1-2 seconds), an election begins.
 
-**Estimated: 8-10 issues**
+**Recovery**: a new leader is elected, typically within 1-2 seconds. The new leader has all committed entries (Raft guarantees this). In-flight writes that were not committed are lost — clients must retry. Writes that were committed but not yet acknowledged to the client may have been applied — the idempotency mechanism (request ID deduplication) ensures retries are safe.
 
-### Phase 3: FDB Distribution from Raft State
+**Impact**: write unavailability for 1-3 seconds. Reads from followers continue uninterrupted. Existing VMs continue running.
 
-**Goal:** FDB entries are derived from Raft state (vm_placements + hypervisors), not from fabric announcements.
+### Minority partition
 
-**Deliverables:**
-- Forge computes FDB from `vm_placements` + `hypervisors` tables
-- On Raft commit of `PlaceVm`: Forge reconciliation adds FDB entries
-- On Raft commit of `DeleteVm`: Forge reconciliation removes FDB entries
-- Full FDB rebuild on Forge restart from local redb
-- Deprecate fabric peer announcement-based FDB distribution
-- ARP proxy entries derived from Raft state
+**Scenario**: network split isolates a minority of nodes from the majority.
 
-**Estimated: 5-6 issues**
+**Majority side**: continues operating normally. Raft has quorum. Writes succeed. New VMs can be created.
 
-### Phase 4: Scheduler (gossip-based scoring + Raft placement commit)
+**Minority side**: cannot write (no quorum). Raft followers see no leader heartbeats, start elections, but cannot win (not enough voters). Reads from local redb still work (stale data). Forge continues reconciling existing VMs based on the last known state. VMs on minority nodes keep running.
 
-**Goal:** Full scheduler with all placement constraints from ADR-004.
+**Recovery**: when the partition heals, Raft replays missed log entries to the minority side. Gossip converges within seconds. Full operation resumes.
 
-**Deliverables:**
-- SWIM gossip integration (foca crate)
-- `HypervisorReport` gossip dissemination
-- Scheduler: full filter-then-score pipeline (zone, labels, taints, anti-affinity, spread, capacity, utilization)
-- Forge admission recheck + rejection + retry
-- Gossip metrics
-- Scheduler metrics
+### Majority partition
 
-**Estimated: 8-10 issues**
+**Scenario**: the majority side has quorum and continues operating. The minority side is effectively identical to the "minority partition" case above.
 
-### Phase 5: Tenant API Routing (any-node access)
+### Node crash
 
-**Goal:** API requests can be sent to any node. Writes are transparently forwarded to the Raft leader.
+**VMs survive**: Cloud Hypervisor runs as separate OS processes. A Forge crash does not terminate VMs.
 
-**Deliverables:**
-- Write forwarding middleware in axum
-- Read path: serve from local redb
-- CLI routing: control socket handler detects active control plane, forwards mutations
-- `?consistency=strong` query parameter for linearizable reads
-- Error handling: leader unknown, leader changed during request, timeout
-- Gateway integration: external API → gateway → any node → leader
+**Recovery**: Forge restarts, re-reads redb (state machine output), and re-reconciles. Running VMs are reconnected via Cloud Hypervisor's REST API. Missing network resources (nftables rules, FDB entries) are rebuilt from Raft state.
 
-**Estimated: 5-6 issues**
+**If the node itself crashes** (hardware failure, kernel panic): VMs on that node are lost. Gossip detects the failure in ~5-15 seconds. The Raft leader waits 60 seconds (configurable), then marks the hypervisor as dead. VMs with `restart_on_failure: true` are rescheduled to healthy hypervisors.
 
-### Phase 6: Non-Voter Nodes for Large Clusters
+### redb corruption
 
-**Goal:** Support clusters >7 nodes efficiently by limiting the number of Raft voters.
+**Scenario**: the state machine database file is corrupted (disk error, incomplete write despite ACID guarantees).
 
-**Deliverables:**
-- Automatic voter/learner management (cap voters at configured max, default 7)
-- Learner promotion on voter failure
-- CLI: `syfrah controlplane members` (show voters, learners, status)
-- Learner-to-voter promotion logic (prefer nodes in underrepresented zones)
-- Documentation: operational guide for large clusters
+**Recovery**: delete the corrupted redb file. On startup, Forge detects the missing file and requests a full snapshot from the Raft leader. The leader sends the latest snapshot, and Forge rebuilds its local state from it. All subsequent log entries are replayed on top of the snapshot. This is functionally equivalent to adding a new node — openraft handles it natively.
 
-**Estimated: 3-4 issues**
+### Network split between AZs
 
-### Estimated Scope
+Raft requires a majority across ALL nodes, not per-AZ. Quorum math:
 
-~37-46 issues across 6 phases. Each phase delivers independently useful functionality. Phase 1 alone makes single-node deployments use the same code path as multi-node deployments, validating the architecture without requiring multiple nodes.
+| Cluster size | Quorum | Tolerates | AZ distribution example |
+|-------------|--------|-----------|------------------------|
+| 3 nodes | 2 | 1 failure | AZ-1: 2 nodes, AZ-2: 1 node. AZ-2 loss = still have quorum. AZ-1 loss = no quorum (minority). |
+| 5 nodes | 3 | 2 failures | AZ-1: 2, AZ-2: 2, AZ-3: 1. Any single AZ loss = still have quorum. |
+| 7 nodes (5 voters) | 3 | 2 voter failures | Distribute voters across 3+ AZs for best resilience. |
 
-## Commercial Value
+**Recommendation**: for multi-AZ deployments, distribute nodes (especially voters) across at least 3 availability zones. This ensures that no single AZ failure can cause a quorum loss.
 
-This ADR delivers the core differentiator of Syfrah: turning independent hypervisors into a unified cloud.
+## 15. Cluster sizing
 
-- **Any-node access.** Operators interact with the cluster, not individual machines. `syfrah compute vm create --zone eu-west-1` works from any node. No SSH-per-server workflows.
-- **Global IPAM.** IP addresses are unique across the entire cluster, guaranteed by consensus. Two VMs in the same subnet on different hypervisors never collide.
-- **Automated placement.** The scheduler picks the best hypervisor based on capacity, topology, constraints, and health — like AWS EC2 or GCP Compute Engine.
-- **Zero-config HA.** Add a third node and the cluster is fault-tolerant. No manual leader designation, no external coordination service, no operational burden.
-- **Provider-agnostic.** The control plane runs over WireGuard. Mix OVH, Hetzner, and Scaleway servers in the same Raft cluster. Cross-provider VM placement works identically.
-- **No external dependencies.** No etcd to deploy, no Consul to monitor, no ZooKeeper to tune. The control plane is the syfrah binary.
-- **Incremental migration.** Start with one server. Everything works. Add more servers when you need them. The control plane activates automatically.
-- **Derived networking.** FDB entries, ARP proxy, nftables rules — all derived from the control plane's authoritative state. No separate distribution protocols, no convergence delays, no missed updates.
+| Configuration | Nodes | Voters | Tolerates | Use case |
+|--------------|-------|--------|-----------|----------|
+| **Single node** | 1 | 1 | 0 failures | Development, testing, single-server deployment |
+| **Two nodes** | 2 | 2 | 0 failures | Replication for data safety, but no HA. Either node failing blocks writes. |
+| **Three nodes** | 3 | 3 | 1 failure | Minimum production HA. Recommended starting point. |
+| **Five nodes** | 5 | 5 | 2 failures | Recommended for multi-AZ production. |
+| **Seven+ nodes** | 7+ | 5 voters + N learners | 2 voter failures | Large deployments. Cap voters at 5 (or 7 max) to keep consensus fast. Additional nodes are learners. |
 
-## Rejected Alternatives
+### Voter vs. learner tradeoffs
 
-### 1. External etcd cluster
+- **More voters** = higher write latency (more nodes must acknowledge each write) but better fault tolerance.
+- **Learners** = receive full state replication, can serve reads, can be promoted to voter without data transfer, but do not participate in elections or quorum.
+- **Promotion**: a learner can be promoted to voter at any time via `PromoteToVoter` command. This is useful for planned maintenance — promote a learner before draining a voter.
 
-**Considered:** Use etcd as the consensus layer, similar to Kubernetes.
+### The single-node case
 
-**Rejected:** etcd is an external dependency that requires separate deployment, monitoring, and maintenance. It assumes low-latency networking (not guaranteed across WAN WireGuard links). It adds operational complexity (etcd upgrades, backup, restore). Syfrah's design principle is "no external dependencies." openraft provides the same consistency guarantees as an embedded library.
+Critical for adoption. A single-node Raft cluster is degenerate — the node is automatically leader, writes are committed locally (no replication latency), and there is zero consensus overhead. It behaves exactly like a local database. When the operator adds a second node, Raft begins replicating. When the third node joins, fault tolerance begins.
 
-### 2. External Consul
+The migration path from 1 to N nodes is seamless. No configuration changes, no data migration, no downtime.
 
-**Considered:** Use Consul for both consensus and service discovery.
+## 16. Bootstrap and migration
 
-**Rejected:** Same dependency concerns as etcd. Additionally, Consul's KV store has a 512KB value limit and is not designed for the volume of state Syfrah manages (IPAM bitmaps, security group rules, route tables). Consul's gossip (Serf) would overlap with our SWIM implementation, adding confusion about which gossip to use for what.
+The migration from the current system (each node independent, local redb per node) to distributed consensus is incremental. No big-bang cutover.
 
-### 3. CRDTs for distributed state
+### Phase 1: single-node "cluster" of 1
 
-**Considered:** Use Conflict-free Replicated Data Types instead of Raft for coordination.
+```
+Node A (the only node):
+  ┌──────────────────────────────┐
+  │  openraft with 1 member       │
+  │  Leader = Node A (automatic)  │
+  │                               │
+  │  All writes go through Raft   │
+  │  (even though there's only    │
+  │   one node — zero overhead)   │
+  │                               │
+  │  State machine writes to redb │
+  │  Forge reads redb as before   │
+  └──────────────────────────────┘
+```
 
-**Rejected:** CRDTs cannot enforce uniqueness constraints. You cannot build IPAM (globally unique IP allocation) or VNI allocation with CRDTs — they are designed for conflict-free convergence, not conflict prevention. The control plane's primary job is preventing conflicts. Raft's sequential log is the right primitive.
+Functionally identical to today. The only difference: writes are routed through the Raft state machine instead of directly mutating redb. This validates the full command pipeline on a single node before introducing distribution.
 
-### 4. Gossip for everything (no Raft)
+**Migration**: existing redb data is imported into the Raft state machine as a bootstrap snapshot. The Raft log starts from this snapshot. No data loss, no behavioral change.
 
-**Considered:** Use gossip for all state, including mutations.
+### Phase 2: add second node
 
-**Rejected:** Gossip is eventually consistent. "Eventually" is not acceptable for IP allocation, VM placement, or resource creation. Two nodes gossiping "I allocated 10.0.1.5" leads to conflicts that no gossip protocol can resolve. Gossip is perfect for health and capacity — it is catastrophically wrong for mutations.
+```
+Node A (leader)    ←── Raft replication ──→    Node B (follower)
+  │                                              │
+  redb (state)                                 redb (state)
+  │                                              │
+  Forge                                         Forge
+```
+
+- Node B joins the fabric mesh (WireGuard).
+- Node B joins the Raft cluster via `AddRaftMember`.
+- The leader sends a snapshot to Node B.
+- Both nodes now have identical redb state.
+- IPAM is shared — no more duplicate IPs.
+- FDB entries are derived from shared placement state — cross-node VXLAN forwarding works.
 
-### 5. Raft for everything (no gossip)
+**Limitation**: 2 nodes = no fault tolerance. Either node failing blocks writes. The system is operational but fragile.
 
-**Considered:** Put health and capacity data into Raft.
+### Phase 3: add third node (production minimum)
 
-**Rejected:** Health and capacity change every few seconds on every node. Replicating this through Raft would create enormous log churn — thousands of entries per minute, all requiring majority quorum. This would dominate the Raft log, increase commit latency for real mutations, and waste disk space. Gossip handles high-frequency, low-criticality data efficiently. Raft handles low-frequency, high-criticality data safely.
+```
+Node A    ←── Raft ──→    Node B    ←── Raft ──→    Node C
+  │                         │                         │
+  redb                     redb                      redb
+  │                         │                         │
+  Forge                    Forge                     Forge
+```
 
-### 6. Dedicated control plane nodes
+- Quorum of 2/3 for writes.
+- Tolerates 1 node failure.
+- Full HA: leader crash results in automatic election, writes resume in 1-3 seconds.
+- Cross-node VXLAN forwarding works between all three nodes.
+- This is the minimum production configuration.
 
-**Considered:** Run Raft only on dedicated controller nodes, not on hypervisors.
+### Phase 4+: scale out
 
-**Rejected:** This creates a separate failure domain and operational burden. Operators must provision and manage "controller" machines that don't run workloads. It violates the "every node is equal" principle. openraft supports embedded operation with minimal overhead — there is no reason to dedicate hardware to it. For large clusters, the voter/learner distinction provides the same scaling benefit without dedicated machines.
+Additional nodes join the same way: `AddRaftMember`, snapshot transfer, full replication. Beyond 5 voters, new nodes join as learners.
 
-### 7. redb as distributed store
+## 17. CLI changes
 
-**Considered:** Use redb directly for distributed state coordination across nodes.
+```bash
+# ── Cluster management ───────────────────────────────────────────
 
-**Rejected:** redb is a single-process embedded key-value store with exclusive file locks. It has no replication, no consensus, no multi-writer support. It is excellent as a local state machine backend for Raft (fast reads, ACID transactions, zero-config), but cannot be the distributed coordination layer itself. openraft provides the consensus algorithm; redb provides the local applied-state storage. These are complementary, not interchangeable.
+syfrah cluster status
+# Output:
+#   Cluster: syfrah-prod
+#   Raft state: Healthy
+#   Leader: hv-eu-1 (fd12:...:a1b2)
+#   Term: 47
+#   Commit index: 12,847
+#   Last applied: 12,847
+#   Members: 3 voters, 2 learners
+#   Gossip: 5 alive, 0 suspect, 0 dead
 
-### 8. Separate desired-state store per node
+syfrah cluster members
+# Output:
+#   ID         NAME      ROLE      STATE     REGION      ZONE         FABRIC IPv6
+#   hv-001     hv-eu-1   voter     Active    eu-west     eu-west-1    fd12:...:a1b2
+#   hv-002     hv-eu-2   voter     Active    eu-west     eu-west-2    fd12:...:c3d4
+#   hv-003     hv-eu-3   voter     Active    eu-central  eu-cent-1    fd12:...:e5f6
+#   hv-004     hv-us-1   learner   Active    us-east     us-east-1    fd12:...:7890
+#   hv-005     hv-us-2   learner   Draining  us-east     us-east-2    fd12:...:abcd
 
-**Considered:** Each node keeps its own desired state in local redb, synced via some protocol.
+syfrah cluster add-member <node> [--voter | --learner]
+# Add a fabric node to the Raft cluster.
+# Default: voter if <5 voters exist, learner otherwise.
 
-**Rejected:** This creates a split-brain problem. If a node goes down, its desired state is lost. The authoritative store (openraft-based, with redb as state machine backend) provides the single desired state that survives node failures. Forge is stateless in intent by design — it reads desired state, never owns it.
+syfrah cluster remove-member <node>
+# Remove a node from the Raft cluster.
+# Fails if removal would break quorum.
 
-## References
+syfrah cluster transfer-leader <node>
+# Manually transfer Raft leadership to the specified node.
+# Used for planned maintenance of the current leader.
 
-- `handbook/ARCHITECTURE.md` — global architecture, stack diagram, failure model
-- `handbook/adr-001-networking-roadmap.md` — VXLAN, FDB distribution, IPAM bitmap design
+syfrah cluster promote <node>
+# Promote a learner to voter.
+
+syfrah cluster demote <node>
+# Demote a voter to learner.
+
+# ── All existing commands work unchanged ─────────────────────────
+# They now go through Raft instead of local redb.
+
+syfrah compute vm create --name web-1 --subnet frontend --project backend --org acme
+# → any node → forward to leader → scheduler → Raft commit
+# → Forge on selected hypervisor reconciles → VM boots
+
+syfrah org create acme
+# → any node → forward to leader → Raft commit → all nodes see it
+
+syfrah sg create web-sg --vpc prod --project backend --org acme
+# → any node → forward to leader → Raft commit
+# → all Forges with VMs in VPC prod re-derive nftables rules
+```
+
+## 18. Performance
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Raft write (single command) | 2-10ms | Dominated by WireGuard RTT between nodes. Single datacenter: ~2ms. Cross-datacenter (EU to US): ~80-150ms. |
+| Raft write (batch of N commands) | 2-10ms + negligible per-command | Batching amortizes the network round trip. |
+| Read from leader (local redb) | <1ms | No network hop. Direct redb read. |
+| Read from follower (local redb) | <1ms | No network hop. Eventually consistent. |
+| Gossip propagation (cluster-wide) | 1-3 seconds | O(log N) rounds for SWIM. 5 nodes = ~2 rounds. |
+| Scheduler decision | <1ms | In-memory computation. No I/O. Gossip data cached in memory. |
+| Total VM create (API to running) | 15-30 seconds | Dominated by image pull + ZeroFS volume creation + Cloud Hypervisor boot. Raft + scheduling overhead is <100ms. |
+| Snapshot creation | 1-10 seconds | Depends on state size. 50 MB redb = ~2 seconds. |
+| Snapshot transfer to new node | 5-60 seconds | Depends on state size + network bandwidth. 50 MB over WireGuard at 100 Mbps = ~5 seconds. |
+
+### Throughput
+
+Raft write throughput is bounded by the leader's ability to replicate to a majority. With pipelined replication:
+
+- **Single datacenter** (2ms RTT): ~1,000-5,000 writes/second
+- **Cross datacenter** (100ms RTT): ~50-200 writes/second
+
+Control plane operations (VM create, subnet create, SG update) are infrequent — tens to hundreds per minute in a busy cluster. The Raft throughput is orders of magnitude beyond what the control plane requires.
+
+## 19. Security
+
+### Transport security
+
+All Raft and gossip traffic travels over the WireGuard fabric (syfrah0). WireGuard provides:
+
+- **Encryption**: ChaCha20-Poly1305 for every packet.
+- **Authentication**: only nodes with the mesh secret can join the fabric.
+- **Integrity**: authenticated encryption prevents tampering.
+
+There is no additional TLS layer. WireGuard's encryption is sufficient and avoids the complexity of certificate management.
+
+### Membership control
+
+- Only fabric members can participate in Raft. A node must first join the WireGuard mesh (manual approval or PIN), then be explicitly added to the Raft cluster via `AddRaftMember`.
+- Leader election is restricted to voter nodes. An attacker who compromises a learner node cannot become leader.
+- Removing a node from Raft (`RemoveRaftMember`) immediately stops it from receiving log entries. The node's local redb becomes stale and is eventually deleted.
+
+### Command validation
+
+The state machine validates every command before applying:
+
+- **Authorization**: the command includes the requesting principal (user, API key). The state machine checks IAM permissions.
+- **Referential integrity**: the command references valid, existing resources in the expected states.
+- **Business rules**: deletion guards (cannot delete a VPC with active subnets), uniqueness constraints (no duplicate org names), capacity bounds (no subnet CIDR overlap).
+
+No command can bypass Raft. Forge's API layer enforces that all mutations are routed through the Raft pipeline. Direct redb writes are not exposed.
+
+### State machine determinism
+
+The state machine must be **strictly deterministic**. Given the same log entries, every node must produce the same state. This means:
+
+- No random number generation during apply (random values like ULIDs are generated before proposal, included in the command).
+- No external I/O during apply (no network calls, no file reads).
+- No dependency on wall clock time during apply (timestamps are included in the command by the proposer).
+
+## 20. Observability
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `syfrah_raft_leader_changes_total` | counter | Number of leader elections observed. |
+| `syfrah_raft_term` | gauge | Current Raft term. |
+| `syfrah_raft_commit_index` | gauge | Highest committed log index. |
+| `syfrah_raft_last_applied` | gauge | Highest applied log index. Lag between commit and applied indicates slow state machine. |
+| `syfrah_raft_apply_duration_seconds` | histogram | Time to apply a committed entry to redb. |
+| `syfrah_raft_log_entries_total` | gauge | Total entries in the Raft log (before compaction). |
+| `syfrah_raft_snapshot_duration_seconds` | histogram | Time to create a snapshot. |
+| `syfrah_raft_replication_lag_entries` | gauge (per follower) | How far behind each follower is. |
+| `syfrah_gossip_members_total` | gauge | Total members in the gossip membership list. |
+| `syfrah_gossip_alive_total` | gauge | Members currently alive. |
+| `syfrah_gossip_suspect_total` | gauge | Members currently suspected. |
+| `syfrah_gossip_dead_total` | gauge | Members declared dead. |
+| `syfrah_scheduler_placements_total` | counter | Total VM placements made by the scheduler. |
+| `syfrah_scheduler_placement_retries_total` | counter | Placements that required retry (admission rejected). |
+| `syfrah_scheduler_placement_duration_seconds` | histogram | Time from CreateInstance to PlaceVm commit. |
+| `syfrah_api_leader_forwards_total` | counter | Requests forwarded from follower to leader. |
+
+### Structured logging
+
+Every significant event is logged with structured fields (JSON format):
+
+- Raft apply: `{ "event": "raft_apply", "index": 12847, "command": "CreateInstance", "vm_id": "web-3", "duration_us": 340 }`
+- Scheduler decision: `{ "event": "schedule", "vm_id": "web-3", "hypervisor": "hv-eu-2", "zone": "eu-west-2", "candidates": 4, "score": 0.87 }`
+- Leader election: `{ "event": "leader_elected", "leader": "hv-eu-1", "term": 48, "election_duration_ms": 1200 }`
+- Gossip state change: `{ "event": "gossip_state", "node": "hv-eu-3", "old": "alive", "new": "suspect" }`
+
+### CLI health check
+
+`syfrah cluster status` provides a real-time snapshot:
+
+```
+Cluster: syfrah-prod
+Raft:
+  State:          Healthy
+  Leader:         hv-eu-1 (term 47, commit 12847)
+  Applied:        12847 (lag: 0)
+  Log entries:    2,341 (last compacted at 10506)
+  Snapshot:       10506 (2 hours ago)
+  Members:        3 voters, 2 learners
+  
+Gossip:
+  Members:        5 alive, 0 suspect, 0 dead
+  Last probe:     0.3s ago
+  
+Scheduler:
+  Placements:     1,247 total (3 retried)
+  Last placement: 4m ago (web-3 → hv-eu-2)
+```
+
+## 21. Implementation phases
+
+### Phase 1 — Raft core (~15 issues)
+
+Implement the openraft integration: `RaftLogStorage`, `RaftStateMachine`, `RaftNetwork`. Single-node Raft that routes all writes through the log. Bootstrap migration (import existing redb data as initial snapshot). Basic cluster membership commands (`add-member`, `remove-member`). Raft health endpoint.
+
+**Deliverable**: a single node where all writes go through Raft. Functionally identical to today, but via consensus.
+
+### Phase 2 — State machine + IPAM (~10 issues)
+
+Implement the full `RaftCommand` enum with validation. Migrate IPAM from direct redb writes to Raft commands. Implement the secondary indexes (`hypervisor_placements`, `vpc_placements`, etc.). Snapshot creation and installation.
+
+**Deliverable**: IPAM allocations are strongly consistent across nodes. No duplicate IPs.
+
+### Phase 3 — Scheduler + API gateway (~10 issues)
+
+Implement the scheduler (filtering, scoring, selection). Implement API leader forwarding (follower proxies writes to leader). Implement the `syfrah cluster` CLI commands. Implement request ID deduplication.
+
+**Deliverable**: operator can create a VM on any node, the scheduler places it automatically, and the API routes correctly.
+
+### Phase 4 — SWIM gossip (~8 issues)
+
+Integrate the `foca` crate. Implement `NodeReport` metadata. Implement gossip-based failure detection. Connect gossip to the scheduler (capacity hints, liveness checks). Implement the Raft leader's node-failure reconciler (dead node leads to VM rescheduling).
+
+**Deliverable**: cluster detects node failures in ~5-15 seconds and reschedules HA workloads.
+
+### Phase 5 — Cross-node networking (FDB distribution) (~5 issues)
+
+Implement FDB derivation from Raft placement state. Implement ARP proxy derivation. Validate end-to-end cross-node VXLAN forwarding. Test: VM on node A pings VM on node B through VXLAN over WireGuard.
+
+**Deliverable**: VMs on different nodes can communicate over the overlay network.
+
+### Phase 6 — Production hardening (~5 issues)
+
+Raft snapshot scheduling and compaction tuning. Prometheus metrics export. Structured logging for all control plane events. Chaos testing (leader kill, network partition, node crash). Performance benchmarking (write throughput, read latency, scheduler decision time). Documentation.
+
+**Deliverable**: production-ready control plane.
+
+## 22. Rejected alternatives
+
+### etcd / Consul (external consensus store)
+
+Rejected. Architecture principle #1: **no external dependencies**. etcd requires a separate cluster of 3-5 nodes, a separate operational burden, a separate failure domain. Consul adds service mesh complexity. Both are external C/Go binaries — the Syfrah binary would depend on external services being available. openraft is embedded, pure Rust, starts with the process, and requires zero external infrastructure.
+
+### CRDTs (Conflict-free Replicated Data Types)
+
+Rejected. CRDTs provide eventual consistency without coordination — attractive for some workloads but **too weak for IPAM**. IP allocation requires strong consistency: two concurrent allocations must not produce the same IP. CRDTs cannot guarantee this without additional coordination, which defeats their purpose. Raft provides the strong consistency IPAM needs, and the performance is more than sufficient for control plane operations.
+
+### Single leader without Raft (custom replication)
+
+Rejected. A hand-rolled leader protocol without Raft's formal guarantees (leader completeness, state machine safety, log matching) is a recipe for data loss and split-brain. Raft is a well-understood, formally verified consensus protocol. openraft is a mature implementation. There is no reason to build a worse version from scratch.
+
+### Gossip-only (no strong consensus)
+
+Rejected. Gossip provides fast propagation but no ordering guarantees and no linearizability. Two nodes gossiping concurrent IPAM allocations can produce conflicting state that is expensive to resolve. Gossip is ideal for health and telemetry (where staleness is acceptable), but not for authoritative state (where conflicts are catastrophic). The two-layer architecture (Raft + gossip) gives each protocol the workload it excels at.
+
+### Paxos
+
+Rejected in favor of Raft. Raft and Paxos provide equivalent safety guarantees, but Raft is significantly easier to understand, implement, and debug. openraft is a production-quality Raft implementation. There is no mature, embeddable, async Paxos implementation for Rust.
+
+### Database replication (PostgreSQL, CockroachDB)
+
+Rejected. External database dependencies violate principle #1. CockroachDB uses Raft internally, but wrapping SQL around what is fundamentally a key-value state machine adds unnecessary complexity. redb is lighter, faster for our access patterns, and has zero external dependencies.
+
+## 23. Commercial value
+
+The control plane transforms Syfrah from a per-node VM manager into a distributed cloud platform. This is the inflection point for commercial viability.
+
+**What it enables:**
+
+- **Multi-node as the default.** Operators add nodes and the platform handles distribution. No manual VM placement, no manual FDB management, no manual IPAM coordination.
+- **Automatic failure recovery.** Node dies, VMs reschedule. The operator sleeps through outages that would previously require manual intervention.
+- **Cross-provider private networking.** VMs on OVH and Hetzner communicate over encrypted private IPs as if they were in the same datacenter. This is the core value proposition — a unified cloud across providers.
+- **Horizontal scalability.** Adding a node adds capacity. The scheduler distributes workloads automatically. The operator grows the platform by renting more servers.
+- **Topology-aware placement.** The scheduler respects zones, labels, taints, and anti-affinity. Operators can express "spread my web servers across availability zones" as a placement constraint.
+- **API-first management.** Terraform providers, CLI tools, and custom integrations can target any node. The platform routes requests transparently. This is the foundation for a managed service.
+- **Operational simplicity.** No etcd cluster to manage, no control plane nodes vs. worker nodes. Every node is equal. The operator manages servers, not infrastructure components.
+
+## 24. References
+
+- `layers/controlplane/README.md` — planned control plane design overview
+- `handbook/ARCHITECTURE.md` — global architecture and stack diagram
+- `handbook/state-and-reconciliation.md` — reconciliation philosophy, source of truth model, resource phase models
+- `handbook/adr-001-networking-roadmap.md` — networking foundation (VPC, VXLAN, IPAM, FDB, config-drive)
 - `handbook/adr-002-security-groups-route-tables.md` — security groups, route tables, NAT gateways, NICs
-- `handbook/adr-003-forge.md` — Forge design, desired state projection, openraft integration, bootstrap mode
-- `handbook/adr-004-hypervisor-model.md` — hypervisor topology, scheduler integration, HypervisorReport, placement algorithm
-- `handbook/state-and-reconciliation.md` — source of truth tables, reconciliation philosophy, phase models
-- `handbook/api-architecture.md` — API transport, gateway pattern, CLI routing
-- `handbook/zones-and-regions.md` — topology metadata, placement semantics
-- `layers/fabric/README.md` — WireGuard mesh, peer announcements, gossip dissemination
-- `layers/controlplane/README.md` — control plane overview, two-layer architecture, Raft scaling
-- `openraft` crate: https://docs.rs/openraft
-- `foca` crate: https://docs.rs/foca
-- `redb` crate: https://docs.rs/redb
+- `handbook/adr-003-forge.md` — Forge per-node orchestrator, materialized view consumption, reconciliation engine
+- `handbook/adr-004-hypervisor-model.md` — hypervisor as first-class resource, Region/Zone/Hypervisor/VM topology
+- `layers/fabric/README.md` — WireGuard mesh, fabric transport for Raft + gossip
+- [openraft](https://github.com/databendlabs/openraft) — Rust Raft implementation
+- [foca](https://github.com/caio/foca) — Rust SWIM implementation
+- [redb](https://github.com/cberner/redb) — Rust embedded key-value store
+- [Raft paper](https://raft.github.io/raft.pdf) — "In Search of an Understandable Consensus Algorithm" (Ongaro, Ousterhout 2014)
+- [SWIM paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf) — "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol" (Das, Gupta, Motivala 2002)
