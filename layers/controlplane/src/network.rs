@@ -140,3 +140,24 @@ impl RaftNetworkV2<SyfrahRaftConfig> for SyfrahNetwork {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::network::RaftNetworkFactory;
+
+    #[tokio::test]
+    async fn factory_creates_client() {
+        let mut factory = SyfrahNetworkFactory::new();
+        let node = SyfrahNode {
+            addr: "[::1]:7200".to_string(),
+        };
+        let network = factory.new_client(1, &node).await;
+        assert_eq!(network.target_addr, "[::1]:7200");
+    }
+
+    #[test]
+    fn factory_default() {
+        let _ = SyfrahNetworkFactory::default();
+    }
+}
