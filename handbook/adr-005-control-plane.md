@@ -203,7 +203,7 @@ The state machine owns **everything that must be consistent across the cluster**
 |----------------|--------|---------|
 | VM runtime status (running, stopped, error) | Forge on the hosting hypervisor | Dashboards, health alerts |
 | Node capacity (free vCPU, memory, disk) | Forge capacity tracker | Scheduler (as hints) |
-| Node liveness (up, suspect, dead) | SWIM protocol | Scheduler (avoid dead nodes) |
+| Node liveness (up, suspect, down) | SWIM protocol | Scheduler (avoid down nodes) |
 | Hypervisor status (reachable, forge version, uptime) | Forge health check | Operational awareness |
 | Drain status | Forge (operator-initiated) | Scheduler (stop placing new VMs) |
 
@@ -392,7 +392,7 @@ Validation happens twice: once on the leader before proposal (fast rejection of 
 
 ### Idempotency
 
-Commands include a client-generated request ID. The state machine maintains a deduplication table mapping recent request IDs to their results. If the same request ID is applied twice (e.g., client retry after timeout), the state machine returns the cached result without re-executing.
+Commands include a client-supplied idempotency key. The state machine maintains a deduplication journal mapping recent keys to their results. If the same key is applied twice (e.g., client retry after timeout), the state machine returns the cached result without re-executing. See section 19 (Request Idempotency) for the full mechanism, TTL, and CLI behavior.
 
 ## 6. Materialized views per hypervisor
 
@@ -449,7 +449,7 @@ Gossip is the fast, decentralized health and telemetry layer. It runs alongside 
 
 | Data | Update frequency | Consumer |
 |------|-----------------|----------|
-| Node liveness (alive, suspect, dead) | Continuous (SWIM probing) | Scheduler, Raft leader (for node failure handling) |
+| Node liveness (Alive, Suspect, Down) | Continuous (SWIM probing) | Scheduler, Raft leader (for node failure handling) |
 | CPU/memory/disk capacity hints | Every 10 seconds | Scheduler (for placement decisions) |
 | Hypervisor state hints (draining, maintenance) | On change | Scheduler (to avoid placing new VMs) |
 | VM count per hypervisor | Every 10 seconds | Scheduler (spread scoring) |
@@ -473,8 +473,10 @@ The gossip layer uses the `foca` crate, a transport-agnostic SWIM (Scalable Weak
 1. **Ping**: each node probes a random subset of known members every 1 second.
 2. **Ping-req** (indirect probe): if a direct ping fails, the node asks K other members to probe the suspect on its behalf. K = 3 by default.
 3. **Suspect**: if both direct and indirect probes fail, the member is marked suspect. Suspicion is disseminated via piggybacked protocol messages.
-4. **Confirm dead**: if a suspect member does not refute the suspicion within the suspicion timeout (default 5 seconds), it is declared dead.
+4. **Confirm down**: if a suspect member does not refute the suspicion within the suspicion timeout (default 5 seconds), it is declared Down.
 5. **Refute**: a suspected node that is actually alive broadcasts a refutation (protocol message with higher incarnation number).
+
+State names align with the foca SWIM implementation: Alive, Suspect, Down.
 
 **Failure detection timing**:
 
@@ -482,7 +484,7 @@ The gossip layer uses the `foca` crate, a transport-agnostic SWIM (Scalable Weak
 |-------|--------|
 | Direct ping | Every 1 second |
 | Suspect declared | After 1 failed direct + 3 failed indirect probes (~2-3 seconds) |
-| Dead declared | Suspect timeout (5 seconds) after suspicion |
+| Down declared | Suspect timeout (5 seconds) after suspicion |
 | Total detection time | ~5-10 seconds (best case) to ~15 seconds (worst case) |
 
 **Custom metadata**: each node piggybacks a `NodeReport` on its protocol messages:
@@ -507,6 +509,22 @@ This metadata is updated locally every 10 seconds and disseminated passively via
 
 The scheduler runs on the Raft leader only. It is invoked when a `CreateInstance` command arrives and a placement decision is needed.
 
+### Scheduler guarantees and limitations
+
+**What the scheduler guarantees:**
+- Global uniqueness of IP addresses (via Raft IPAM)
+- Placement decision recorded in Raft (authoritative)
+- Forge admission recheck prevents overcommit
+
+**What the scheduler does NOT guarantee (Phase 1-3):**
+- Optimal placement under high contention (no reservations — multiple schedulers may pick the same hypervisor)
+- Bounded placement latency (retries under contention)
+- Fair distribution under burst (hotspot possible until gossip converges)
+
+Without reservations, placement is optimistic. Strong uniqueness is guaranteed for identifiers and allocations (IPs, VNIs, NICs), but compute admission is only guaranteed at Forge execution time. Under concurrent burst creates, retry storms are possible.
+
+Future (Phase 6+): in-flight reservations at the scheduler level reduce contention from O(N²) retries to O(1) placement.
+
 ### Scheduling pipeline
 
 ```
@@ -522,7 +540,7 @@ CreateInstance arrives at the leader
          ▼
 2. Query gossip for hypervisor capacity hints
    - available vCPU, memory, disk per hypervisor
-   - node liveness (alive only — exclude suspect and dead)
+   - node liveness (alive only — exclude suspect and down)
          │
          ▼
 3. Filter: build candidate list
@@ -539,6 +557,9 @@ CreateInstance arrives at the leader
    b. Zone spread score (prefer zones with fewer VMs of this type)
    c. Anti-affinity score (penalize colocation with conflicting VMs)
    d. Data locality score (prefer nodes that already have the VM image cached)
+         │
+         ▼
+   **Gossip staleness:** The scheduler uses gossip capacity reports that may be up to 30 seconds stale. Under burst conditions, the reported available capacity may not reflect in-flight reservations or recent placements not yet propagated. The Forge admission recheck is the true capacity gate — gossip is scoring input, not a guarantee.
          │
          ▼
 5. Select: pick the highest-scoring hypervisor
@@ -588,11 +609,49 @@ trait Scheduler: Send + Sync {
 
 The scheduler is also invoked when:
 
-- **A hypervisor is declared dead** (gossip dead for >60 seconds, Raft leader commits hypervisor state change). VMs on the dead hypervisor with `restart_on_failure: true` are rescheduled to healthy hypervisors.
+- **A hypervisor is declared down** (gossip down for >60 seconds, Raft leader commits hypervisor state change). VMs on the down hypervisor with `restart_on_failure: true` are rescheduled to healthy hypervisors.
 - **A hypervisor enters draining state** (operator-initiated). The scheduler migrates VMs to other hypervisors one at a time (stop, reschedule, start).
 - **A placement is rejected by admission control**. The scheduler retries with the next best candidate.
 
-## 9. API gateway — single entry point
+## 9. Placement Fencing
+
+Every VM placement carries a monotonically increasing `placement_generation` (u64), assigned by the Raft state machine at commit time.
+
+### The problem: stale placements after reschedule
+
+When a hypervisor becomes unreachable and a VM is rescheduled:
+1. Leader commits `RescheduleVm { vm_id, from: hv-002, to: hv-005, generation: 42 }`
+2. hv-005 Forge starts the VM with generation 42
+3. hv-002 comes back online with the OLD VM still running (generation 41)
+
+Without fencing, hv-002's Forge would continue reconciling the stale VM — resulting in a double-run.
+
+### The invariant
+
+**A Forge must refuse to reconcile any VM whose local placement generation is older than the Raft placement record.**
+
+On every reconciliation cycle, Forge compares:
+- `local_generation` (from its last known placement)
+- `raft_generation` (from the materialized desired state)
+
+If `local_generation < raft_generation`: the VM has been rescheduled elsewhere. Forge MUST:
+1. Stop the local VM process immediately
+2. Clean up all local resources (TAP, nftables, FDB)
+3. Release the local IPAM reservation (if any)
+4. Log: "fenced stale VM {id} (local gen {N} < raft gen {M})"
+
+If `local_generation == raft_generation` AND `hypervisor_id != this_node`: same — the VM doesn't belong here.
+
+### Double-run protection
+
+This is the primary defense against double-run. Without it:
+- Stateless VMs: two copies running = split brain for clients
+- Stateful VMs: two copies writing to the same volume = data corruption
+- Network: two VMs with the same IP = ARP conflicts, FDB confusion
+
+Fencing is not optional. It is a correctness requirement.
+
+## 10. API gateway — single entry point
 
 Every node runs an axum HTTP server on its fabric IPv6 address, port 7100 (the Forge API port, as defined in ADR-003). The operator, Terraform provider, or any API client talks to ANY node.
 
@@ -637,7 +696,7 @@ Each node tracks the current Raft leader via openraft's notifications. When a fo
 
 The fabric-internal API (HTTP on syfrah0) is the foundation. A future external API (gRPC or HTTPS on a public interface) will proxy to the internal API. This ADR does not define the external API — it is a separate concern.
 
-## 10. IPAM becomes distributed
+## 11. IPAM becomes distributed
 
 ### The problem today
 
@@ -681,7 +740,7 @@ Reserved → Assigned → Released
 
 MAC addresses are deterministically derived from IPs: `02:00:{IP octets in hex}`. For example, `10.1.0.5` produces `02:00:0a:01:00:05`. This eliminates the need for a MAC allocation service. The MAC is computed, never stored as authoritative state (though it appears in placement records for convenience).
 
-## 11. FDB becomes derived from Raft state
+## 12. FDB becomes derived from Raft state
 
 ### The problem today
 
@@ -691,29 +750,28 @@ FDB entries are not distributed. A node has no knowledge of VMs on other nodes. 
 
 FDB entries are **derived from VM placement records in Raft**. Every `PlaceVm` entry contains the VM's MAC, IP, and hosting hypervisor. Each Forge reads the global placement state and populates its local FDB table.
 
-### Derivation logic
+### Derivation strategy
 
-On each reconciliation cycle, Forge on node N:
+**Cold rebuild (on Forge start / restart):**
+Full scan of all VM placements in the local VPCs. O(total VMs in VPC). Acceptable at startup — happens once.
 
-1. Reads all VPCs that have VMs on node N (from `vpc_hypervisors` index).
-2. For each such VPC, reads all VM placements (from `vpc_placements` index).
-3. For each remote placement (hypervisor_id != node N):
-   - Looks up the remote hypervisor's fabric IPv6 address.
-   - Adds a static FDB entry: `bridge fdb add {mac} dev syfvx-{vpc_id} dst {remote_fabric_ipv6}`.
-   - Adds an ARP proxy entry: `ip neigh add {ip} lladdr {mac} dev syfvx-{vpc_id} nud permanent`.
-4. For each local placement (hypervisor_id == node N):
-   - The MAC resolves locally via the bridge — no FDB entry needed.
-5. Removes stale FDB entries for VMs that no longer exist or have moved.
+**Incremental reconciliation (normal operation):**
+When a new Raft entry is committed (PlaceVm, RemoveVm), Forge applies only the delta:
+- PlaceVm on remote hypervisor: add one FDB entry + one ARP proxy
+- RemoveVm on remote hypervisor: remove one FDB entry + one ARP proxy
+- PlaceVm on this hypervisor: no FDB needed (local bridge forwarding)
 
-This is a full reconciliation — no incremental updates to track, no events to replay. The Raft state is the source of truth; FDB is recomputed from it. If a node restarts, the next reconciliation cycle rebuilds FDB from scratch.
+The reconciliation loop (every 5s) verifies the FDB set matches the expected set derived from Raft state. If drift is detected, only the drifted entries are corrected — not the entire table.
+
+This keeps the steady-state cost at O(1) per placement change, not O(N) per reconciliation cycle.
 
 ### Consistency
 
-FDB entries are eventually consistent with Raft state. The delay is bounded by the reconciliation interval (default 30 seconds) or the Raft apply notification (near-instant). In practice, FDB is updated within 1-2 seconds of a new VM placement being committed.
+FDB entries are eventually consistent with Raft state. The delay is bounded by the reconciliation interval (default 5 seconds) or the Raft apply notification (near-instant). In practice, FDB is updated within 1-2 seconds of a new VM placement being committed.
 
 During this window, packets destined for a newly placed VM may be dropped. This is acceptable — the VM is still booting during this window anyway.
 
-## 12. Cross-node VM networking flow (the endgame)
+## 13. Cross-node VM networking flow (the endgame)
 
 This is the complete flow that demonstrates every component working together.
 
@@ -791,7 +849,7 @@ Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet fronte
 8. Leader responds to operator: VM web-3 created, IP 10.1.0.5, hypervisor hv-eu-2
 ```
 
-## 13. Consistency guarantees
+## 14. Consistency guarantees
 
 | Operation | Guarantee | Mechanism |
 |-----------|-----------|-----------|
@@ -802,6 +860,19 @@ Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet fronte
 | **Forge reconciliation** | Eventual convergence | Within 1-3 reconciliation cycles (30-90 seconds) after state change. Faster when triggered by Raft apply notification (near-instant). |
 | **FDB propagation** | Eventual | Derived from Raft state during reconciliation. New entries appear within 1-30 seconds. |
 
+### Read-your-writes
+
+The write response from the leader IS the authoritative confirmation. The client can trust it immediately.
+
+However, subsequent reads from a different node may not reflect the write yet (replication lag, typically <100ms).
+
+Contract:
+- **Read from the same node that processed the write**: guaranteed read-your-writes (leader always has latest state)
+- **Read from a follower**: eventually consistent (may lag by 1-2 Raft rounds)
+- **Read with `?consistency=strong`**: forwarded to leader, linearizable, but higher latency
+
+For Terraform providers and SDK clients: the create/update response contains the full resource state. Clients should use this response rather than immediately re-reading from a potentially stale follower.
+
 ### Ordering guarantees
 
 - All Raft commands are totally ordered. Every node sees the same sequence.
@@ -809,7 +880,7 @@ Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet fronte
 - Gossip provides no ordering guarantees. Observations may arrive out of order.
 - Forge reconciliation is idempotent — ordering of reconciliation cycles does not matter.
 
-## 14. Failure modes
+## 15. Failure modes
 
 ### Leader crash
 
@@ -839,7 +910,7 @@ Operator: syfrah compute vm create --name web-3 --zone eu-west-2 --subnet fronte
 
 **Recovery**: Forge restarts, re-reads redb (state machine output), and re-reconciles. Running VMs are reconnected via Cloud Hypervisor's REST API. Missing network resources (nftables rules, FDB entries) are rebuilt from Raft state.
 
-**If the node itself crashes** (hardware failure, kernel panic): VMs on that node are lost. Gossip detects the failure in ~5-15 seconds. The Raft leader waits 60 seconds (configurable), then marks the hypervisor as dead. VMs with `restart_on_failure: true` are rescheduled to healthy hypervisors.
+**If the node itself crashes** (hardware failure, kernel panic): VMs on that node are lost. Gossip detects the failure in ~5-15 seconds. The Raft leader waits 60 seconds (configurable), then marks the hypervisor as down. VMs with `restart_on_failure: true` are rescheduled to healthy hypervisors.
 
 ### redb corruption
 
@@ -859,7 +930,7 @@ Raft requires a majority across ALL nodes, not per-AZ. Quorum math:
 
 **Recommendation**: for multi-AZ deployments, distribute nodes (especially voters) across at least 3 availability zones. This ensures that no single AZ failure can cause a quorum loss.
 
-## 15. Cluster sizing
+## 16. Cluster sizing
 
 | Configuration | Nodes | Voters | Tolerates | Use case |
 |--------------|-------|--------|-----------|----------|
@@ -875,13 +946,22 @@ Raft requires a majority across ALL nodes, not per-AZ. Quorum math:
 - **Learners** = receive full state replication, can serve reads, can be promoted to voter without data transfer, but do not participate in elections or quorum.
 - **Promotion**: a learner can be promoted to voter at any time via `PromoteToVoter` command. This is useful for planned maintenance — promote a learner before draining a voter.
 
+### Default node roles
+
+- Every joined node runs the control plane runtime (Raft + gossip)
+- Every node receives the full replicated state machine (needed for local reads and Forge reconciliation)
+- New nodes join as **learners** by default (receive state, don't vote)
+- Voter promotion is explicit: `syfrah controlplane promote <node>` or policy-driven (auto-promote up to N voters)
+- Non-hypervisor nodes (routers, monitoring) can be voters if desired (they don't host VMs but participate in consensus)
+- Recommended: voters are the most stable nodes (longest uptime, best network), not necessarily the busiest hypervisors
+
 ### The single-node case
 
 Critical for adoption. A single-node Raft cluster is degenerate — the node is automatically leader, writes are committed locally (no replication latency), and there is zero consensus overhead. It behaves exactly like a local database. When the operator adds a second node, Raft begins replicating. When the third node joins, fault tolerance begins.
 
 The migration path from 1 to N nodes is seamless. No configuration changes, no data migration, no downtime.
 
-## 16. Bootstrap and migration
+## 17. Bootstrap and migration
 
 The migration from the current system (each node independent, local redb per node) to distributed consensus is incremental. No big-bang cutover.
 
@@ -904,7 +984,26 @@ Node A (the only node):
 
 Functionally identical to today. The only difference: writes are routed through the Raft state machine instead of directly mutating redb. This validates the full command pipeline on a single node before introducing distribution.
 
-**Migration**: existing redb data is imported into the Raft state machine as a bootstrap snapshot. The Raft log starts from this snapshot. No data loss, no behavioral change.
+### Migration cutover sequence
+
+No downtime for already running VMs. A short mutation freeze is required during the Raft bootstrap on the initial node.
+
+1. Operator initiates: `syfrah controlplane init`
+2. Forge enters migration mode: rejects new mutations (creates, deletes) with `503 Service Unavailable — control plane migration in progress`
+3. Running VMs continue operating — reconciliation continues for existing resources
+4. Forge snapshots current redb state
+5. Initializes single-node Raft cluster with snapshot as initial state
+6. Switches write path from direct-redb to Raft
+7. Resumes accepting mutations
+8. Mutation freeze duration: typically 2-5 seconds (redb snapshot + Raft init)
+
+Subsequent nodes joining the Raft cluster receive the state via Raft snapshot replication — no per-node migration needed.
+
+Key guarantees:
+- Running VMs: zero downtime (they are OS processes, independent of Forge)
+- Reads: available throughout (local redb still serves)
+- Writes: briefly unavailable (2-5s during cutover)
+- No data loss: redb snapshot is the complete state
 
 ### Phase 2: add second node
 
@@ -945,7 +1044,7 @@ Node A    ←── Raft ──→    Node B    ←── Raft ──→    Node
 
 Additional nodes join the same way: `AddRaftMember`, snapshot transfer, full replication. Beyond 5 voters, new nodes join as learners.
 
-## 17. CLI changes
+## 18. CLI changes
 
 ```bash
 # ── Cluster management ───────────────────────────────────────────
@@ -959,7 +1058,7 @@ syfrah cluster status
 #   Commit index: 12,847
 #   Last applied: 12,847
 #   Members: 3 voters, 2 learners
-#   Gossip: 5 alive, 0 suspect, 0 dead
+#   Gossip: 5 alive, 0 suspect, 0 down
 
 syfrah cluster members
 # Output:
@@ -1003,7 +1102,44 @@ syfrah sg create web-sg --vpc prod --project backend --org acme
 # → all Forges with VMs in VPC prod re-derive nftables rules
 ```
 
-## 18. Performance
+## 19. Request Idempotency
+
+All mutating API operations support a client-supplied `Idempotency-Key` header (or `client_token` field in the request body).
+
+### The problem: lost responses
+
+1. Client sends `POST /v1/instances` with `Idempotency-Key: abc-123`
+2. Raft leader commits the create
+3. Response is lost (network error, timeout)
+4. Client retries with same `Idempotency-Key: abc-123`
+5. State machine recognizes the key → returns the original result without re-executing
+
+### Implementation
+
+The state machine maintains a deduplication journal:
+- Key: idempotency key (string, max 64 chars)
+- Value: { command_index: u64, result: CommandResult, expires_at: u64 }
+- TTL: 24 hours (after which the key is garbage collected)
+
+On every command application:
+1. Check if idempotency key exists in journal
+2. If yes and not expired: return cached result (no re-execution)
+3. If no: execute command, store result in journal with key
+
+### Scope
+
+- Idempotency keys are scoped per-client (identified by the key itself)
+- Keys are stored in the Raft state machine (replicated, survives leader failover)
+- The journal is compacted during Raft snapshots (expired entries removed)
+
+### CLI behavior
+
+The CLI auto-generates an idempotency key for every mutation:
+`{command}_{timestamp}_{random}` — e.g., `create_vm_1711900000_a1b2c3`
+
+This means CLI retries (e.g., user re-runs the same command after a timeout) may create a NEW key and thus a new resource. To get true retry safety, the user must supply `--idempotency-key` explicitly.
+
+## 20. Performance
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
@@ -1026,7 +1162,7 @@ Raft write throughput is bounded by the leader's ability to replicate to a major
 
 Control plane operations (VM create, subnet create, SG update) are infrequent — tens to hundreds per minute in a busy cluster. The Raft throughput is orders of magnitude beyond what the control plane requires.
 
-## 19. Security
+## 21. Security
 
 ### Transport security
 
@@ -1054,6 +1190,21 @@ The state machine validates every command before applying:
 
 No command can bypass Raft. Forge's API layer enforces that all mutations are routed through the Raft pipeline. Direct redb writes are not exposed.
 
+### What per-request signatures protect against
+
+- Message spoofing from outside the mesh
+- Routing errors (message arrives at wrong handler)
+- Replay attacks (with nonce/timestamp)
+- Audit trail (which node sent what)
+
+### What they do NOT protect against
+
+- A fully compromised mesh member (the attacker has the signing key)
+- A malicious voter corrupting the Raft log (Raft assumes honest majority)
+- Side-channel attacks on the state machine
+
+Per-request signatures improve message authenticity and auditability, but do not by themselves mitigate a fully compromised cluster member. True defense against compromised nodes requires Byzantine fault tolerance (BFT), which is out of scope.
+
 ### State machine determinism
 
 The state machine must be **strictly deterministic**. Given the same log entries, every node must produce the same state. This means:
@@ -1062,7 +1213,7 @@ The state machine must be **strictly deterministic**. Given the same log entries
 - No external I/O during apply (no network calls, no file reads).
 - No dependency on wall clock time during apply (timestamps are included in the command by the proposer).
 
-## 20. Observability
+## 22. Observability
 
 ### Prometheus metrics
 
@@ -1079,7 +1230,7 @@ The state machine must be **strictly deterministic**. Given the same log entries
 | `syfrah_gossip_members_total` | gauge | Total members in the gossip membership list. |
 | `syfrah_gossip_alive_total` | gauge | Members currently alive. |
 | `syfrah_gossip_suspect_total` | gauge | Members currently suspected. |
-| `syfrah_gossip_dead_total` | gauge | Members declared dead. |
+| `syfrah_gossip_down_total` | gauge | Members declared down. |
 | `syfrah_scheduler_placements_total` | counter | Total VM placements made by the scheduler. |
 | `syfrah_scheduler_placement_retries_total` | counter | Placements that required retry (admission rejected). |
 | `syfrah_scheduler_placement_duration_seconds` | histogram | Time from CreateInstance to PlaceVm commit. |
@@ -1109,7 +1260,7 @@ Raft:
   Members:        3 voters, 2 learners
   
 Gossip:
-  Members:        5 alive, 0 suspect, 0 dead
+  Members:        5 alive, 0 suspect, 0 down
   Last probe:     0.3s ago
   
 Scheduler:
@@ -1117,7 +1268,7 @@ Scheduler:
   Last placement: 4m ago (web-3 → hv-eu-2)
 ```
 
-## 21. Implementation phases
+## 23. Implementation phases
 
 ### Phase 1 — Raft core (~15 issues)
 
@@ -1139,7 +1290,7 @@ Implement the scheduler (filtering, scoring, selection). Implement API leader fo
 
 ### Phase 4 — SWIM gossip (~8 issues)
 
-Integrate the `foca` crate. Implement `NodeReport` metadata. Implement gossip-based failure detection. Connect gossip to the scheduler (capacity hints, liveness checks). Implement the Raft leader's node-failure reconciler (dead node leads to VM rescheduling).
+Integrate the `foca` crate. Implement `NodeReport` metadata. Implement gossip-based failure detection. Connect gossip to the scheduler (capacity hints, liveness checks). Implement the Raft leader's node-failure reconciler (down node leads to VM rescheduling).
 
 **Deliverable**: cluster detects node failures in ~5-15 seconds and reschedules HA workloads.
 
@@ -1155,7 +1306,7 @@ Raft snapshot scheduling and compaction tuning. Prometheus metrics export. Struc
 
 **Deliverable**: production-ready control plane.
 
-## 22. Rejected alternatives
+## 24. Rejected alternatives
 
 ### etcd / Consul (external consensus store)
 
@@ -1181,7 +1332,7 @@ Rejected in favor of Raft. Raft and Paxos provide equivalent safety guarantees, 
 
 Rejected. External database dependencies violate principle #1. CockroachDB uses Raft internally, but wrapping SQL around what is fundamentally a key-value state machine adds unnecessary complexity. redb is lighter, faster for our access patterns, and has zero external dependencies.
 
-## 23. Commercial value
+## 25. Commercial value
 
 The control plane transforms Syfrah from a per-node VM manager into a distributed cloud platform. This is the inflection point for commercial viability.
 
@@ -1195,7 +1346,7 @@ The control plane transforms Syfrah from a per-node VM manager into a distribute
 - **API-first management.** Terraform providers, CLI tools, and custom integrations can target any node. The platform routes requests transparently. This is the foundation for a managed service.
 - **Operational simplicity.** No etcd cluster to manage, no control plane nodes vs. worker nodes. Every node is equal. The operator manages servers, not infrastructure components.
 
-## 24. References
+## 26. References
 
 - `layers/controlplane/README.md` — planned control plane design overview
 - `handbook/ARCHITECTURE.md` — global architecture and stack diagram
