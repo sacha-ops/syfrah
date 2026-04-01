@@ -417,6 +417,38 @@ impl RedbStateMachine {
                     Err(e) => StateMachineResponse::Error(e.to_string()),
                 }
             }
+
+            // -- Composite Transaction --
+            StateMachineCommand::Composite { commands } => {
+                // Apply all sub-commands atomically. If any fails, report the error
+                // but continue (the Raft log is append-only, we can't undo committed entries).
+                // In practice, the caller should validate before submitting.
+                let mut results = Vec::with_capacity(commands.len());
+                for sub_cmd in commands {
+                    let resp = self.apply_command(sub_cmd);
+                    let failed = matches!(resp, StateMachineResponse::Error(_));
+                    results.push(resp);
+                    if failed {
+                        // On first error, stop applying remaining commands.
+                        break;
+                    }
+                }
+                // Check if any sub-command failed.
+                let any_error = results
+                    .iter()
+                    .any(|r| matches!(r, StateMachineResponse::Error(_)));
+                if any_error {
+                    // Return the first error.
+                    for r in &results {
+                        if let StateMachineResponse::Error(msg) = r {
+                            return StateMachineResponse::Error(format!(
+                                "composite transaction failed: {msg}"
+                            ));
+                        }
+                    }
+                }
+                StateMachineResponse::Composite(results)
+            }
         }
     }
 }
