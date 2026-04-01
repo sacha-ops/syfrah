@@ -48,7 +48,7 @@ impl RaftClient {
             Ok(resp) => {
                 let sm_resp = resp.response().clone();
                 debug!("raft client: command applied locally (leader)");
-                return Ok(sm_resp);
+                Ok(sm_resp)
             }
             Err(e) => {
                 // Check if the error indicates we are not the leader.
@@ -57,11 +57,13 @@ impl RaftClient {
                     // Extract leader info and forward.
                     if let Some((leader_id, leader_addr)) = self.find_leader().await {
                         debug!("raft client: forwarding to leader {leader_id} at {leader_addr}");
-                        return self.forward_to_leader(&leader_addr, &cmd).await;
+                        self.forward_to_leader(&leader_addr, &cmd).await
+                    } else {
+                        Err("no leader available — cluster may be electing".to_string())
                     }
-                    return Err("no leader available — cluster may be electing".to_string());
+                } else {
+                    Err(format!("raft write error: {e}"))
                 }
-                return Err(format!("raft write error: {e}"));
             }
         }
     }
