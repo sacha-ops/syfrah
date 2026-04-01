@@ -1091,6 +1091,13 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Raft placement hook (for cross-node FDB distribution) ----------------
+    //
+    // Created early so the compute layer can reference it. The actual Raft
+    // client is injected later when the control plane is initialized.
+    let raft_client_holder: Arc<std::sync::Mutex<Option<syfrah_controlplane::RaftClient>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     // -- Compute layer integration ------------------------------------------
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
@@ -1198,6 +1205,57 @@ pub async fn run_daemon(
                         // from actual SG rules instead of hardcoded defaults.
                         if let Some(ref sg_rs) = shared_sg_rule_store {
                             vm_manager.set_sg_rule_store(Arc::clone(sg_rs));
+                        }
+
+                        // Wire Raft placement hook so VM creations are
+                        // replicated to all nodes for FDB distribution.
+                        {
+                            let raft_holder = Arc::clone(&raft_client_holder);
+                            #[allow(clippy::type_complexity)]
+                            let hook: Arc<
+                                dyn Fn(&str, &str, &str, &str, &str, u64, bool) + Send + Sync,
+                            > = Arc::new(
+                                move |vm_id,
+                                      hypervisor_id,
+                                      subnet_id,
+                                      ip,
+                                      mac,
+                                      generation,
+                                      is_add| {
+                                    let client = raft_holder.lock().unwrap().clone();
+                                    if let Some(client) = client {
+                                        let cmd = if is_add {
+                                            syfrah_controlplane::StateMachineCommand::PlaceVm {
+                                                vm_id: vm_id.to_string(),
+                                                hypervisor_id: hypervisor_id.to_string(),
+                                                subnet_id: subnet_id.to_string(),
+                                                ip: ip.to_string(),
+                                                mac: mac.to_string(),
+                                                generation,
+                                            }
+                                        } else {
+                                            syfrah_controlplane::StateMachineCommand::RemoveVm {
+                                                vm_id: vm_id.to_string(),
+                                            }
+                                        };
+                                        // Fire and forget — the Raft client submit is async,
+                                        // so we spawn a task. Errors are non-fatal.
+                                        let vm_id_owned = vm_id.to_string();
+                                        let rt = tokio::runtime::Handle::try_current();
+                                        if let Ok(handle) = rt {
+                                            handle.spawn(async move {
+                                                if let Err(e) = client.write(cmd).await {
+                                                    tracing::warn!(
+                                                        vm_id = %vm_id_owned,
+                                                        "Raft placement replication failed: {e}"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
+                                },
+                            );
+                            vm_manager.set_raft_placement_hook(hook);
                         }
 
                         info!("compute: networking wired (IPAM, bridge, VXLAN, TAP, nftables)");
@@ -1442,6 +1500,14 @@ pub async fn run_daemon(
 
             // Create a Raft client for routing mutations through the cluster.
             let raft_client = syfrah_controlplane::RaftClient::new(raft.clone());
+
+            // Inject the Raft client into the placement hook so VM creations
+            // are replicated to all nodes for FDB distribution.
+            {
+                let mut holder = raft_client_holder.lock().unwrap();
+                *holder = Some(raft_client.clone());
+                info!("raft: injected Raft client into placement hook");
+            }
 
             // Inject the Raft client into the org handler so mutations go through Raft.
             if let Some(ref handler) = raft_org_handler {

@@ -241,6 +241,12 @@ pub struct VmManager {
     hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
     /// Name of this node (used to look up the local hypervisor record).
     local_node_name: Option<String>,
+    /// Optional callback to replicate VM placements through Raft.
+    /// Called after local placement store update so other nodes learn about
+    /// this VM and can populate FDB entries.
+    /// Args: (vm_id, hypervisor_id, subnet_id, ip, mac, generation, is_add).
+    #[allow(clippy::type_complexity)]
+    raft_placement_hook: Option<Arc<dyn Fn(&str, &str, &str, &str, &str, u64, bool) + Send + Sync>>,
 }
 
 impl VmManager {
@@ -332,6 +338,7 @@ impl VmManager {
             sg_rule_store: None,
             hypervisor_store: None,
             local_node_name: None,
+            raft_placement_hook: None,
         })
     }
 
@@ -371,6 +378,18 @@ impl VmManager {
         self.ipam_store = Some(ipam_store);
         self.placement_store = Some(placement_store);
         self.local_node = Some(local_node);
+    }
+
+    /// Set the Raft placement hook for cross-node FDB distribution.
+    ///
+    /// When set, VM creation and deletion will replicate placement records
+    /// through Raft so that all nodes can populate FDB entries for remote VMs.
+    #[allow(clippy::type_complexity)]
+    pub fn set_raft_placement_hook(
+        &mut self,
+        hook: Arc<dyn Fn(&str, &str, &str, &str, &str, u64, bool) + Send + Sync>,
+    ) {
+        self.raft_placement_hook = Some(hook);
     }
 
     /// Set the SG rule store so that SG-based nftables rules are applied
@@ -535,6 +554,9 @@ impl VmManager {
                 );
                 if let Some(ref rs) = self.sg_rule_store {
                     ns = ns.with_sg_rule_store(Arc::clone(rs));
+                }
+                if let Some(ref hook) = self.raft_placement_hook {
+                    ns = ns.with_raft_placement_hook(Arc::clone(hook));
                 }
                 let is_container = self.runtime.name().starts_with("container");
                 match ns
