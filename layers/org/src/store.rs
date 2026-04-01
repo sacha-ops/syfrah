@@ -780,6 +780,11 @@ impl OrgStore {
             })
     }
 
+    /// Get a subnet by its SubnetId (the raw redb key, e.g., "vpc_name/subnet_name").
+    pub fn get_subnet_by_id(&self, subnet_id: &str) -> Result<Option<Subnet>> {
+        Ok(self.db.get::<Subnet>(SUBNETS_TABLE, subnet_id)?)
+    }
+
     /// List all subnets in a VPC.
     pub fn list_subnets(&self, vpc_name: &str) -> Result<Vec<Subnet>> {
         let prefix = format!("{vpc_name}/");

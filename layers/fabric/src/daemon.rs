@@ -1061,6 +1061,36 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Shared IPAM + placement stores ----------------------------------------
+    //
+    // Opened once and shared between the state machine (Raft) and the compute
+    // layer. redb only allows one exclusive lock per database file.
+    let shared_ipam_store: Option<Arc<syfrah_org::IpamStore>> =
+        match syfrah_state::LayerDb::open("ipam") {
+            Ok(ipam_db) => {
+                let store = Arc::new(syfrah_org::IpamStore::new(ipam_db));
+                info!("shared IPAM store opened");
+                Some(store)
+            }
+            Err(e) => {
+                warn!("IPAM store init failed (non-fatal): {e}");
+                None
+            }
+        };
+
+    let shared_placement_store: Option<Arc<syfrah_org::PlacementStore>> =
+        match syfrah_state::LayerDb::open("placement") {
+            Ok(placement_db) => {
+                let store = Arc::new(syfrah_org::PlacementStore::new(placement_db));
+                info!("shared placement store opened");
+                Some(store)
+            }
+            Err(e) => {
+                warn!("placement store init failed (non-fatal): {e}");
+                None
+            }
+        };
+
     // -- Compute layer integration ------------------------------------------
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
@@ -1098,17 +1128,13 @@ pub async fn run_daemon(
         let compute_config = syfrah_compute::ComputeConfig::default();
         match syfrah_compute::VmManager::new(compute_config) {
             Ok(mut vm_manager) => {
-                // Wire networking into VmManager: reuse the shared org store
-                // and open ipam/placement stores.
+                // Wire networking into VmManager: reuse the shared stores.
                 let net_ok = match (
                     shared_org_store.clone(),
-                    syfrah_state::LayerDb::open("ipam"),
-                    syfrah_state::LayerDb::open("placement"),
+                    shared_ipam_store.clone(),
+                    shared_placement_store.clone(),
                 ) {
-                    (Some(org_store), Ok(ipam_db), Ok(placement_db)) => {
-                        let ipam_store = Arc::new(syfrah_org::ipam::IpamStore::new(ipam_db));
-                        let placement_store =
-                            Arc::new(syfrah_org::PlacementStore::new(placement_db));
+                    (Some(org_store), Some(ipam_store), Some(placement_store)) => {
                         let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
                             Arc::new(syfrah_overlay::LinuxBackend::new());
                         let local_node = my_record.mesh_ipv6.to_string();
@@ -1181,11 +1207,11 @@ pub async fn run_daemon(
                         if org_res.is_none() {
                             warn!("compute: org store not available");
                         }
-                        if let Err(e) = ipam_res {
-                            warn!("compute: failed to open ipam store: {e}");
+                        if ipam_res.is_none() {
+                            warn!("compute: IPAM store not available");
                         }
-                        if let Err(e) = placement_res {
-                            warn!("compute: failed to open placement store: {e}");
+                        if placement_res.is_none() {
+                            warn!("compute: placement store not available");
                         }
                         warn!("compute: networking not available (store init failed)");
                         false
@@ -1370,12 +1396,26 @@ pub async fn run_daemon(
                 syfrah_state::LayerDb::open("raft_log").expect("failed to open raft_log database");
             let log_store = std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
 
-            let sm = std::sync::Arc::new(syfrah_controlplane::RedbStateMachine::new(
+            let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
                 shared_org_store.clone().unwrap_or_else(|| {
                     let db = syfrah_state::LayerDb::open("org").unwrap();
                     std::sync::Arc::new(syfrah_org::OrgStore::new(db))
                 }),
-            ));
+            );
+
+            // Wire shared IPAM store into the state machine for distributed IP allocation.
+            if let Some(ref ipam) = shared_ipam_store {
+                sm_builder = sm_builder.with_ipam_store(Arc::clone(ipam));
+                info!("raft: IPAM store wired into state machine");
+            }
+
+            // Wire shared placement store into the state machine for VM placement tracking.
+            if let Some(ref placement) = shared_placement_store {
+                sm_builder = sm_builder.with_placement_store(Arc::clone(placement));
+                info!("raft: placement store wired into state machine");
+            }
+
+            let sm = std::sync::Arc::new(sm_builder);
 
             let network = syfrah_controlplane::SyfrahNetworkFactory::new();
 

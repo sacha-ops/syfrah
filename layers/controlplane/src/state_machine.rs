@@ -36,6 +36,8 @@ pub struct SmState {
 /// so the state machine output IS the local redb state.
 pub struct RedbStateMachine {
     pub org_store: Arc<syfrah_org::OrgStore>,
+    pub ipam_store: Option<Arc<syfrah_org::IpamStore>>,
+    pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -46,10 +48,24 @@ impl RedbStateMachine {
     pub fn new(org_store: Arc<syfrah_org::OrgStore>) -> Self {
         Self {
             org_store,
+            ipam_store: None,
+            placement_store: None,
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
         }
+    }
+
+    /// Set the IPAM store for distributed IP allocation.
+    pub fn with_ipam_store(mut self, store: Arc<syfrah_org::IpamStore>) -> Self {
+        self.ipam_store = Some(store);
+        self
+    }
+
+    /// Set the placement store for VM placement tracking.
+    pub fn with_placement_store(mut self, store: Arc<syfrah_org::PlacementStore>) -> Self {
+        self.placement_store = Some(store);
+        self
     }
 
     /// Apply a single command to the state machine.
@@ -224,13 +240,55 @@ impl RedbStateMachine {
             }
 
             // -- IPAM --
-            StateMachineCommand::AllocateIp { .. } => {
-                warn!("IPAM commands will be wired in issue #1048");
-                StateMachineResponse::Ok
+            StateMachineCommand::AllocateIp { subnet_id } => {
+                let ipam = match &self.ipam_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "IPAM store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                // Look up the subnet CIDR from the org store.
+                let subnet = match self.org_store.get_subnet_by_id(subnet_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "subnet not found: {subnet_id}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match ipam.reserve_ip(subnet_id, &subnet.cidr) {
+                    Ok(alloc) => StateMachineResponse::AllocatedIp {
+                        ip: alloc.ip,
+                        mac: alloc.mac,
+                    },
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::ReleaseIp { .. } => {
-                warn!("IPAM commands will be wired in issue #1048");
-                StateMachineResponse::Ok
+            StateMachineCommand::ReleaseIp { subnet_id, ip } => {
+                let ipam = match &self.ipam_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "IPAM store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                let subnet = match self.org_store.get_subnet_by_id(subnet_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "subnet not found: {subnet_id}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match ipam.release_ip(subnet_id, &subnet.cidr, ip) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
 
             // -- NIC --
@@ -494,11 +552,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_unimplemented_returns_ok() {
+    fn apply_allocate_ip_without_ipam_store_returns_error() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
         let resp = sm.apply_command(&StateMachineCommand::AllocateIp {
             subnet_id: "sub-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn apply_passthrough_commands_return_ok() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Hypervisor commands use a separate store and are pass-through.
+        let resp = sm.apply_command(&StateMachineCommand::RegisterHypervisor {
+            name: "hv1".to_string(),
+            region: "eu".to_string(),
+            zone: "az1".to_string(),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
     }
