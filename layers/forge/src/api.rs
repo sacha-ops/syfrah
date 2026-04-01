@@ -102,6 +102,25 @@ impl ConsistencyQuery {
     }
 }
 
+/// Query parameters for direct placement (skips leader forwarding).
+#[derive(Deserialize, Debug, Default)]
+pub struct DirectPlacementQuery {
+    /// When set to "true", the request is processed locally without
+    /// leader forwarding. Used by the scheduler when placing VMs on
+    /// remote hypervisors — the target node must create locally.
+    pub direct: Option<String>,
+}
+
+impl DirectPlacementQuery {
+    /// Returns true if this is a direct placement (skip leader forwarding).
+    fn is_direct(&self) -> bool {
+        self.direct
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+}
+
 /// Request body for creating an instance.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CreateInstanceRequest {
@@ -785,15 +804,19 @@ async fn list_tasks_handler(
 /// POST /v1/instances — create a new VM instance.
 async fn create_instance_handler(
     State(state): State<Arc<ForgeState>>,
+    Query(params): Query<DirectPlacementQuery>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> impl IntoResponse {
     // Leader forwarding: if Raft is active and we are NOT the leader,
     // forward the entire request to the leader's Forge API.
-    if let Some(leader_addr) = should_forward_to_leader(&state).await {
-        debug!("create_instance: not leader, forwarding to leader at {leader_addr}");
-        match forward_post_to_leader(&leader_addr, "/v1/instances", &req).await {
-            Ok(resp) => return resp,
-            Err(resp) => return resp,
+    // Skip forwarding if this is a direct placement from the scheduler.
+    if !params.is_direct() {
+        if let Some(leader_addr) = should_forward_to_leader(&state).await {
+            debug!("create_instance: not leader, forwarding to leader at {leader_addr}");
+            match forward_post_to_leader(&leader_addr, "/v1/instances", &req).await {
+                Ok(resp) => return resp,
+                Err(resp) => return resp,
+            }
         }
     }
 
