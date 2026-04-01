@@ -11,6 +11,7 @@ members = [
     "layers/overlay",
     "layers/storage",
     "layers/org",
+    "layers/controlplane",
     "bin/syfrah",
 ]
 exclude = [
