@@ -53,8 +53,11 @@ impl RedbStateMachine {
     }
 
     /// Apply a single command to the state machine.
-    fn apply_command(&self, cmd: &StateMachineCommand) -> StateMachineResponse {
+    ///
+    /// Every mutation goes through here on ALL Raft nodes, producing identical redb state.
+    pub fn apply_command(&self, cmd: &StateMachineCommand) -> StateMachineResponse {
         match cmd {
+            // -- Org --
             StateMachineCommand::CreateOrg { name } => match self.org_store.create(name) {
                 Ok(org) => StateMachineResponse::Created(org.id.0),
                 Err(e) => StateMachineResponse::Error(e.to_string()),
@@ -63,6 +66,8 @@ impl RedbStateMachine {
                 Ok(()) => StateMachineResponse::Ok,
                 Err(e) => StateMachineResponse::Error(e.to_string()),
             },
+
+            // -- Project --
             StateMachineCommand::CreateProject { name, org } => {
                 match self.org_store.create_project(org, name) {
                     Ok(proj) => StateMachineResponse::Created(proj.id.0),
@@ -75,10 +80,197 @@ impl RedbStateMachine {
                     Err(e) => StateMachineResponse::Error(e.to_string()),
                 }
             }
-            // For Phase 1, remaining commands return Ok.
-            // They will be wired to actual store methods in Phase 2.
-            _ => {
-                warn!("unimplemented state machine command: {cmd}");
+
+            // -- Environment --
+            StateMachineCommand::CreateEnv {
+                name,
+                project,
+                org,
+                ttl,
+                deletion_protection,
+                labels,
+            } => {
+                match self.org_store.create_env(
+                    org,
+                    project,
+                    name,
+                    *ttl,
+                    *deletion_protection,
+                    labels.clone(),
+                ) {
+                    Ok(env) => StateMachineResponse::Created(env.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DeleteEnv { name, project, org } => {
+                match self.org_store.delete_env(org, project, name) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- VPC --
+            StateMachineCommand::CreateVpc {
+                name,
+                cidr,
+                owner,
+                shared,
+            } => {
+                use syfrah_org::types::{OrgId, VpcOwner};
+                // Reconstruct VpcOwner from the string representation.
+                let vpc_owner = VpcOwner::Org(OrgId(owner.clone()));
+                match self.org_store.create_vpc(name, cidr, vpc_owner, *shared) {
+                    Ok(vpc) => StateMachineResponse::Created(vpc.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DeleteVpc { name } => match self.org_store.delete_vpc(name) {
+                Ok(()) => StateMachineResponse::Ok,
+                Err(e) => StateMachineResponse::Error(e.to_string()),
+            },
+            StateMachineCommand::PeerVpc { vpc_a, vpc_b } => {
+                match self.org_store.create_peering(vpc_a, vpc_b) {
+                    Ok(_) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::UnpeerVpc { vpc_a, vpc_b } => {
+                match self.org_store.delete_peering(vpc_a, vpc_b) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- Subnet --
+            StateMachineCommand::CreateSubnet {
+                name,
+                vpc,
+                env_id,
+                cidr,
+            } => {
+                use syfrah_org::types::EnvironmentId;
+                let eid = EnvironmentId(env_id.clone());
+                match self
+                    .org_store
+                    .create_subnet(vpc, &eid, name, cidr.as_deref())
+                {
+                    Ok(subnet) => StateMachineResponse::Created(subnet.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DeleteSubnet { name, vpc } => {
+                match self.org_store.delete_subnet(vpc, name) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- Security Groups --
+            StateMachineCommand::CreateSg { name, vpc } => {
+                match self.org_store.create_security_group(name, vpc, "") {
+                    Ok(sg) => StateMachineResponse::Created(sg.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DeleteSg { name } => {
+                match self.org_store.delete_security_group(name, None) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::AddSgRule { .. } => {
+                // SG rules are handled by the SgRuleStore, not OrgStore.
+                // For now, return Ok — SG rule store integration will be added.
+                warn!("SG rule commands not yet wired to SgRuleStore in state machine");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::RemoveSgRule { .. } => {
+                warn!("SG rule commands not yet wired to SgRuleStore in state machine");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::AttachSg { sg, nic_id } => {
+                match self.org_store.attach_sg_to_nic(sg, nic_id) {
+                    Ok(_) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DetachSg { sg, nic_id } => {
+                match self.org_store.detach_sg_from_nic(sg, nic_id) {
+                    Ok(_) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- NAT Gateway --
+            StateMachineCommand::CreateNatGw { .. } => {
+                // NAT GW creation requires VPC ID resolution, which is complex.
+                // For now, log and return Ok.
+                warn!("NAT GW create not yet fully wired in state machine");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::DeleteNatGw { .. } => {
+                warn!("NAT GW delete not yet fully wired in state machine");
+                StateMachineResponse::Ok
+            }
+
+            // -- Routes --
+            StateMachineCommand::AddRoute { .. } => {
+                warn!("Route add not yet fully wired in state machine");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::DeleteRoute { .. } => {
+                warn!("Route delete not yet fully wired in state machine");
+                StateMachineResponse::Ok
+            }
+
+            // -- IPAM --
+            StateMachineCommand::AllocateIp { .. } => {
+                warn!("IPAM commands will be wired in issue #1048");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::ReleaseIp { .. } => {
+                warn!("IPAM commands will be wired in issue #1048");
+                StateMachineResponse::Ok
+            }
+
+            // -- NIC --
+            StateMachineCommand::CreateNic { .. } => {
+                warn!("NIC commands will be wired in later issues");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::DeleteNic { nic_id } => match self.org_store.delete_nic(nic_id) {
+                Ok(()) => StateMachineResponse::Ok,
+                Err(e) => StateMachineResponse::Error(e.to_string()),
+            },
+
+            // -- Hypervisor --
+            StateMachineCommand::RegisterHypervisor { .. } => {
+                warn!("Hypervisor commands use separate HypervisorStore — pass-through");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::EnableHypervisor { .. }
+            | StateMachineCommand::DrainHypervisor { .. }
+            | StateMachineCommand::DecommissionHypervisor { .. } => {
+                warn!("Hypervisor state commands use separate HypervisorStore — pass-through");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::UpdateHypervisorLabels { .. }
+            | StateMachineCommand::UpdateHypervisorTaints { .. } => {
+                warn!("Hypervisor metadata commands use separate HypervisorStore — pass-through");
+                StateMachineResponse::Ok
+            }
+
+            // -- VM Placement --
+            StateMachineCommand::PlaceVm { .. } => {
+                warn!("PlaceVm will be wired in issue #1049");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::RemoveVm { .. } => {
+                warn!("RemoveVm will be wired in issue #1049");
+                StateMachineResponse::Ok
+            }
+            StateMachineCommand::RescheduleVm { .. } => {
+                warn!("RescheduleVm will be wired in later issues");
                 StateMachineResponse::Ok
             }
         }

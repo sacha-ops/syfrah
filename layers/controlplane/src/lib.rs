@@ -1,8 +1,9 @@
 //! Control plane layer — distributed consensus via Raft for Syfrah.
 //!
 //! Uses openraft to replicate state machine commands across cluster nodes.
-//! Phase 1: single-node bootstrap with redb-backed log and state machine.
+//! Phase 2: mutations routed through Raft, multi-node coordination.
 
+pub mod client;
 pub mod commands;
 pub mod log_storage;
 pub mod network;
@@ -10,6 +11,7 @@ pub mod server;
 pub mod state_machine;
 pub mod types;
 
+pub use client::RaftClient;
 pub use commands::{StateMachineCommand, StateMachineResponse};
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
