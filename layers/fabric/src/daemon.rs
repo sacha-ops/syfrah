@@ -1303,6 +1303,11 @@ pub async fn run_daemon(
             vm_manager: shared_vm_manager.clone(),
             capacity: Some(forge_capacity),
             org_store: shared_org_store.clone(),
+            network_backend: Some(std::sync::Arc::new(syfrah_overlay::LinuxBackend::new())
+                as std::sync::Arc<dyn syfrah_overlay::NetworkBackend>),
+            generation_tracker: Some(std::sync::Arc::new(
+                syfrah_forge::generation::GenerationTracker::new(),
+            )),
         });
 
         let bind_addr: std::net::SocketAddr =
