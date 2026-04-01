@@ -69,6 +69,19 @@ pub struct ExpectedSgAssignment {
     pub security_groups: Vec<String>,
 }
 
+/// Expected FDB entry for a remote VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedFdbEntry {
+    /// VXLAN interface name (e.g. `syfx-abcdef`).
+    pub vxlan: String,
+    /// VM MAC address.
+    pub mac: String,
+    /// Remote hypervisor's fabric IPv6 (VTEP destination).
+    pub dst: String,
+    /// VM IP address (for ARP proxy).
+    pub ip: String,
+}
+
 /// Snapshot of expected network state gathered from redb.
 ///
 /// Passed to [`reconcile_network`] so it can compare against the kernel.
@@ -87,6 +100,10 @@ pub struct NetworkState {
     /// Expected SG assignments for each VM (used for SG drift detection).
     #[serde(default)]
     pub sg_assignments: Vec<ExpectedSgAssignment>,
+    /// Expected FDB entries derived from Raft placement state.
+    /// Only entries for REMOTE VMs (not local) should be listed here.
+    #[serde(default)]
+    pub fdb_entries: Vec<ExpectedFdbEntry>,
 }
 
 // ── Reconcile report ───────────────────────────────────────────────────
@@ -103,6 +120,12 @@ pub struct ReconcileReport {
     /// SG chains that were detected as drifted and re-applied.
     #[serde(default)]
     pub sg_chains_reapplied: usize,
+    /// FDB entries that were missing and re-added.
+    #[serde(default)]
+    pub fdb_entries_added: usize,
+    /// Stale FDB entries that were removed.
+    #[serde(default)]
+    pub fdb_entries_removed: usize,
     /// Warnings emitted (orphaned TAPs, orphaned kernel interfaces, etc.).
     pub warnings: Vec<String>,
 }
@@ -157,10 +180,15 @@ pub async fn reconcile_network(
     // 6. Detect SG drift — re-apply SG chains for VMs with assigned SGs.
     reconcile_sg_chains(expected_state, &mut report);
 
+    // 7. Reconcile FDB entries — add missing, remove stale.
+    reconcile_fdb_entries(backend, expected_state, &mut report).await;
+
     if report.bridges_fixed > 0
         || report.rules_reapplied > 0
         || report.orphans_reclaimed > 0
         || report.sg_chains_reapplied > 0
+        || report.fdb_entries_added > 0
+        || report.fdb_entries_removed > 0
         || !report.warnings.is_empty()
     {
         info!(
@@ -168,6 +196,8 @@ pub async fn reconcile_network(
             rules_reapplied = report.rules_reapplied,
             orphans_reclaimed = report.orphans_reclaimed,
             sg_chains_reapplied = report.sg_chains_reapplied,
+            fdb_added = report.fdb_entries_added,
+            fdb_removed = report.fdb_entries_removed,
             warnings = report.warnings.len(),
             "reconciliation complete"
         );
@@ -346,6 +376,133 @@ fn reconcile_sg_chains(state: &NetworkState, report: &mut ReconcileReport) {
             "re-applying SG chains for VM"
         );
         report.sg_chains_reapplied += 1;
+    }
+}
+
+/// Reconcile FDB entries: add missing entries, remove stale ones.
+///
+/// Compares expected FDB entries (derived from Raft placement state) against
+/// actual kernel FDB entries. Only touches drifted entries — not a full rebuild.
+async fn reconcile_fdb_entries(
+    backend: &dyn NetworkBackend,
+    state: &NetworkState,
+    report: &mut ReconcileReport,
+) {
+    use std::collections::{HashMap, HashSet};
+
+    if state.fdb_entries.is_empty() {
+        return;
+    }
+
+    // Group expected entries by VXLAN interface for efficient lookups.
+    let mut expected_by_vxlan: HashMap<&str, Vec<&ExpectedFdbEntry>> = HashMap::new();
+    for entry in &state.fdb_entries {
+        expected_by_vxlan
+            .entry(entry.vxlan.as_str())
+            .or_default()
+            .push(entry);
+    }
+
+    for (vxlan, expected_entries) in &expected_by_vxlan {
+        // Read actual FDB entries from the kernel.
+        let actual_fdb = match backend.list_fdb_entries(vxlan).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("failed to list FDB entries for {vxlan}: {e}"));
+                continue;
+            }
+        };
+        let actual_fdb_set: HashSet<(&str, &str)> = actual_fdb
+            .iter()
+            .map(|(mac, dst)| (mac.as_str(), dst.as_str()))
+            .collect();
+
+        // Read actual ARP entries from the kernel.
+        let actual_arp = match backend.list_arp_entries(vxlan).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("failed to list ARP entries for {vxlan}: {e}"));
+                continue;
+            }
+        };
+        let actual_arp_set: HashSet<(&str, &str)> = actual_arp
+            .iter()
+            .map(|(ip, mac)| (ip.as_str(), mac.as_str()))
+            .collect();
+
+        // Build expected sets.
+        let expected_fdb_set: HashSet<(&str, &str)> = expected_entries
+            .iter()
+            .map(|e| (e.mac.as_str(), e.dst.as_str()))
+            .collect();
+        let expected_arp_set: HashSet<(&str, &str)> = expected_entries
+            .iter()
+            .map(|e| (e.ip.as_str(), e.mac.as_str()))
+            .collect();
+
+        // Add missing FDB entries.
+        for entry in expected_entries {
+            if !actual_fdb_set.contains(&(entry.mac.as_str(), entry.dst.as_str())) {
+                let bridge =
+                    vxlan.replace(crate::naming::VXLAN_PREFIX, crate::naming::BRIDGE_PREFIX);
+                if let Err(e) = backend.add_fdb_entry(&bridge, &entry.mac, &entry.dst).await {
+                    report
+                        .warnings
+                        .push(format!("FDB reconcile: add failed for {}: {e}", entry.mac));
+                } else {
+                    report.fdb_entries_added += 1;
+                }
+            }
+            if !actual_arp_set.contains(&(entry.ip.as_str(), entry.mac.as_str())) {
+                if let Err(e) = backend.add_arp_proxy(vxlan, &entry.ip, &entry.mac).await {
+                    report
+                        .warnings
+                        .push(format!("ARP reconcile: add failed for {}: {e}", entry.ip));
+                } else {
+                    // Count ARP adds with FDB adds for simplicity.
+                    report.fdb_entries_added += 1;
+                }
+            }
+        }
+
+        // Remove stale FDB entries (entries in kernel but not in expected state).
+        for (mac, _dst) in &actual_fdb {
+            // Only manage syfrah-derived MACs (02:00:0a:...).
+            if !mac.starts_with("02:00:") {
+                continue;
+            }
+            if !expected_fdb_set.iter().any(|(m, _)| *m == mac.as_str()) {
+                let bridge =
+                    vxlan.replace(crate::naming::VXLAN_PREFIX, crate::naming::BRIDGE_PREFIX);
+                if let Err(e) = backend.remove_fdb_entry(&bridge, mac).await {
+                    report
+                        .warnings
+                        .push(format!("FDB reconcile: remove failed for {mac}: {e}"));
+                } else {
+                    report.fdb_entries_removed += 1;
+                }
+            }
+        }
+
+        // Remove stale ARP entries.
+        for (ip, mac) in &actual_arp {
+            if !mac.starts_with("02:00:") {
+                continue;
+            }
+            if !expected_arp_set.iter().any(|(i, _)| *i == ip.as_str()) {
+                if let Err(e) = backend.remove_arp_proxy(vxlan, ip).await {
+                    report
+                        .warnings
+                        .push(format!("ARP reconcile: remove failed for {ip}: {e}"));
+                } else {
+                    report.fdb_entries_removed += 1;
+                }
+            }
+        }
     }
 }
 

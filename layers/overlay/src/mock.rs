@@ -14,6 +14,10 @@ pub struct MockBackend {
     fail_methods: Mutex<HashSet<String>>,
     /// Simulated kernel interfaces (bridges, TAPs, VXLANs).
     interfaces: Mutex<HashSet<String>>,
+    /// Simulated FDB entries per VXLAN: (mac, dst).
+    fdb_entries: Mutex<Vec<(String, String, String)>>,
+    /// Simulated ARP proxy entries per VXLAN: (ip, mac).
+    arp_entries: Mutex<Vec<(String, String, String)>>,
 }
 
 impl MockBackend {
@@ -22,6 +26,8 @@ impl MockBackend {
             calls: Mutex::new(Vec::new()),
             fail_methods: Mutex::new(HashSet::new()),
             interfaces: Mutex::new(HashSet::new()),
+            fdb_entries: Mutex::new(Vec::new()),
+            arp_entries: Mutex::new(Vec::new()),
         }
     }
 
@@ -59,6 +65,24 @@ impl MockBackend {
         for iface in ifaces {
             guard.insert(iface);
         }
+    }
+
+    /// Add a simulated FDB entry for testing list_fdb_entries.
+    pub fn add_fdb(&self, vxlan: &str, mac: &str, dst: &str) {
+        self.fdb_entries.lock().expect("lock poisoned").push((
+            vxlan.to_string(),
+            mac.to_string(),
+            dst.to_string(),
+        ));
+    }
+
+    /// Add a simulated ARP proxy entry for testing list_arp_entries.
+    pub fn add_arp(&self, vxlan: &str, ip: &str, mac: &str) {
+        self.arp_entries.lock().expect("lock poisoned").push((
+            vxlan.to_string(),
+            ip.to_string(),
+            mac.to_string(),
+        ));
     }
 
     fn record(&self, call: String) {
@@ -239,6 +263,26 @@ impl NetworkBackend for MockBackend {
         matched.sort();
         Ok(matched)
     }
+
+    async fn list_fdb_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>> {
+        self.record(format!("list_fdb_entries({vxlan})"));
+        let entries = self.fdb_entries.lock().expect("lock poisoned");
+        Ok(entries
+            .iter()
+            .filter(|(v, _, _)| v == vxlan)
+            .map(|(_, mac, dst)| (mac.clone(), dst.clone()))
+            .collect())
+    }
+
+    async fn list_arp_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>> {
+        self.record(format!("list_arp_entries({vxlan})"));
+        let entries = self.arp_entries.lock().expect("lock poisoned");
+        Ok(entries
+            .iter()
+            .filter(|(v, _, _)| v == vxlan)
+            .map(|(_, ip, mac)| (ip.clone(), mac.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -304,9 +348,11 @@ mod tests {
         b.list_interfaces(crate::naming::BRIDGE_PREFIX)
             .await
             .unwrap();
+        b.list_fdb_entries(&vx100).await.unwrap();
+        b.list_arp_entries(&vx100).await.unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 23, "expected one call per trait method");
+        assert_eq!(calls.len(), 25, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));
