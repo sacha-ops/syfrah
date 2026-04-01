@@ -18,4 +18,4 @@ pub use state_machine::RedbStateMachine;
 pub use types::{SyfrahNode, SyfrahRaftConfig};
 
 /// The concrete Raft type for Syfrah.
-pub type SyfrahRaft = openraft::Raft<SyfrahRaftConfig, RedbStateMachine>;
+pub type SyfrahRaft = openraft::Raft<SyfrahRaftConfig, std::sync::Arc<RedbStateMachine>>;
