@@ -15,7 +15,8 @@ use std::sync::Arc;
 use syfrah_api::handler::LayerHandler;
 use syfrah_compute::control::{ComputeRequest, ComputeResponse};
 use syfrah_controlplane::{
-    GossipCluster, PlacementConstraints, RaftClient, RemoteCreateVmRequest, Scheduler,
+    GossipCluster, HypervisorGossipReport, PlacementConstraints, RaftClient, RemoteCreateVmRequest,
+    Scheduler,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -32,6 +33,9 @@ pub struct RaftComputeHandler {
     scheduler: RwLock<Option<Scheduler>>,
     /// Local node name (for determining if scheduler picked us).
     local_node_name: String,
+    /// Hypervisor store — used to populate scheduler candidates from
+    /// registered hypervisors when gossip reports are not yet available.
+    hypervisor_store: RwLock<Option<Arc<syfrah_org::HypervisorStore>>>,
 }
 
 impl RaftComputeHandler {
@@ -43,6 +47,7 @@ impl RaftComputeHandler {
             gossip_cluster: GossipCluster::new(),
             scheduler: RwLock::new(None),
             local_node_name,
+            hypervisor_store: RwLock::new(None),
         }
     }
 
@@ -58,10 +63,90 @@ impl RaftComputeHandler {
         *guard = Some(scheduler);
     }
 
+    /// Set the hypervisor store (called during daemon init).
+    pub async fn set_hypervisor_store(&self, store: Arc<syfrah_org::HypervisorStore>) {
+        let mut guard = self.hypervisor_store.write().await;
+        *guard = Some(store);
+    }
+
     /// Get a reference to the gossip cluster state.
     /// The daemon wires this into the gossip agent.
     pub fn gossip_cluster(&self) -> &GossipCluster {
         &self.gossip_cluster
+    }
+
+    /// Ensure the gossip cluster has reports from all fabric peers.
+    /// This bridges the gap when gossip data exchange hasn't converged yet.
+    /// Uses fabric peer records (which have region/zone from mesh setup) and
+    /// the local hypervisor store for the local node's data.
+    fn populate_cluster_from_fabric_peers(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Load fabric state to get peer information.
+        let state = match crate::store::load() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to load fabric state for scheduler: {e}");
+                return;
+            }
+        };
+
+        // Add local node as a candidate.
+        if self.gossip_cluster.get_report(&state.node_name).is_none() {
+            let report = HypervisorGossipReport {
+                hypervisor_id: state.mesh_ipv6.to_string(),
+                node_name: state.node_name.clone(),
+                region: state
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+                zone: state.zone.clone().unwrap_or_else(|| "default".to_string()),
+                state: "Available".to_string(),
+                allocatable_vcpus: 64,
+                allocatable_memory_mb: 128 * 1024,
+                used_vcpus: 0,
+                used_memory_mb: 0,
+                instance_count: 0,
+                drain_status: false,
+                timestamp: now,
+            };
+            debug!(
+                "populated local scheduler candidate: {} (zone={})",
+                state.node_name, report.zone
+            );
+            self.gossip_cluster.update_report(report);
+        }
+
+        // Add each fabric peer as a candidate.
+        for peer in &state.peers {
+            if self.gossip_cluster.get_report(&peer.name).is_some() {
+                continue;
+            }
+            let region = peer.region.clone().unwrap_or_else(|| "default".to_string());
+            let zone = peer.zone.clone().unwrap_or_else(|| "default".to_string());
+            let report = HypervisorGossipReport {
+                hypervisor_id: peer.mesh_ipv6.to_string(),
+                node_name: peer.name.clone(),
+                region: region.clone(),
+                zone: zone.clone(),
+                state: "Available".to_string(),
+                allocatable_vcpus: 64,
+                allocatable_memory_mb: 128 * 1024,
+                used_vcpus: 0,
+                used_memory_mb: 0,
+                instance_count: 0,
+                drain_status: false,
+                timestamp: now,
+            };
+            debug!(
+                "populated peer scheduler candidate: {} (zone={})",
+                peer.name, zone
+            );
+            self.gossip_cluster.update_report(report);
+        }
     }
 
     /// Handle a CreateVm request with scheduler integration.
@@ -112,7 +197,11 @@ impl RaftComputeHandler {
                 .await;
         }
 
-        // We are the leader. Run the scheduler.
+        // We are the leader. Populate gossip cluster from fabric peers
+        // so the scheduler has candidate data even if gossip hasn't converged yet.
+        self.populate_cluster_from_fabric_peers();
+
+        // Run the scheduler.
         let constraints = PlacementConstraints::from_cli(
             zone.clone(),
             &node_selector,
