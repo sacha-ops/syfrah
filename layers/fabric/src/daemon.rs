@@ -1320,6 +1320,9 @@ pub async fn run_daemon(
             drain_controller: Some(std::sync::Arc::new(
                 syfrah_forge::drain::DrainController::new(),
             )),
+            metrics_collector: Some(std::sync::Arc::new(
+                syfrah_forge::metrics::MetricsCollector::new(),
+            )),
         });
 
         let bind_addr: std::net::SocketAddr =

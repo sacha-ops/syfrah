@@ -43,6 +43,8 @@ pub struct ForgeState {
     pub fdb_registry: Arc<Mutex<HashMap<String, FdbEntry>>>,
     /// Drain controller for node drain/undrain protocol.
     pub drain_controller: Option<Arc<DrainController>>,
+    /// Prometheus metrics collector.
+    pub metrics_collector: Option<Arc<crate::metrics::MetricsCollector>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -403,6 +405,49 @@ async fn metrics_handler(State(state): State<Arc<ForgeState>>) -> impl IntoRespo
             "uptime_seconds": uptime,
             "vm_count": vm_count,
         })),
+    )
+}
+
+/// GET /metrics — Prometheus text exposition format.
+async fn prometheus_metrics_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+    let (vm_count, running, stopped) = match state.vm_manager.as_ref() {
+        Some(m) => {
+            let vms = m.list().await;
+            let total = vms.len();
+            // Count running vs stopped based on process status.
+            // For now, all listed VMs are considered running.
+            (total, total, 0usize)
+        }
+        None => (0, 0, 0),
+    };
+
+    let (cpu_ratio, mem_ratio) = match state.capacity.as_ref() {
+        Some(cap) => {
+            let alloc_v = cap.allocatable_vcpus() as f64;
+            let alloc_m = cap.allocatable_memory_mb() as f64;
+            let used_v = cap.used_vcpus() as f64;
+            let used_m = cap.used_memory_mb() as f64;
+            (
+                if alloc_v > 0.0 { used_v / alloc_v } else { 0.0 },
+                if alloc_m > 0.0 { used_m / alloc_m } else { 0.0 },
+            )
+        }
+        None => (0.0, 0.0),
+    };
+
+    let body = match state.metrics_collector.as_ref() {
+        Some(collector) => collector.render(vm_count, running, stopped, cpu_ratio, mem_ratio),
+        None => {
+            // Render basic metrics without collector
+            let collector = crate::metrics::MetricsCollector::new();
+            collector.render(vm_count, running, stopped, cpu_ratio, mem_ratio)
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
     )
 }
 
@@ -1841,6 +1886,7 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
             get(drain_status_handler).post(drain_handler),
         )
         .route("/v1/hypervisor/activate", post(activate_handler))
+        .route("/metrics", get(prometheus_metrics_handler))
         // -- Deprecated /v1/node/* aliases --
         .route("/v1/node/health", get(health_handler))
         .route("/v1/node/status", get(status_handler))
@@ -1960,6 +2006,7 @@ mod tests {
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
+            metrics_collector: None,
         })
     }
 
@@ -1983,6 +2030,7 @@ mod tests {
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
+            metrics_collector: None,
         });
         (dir, state)
     }
@@ -2205,6 +2253,7 @@ mod tests {
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
+            metrics_collector: None,
         });
         let app = forge_router(state);
 
@@ -2241,6 +2290,7 @@ mod tests {
             nat_gw_registry: Arc::new(Mutex::new(HashMap::new())),
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
+            metrics_collector: None,
         })
     }
 
