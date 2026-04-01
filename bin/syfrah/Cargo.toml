@@ -23,6 +23,7 @@ syfrah-controlplane = { path = "../../layers/controlplane" }
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json.workspace = true
+tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 tokio.workspace = true
