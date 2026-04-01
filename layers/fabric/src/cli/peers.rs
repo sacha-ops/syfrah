@@ -360,6 +360,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         }
     }
 
@@ -457,6 +458,7 @@ mod tests {
                 region: Region::new(region).unwrap(),
                 zone: Zone::new(zone).unwrap(),
             }),
+            hypervisor_report: None,
         }
     }
 

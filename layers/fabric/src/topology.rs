@@ -208,6 +208,7 @@ mod tests {
                 region: Region::new(region).unwrap(),
                 zone: Zone::new(zone).unwrap(),
             }),
+            hypervisor_report: None,
         }
     }
 
@@ -321,6 +322,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         };
 
         let view = TopologyView::from_peers(&[peer]);
@@ -387,6 +389,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         };
         let other = PeerRecord {
             name: "other".to_owned(),
@@ -398,6 +401,7 @@ mod tests {
             region: None,
             zone: None,
             topology: None,
+            hypervisor_report: None,
         };
         // Both default to ("default", "default") → same zone
         let tiers = super::partition_by_tier(&source, &[other]);

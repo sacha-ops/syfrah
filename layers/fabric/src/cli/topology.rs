@@ -44,6 +44,7 @@ pub async fn run(opts: TopologyOpts) -> Result<()> {
         region: state.region.clone(),
         zone: state.zone.clone(),
         topology: Topology::from_strings(state.region.as_deref(), state.zone.as_deref()),
+        hypervisor_report: None,
     };
     let mut all_nodes = state.peers.clone();
     all_nodes.push(local_peer);
