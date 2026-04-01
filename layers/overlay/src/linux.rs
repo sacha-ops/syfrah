@@ -235,12 +235,44 @@ impl NetworkBackend for LinuxBackend {
             ],
         )
         .await?;
+
+        // Wait for the kernel to make the devices visible. The netlink
+        // creation is asynchronous — the device may not appear in sysfs
+        // immediately. Retry up to 3 times with 100ms delay.
+        for attempt in 1..=3 {
+            if Self::interface_exists(name_a).await && Self::interface_exists(name_b).await {
+                break;
+            }
+            tracing::debug!(
+                attempt,
+                name_a,
+                name_b,
+                "veth pair not yet visible, waiting 100ms"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         Self::run("ip", &["link", "set", name_a, "up"]).await?;
         Self::run("ip", &["link", "set", name_b, "up"]).await?;
         Ok(())
     }
 
     async fn move_to_netns(&self, iface: &str, pid: u32) -> Result<()> {
+        // Retry up to 3 times if the interface is not yet visible (race
+        // condition between veth creation and netns move).
+        for attempt in 1..=3 {
+            if Self::interface_exists(iface).await {
+                Self::run("ip", &["link", "set", iface, "netns", &pid.to_string()]).await?;
+                return Ok(());
+            }
+            tracing::debug!(
+                attempt,
+                iface,
+                "interface not yet visible for netns move, waiting 100ms"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Final attempt without existence check — let it fail with a proper error.
         Self::run("ip", &["link", "set", iface, "netns", &pid.to_string()]).await?;
         Ok(())
     }
