@@ -552,7 +552,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn apply_allocate_ip_without_ipam_store_returns_error() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
