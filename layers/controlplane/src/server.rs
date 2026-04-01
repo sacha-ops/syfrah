@@ -111,7 +111,7 @@ async fn install_snapshot_handler(
 }
 
 /// Status response for the Raft cluster.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RaftStatusResponse {
     pub id: u64,
     pub state: String,

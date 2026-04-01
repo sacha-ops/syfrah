@@ -9,6 +9,7 @@ use syfrah_fabric::cli;
 use syfrah_fabric::daemon::{self, DaemonConfig};
 use syfrah_state::cli::StateCommand;
 
+mod controlplane;
 mod update;
 
 #[derive(Parser)]
@@ -87,6 +88,12 @@ enum Commands {
     Hypervisor {
         #[command(subcommand)]
         command: syfrah_org::HypervisorCommand,
+    },
+    /// Manage the Raft control plane
+    #[command(name = "controlplane")]
+    ControlPlane {
+        #[command(subcommand)]
+        command: controlplane::ControlPlaneCommand,
     },
     /// Inspect and manage layer state databases
     State {
@@ -969,6 +976,7 @@ async fn run() -> Result<()> {
         Commands::NatGw { command } => syfrah_org::cli::run_nat_gw(command).await,
         Commands::Route { command } => syfrah_org::cli::run_route(command).await,
         Commands::Hypervisor { command } => syfrah_org::cli::run_hypervisor(command).await,
+        Commands::ControlPlane { command } => controlplane::run(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let mut buf = Vec::new();
