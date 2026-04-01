@@ -84,6 +84,24 @@ pub struct TaskListQuery {
     pub resource_id: Option<String>,
 }
 
+/// Query parameters for consistency control on GET endpoints.
+#[derive(Deserialize, Debug, Default)]
+pub struct ConsistencyQuery {
+    /// When set to "strong", the read is forwarded to the Raft leader
+    /// which performs a ReadIndex check to guarantee linearizability.
+    pub consistency: Option<String>,
+}
+
+impl ConsistencyQuery {
+    /// Returns true if the caller requested strong (linearizable) consistency.
+    fn is_strong(&self) -> bool {
+        self.consistency
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("strong"))
+            .unwrap_or(false)
+    }
+}
+
 /// Request body for creating an instance.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CreateInstanceRequest {
@@ -412,6 +430,61 @@ async fn forward_simple_to_leader(
 
     let resp = req_builder.send().await.map_err(|e| {
         warn!("leader forward failed: {e}");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "code": "FORGE_LEADER_UNREACHABLE",
+                "message": format!("failed to reach leader at {leader_addr}: {e}")
+            })),
+        )
+    })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| {
+        serde_json::json!({"code": "FORGE_FORWARD_PARSE_ERROR", "message": "failed to parse leader response"})
+    });
+
+    Ok((
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(body),
+    ))
+}
+
+/// Get the Raft leader's Forge address if Raft is initialized.
+/// Used for strong reads — we always forward to leader regardless of our role.
+async fn leader_forge_addr_for_strong_read(state: &ForgeState) -> Option<String> {
+    let guard = state.raft_client.read().await;
+    let client = guard.as_ref()?;
+    let raft_addr = client.leader_addr()?;
+    Some(raft_addr.replace(":7200", ":7100"))
+}
+
+/// Forward a GET request to the leader for strong reads.
+async fn forward_get_to_leader(
+    leader_addr: &str,
+    path: &str,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    debug!(
+        "strong read: forwarding GET {} to leader at {}",
+        path, leader_addr
+    );
+    let url = format!("http://{leader_addr}{path}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "FORGE_FORWARD_FAILED",
+                    "message": format!("failed to build HTTP client: {e}")
+                })),
+            )
+        })?;
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        warn!("strong read forward failed: {e}");
         (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
@@ -884,7 +957,28 @@ async fn create_instance_handler(
 }
 
 /// GET /v1/instances — list all instances.
-async fn list_instances_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
+/// Supports `?consistency=strong` for linearizable reads via the leader.
+async fn list_instances_handler(
+    State(state): State<Arc<ForgeState>>,
+    Query(params): Query<ConsistencyQuery>,
+) -> impl IntoResponse {
+    // Strong consistency: forward to leader for linearizable read.
+    if params.is_strong() {
+        if let Some(leader_addr) = leader_forge_addr_for_strong_read(&state).await {
+            // If we ARE the leader, serve locally (no forwarding needed).
+            let is_leader = {
+                let guard = state.raft_client.read().await;
+                guard.as_ref().map(|c| c.is_leader()).unwrap_or(false)
+            };
+            if !is_leader {
+                match forward_get_to_leader(&leader_addr, "/v1/instances").await {
+                    Ok(resp) => return resp,
+                    Err(resp) => return resp,
+                }
+            }
+        }
+    }
+
     let Some(ref vm_manager) = state.vm_manager else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -899,10 +993,28 @@ async fn list_instances_handler(State(state): State<Arc<ForgeState>>) -> impl In
 }
 
 /// GET /v1/instances/:id — get a single instance.
+/// Supports `?consistency=strong` for linearizable reads via the leader.
 async fn get_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Path(id): Path<String>,
+    Query(params): Query<ConsistencyQuery>,
 ) -> impl IntoResponse {
+    // Strong consistency: forward to leader for linearizable read.
+    if params.is_strong() {
+        if let Some(leader_addr) = leader_forge_addr_for_strong_read(&state).await {
+            let is_leader = {
+                let guard = state.raft_client.read().await;
+                guard.as_ref().map(|c| c.is_leader()).unwrap_or(false)
+            };
+            if !is_leader {
+                match forward_get_to_leader(&leader_addr, &format!("/v1/instances/{id}")).await {
+                    Ok(resp) => return resp,
+                    Err(resp) => return resp,
+                }
+            }
+        }
+    }
+
     let Some(ref vm_manager) = state.vm_manager else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
