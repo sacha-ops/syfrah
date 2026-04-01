@@ -319,17 +319,103 @@ impl RedbStateMachine {
             }
 
             // -- VM Placement --
-            StateMachineCommand::PlaceVm { .. } => {
-                warn!("PlaceVm will be wired in issue #1049");
-                StateMachineResponse::Ok
+            StateMachineCommand::PlaceVm {
+                vm_id,
+                hypervisor_id,
+                subnet_id,
+                ip,
+                mac,
+                generation,
+            } => {
+                let placement_store = match &self.placement_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "placement store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                // Resolve the VPC ID from the subnet.
+                let vpc_id = match self.org_store.get_subnet_by_id(subnet_id) {
+                    Ok(Some(s)) => s.vpc_id.0,
+                    Ok(None) => subnet_id.split('/').next().unwrap_or("unknown").to_string(),
+                    Err(_) => subnet_id.split('/').next().unwrap_or("unknown").to_string(),
+                };
+                let placement = syfrah_org::types::VmPlacement {
+                    vpc_id,
+                    vm_id: vm_id.clone(),
+                    vm_mac: mac.clone(),
+                    vm_ip: ip.clone(),
+                    subnet_id: subnet_id.clone(),
+                    hypervisor_id: hypervisor_id.clone(),
+                    action: syfrah_org::types::PlacementAction::Add,
+                    created_at: now,
+                    placement_generation: *generation,
+                };
+                match placement_store.add_placement(&placement) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::RemoveVm { .. } => {
-                warn!("RemoveVm will be wired in issue #1049");
-                StateMachineResponse::Ok
+            StateMachineCommand::RemoveVm { vm_id } => {
+                let placement_store = match &self.placement_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "placement store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                // List all placements to find the one matching this VM.
+                match placement_store.list_all() {
+                    Ok(placements) => {
+                        for p in &placements {
+                            if p.vm_id == *vm_id {
+                                let _ = placement_store.remove_placement(&p.vpc_id, vm_id);
+                                return StateMachineResponse::Ok;
+                            }
+                        }
+                        StateMachineResponse::Error(format!("placement not found for VM: {vm_id}"))
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::RescheduleVm { .. } => {
-                warn!("RescheduleVm will be wired in later issues");
-                StateMachineResponse::Ok
+            StateMachineCommand::RescheduleVm {
+                vm_id,
+                from: _,
+                to,
+                generation,
+            } => {
+                let placement_store = match &self.placement_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "placement store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                // Update the placement in-place: change hypervisor_id and generation.
+                match placement_store.list_all() {
+                    Ok(placements) => {
+                        for p in &placements {
+                            if p.vm_id == *vm_id {
+                                let mut updated = p.clone();
+                                updated.hypervisor_id = to.clone();
+                                updated.placement_generation = *generation;
+                                return match placement_store.add_placement(&updated) {
+                                    Ok(()) => StateMachineResponse::Ok,
+                                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                                };
+                            }
+                        }
+                        StateMachineResponse::Error(format!("placement not found for VM: {vm_id}"))
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
         }
     }
