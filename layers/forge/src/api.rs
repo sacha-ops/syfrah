@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use syfrah_api::handler::LayerHandler;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::capacity::CapacityTracker;
 use crate::drain::DrainController;
@@ -45,6 +45,12 @@ pub struct ForgeState {
     pub drain_controller: Option<Arc<DrainController>>,
     /// Prometheus metrics collector.
     pub metrics_collector: Option<Arc<crate::metrics::MetricsCollector>>,
+    /// Raft client for leader-forwarding on mutation requests.
+    /// When set and this node is NOT the leader, mutation requests are
+    /// transparently forwarded to the leader's Forge HTTP API.
+    /// Wrapped in RwLock because it's injected after Forge starts (Raft
+    /// initialization happens later in the daemon startup sequence).
+    pub raft_client: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::RaftClient>>>,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -79,7 +85,7 @@ pub struct TaskListQuery {
 }
 
 /// Request body for creating an instance.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct CreateInstanceRequest {
     pub name: String,
     pub image: String,
@@ -310,6 +316,120 @@ pub struct NicResponse {
 #[derive(Deserialize, Debug)]
 pub struct NicListQuery {
     pub vm_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Leader forwarding — transparent Raft leader forwarding for mutations
+// ---------------------------------------------------------------------------
+
+/// Check if we should forward this mutation to the leader.
+/// Returns `Some(leader_forge_addr)` if we should forward, `None` if we should handle locally.
+async fn should_forward_to_leader(state: &ForgeState) -> Option<String> {
+    let guard = state.raft_client.read().await;
+    let client = guard.as_ref()?;
+    if client.is_leader() {
+        return None; // We are the leader, process locally
+    }
+    // Derive Forge address from Raft address (port 7100 instead of 7200).
+    let raft_addr = client.leader_addr()?;
+    Some(raft_addr.replace(":7200", ":7100"))
+}
+
+/// Forward a JSON POST request to the leader's Forge API.
+async fn forward_post_to_leader<T: Serialize>(
+    leader_addr: &str,
+    path: &str,
+    body: &T,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    debug!("forwarding POST {} to leader at {}", path, leader_addr);
+    let url = format!("http://{leader_addr}{path}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "FORGE_FORWARD_FAILED",
+                    "message": format!("failed to build HTTP client: {e}")
+                })),
+            )
+        })?;
+
+    let resp = client.post(&url).json(body).send().await.map_err(|e| {
+        warn!("leader forward failed: {e}");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "code": "FORGE_LEADER_UNREACHABLE",
+                "message": format!("failed to reach leader at {leader_addr}: {e}")
+            })),
+        )
+    })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| {
+        serde_json::json!({"code": "FORGE_FORWARD_PARSE_ERROR", "message": "failed to parse leader response"})
+    });
+
+    Ok((
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(body),
+    ))
+}
+
+/// Forward a simple (no-body) request to the leader's Forge API.
+async fn forward_simple_to_leader(
+    leader_addr: &str,
+    method: &str,
+    path: &str,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    debug!(
+        "forwarding {} {} to leader at {}",
+        method, path, leader_addr
+    );
+    let url = format!("http://{leader_addr}{path}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "FORGE_FORWARD_FAILED",
+                    "message": format!("failed to build HTTP client: {e}")
+                })),
+            )
+        })?;
+
+    let req_builder = match method {
+        "DELETE" => client.delete(&url),
+        "POST" => client.post(&url),
+        _ => client.get(&url),
+    };
+
+    let resp = req_builder.send().await.map_err(|e| {
+        warn!("leader forward failed: {e}");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "code": "FORGE_LEADER_UNREACHABLE",
+                "message": format!("failed to reach leader at {leader_addr}: {e}")
+            })),
+        )
+    })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| {
+        serde_json::json!({"code": "FORGE_FORWARD_PARSE_ERROR", "message": "failed to parse leader response"})
+    });
+
+    Ok((
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(body),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +714,16 @@ async fn create_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> impl IntoResponse {
+    // Leader forwarding: if Raft is active and we are NOT the leader,
+    // forward the entire request to the leader's Forge API.
+    if let Some(leader_addr) = should_forward_to_leader(&state).await {
+        debug!("create_instance: not leader, forwarding to leader at {leader_addr}");
+        match forward_post_to_leader(&leader_addr, "/v1/instances", &req).await {
+            Ok(resp) => return resp,
+            Err(resp) => return resp,
+        }
+    }
+
     // Drain check: reject new creates when draining.
     if let Some(ref drain) = state.drain_controller {
         if drain.is_draining() {
@@ -807,6 +937,16 @@ async fn delete_instance_handler(
     State(state): State<Arc<ForgeState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Leader forwarding for mutations.
+    if let Some(leader_addr) = should_forward_to_leader(&state).await {
+        debug!("delete_instance: not leader, forwarding to leader at {leader_addr}");
+        match forward_simple_to_leader(&leader_addr, "DELETE", &format!("/v1/instances/{id}")).await
+        {
+            Ok(resp) => return resp,
+            Err(resp) => return resp,
+        }
+    }
+
     let Some(ref vm_manager) = state.vm_manager else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2011,6 +2151,7 @@ mod tests {
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
             metrics_collector: None,
+            raft_client: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -2035,6 +2176,7 @@ mod tests {
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
             metrics_collector: None,
+            raft_client: Arc::new(tokio::sync::RwLock::new(None)),
         });
         (dir, state)
     }
@@ -2262,6 +2404,7 @@ mod tests {
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
             metrics_collector: None,
+            raft_client: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let app = forge_router(state);
 
@@ -2299,6 +2442,7 @@ mod tests {
             fdb_registry: Arc::new(Mutex::new(HashMap::new())),
             drain_controller: None,
             metrics_collector: None,
+            raft_client: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 

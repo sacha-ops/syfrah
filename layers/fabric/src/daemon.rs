@@ -1364,6 +1364,11 @@ pub async fn run_daemon(
         control::start_control_listener(&control_path, router).await;
     });
 
+    // Raft client holder for Forge — injected when Raft is initialized so
+    // the Forge HTTP API can forward mutations to the Raft leader.
+    let forge_raft_client: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::RaftClient>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     // -- Forge HTTP API server -----------------------------------------------
     //
     // Migration: daemon.rs starts the Forge HTTP server alongside the control
@@ -1419,6 +1424,7 @@ pub async fn run_daemon(
             metrics_collector: Some(std::sync::Arc::new(
                 syfrah_forge::metrics::MetricsCollector::new(),
             )),
+            raft_client: Arc::clone(&forge_raft_client),
         });
 
         let bind_addr: std::net::SocketAddr =
@@ -1507,6 +1513,17 @@ pub async fn run_daemon(
                 let mut holder = raft_client_holder.lock().unwrap();
                 *holder = Some(raft_client.clone());
                 info!("raft: injected Raft client into placement hook");
+            }
+
+            // Inject the Raft client into the Forge HTTP API for leader forwarding.
+            {
+                let holder = Arc::clone(&forge_raft_client);
+                let client = raft_client.clone();
+                tokio::spawn(async move {
+                    let mut guard = holder.write().await;
+                    *guard = Some(client);
+                    info!("raft: injected Raft client into Forge API for leader forwarding");
+                });
             }
 
             // Inject the Raft client into the org handler so mutations go through Raft.
