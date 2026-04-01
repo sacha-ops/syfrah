@@ -1308,6 +1308,9 @@ pub async fn run_daemon(
             generation_tracker: Some(std::sync::Arc::new(
                 syfrah_forge::generation::GenerationTracker::new(),
             )),
+            nic_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
 
         let bind_addr: std::net::SocketAddr =
