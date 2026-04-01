@@ -693,7 +693,10 @@ fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
     let snapshot = client.metrics_snapshot();
     let mut out = String::with_capacity(1024);
 
-    let _ = writeln!(out, "# HELP raft_state Current Raft state (0=follower, 1=candidate, 2=leader)");
+    let _ = writeln!(
+        out,
+        "# HELP raft_state Current Raft state (0=follower, 1=candidate, 2=leader)"
+    );
     let _ = writeln!(out, "# TYPE raft_state gauge");
     let _ = writeln!(out, "raft_state {}", snapshot.state);
 
@@ -705,7 +708,10 @@ fn render_raft_metrics(client: &syfrah_controlplane::RaftClient) -> String {
     let _ = writeln!(out, "# TYPE raft_commit_index gauge");
     let _ = writeln!(out, "raft_commit_index {}", snapshot.commit_index);
 
-    let _ = writeln!(out, "# HELP raft_last_applied Index of last applied log entry");
+    let _ = writeln!(
+        out,
+        "# HELP raft_last_applied Index of last applied log entry"
+    );
     let _ = writeln!(out, "# TYPE raft_last_applied gauge");
     let _ = writeln!(out, "raft_last_applied {}", snapshot.last_applied);
 
@@ -732,19 +738,44 @@ fn render_gossip_metrics(cluster: &syfrah_controlplane::GossipCluster) -> String
     let snapshot = cluster.metrics_snapshot();
     let mut out = String::with_capacity(512);
 
-    let _ = writeln!(out, "# HELP gossip_members_total Number of gossip members by state");
+    let _ = writeln!(
+        out,
+        "# HELP gossip_members_total Number of gossip members by state"
+    );
     let _ = writeln!(out, "# TYPE gossip_members_total gauge");
-    let _ = writeln!(out, "gossip_members_total{{state=\"alive\"}} {}", snapshot.members_alive);
-    let _ = writeln!(out, "gossip_members_total{{state=\"suspect\"}} {}", snapshot.members_suspect);
-    let _ = writeln!(out, "gossip_members_total{{state=\"down\"}} {}", snapshot.members_down);
+    let _ = writeln!(
+        out,
+        "gossip_members_total{{state=\"alive\"}} {}",
+        snapshot.members_alive
+    );
+    let _ = writeln!(
+        out,
+        "gossip_members_total{{state=\"suspect\"}} {}",
+        snapshot.members_suspect
+    );
+    let _ = writeln!(
+        out,
+        "gossip_members_total{{state=\"down\"}} {}",
+        snapshot.members_down
+    );
 
-    let _ = writeln!(out, "# HELP gossip_messages_sent_total Total gossip messages sent");
+    let _ = writeln!(
+        out,
+        "# HELP gossip_messages_sent_total Total gossip messages sent"
+    );
     let _ = writeln!(out, "# TYPE gossip_messages_sent_total counter");
     let _ = writeln!(out, "gossip_messages_sent_total {}", snapshot.messages_sent);
 
-    let _ = writeln!(out, "# HELP gossip_messages_received_total Total gossip messages received");
+    let _ = writeln!(
+        out,
+        "# HELP gossip_messages_received_total Total gossip messages received"
+    );
     let _ = writeln!(out, "# TYPE gossip_messages_received_total counter");
-    let _ = writeln!(out, "gossip_messages_received_total {}", snapshot.messages_received);
+    let _ = writeln!(
+        out,
+        "gossip_messages_received_total {}",
+        snapshot.messages_received
+    );
 
     out
 }
