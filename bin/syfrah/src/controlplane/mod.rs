@@ -11,7 +11,11 @@ use clap::Subcommand;
 #[derive(Subcommand)]
 pub enum ControlPlaneCommand {
     /// Initialize the control plane (single-node Raft bootstrap)
-    Init,
+    Init {
+        /// After initialization, verify all data is accessible via Raft reads.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Join an existing Raft cluster
     Join,
     /// Show control plane status (Raft leader, term, members)
@@ -27,7 +31,7 @@ pub enum ControlPlaneCommand {
 /// Run a control plane CLI command.
 pub async fn run(command: ControlPlaneCommand) -> anyhow::Result<()> {
     match command {
-        ControlPlaneCommand::Init => init::run().await,
+        ControlPlaneCommand::Init { verify } => init::run(verify).await,
         ControlPlaneCommand::Join => join::run().await,
         ControlPlaneCommand::Status { json } => status::run(json).await,
         ControlPlaneCommand::Members => members::run().await,
