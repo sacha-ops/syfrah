@@ -48,7 +48,7 @@ pub struct VmPlacementAnnouncement {
     pub subnet_id: String,
     /// The fabric address of the node hosting this VM (e.g. the node's
     /// WireGuard IPv6 address).
-    pub hosting_node: String,
+    pub hypervisor_id: String,
     /// Whether this is an add or remove announcement.
     pub action: PlacementAction,
 }
@@ -102,7 +102,7 @@ where
         vpc_id = %announcement.vpc_id,
         vm_id = %announcement.vm_id,
         action = %announcement.action,
-        hosting_node = %announcement.hosting_node,
+        hypervisor_id = %announcement.hypervisor_id,
         "broadcasting VM placement announcement"
     );
 
@@ -133,7 +133,7 @@ pub fn handle_vm_placement(
         vpc_id = %announcement.vpc_id,
         vm_id = %announcement.vm_id,
         action = %announcement.action,
-        hosting_node = %announcement.hosting_node,
+        hypervisor_id = %announcement.hypervisor_id,
         "received VM placement announcement"
     );
 
@@ -154,7 +154,7 @@ mod tests {
             vm_mac: "02:00:0a:00:01:05".to_string(),
             vm_ip: "10.0.1.5".to_string(),
             subnet_id: "subnet-frontend".to_string(),
-            hosting_node: "fd12:3456:7800::1".to_string(),
+            hypervisor_id: "fd12:3456:7800::1".to_string(),
             action: PlacementAction::Add,
         }
     }
@@ -166,7 +166,7 @@ mod tests {
             vm_mac: "02:00:0a:00:01:05".to_string(),
             vm_ip: "10.0.1.5".to_string(),
             subnet_id: "subnet-frontend".to_string(),
-            hosting_node: "fd12:3456:7800::1".to_string(),
+            hypervisor_id: "fd12:3456:7800::1".to_string(),
             action: PlacementAction::Remove,
         }
     }
@@ -187,7 +187,7 @@ mod tests {
             "vm_mac": "02:00:0a:00:02:03",
             "vm_ip": "10.0.2.3",
             "subnet_id": "subnet-database",
-            "hosting_node": "fd12:3456:7800::2",
+            "hypervisor_id": "fd12:3456:7800::2",
             "action": "add"
         }"#;
         let announcement = VmPlacementAnnouncement::from_json_string(json_str).unwrap();
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(announcement.vm_mac, "02:00:0a:00:02:03");
         assert_eq!(announcement.vm_ip, "10.0.2.3");
         assert_eq!(announcement.subnet_id, "subnet-database");
-        assert_eq!(announcement.hosting_node, "fd12:3456:7800::2");
+        assert_eq!(announcement.hypervisor_id, "fd12:3456:7800::2");
         assert_eq!(announcement.action, PlacementAction::Add);
     }
 

@@ -48,7 +48,7 @@ pub struct RecoveryPlacement {
     pub vm_id: String,
     pub vm_mac: String,
     pub vm_ip: String,
-    pub hosting_node: String,
+    pub hypervisor_id: String,
 }
 
 /// Summary of what the recovery function did.
@@ -114,7 +114,7 @@ pub async fn recover_network(
     // VPCs that have at least one local placement need a bridge + VXLAN.
     let local_vpc_ids: HashSet<&str> = placements
         .iter()
-        .filter(|p| p.hosting_node == local_node)
+        .filter(|p| p.hypervisor_id == local_node)
         .map(|p| p.vpc_id.as_str())
         .collect();
 
@@ -131,7 +131,7 @@ pub async fn recover_network(
     // Expected TAPs: local placements -> naming::tap_name(vm_id)
     let expected_taps: HashSet<String> = placements
         .iter()
-        .filter(|p| p.hosting_node == local_node)
+        .filter(|p| p.hypervisor_id == local_node)
         .map(|p| naming::tap_name(&p.vm_id))
         .collect();
 
@@ -207,7 +207,7 @@ pub async fn recover_network(
 
     // ── 5. Re-apply nftables rules ────────────────────────────────────
     // nftables rules do not survive reboot — re-apply for every local VM.
-    for p in placements.iter().filter(|p| p.hosting_node == local_node) {
+    for p in placements.iter().filter(|p| p.hypervisor_id == local_node) {
         let tap = naming::tap_name(&p.vm_id);
 
         if let Err(e) = backend.apply_vm_rules(&tap, &p.vm_mac, &p.vm_ip).await {
@@ -235,7 +235,7 @@ pub async fn recover_network(
     }
 
     // ── 6. Re-populate FDB from placements ────────────────────────────
-    for p in placements.iter().filter(|p| p.hosting_node != local_node) {
+    for p in placements.iter().filter(|p| p.hypervisor_id != local_node) {
         let bridge = naming::bridge_name(&p.vpc_id);
         let vxlan = naming::vxlan_name(&p.vpc_id);
 
@@ -244,7 +244,7 @@ pub async fn recover_network(
             continue;
         }
 
-        match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hosting_node).await {
+        match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hypervisor_id).await {
             Ok(()) => {}
             Err(e) => {
                 warn!(
@@ -353,7 +353,7 @@ mod tests {
             vm_id: vm_id.to_string(),
             vm_mac: mac.to_string(),
             vm_ip: ip.to_string(),
-            hosting_node: node.to_string(),
+            hypervisor_id: node.to_string(),
         }
     }
 

@@ -473,7 +473,7 @@ pub struct VmPlacement {
     pub vm_mac: String,
     pub vm_ip: String,
     pub subnet_id: String,
-    pub hosting_node: String,
+    pub hypervisor_id: String,
     pub action: PlacementAction,
     pub created_at: u64,
 }

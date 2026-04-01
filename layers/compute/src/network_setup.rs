@@ -377,7 +377,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             vm_mac: mac.to_string(),
             vm_ip: ip.to_string(),
             subnet_id: subnet_id.to_string(),
-            hosting_node: self.local_node.clone(),
+            hypervisor_id: self.local_node.clone(),
             action: PlacementAction::Add,
             created_at: now,
         };
@@ -835,7 +835,7 @@ mod tests {
         let p = stored.unwrap();
         assert_eq!(p.vm_ip, "10.0.1.3");
         assert_eq!(p.vm_mac, "02:00:0a:00:01:03");
-        assert_eq!(p.hosting_node, LOCAL_NODE);
+        assert_eq!(p.hypervisor_id, LOCAL_NODE);
     }
 
     #[tokio::test]

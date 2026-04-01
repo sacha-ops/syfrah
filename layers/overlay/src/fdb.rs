@@ -28,7 +28,7 @@ pub struct VmPlacement {
     pub vm_mac: String,
     pub vm_ip: String,
     pub subnet_id: String,
-    pub hosting_node: String,
+    pub hypervisor_id: String,
     pub action: PlacementAction,
 }
 
@@ -46,7 +46,7 @@ pub struct RebuildSummary {
 /// Rebuild FDB tables from persisted `vm_placements`.
 ///
 /// Called at daemon startup after reconnecting VMs. Iterates all placements
-/// and adds FDB + ARP proxy entries for every remote VM (where `hosting_node`
+/// and adds FDB + ARP proxy entries for every remote VM (where `hypervisor_id`
 /// differs from `local_node`). Local placements are skipped. Failures are
 /// counted but do not abort the rebuild — the function is best-effort so
 /// that a single stale placement does not block the entire daemon startup.
@@ -58,7 +58,7 @@ pub async fn rebuild_fdb(
     let mut summary = RebuildSummary::default();
 
     for p in placements {
-        if p.hosting_node == local_node {
+        if p.hypervisor_id == local_node {
             summary.skipped_local += 1;
             continue;
         }
@@ -66,7 +66,7 @@ pub async fn rebuild_fdb(
         let bridge = naming::bridge_name(&p.vpc_id);
         let vxlan = naming::vxlan_name(&p.vpc_id);
 
-        match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hosting_node).await {
+        match add_fdb_entry(backend, &bridge, &p.vm_mac, &p.hypervisor_id).await {
             Ok(()) => {}
             Err(e) => {
                 warn!(
@@ -173,7 +173,7 @@ pub async fn sync_placement(
     local_node: &str,
 ) -> Result<()> {
     // Don't add FDB entries for VMs running on this node.
-    if placement.hosting_node == local_node {
+    if placement.hypervisor_id == local_node {
         return Ok(());
     }
 
@@ -182,7 +182,13 @@ pub async fn sync_placement(
 
     match placement.action {
         PlacementAction::Add => {
-            add_fdb_entry(backend, &bridge, &placement.vm_mac, &placement.hosting_node).await?;
+            add_fdb_entry(
+                backend,
+                &bridge,
+                &placement.vm_mac,
+                &placement.hypervisor_id,
+            )
+            .await?;
             add_arp_proxy(backend, &vxlan, &placement.vm_ip, &placement.vm_mac).await?;
         }
         PlacementAction::Remove => {
@@ -266,14 +272,14 @@ mod tests {
         assert!(calls[1].starts_with("add_arp_proxy("));
     }
 
-    fn make_placement(action: PlacementAction, hosting_node: &str) -> VmPlacement {
+    fn make_placement(action: PlacementAction, hypervisor_id: &str) -> VmPlacement {
         VmPlacement {
             vpc_id: "100".to_string(),
             vm_id: "vm-1".to_string(),
             vm_mac: MAC.to_string(),
             vm_ip: IP.to_string(),
             subnet_id: "sub-1".to_string(),
-            hosting_node: hosting_node.to_string(),
+            hypervisor_id: hypervisor_id.to_string(),
             action,
         }
     }
@@ -349,7 +355,7 @@ mod tests {
             vm_mac: mac.to_string(),
             vm_ip: ip.to_string(),
             subnet_id: "sub-1".to_string(),
-            hosting_node: node.to_string(),
+            hypervisor_id: node.to_string(),
             action: PlacementAction::Add,
         }
     }

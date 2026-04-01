@@ -148,7 +148,7 @@ fn make_placement(vpc: &str, vm: &str, node: &str, subnet: &str) -> VmPlacement 
         vm_mac: format!("02:00:0a:00:01:{:02x}", vm.len()),
         vm_ip: format!("10.0.1.{}", vm.len()),
         subnet_id: subnet.to_string(),
-        hosting_node: node.to_string(),
+        hypervisor_id: node.to_string(),
         action: PlacementAction::Add,
         created_at: 1700000000,
     }
@@ -228,7 +228,7 @@ fn list_by_node() {
 
     let node1 = store.list_by_node("fd00::1").unwrap();
     assert_eq!(node1.len(), 2, "expected 2 placements on fd00::1");
-    assert!(node1.iter().all(|p| p.hosting_node == "fd00::1"));
+    assert!(node1.iter().all(|p| p.hypervisor_id == "fd00::1"));
 
     let node2 = store.list_by_node("fd00::2").unwrap();
     assert_eq!(node2.len(), 1, "expected 1 placement on fd00::2");
