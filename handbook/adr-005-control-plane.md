@@ -116,12 +116,15 @@ All traffic is encrypted by WireGuard. No additional TLS layer is needed.
 
 ### Raft group membership
 
-Every node that joins the fabric becomes a Raft member. The membership model:
+Joining the fabric makes a node eligible for Raft membership but does not automatically add it to the Raft cluster. Raft membership is managed separately:
 
-- **Voter nodes**: participate in leader election and quorum. Default for the first 5 nodes.
-- **Non-voter (learner) nodes**: replicate the full Raft log and maintain an identical redb, but do not vote. Used for clusters larger than 5-7 nodes to keep quorum fast while still distributing state everywhere.
+- **Single-node bootstrap**: the initial node auto-creates a single-member Raft cluster
+- **Subsequent nodes**: join the fabric first, then are added to Raft as learners via `syfrah controlplane join` or auto-join policy
+- **Auto-join policy** (optional): new fabric members are automatically added as learners up to a configured limit
 
-The Raft group is the full set of nodes. Every hypervisor and every non-hypervisor node participates. Non-hypervisor nodes (routers, monitoring boxes) still need the Raft state for FDB population, SG enforcement, and API serving.
+This separation ensures that misconfigured or transient nodes don't destabilize the Raft cluster.
+
+The Raft group is the full set of nodes. Every hypervisor and every non-hypervisor node participates. Non-hypervisor nodes still receive the full Raft state for API serving, leadership eligibility, and any local control-plane functions they host. FDB population and SG enforcement are only performed on nodes that participate in the overlay data plane (typically hypervisors and dedicated network nodes).
 
 ### Leader election
 
@@ -569,7 +572,7 @@ CreateInstance arrives at the leader
    - AllocateIp { subnet_id, vm_id }
    - CreateNic { vm_id, subnet_id, vpc_id, ip, mac }
    - PlaceVm { vm_id, hypervisor_id, subnet_id, ip, mac }
-   All three are committed atomically in a single Raft log batch.
+   All three are encoded as one composite placement transaction in a single Raft log entry and applied atomically by the state machine in a single redb write transaction. Either all three succeed or none do.
          │
          ▼
 7. Forge on the selected hypervisor reads the placement from redb
@@ -1175,7 +1178,7 @@ Contract:
 - Same key + different operation → 409 Conflict (key reuse error)
 - Different key + same operation → new execution (not a retry)
 
-"Same logical operation" is determined by comparing the command type and primary identifiers (e.g., CreateVm with the same name), not by deep payload comparison.
+"Same operation" is determined by comparing a normalized request fingerprint derived from the command type and the full semantically relevant payload (all fields that affect the outcome). For example, `CreateVm{name: "web-1", vcpus: 2}` and `CreateVm{name: "web-1", vcpus: 8}` with the same idempotency key produce a 409 Conflict because the payloads differ, even though the name matches.
 
 ### CLI behavior
 
