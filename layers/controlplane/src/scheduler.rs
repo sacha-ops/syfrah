@@ -403,6 +403,7 @@ impl Scheduler {
     ///
     /// The `admission_check` closure receives a `PlacementDecision` and
     /// returns `Ok(())` if admitted, or `Err(reason)` if rejected.
+    #[allow(clippy::too_many_arguments)]
     pub fn schedule_with_retry<F>(
         &self,
         vcpus: u32,
@@ -708,7 +709,7 @@ mod tests {
                 &cluster,
                 &HashMap::new(),
                 3,
-                |decision| {
+                |_decision| {
                     call_count += 1;
                     if call_count == 1 {
                         // Reject the first pick
