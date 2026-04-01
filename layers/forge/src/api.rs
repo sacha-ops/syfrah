@@ -165,6 +165,52 @@ pub struct CreateNicRequest {
     pub security_groups: Vec<String>,
 }
 
+/// Request body for applying security group rules to a VM.
+#[derive(Deserialize, Debug)]
+pub struct ApplySgRequest {
+    /// VM identifier.
+    pub vm_id: String,
+    /// NIC's private IP address.
+    pub ip: String,
+    /// NIC's MAC address.
+    pub mac: String,
+    /// Security group names attached to this NIC.
+    pub security_groups: Vec<String>,
+    /// Security group rules to apply.
+    #[serde(default)]
+    pub rules: Vec<SgRuleInput>,
+    /// Map of SG name -> list of IPs for SG reference resolution.
+    #[serde(default)]
+    pub sg_ip_map: HashMap<String, Vec<String>>,
+}
+
+/// Input format for a security group rule.
+#[derive(Deserialize, Debug)]
+pub struct SgRuleInput {
+    pub id: String,
+    pub sg_id: String,
+    pub direction: String,
+    pub protocol: String,
+    #[serde(default)]
+    pub port_range_start: Option<u16>,
+    #[serde(default)]
+    pub port_range_end: Option<u16>,
+    pub source: String,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
+fn default_priority() -> u32 {
+    100
+}
+
+/// Request body for removing SG rules from a VM.
+#[derive(Deserialize, Debug)]
+pub struct RemoveSgRequest {
+    /// VM identifier whose chains should be flushed.
+    pub vm_id: String,
+}
+
 /// Response for NIC operations.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NicResponse {
@@ -1072,6 +1118,153 @@ async fn list_nics_handler(
     (StatusCode::OK, Json(serde_json::to_value(nics).unwrap()))
 }
 
+// ---------------------------------------------------------------------------
+// Security Group handlers
+// ---------------------------------------------------------------------------
+
+/// Convert SgRuleInput to overlay SecurityGroupRule.
+fn to_sg_rule(input: &SgRuleInput) -> syfrah_overlay::sg::SecurityGroupRule {
+    use syfrah_overlay::sg::*;
+    SecurityGroupRule {
+        id: RuleId(input.id.clone()),
+        sg_id: SecurityGroupId(input.sg_id.clone()),
+        direction: input.direction.parse().unwrap_or(Direction::Ingress),
+        protocol: match input.protocol.to_lowercase().as_str() {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            "icmp" => Protocol::Icmp,
+            _ => Protocol::All,
+        },
+        port_range: match (input.port_range_start, input.port_range_end) {
+            (Some(start), Some(end)) => Some(PortRange {
+                from: start,
+                to: end,
+            }),
+            (Some(start), None) => Some(PortRange {
+                from: start,
+                to: start,
+            }),
+            _ => None,
+        },
+        source: TrafficSource::Cidr(input.source.clone()),
+        priority: input.priority,
+        description: String::new(),
+        created_at: 0,
+    }
+}
+
+/// POST /v1/networks/sg/apply — generate nftables from SG rules, apply per-VM chains.
+async fn apply_sg_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<ApplySgRequest>,
+) -> impl IntoResponse {
+    let _backend = match state.network_backend {
+        Some(ref b) => b,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "code": "FORGE_NETWORK_UNAVAILABLE",
+                    "message": "network backend not initialized"
+                })),
+            );
+        }
+    };
+
+    let nic = syfrah_overlay::sg_nft::NetworkInterface {
+        id: syfrah_overlay::sg_nft::NicId(format!("nic-{}", req.vm_id)),
+        vm_id: req.vm_id.clone(),
+        private_ip: match req.ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "code": "FORGE_INVALID_IP",
+                        "message": format!("invalid IP address: {}", req.ip)
+                    })),
+                );
+            }
+        },
+        mac: req.mac.clone(),
+        security_groups: req
+            .security_groups
+            .iter()
+            .map(|s| syfrah_overlay::sg::SecurityGroupId(s.clone()))
+            .collect(),
+    };
+
+    let rules: Vec<syfrah_overlay::sg::SecurityGroupRule> =
+        req.rules.iter().map(to_sg_rule).collect();
+
+    // Build the ruleset (this is pure computation, no I/O).
+    let ruleset = syfrah_overlay::sg_nft::build_sg_ruleset(&nic, &rules, &req.sg_ip_map);
+
+    // Apply via nft -f - (this shells out).
+    if let Err(e) = syfrah_overlay::nft::apply_ruleset(&ruleset) {
+        warn!(vm_id = %req.vm_id, error = %e, "failed to apply SG rules");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_SG_APPLY_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    info!(vm_id = %req.vm_id, sg_count = req.security_groups.len(), "SG rules applied");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_SG_APPLIED",
+            "vm_id": req.vm_id,
+            "chains": [
+                syfrah_overlay::sg_nft::ingress_chain_name(&req.vm_id),
+                syfrah_overlay::sg_nft::egress_chain_name(&req.vm_id),
+            ]
+        })),
+    )
+}
+
+/// POST /v1/networks/sg/remove — flush VM chains.
+async fn remove_sg_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<RemoveSgRequest>,
+) -> impl IntoResponse {
+    let _backend = match state.network_backend {
+        Some(ref b) => b,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "code": "FORGE_NETWORK_UNAVAILABLE",
+                    "message": "network backend not initialized"
+                })),
+            );
+        }
+    };
+
+    if let Err(e) = syfrah_overlay::sg_nft::remove_sg_for_vm(&req.vm_id) {
+        warn!(vm_id = %req.vm_id, error = %e, "failed to remove SG chains");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "FORGE_SG_REMOVE_FAILED",
+                "message": e.to_string()
+            })),
+        );
+    }
+
+    info!(vm_id = %req.vm_id, "SG chains removed");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": "FORGE_SG_REMOVED",
+            "vm_id": req.vm_id
+        })),
+    )
+}
+
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
@@ -1099,6 +1292,9 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
             get(list_nics_handler).post(create_nic_handler),
         )
         .route("/v1/networks/interfaces/{id}", delete(delete_nic_handler))
+        // -- Networks: Security Groups --
+        .route("/v1/networks/sg/apply", post(apply_sg_handler))
+        .route("/v1/networks/sg/remove", post(remove_sg_handler))
         // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
@@ -1669,5 +1865,61 @@ mod tests {
         let nics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(nics.len(), 1);
         assert_eq!(nics[0]["vm_id"], "vm-a");
+    }
+
+    #[tokio::test]
+    async fn sg_apply_unavailable_without_network() {
+        let state = test_state();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/sg/apply")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-1","ip":"10.1.0.3","mac":"02:00:0a:01:00:03","security_groups":["default"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn sg_remove_unavailable_without_network() {
+        let state = test_state();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/sg/remove")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"vm_id":"vm-1"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn sg_apply_invalid_ip() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/sg/apply")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"vm_id":"vm-1","ip":"not-an-ip","mac":"02:00:0a:01:00:03","security_groups":["default"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["code"], "FORGE_INVALID_IP");
     }
 }
