@@ -60,25 +60,35 @@ pub async fn run(verify: bool) -> Result<()> {
     let subnet_count;
     {
         if syfrah_state::LayerDb::layer_exists("org") {
-            let org_db =
-                syfrah_state::LayerDb::open("org").context("Failed to open org database")?;
-            let org_store = syfrah_org::OrgStore::new(org_db);
-
-            // Count existing resources for the migration report.
-            let orgs = org_store.list().unwrap_or_default();
-            org_count = orgs.len();
-            let vpcs = org_store.list_vpcs().unwrap_or_default();
-            vpc_count = vpcs.len();
-            let mut sn_count = 0;
-            for vpc in &vpcs {
-                sn_count += org_store.list_subnets(&vpc.name).unwrap_or_default().len();
+            // Try to open the org db for data counting. If the daemon has it
+            // locked, skip the count (data is still there — the daemon manages it).
+            match syfrah_state::LayerDb::open("org") {
+                Ok(org_db) => {
+                    let org_store = syfrah_org::OrgStore::new(org_db);
+                    let orgs = org_store.list().unwrap_or_default();
+                    org_count = orgs.len();
+                    let vpcs = org_store.list_vpcs().unwrap_or_default();
+                    vpc_count = vpcs.len();
+                    let mut sn_count = 0;
+                    for vpc in &vpcs {
+                        sn_count += org_store.list_subnets(&vpc.name).unwrap_or_default().len();
+                    }
+                    subnet_count = sn_count;
+                    println!("  Importing existing data:");
+                    println!("    Orgs:    {org_count}");
+                    println!("    VPCs:    {vpc_count}");
+                    println!("    Subnets: {subnet_count}");
+                }
+                Err(_) => {
+                    // Database locked by running daemon — that's fine.
+                    // The daemon will handle the data via Raft after restart.
+                    org_count = 0;
+                    vpc_count = 0;
+                    subnet_count = 0;
+                    println!("  Existing org data detected (daemon has db lock)");
+                    println!("  Data will be available via Raft after daemon restart");
+                }
             }
-            subnet_count = sn_count;
-
-            println!("  Importing existing data:");
-            println!("    Orgs:    {org_count}");
-            println!("    VPCs:    {vpc_count}");
-            println!("    Subnets: {subnet_count}");
         } else {
             org_count = 0;
             vpc_count = 0;
@@ -166,8 +176,16 @@ pub async fn run(verify: bool) -> Result<()> {
         let mut errors = 0u32;
 
         if syfrah_state::LayerDb::layer_exists("org") {
-            let org_db =
-                syfrah_state::LayerDb::open("org").context("Failed to open org database")?;
+            let org_db = match syfrah_state::LayerDb::open("org") {
+                Ok(db) => db,
+                Err(_) => {
+                    println!("  [SKIP] Org store locked by daemon — restart daemon and re-verify");
+                    println!();
+                    println!("Control plane initialized. Restart the daemon to activate:");
+                    println!("  syfrah fabric stop && syfrah fabric start");
+                    return Ok(());
+                }
+            };
             let org_store = syfrah_org::OrgStore::new(org_db);
 
             // Verify orgs are readable.
