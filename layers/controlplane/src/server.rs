@@ -256,6 +256,30 @@ pub struct RaftStatusResponse {
     pub last_log_index: Option<u64>,
     pub last_applied_index: Option<u64>,
     pub members: Vec<u64>,
+    /// Enhanced member details with roles and addresses.
+    #[serde(default)]
+    pub member_details: Vec<ClusterMemberDetail>,
+    /// Commit index (same as last_applied_index for leader).
+    #[serde(default)]
+    pub commit_index: Option<u64>,
+    /// Total number of log entries.
+    #[serde(default)]
+    pub log_entries: Option<u64>,
+    /// Number of voters.
+    #[serde(default)]
+    pub voter_count: u32,
+    /// Number of learners.
+    #[serde(default)]
+    pub learner_count: u32,
+}
+
+/// Detailed cluster member information.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ClusterMemberDetail {
+    pub node_id: u64,
+    pub addr: String,
+    pub role: String, // "voter" or "learner"
+    pub is_leader: bool,
 }
 
 async fn status_handler(
@@ -264,7 +288,32 @@ async fn status_handler(
     use openraft::rt::watch::WatchReceiver;
     let metrics = state.raft.metrics().borrow_watched().clone();
 
-    let members: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+    let voter_ids: std::collections::HashSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+    let members: Vec<u64> = voter_ids.iter().copied().collect();
+    let leader_id = metrics.current_leader;
+
+    let member_details: Vec<ClusterMemberDetail> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, node)| {
+            let role = if voter_ids.contains(id) {
+                "voter"
+            } else {
+                "learner"
+            };
+            ClusterMemberDetail {
+                node_id: *id,
+                addr: node.addr.clone(),
+                role: role.to_string(),
+                is_leader: leader_id == Some(*id),
+            }
+        })
+        .collect();
+
+    let voter_count = voter_ids.len() as u32;
+    let learner_count = (member_details.len() as u32).saturating_sub(voter_count);
 
     let resp = RaftStatusResponse {
         id: metrics.id,
@@ -276,6 +325,13 @@ async fn status_handler(
             .last_applied
             .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index()),
         members,
+        member_details,
+        commit_index: metrics
+            .last_applied
+            .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index()),
+        log_entries: metrics.last_log_index,
+        voter_count,
+        learner_count,
     };
     Ok(Json(resp))
 }
