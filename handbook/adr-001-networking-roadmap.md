@@ -263,7 +263,7 @@ VmPlacement {
     vm_mac: MacAddr,
     vm_ip: Ipv4Addr,
     subnet_id: SubnetId,
-    hosting_node: FabricIpv6,   // which node the VM is on
+    hypervisor_id: FabricIpv6,   // which node the VM is on
     action: Add | Remove,
 }
 ```
@@ -271,7 +271,7 @@ VmPlacement {
 **On single node**: FDB entries point to local bridge (no VTEP needed). Announcements are stored but no remote distribution occurs.
 
 **On multi-node**: each node receives the announcement and:
-1. Adds FDB entry: `bridge fdb add {mac} dev syfvx-{vpc_id} dst {hosting_node_ipv6}`
+1. Adds FDB entry: `bridge fdb add {mac} dev syfvx-{vpc_id} dst {hypervisor_id_ipv6}`
 2. Adds ARP proxy: `ip neigh add {vm_ip} lladdr {mac} dev syfvx-{vpc_id} nud permanent`
 
 **Persistence**: redb table — `vm_placements` (vpc_id + vm_id → node, mac, ip, subnet). Rebuilt from fabric announcements on restart.

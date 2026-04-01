@@ -142,6 +142,7 @@ The CLI binary in `bin/syfrah` composes these crates and contains no logic of it
 - [handbook/state-and-reconciliation.md](handbook/state-and-reconciliation.md) — State ownership and reconciliation design
 - [handbook/cli.md](handbook/cli.md) — CLI command tree
 - [handbook/testing.md](handbook/testing.md) — Testing strategy
+- [handbook/adr-004-hypervisor-model.md](handbook/adr-004-hypervisor-model.md) — Hypervisor model (Region/Zone/Hypervisor/VM topology)
 
 ## Roadmap
 
