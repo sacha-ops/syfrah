@@ -18,10 +18,16 @@ use tracing::{info, warn};
 use crate::types::SyfrahRaftConfig;
 use crate::SyfrahRaft;
 
+/// Default maximum number of voters in the cluster.
+/// Nodes beyond this limit join as learners automatically.
+pub const DEFAULT_MAX_VOTERS: u32 = 5;
+
 /// Shared state for the Raft HTTP server.
 #[derive(Clone)]
 pub struct RaftServerState {
     pub raft: SyfrahRaft,
+    /// Maximum number of voters. Nodes beyond this join as learners.
+    pub max_voters: u32,
 }
 
 /// The Raft HTTP server handling inter-node RPCs.
@@ -58,6 +64,7 @@ pub fn raft_router(state: Arc<RaftServerState>) -> Router {
         .route("/raft/write", post(client_write_handler))
         .route("/raft/join", post(join_handler))
         .route("/raft/promote", post(promote_handler))
+        .route("/raft/demote", post(demote_handler))
         .route("/raft/status", get(status_handler))
         .route("/raft/members", get(members_handler))
         .with_state(state)
@@ -172,9 +179,53 @@ async fn join_handler(
         })?;
 
     info!("raft: node {} added as learner", req.node_id);
-    Ok(Json(
-        serde_json::json!({ "status": "joined", "node_id": req.node_id }),
-    ))
+
+    // Auto-promote to voter if under the max_voters limit.
+    let current_voters = {
+        use openraft::rt::watch::WatchReceiver;
+        let metrics = state.raft.metrics().borrow_watched().clone();
+        metrics.membership_config.membership().voter_ids().count() as u32
+    };
+
+    if current_voters < state.max_voters {
+        use openraft::ChangeMembers;
+        match state
+            .raft
+            .change_membership(
+                ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([req.node_id])),
+                true,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "raft: node {} auto-promoted to voter ({}/{} voters)",
+                    req.node_id,
+                    current_voters + 1,
+                    state.max_voters
+                );
+                return Ok(Json(serde_json::json!({
+                    "status": "joined_as_voter",
+                    "node_id": req.node_id,
+                    "role": "voter"
+                })));
+            }
+            Err(e) => {
+                warn!("raft: auto-promote failed (node stays as learner): {e:?}");
+            }
+        }
+    } else {
+        info!(
+            "raft: voter limit reached ({}/{}), node {} stays as learner",
+            current_voters, state.max_voters, req.node_id
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "joined",
+        "node_id": req.node_id,
+        "role": "learner"
+    })))
 }
 
 /// Handle a promote request: promote learner to voter.
@@ -202,6 +253,43 @@ async fn promote_handler(
     info!("raft: node {} promoted to voter", req.node_id);
     Ok(Json(
         serde_json::json!({ "status": "promoted", "node_id": req.node_id }),
+    ))
+}
+
+/// Request to demote a voter to learner.
+#[derive(Deserialize)]
+pub struct DemoteRequest {
+    pub node_id: u64,
+}
+
+/// Handle a demote request: demote voter to learner.
+///
+/// Removes the node from the voter set. The node remains as a learner
+/// and continues to receive replicated log entries.
+async fn demote_handler(
+    State(state): State<Arc<RaftServerState>>,
+    Json(req): Json<DemoteRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use openraft::ChangeMembers;
+
+    info!("raft: demote request for node {}", req.node_id);
+
+    // Remove from voter set (retain=true keeps the node as a learner).
+    state
+        .raft
+        .change_membership(
+            ChangeMembers::RemoveVoters(std::collections::BTreeSet::from([req.node_id])),
+            true,
+        )
+        .await
+        .map_err(|e| {
+            warn!("demote failed: {e:?}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    info!("raft: node {} demoted to learner", req.node_id);
+    Ok(Json(
+        serde_json::json!({ "status": "demoted", "node_id": req.node_id }),
     ))
 }
 
