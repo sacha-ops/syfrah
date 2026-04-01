@@ -222,15 +222,74 @@ impl RaftLogStorage<SyfrahRaftConfig> for Arc<RedbLogStore> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn log_store_empty_state() {
+    fn make_db() -> (tempfile::TempDir, LayerDb) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_raft.redb");
-        std::env::set_var("SYFRAH_STATE_DIR", dir.path());
         let db = LayerDb::open_at(&db_path).unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn log_store_empty_state() {
+        let (_dir, db) = make_db();
         let mut store = Arc::new(RedbLogStore::new(db));
         let state = store.get_log_state().await.unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn vote_persistence() {
+        let (_dir, db) = make_db();
+        let mut store = Arc::new(RedbLogStore::new(db));
+
+        // Initially no vote.
+        let vote = store.read_vote().await.unwrap();
+        assert!(vote.is_none());
+
+        // Save a vote.
+        let v = Vote::new(1, 1);
+        store.save_vote(&v).await.unwrap();
+
+        // Read it back.
+        let vote = store.read_vote().await.unwrap();
+        assert!(vote.is_some());
+    }
+
+    #[tokio::test]
+    async fn committed_persistence() {
+        let (_dir, db) = make_db();
+        let mut store = Arc::new(RedbLogStore::new(db));
+
+        // Initially no committed.
+        let committed = store.read_committed().await.unwrap();
+        assert!(committed.is_none());
+
+        // Save committed = None is a no-op.
+        store.save_committed(None).await.unwrap();
+        let committed = store.read_committed().await.unwrap();
+        assert!(committed.is_none());
+    }
+
+    #[tokio::test]
+    async fn log_store_restores_from_redb() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_raft.redb");
+
+        // Create a store and save a vote.
+        {
+            let db = LayerDb::open_at(&db_path).unwrap();
+            let mut store = Arc::new(RedbLogStore::new(db));
+            let v = Vote::new(1, 1);
+            store.save_vote(&v).await.unwrap();
+        }
+
+        // Re-open and verify the vote was restored.
+        {
+            let db = LayerDb::open_at(&db_path).unwrap();
+            let mut store = Arc::new(RedbLogStore::new(db));
+            let vote = store.read_vote().await.unwrap();
+            assert!(vote.is_some(), "vote should be restored from redb");
+        }
     }
 }
