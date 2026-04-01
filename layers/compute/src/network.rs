@@ -34,7 +34,7 @@ pub struct NetworkInfo {
     /// TAP device name (hash-based, e.g., "syft-a1b2c3d4").
     pub tap_name: String,
     /// Hosting node fabric address (for FDB removal).
-    pub hosting_node: String,
+    pub hypervisor_id: String,
 }
 
 // ── NetworkCleanup ──────────────────────────────────────────────────────
@@ -233,7 +233,7 @@ mod tests {
             ip: "10.0.1.3".to_string(),
             mac: "02:00:0a:00:01:03".to_string(),
             tap_name: syfrah_overlay::naming::tap_name("web-1"),
-            hosting_node: "fd00::1".to_string(),
+            hypervisor_id: "fd00::1".to_string(),
         }
     }
 

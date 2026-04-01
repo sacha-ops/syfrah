@@ -70,11 +70,11 @@ impl PlacementStore {
     }
 
     /// List all placements hosted on a given node (fabric IPv6).
-    pub fn list_by_node(&self, hosting_node: &str) -> Result<Vec<VmPlacement>> {
+    pub fn list_by_node(&self, hypervisor_id: &str) -> Result<Vec<VmPlacement>> {
         let entries: Vec<(String, VmPlacement)> = self.db.list(TABLE)?;
         Ok(entries
             .into_iter()
-            .filter(|(_, p)| p.hosting_node == hosting_node)
+            .filter(|(_, p)| p.hypervisor_id == hypervisor_id)
             .map(|(_, p)| p)
             .collect())
     }

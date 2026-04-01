@@ -858,7 +858,7 @@ impl VmManager {
                 ip: nr.ip.clone(),
                 mac: nr.mac.clone(),
                 tap_name: nr.tap_name.clone(),
-                hosting_node: nr.placement.hosting_node.clone(),
+                hypervisor_id: nr.placement.hypervisor_id.clone(),
             };
             (
                 Some(nr.ip.clone()),
