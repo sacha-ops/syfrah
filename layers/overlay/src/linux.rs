@@ -600,4 +600,34 @@ impl NetworkBackend for LinuxBackend {
         names.sort();
         Ok(names)
     }
+
+    async fn list_fdb_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>> {
+        let output = Self::run("bridge", &["fdb", "show", "dev", vxlan]).await?;
+        let mut entries = Vec::new();
+        for line in output.lines() {
+            // Format: "02:00:0a:01:00:03 dst fd12::1 self permanent"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "dst" {
+                let mac = parts[0].to_string();
+                let dst = parts[2].to_string();
+                entries.push((mac, dst));
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn list_arp_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>> {
+        let output = Self::run("ip", &["neigh", "show", "dev", vxlan, "nud", "permanent"]).await?;
+        let mut entries = Vec::new();
+        for line in output.lines() {
+            // Format: "10.1.0.3 lladdr 02:00:0a:01:00:03 PERMANENT"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "lladdr" {
+                let ip = parts[0].to_string();
+                let mac = parts[2].to_string();
+                entries.push((ip, mac));
+            }
+        }
+        Ok(entries)
+    }
 }

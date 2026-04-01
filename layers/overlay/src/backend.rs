@@ -105,4 +105,16 @@ pub trait NetworkBackend: Send + Sync {
     /// discover existing `syfb-*`, `syfx-*`, `syft-*`, and
     /// `syfp*` interfaces.
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// List FDB entries on a VXLAN interface.
+    ///
+    /// Returns `(mac, dst)` pairs from `bridge fdb show dev <vxlan>`.
+    /// Used by the FDB reconciliation loop to detect drift.
+    async fn list_fdb_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>>;
+
+    /// List ARP proxy (neighbor) entries on a VXLAN interface.
+    ///
+    /// Returns `(ip, mac)` pairs from `ip neigh show dev <vxlan>` where
+    /// state is `PERMANENT`.
+    async fn list_arp_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>>;
 }
