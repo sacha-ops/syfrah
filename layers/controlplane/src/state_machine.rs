@@ -226,3 +226,115 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_org_store() -> (tempfile::TempDir, Arc<syfrah_org::OrgStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_org.redb");
+        let db = syfrah_state::LayerDb::open_at(&db_path).unwrap();
+        (dir, Arc::new(syfrah_org::OrgStore::new(db)))
+    }
+
+    #[test]
+    fn apply_create_org() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store.clone());
+        let cmd = StateMachineCommand::CreateOrg {
+            name: "testorg".to_string(),
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Created(id) => assert!(id.contains("testorg")),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Verify it was actually created.
+        let org = store.get("testorg").unwrap();
+        assert!(org.is_some());
+    }
+
+    #[test]
+    fn apply_create_org_duplicate() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store.clone());
+        let cmd = StateMachineCommand::CreateOrg {
+            name: "dup".to_string(),
+        };
+        let _ = sm.apply_command(&cmd);
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_delete_org() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store.clone());
+        let _ = sm.apply_command(&StateMachineCommand::CreateOrg {
+            name: "del".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::DeleteOrg {
+            name: "del".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        assert!(store.get("del").unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_create_project() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store.clone());
+        let _ = sm.apply_command(&StateMachineCommand::CreateOrg {
+            name: "acme".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::CreateProject {
+            name: "backend".to_string(),
+            org: "acme".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Created(id) => assert!(id.contains("backend")),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_unimplemented_returns_ok() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&StateMachineCommand::AllocateIp {
+            subnet_id: "sub-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip() {
+        let (_dir, store) = make_org_store();
+        let mut sm = Arc::new(RedbStateMachine::new(store));
+
+        // Build a snapshot.
+        use openraft::storage::RaftSnapshotBuilder;
+        let snap = sm.build_snapshot().await.unwrap();
+        assert!(!snap.snapshot.into_inner().is_empty());
+
+        // Get current snapshot.
+        use openraft::storage::RaftStateMachine;
+        let current = sm.get_current_snapshot().await.unwrap();
+        assert!(current.is_some());
+    }
+
+    #[tokio::test]
+    async fn applied_state_default() {
+        let (_dir, store) = make_org_store();
+        let mut sm = Arc::new(RedbStateMachine::new(store));
+        use openraft::storage::RaftStateMachine;
+        let (last, membership) = sm.applied_state().await.unwrap();
+        assert!(last.is_none());
+        // Default membership should be empty.
+        assert_eq!(membership.membership().voter_ids().count(), 0);
+    }
+}
