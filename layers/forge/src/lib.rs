@@ -26,6 +26,7 @@
 
 pub mod api;
 pub mod capacity;
+pub mod cleanup;
 pub mod drift;
 pub mod generation;
 pub mod health;
