@@ -174,9 +174,33 @@ impl HypervisorLayerHandler {
                             Err(e) => HypervisorResponse::Error(e.to_string()),
                         }
                     }
-                    Ok(None) => HypervisorResponse::Error(
-                        "no hypervisor on this node — is KVM available?".to_string(),
-                    ),
+                    Ok(None) => {
+                        let hw = crate::discovery::probe_hardware();
+                        let cap = crate::discovery::compute_capacity(&hw);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let hv = crate::types::Hypervisor {
+                            id: crate::types::HypervisorId(format!("hv-{}", &self.local_node_name)),
+                            name: self.local_node_name.clone(),
+                            region,
+                            zone,
+                            state: crate::types::HypervisorState::NotReady,
+                            fabric_node_id: self.local_node_name.clone(),
+                            public_ip: String::new(),
+                            fabric_ipv6: String::new(),
+                            hardware: hw,
+                            capacity: cap,
+                            labels: std::collections::HashMap::new(),
+                            taints: Vec::new(),
+                            created_at: now,
+                        };
+                        match self.store.create(&hv) {
+                            Ok(()) => HypervisorResponse::Hypervisor(Box::new(hv)),
+                            Err(e) => HypervisorResponse::Error(e.to_string()),
+                        }
+                    }
                     Err(e) => HypervisorResponse::Error(e.to_string()),
                 }
             }

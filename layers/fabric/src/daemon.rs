@@ -1030,6 +1030,25 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Hypervisor store (shared) -------------------------------------------
+    //
+    // Open the hypervisor database once so it can be shared between the
+    // compute layer (VM region/zone metadata) and the hypervisor handler
+    // (CLI commands + auto-discovery).  redb only allows a single open
+    // handle per database file, so we must avoid opening it twice.
+    let shared_hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>> =
+        match syfrah_state::LayerDb::open("hypervisor") {
+            Ok(hv_db) => {
+                let store = Arc::new(syfrah_org::HypervisorStore::new(hv_db));
+                info!("hypervisor store opened");
+                Some(store)
+            }
+            Err(e) => {
+                warn!("hypervisor store init failed (non-fatal): {e}");
+                None
+            }
+        };
+
     // -- Compute layer integration ------------------------------------------
     //
     // Initialise VmManager, reconnect existing VMs, start the monitor loop,
@@ -1164,9 +1183,8 @@ pub async fn run_daemon(
 
                 // Wire the hypervisor store so VMs get hypervisor/region/zone
                 // metadata at creation time.
-                if let Ok(hv_db) = syfrah_state::LayerDb::open("hypervisor") {
-                    let hv_store = Arc::new(syfrah_org::HypervisorStore::new(hv_db));
-                    vm_manager.set_hypervisor_store(hv_store, my_record.name.clone());
+                if let Some(ref hv_store) = shared_hypervisor_store {
+                    vm_manager.set_hypervisor_store(Arc::clone(hv_store), my_record.name.clone());
                     info!("compute: hypervisor store wired (region/zone in vm get)");
                 }
 
@@ -1210,45 +1228,33 @@ pub async fn run_daemon(
         }
     }
 
-    // -- Hypervisor auto-discovery ---------------------------------------------
+    // -- Hypervisor auto-discovery + handler registration ----------------------
     //
-    // If this node has /dev/kvm, discover (or recover) a hypervisor record.
-    // The hypervisor store is opened from the org layer's database.
-    let shared_hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>> =
-        match syfrah_state::LayerDb::open("hypervisor") {
-            Ok(hv_db) => {
-                let store = Arc::new(syfrah_org::HypervisorStore::new(hv_db));
-                let region = my_record.region.as_deref().unwrap_or("default");
-                let zone = my_record.zone.as_deref().unwrap_or("default");
-                let fabric_ipv6 = my_record.mesh_ipv6.to_string();
-                let public_ip = my_record.endpoint.ip().to_string();
-                let fabric_node_id = wg_pubkey.to_base64();
+    // If the hypervisor store was opened successfully, run auto-discovery
+    // (if KVM is present) and always register the handler so that CLI
+    // commands like `syfrah hypervisor register` work on every node.
+    if let Some(ref hv_store) = shared_hypervisor_store {
+        let region = my_record.region.as_deref().unwrap_or("default");
+        let zone = my_record.zone.as_deref().unwrap_or("default");
+        let fabric_ipv6 = my_record.mesh_ipv6.to_string();
+        let public_ip = my_record.endpoint.ip().to_string();
+        let fabric_node_id = wg_pubkey.to_base64();
 
-                let _hv_name = syfrah_org::discovery::discover_hypervisor(
-                    &store,
-                    &my_record.name,
-                    &fabric_node_id,
-                    region,
-                    zone,
-                    &public_ip,
-                    &fabric_ipv6,
-                );
-                // Register the hypervisor layer handler for CLI commands.
-                let hv_handler = syfrah_org::HypervisorLayerHandler::new(
-                    Arc::clone(&store),
-                    my_record.name.clone(),
-                );
-                router.register("hypervisor", Arc::new(hv_handler));
-                info!("hypervisor layer initialised");
-
-                Some(store)
-            }
-            Err(e) => {
-                warn!("hypervisor store init failed (non-fatal): {e}");
-                None
-            }
-        };
-    let _ = &shared_hypervisor_store;
+        let _hv_name = syfrah_org::discovery::discover_hypervisor(
+            hv_store,
+            &my_record.name,
+            &fabric_node_id,
+            region,
+            zone,
+            &public_ip,
+            &fabric_ipv6,
+        );
+        // Register the hypervisor layer handler for CLI commands.
+        let hv_handler =
+            syfrah_org::HypervisorLayerHandler::new(Arc::clone(hv_store), my_record.name.clone());
+        router.register("hypervisor", Arc::new(hv_handler));
+        info!("hypervisor layer initialised");
+    }
 
     // Register the forge layer handler on the control socket so future
     // `syfrah forge` CLI commands can be routed through the daemon.
