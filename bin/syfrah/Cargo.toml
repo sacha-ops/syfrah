@@ -19,6 +19,10 @@ syfrah-fabric = { path = "../../layers/fabric" }
 syfrah-org = { path = "../../layers/org" }
 syfrah-overlay = { path = "../../layers/overlay" }
 syfrah-state = { path = "../../layers/state" }
+syfrah-controlplane = { path = "../../layers/controlplane" }
+openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 tokio.workspace = true
