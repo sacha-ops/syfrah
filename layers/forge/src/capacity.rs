@@ -208,6 +208,56 @@ impl CapacityTracker {
         self.available_vcpus() >= vcpus && self.available_memory_mb() >= memory_mb
     }
 
+    /// Atomically check-and-reserve: returns true if admitted, false if rejected.
+    /// This prevents double-booking under concurrent creates by holding the lock
+    /// across the check+reserve operation.
+    pub fn try_reserve(&self, id: &str, vcpus: u32, memory_mb: u64) -> bool {
+        let mut reservations = self.reservations.lock().unwrap();
+        // Expire old reservations first
+        reservations.retain(|_, r| r.created_at.elapsed() < RESERVATION_EXPIRY);
+
+        // Calculate available with lock held
+        let used_v = *self.used_vcpus.lock().unwrap();
+        let used_m = *self.used_memory_mb.lock().unwrap();
+        let reserved_v: u32 = reservations.values().map(|r| r.vcpus).sum();
+        let reserved_m: u64 = reservations.values().map(|r| r.memory_mb).sum();
+
+        let avail_v = self.total_vcpus.saturating_sub(used_v + reserved_v);
+        let avail_m = self.total_memory_mb.saturating_sub(used_m + reserved_m);
+
+        if avail_v >= vcpus && avail_m >= memory_mb {
+            reservations.insert(
+                id.to_string(),
+                Reservation {
+                    vcpus,
+                    memory_mb,
+                    created_at: Instant::now(),
+                },
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// List active (non-expired) reservations.
+    pub fn list_reservations(&self) -> Vec<(String, Reservation)> {
+        let reservations = self.reservations.lock().unwrap();
+        reservations
+            .iter()
+            .filter(|(_, r)| r.created_at.elapsed() < RESERVATION_EXPIRY)
+            .map(|(id, r)| (id.clone(), r.clone()))
+            .collect()
+    }
+
+    /// Purge expired reservations, returning the count of purged entries.
+    pub fn purge_expired(&self) -> usize {
+        let mut reservations = self.reservations.lock().unwrap();
+        let before = reservations.len();
+        reservations.retain(|_, r| r.created_at.elapsed() < RESERVATION_EXPIRY);
+        before - reservations.len()
+    }
+
     /// Reserve resources for an upcoming creation (60s expiry).
     pub fn reserve(&self, id: &str, vcpus: u32, memory_mb: u64) {
         let mut reservations = self.reservations.lock().unwrap();
@@ -510,5 +560,75 @@ mod tests {
         tracker.commit("vm-1", 1, 2048);
         assert_eq!(tracker.used_vcpus(), 1);
         assert_eq!(tracker.used_memory_mb(), 2048);
+    }
+
+    #[test]
+    fn try_reserve_atomic_prevents_double_booking() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+
+        // First reservation succeeds
+        assert!(tracker.try_reserve("vm-1", 2, 4096));
+        // Second succeeds (still room)
+        assert!(tracker.try_reserve("vm-2", 2, 4096));
+        // Third fails — no room left
+        assert!(!tracker.try_reserve("vm-3", 1, 1024));
+
+        // After committing one, room is still taken (committed, not reserved)
+        tracker.commit("vm-1", 2, 4096);
+        // Still no room because vm-2 reservation is active
+        assert!(!tracker.try_reserve("vm-4", 1, 1024));
+    }
+
+    #[test]
+    fn list_reservations_shows_active() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
+        tracker.reserve("vm-1", 2, 4096);
+        tracker.reserve("vm-2", 1, 2048);
+
+        let active = tracker.list_reservations();
+        assert_eq!(active.len(), 2);
+    }
+
+    #[test]
+    fn purge_expired_clears_old() {
+        let tracker = CapacityTracker::with_capacity(8, 16384);
+
+        // Insert an expired reservation manually
+        {
+            let mut reservations = tracker.reservations.lock().unwrap();
+            reservations.insert(
+                "old-vm".to_string(),
+                Reservation {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    created_at: Instant::now() - Duration::from_secs(120),
+                },
+            );
+        }
+
+        let purged = tracker.purge_expired();
+        assert_eq!(purged, 1);
+        assert!(tracker.list_reservations().is_empty());
+    }
+
+    #[test]
+    fn try_reserve_expires_stale_before_check() {
+        let tracker = CapacityTracker::with_capacity(4, 8192);
+
+        // Fill with an expired reservation
+        {
+            let mut reservations = tracker.reservations.lock().unwrap();
+            reservations.insert(
+                "expired-vm".to_string(),
+                Reservation {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    created_at: Instant::now() - Duration::from_secs(120),
+                },
+            );
+        }
+
+        // try_reserve should succeed because expired reservation is purged first
+        assert!(tracker.try_reserve("new-vm", 4, 8192));
     }
 }
