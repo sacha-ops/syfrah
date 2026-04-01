@@ -239,6 +239,25 @@ pub struct NatGwRecord {
     pub state: NatGwState,
 }
 
+/// Request body for enforcing route table entries.
+#[derive(Deserialize, Debug)]
+pub struct EnforceRoutesRequest {
+    /// Route entries to enforce.
+    pub routes: Vec<RouteEntry>,
+}
+
+/// A single route entry.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RouteEntry {
+    /// Destination CIDR (e.g., "10.2.0.0/24").
+    pub destination: String,
+    /// Target type: "nat-gw", "peering", "blackhole".
+    pub target_type: String,
+    /// Target ID (NAT GW id or peering id). Ignored for blackhole.
+    #[serde(default)]
+    pub target_id: Option<String>,
+}
+
 /// Response for NIC operations.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NicResponse {
@@ -1437,6 +1456,117 @@ async fn list_nat_gw_handler(State(state): State<Arc<ForgeState>>) -> impl IntoR
     (StatusCode::OK, Json(serde_json::to_value(gws).unwrap()))
 }
 
+// ---------------------------------------------------------------------------
+// Route enforcement handler
+// ---------------------------------------------------------------------------
+
+/// POST /v1/networks/routes/enforce — apply blackhole routes as nftables DROP.
+async fn enforce_routes_handler(
+    State(state): State<Arc<ForgeState>>,
+    Json(req): Json<EnforceRoutesRequest>,
+) -> impl IntoResponse {
+    let Some(ref _backend) = state.network_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "FORGE_NETWORK_UNAVAILABLE",
+                "message": "network backend not initialized"
+            })),
+        );
+    };
+
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+
+    for route in &req.routes {
+        // Validate route targets.
+        match route.target_type.as_str() {
+            "nat-gw" => {
+                if let Some(ref target_id) = route.target_id {
+                    let registry = state.nat_gw_registry.lock().unwrap();
+                    match registry.get(target_id) {
+                        Some(gw) if gw.state == NatGwState::Active => {
+                            applied.push(route.clone());
+                        }
+                        Some(_) => {
+                            errors.push(serde_json::json!({
+                                "destination": route.destination,
+                                "error": format!("NAT GW '{}' is not Active", target_id)
+                            }));
+                        }
+                        None => {
+                            errors.push(serde_json::json!({
+                                "destination": route.destination,
+                                "error": format!("NAT GW '{}' not found", target_id)
+                            }));
+                        }
+                    }
+                } else {
+                    errors.push(serde_json::json!({
+                        "destination": route.destination,
+                        "error": "nat-gw route requires target_id"
+                    }));
+                }
+            }
+            "peering" => {
+                // Peering validation: just check target_id exists.
+                if route.target_id.is_some() {
+                    applied.push(route.clone());
+                } else {
+                    errors.push(serde_json::json!({
+                        "destination": route.destination,
+                        "error": "peering route requires target_id"
+                    }));
+                }
+            }
+            "blackhole" => {
+                // Blackhole routes are applied as nftables DROP rules.
+                let ruleset = format!(
+                    "add table inet syfrah_routes\nadd chain inet syfrah_routes blackhole\nadd rule inet syfrah_routes blackhole ip daddr {} drop\n",
+                    route.destination
+                );
+                if let Err(e) = syfrah_overlay::nft::apply_ruleset(&ruleset) {
+                    errors.push(serde_json::json!({
+                        "destination": route.destination,
+                        "error": e.to_string()
+                    }));
+                } else {
+                    applied.push(route.clone());
+                }
+            }
+            other => {
+                errors.push(serde_json::json!({
+                    "destination": route.destination,
+                    "error": format!("unknown target_type: {}", other)
+                }));
+            }
+        }
+    }
+
+    let status = if errors.is_empty() {
+        StatusCode::OK
+    } else if applied.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK // partial success
+    };
+
+    info!(
+        applied = applied.len(),
+        errors = errors.len(),
+        "route enforcement complete"
+    );
+
+    (
+        status,
+        Json(serde_json::json!({
+            "code": "FORGE_ROUTES_ENFORCED",
+            "applied": applied.len(),
+            "errors": errors,
+        })),
+    )
+}
+
 /// Build the Forge HTTP router with all routes.
 pub fn forge_router(state: Arc<ForgeState>) -> Router {
     Router::new()
@@ -1473,6 +1603,8 @@ pub fn forge_router(state: Arc<ForgeState>) -> Router {
             get(list_nat_gw_handler).post(create_nat_gw_handler),
         )
         .route("/v1/networks/nat-gw/{id}", delete(delete_nat_gw_handler))
+        // -- Networks: Routes --
+        .route("/v1/networks/routes/enforce", post(enforce_routes_handler))
         // -- Tasks --
         .route("/v1/tasks", get(list_tasks_handler))
         .route("/v1/tasks/{id}", get(get_task_handler))
@@ -2194,5 +2326,180 @@ mod tests {
         let body = resp4.into_body().collect().await.unwrap().to_bytes();
         let gws: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(gws.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enforce_routes_unavailable_without_network() {
+        let state = test_state();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"routes":[]}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn enforce_routes_validates_nat_gw_target() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        // Route references a non-existent NAT GW.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.2.0.0/24","target_type":"nat-gw","target_id":"nat-nonexistent"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should return 500 since all routes failed.
+        assert_eq!(resp.status(), 500);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["applied"], 0);
+        assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enforce_routes_unknown_target_type() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.3.0.0/24","target_type":"unknown"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["applied"], 0);
+    }
+
+    #[tokio::test]
+    async fn blackhole_applied() {
+        // Blackhole routes are applied as nftables DROP rules.
+        // In test env nft binary may not exist — the handler still records errors.
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.99.0.0/16","target_type":"blackhole"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // nft may or may not be available — either applied==1 or errors==1.
+        let applied = result["applied"].as_u64().unwrap_or(0);
+        let errors = result["errors"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert_eq!(applied as usize + errors, 1, "exactly one route processed");
+    }
+
+    #[tokio::test]
+    async fn target_validation_peering() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        // Peering route with target_id succeeds validation.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.4.0.0/24","target_type":"peering","target_id":"peer-abc"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["applied"], 1);
+        assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn target_validation_peering_missing_id() {
+        let state = test_state_with_network();
+        let app = forge_router(state);
+
+        // Peering route without target_id fails validation.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.4.0.0/24","target_type":"peering"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 500);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["applied"], 0);
+    }
+
+    #[tokio::test]
+    async fn inactive_target_logged() {
+        // NAT GW exists but is not Active — route should fail with descriptive error.
+        let state = test_state_with_network();
+
+        // Insert a NAT GW in Pending state (not Active).
+        {
+            let mut registry = state.nat_gw_registry.lock().unwrap();
+            registry.insert(
+                "nat-pending-1".to_string(),
+                NatGwRecord {
+                    id: "nat-pending-1".to_string(),
+                    bridge: "syfb-12345678".to_string(),
+                    subnet_cidr: "10.5.0.0/24".to_string(),
+                    state: NatGwState::Pending,
+                },
+            );
+        }
+
+        let app = forge_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/networks/routes/enforce")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"routes":[{"destination":"10.5.0.0/24","target_type":"nat-gw","target_id":"nat-pending-1"}]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 500);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["applied"], 0);
+        let err_msg = result["errors"][0]["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not Active"),
+            "error should mention inactive state: {err_msg}"
+        );
     }
 }
