@@ -33,6 +33,7 @@ pub mod drain;
 pub mod drift;
 pub mod generation;
 pub mod health;
+pub mod metrics;
 pub mod ownership;
 pub mod reconciler;
 pub mod runtime;
