@@ -94,6 +94,8 @@ pub struct HypervisorLayerHandler {
     store: Arc<HypervisorStore>,
     /// The local node name (to identify "this" hypervisor for status/capacity).
     local_node_name: String,
+    /// Optional placement store for VM count checks (deletion guards).
+    placement_store: Option<Arc<crate::placement::PlacementStore>>,
 }
 
 impl HypervisorLayerHandler {
@@ -101,7 +103,23 @@ impl HypervisorLayerHandler {
         Self {
             store,
             local_node_name,
+            placement_store: None,
         }
+    }
+
+    /// Set the placement store for VM count guard checks.
+    pub fn with_placement_store(mut self, store: Arc<crate::placement::PlacementStore>) -> Self {
+        self.placement_store = Some(store);
+        self
+    }
+
+    /// Count VMs on a given hypervisor (by fabric IPv6).
+    fn vm_count_on(&self, fabric_ipv6: &str) -> usize {
+        self.placement_store
+            .as_ref()
+            .and_then(|ps| ps.list_by_node(fabric_ipv6).ok())
+            .map(|vms| vms.len())
+            .unwrap_or(0)
     }
 }
 
@@ -250,6 +268,15 @@ impl HypervisorLayerHandler {
             }
 
             HypervisorRequest::Maintenance { name, drain: _ } => {
+                // Guard: must drain first (no running VMs)
+                if let Ok(Some(hv)) = self.store.get(&name) {
+                    let count = self.vm_count_on(&hv.fabric_ipv6);
+                    if count > 0 {
+                        return HypervisorResponse::Error(format!(
+                            "cannot enter maintenance: {count} VM(s) still running on '{name}'. Drain first."
+                        ));
+                    }
+                }
                 match self.store.update_state(&name, HypervisorState::Maintenance) {
                     Ok(()) => HypervisorResponse::Ok,
                     Err(e) => HypervisorResponse::Error(e.to_string()),
@@ -257,6 +284,21 @@ impl HypervisorLayerHandler {
             }
 
             HypervisorRequest::Decommission { name } => {
+                // Guard: no running VMs
+                if let Ok(Some(hv)) = self.store.get(&name) {
+                    let count = self.vm_count_on(&hv.fabric_ipv6);
+                    if count > 0 {
+                        return HypervisorResponse::Error(format!(
+                            "cannot decommission: {count} VM(s) still running on '{name}'. Drain first."
+                        ));
+                    }
+                    // Guard: Decommissioned is terminal
+                    if hv.state == HypervisorState::Decommissioned {
+                        return HypervisorResponse::Error(
+                            "hypervisor is already decommissioned".to_string(),
+                        );
+                    }
+                }
                 match self
                     .store
                     .update_state(&name, HypervisorState::Decommissioned)
