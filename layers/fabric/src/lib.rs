@@ -9,6 +9,7 @@ pub mod grpc_api;
 pub mod http_api;
 pub mod metrics;
 pub mod peering;
+pub mod raft_compute_handler;
 pub mod raft_handler;
 pub mod sanitize;
 pub mod sd_watchdog;

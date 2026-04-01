@@ -1107,6 +1107,8 @@ pub async fn run_daemon(
     // AND start) so that `syfrah compute` commands are always available.
     info!("compute layer: starting initialisation");
     let shared_vm_manager: Option<Arc<syfrah_compute::VmManager>>;
+    let mut raft_compute_handler_ref: Option<Arc<crate::raft_compute_handler::RaftComputeHandler>> =
+        None;
     {
         // Pre-create prerequisite directories so VmManager::new() succeeds
         // even on a fresh node (join path) where install.sh was not run.
@@ -1306,10 +1308,18 @@ pub async fn run_daemon(
                 // Start the background health-check monitor.
                 vm_manager.start_monitor();
 
-                // Register the compute layer handler.
-                let compute_handler =
-                    syfrah_compute::ComputeLayerHandler::new(Arc::clone(&vm_manager));
-                router.register("compute", Arc::new(compute_handler));
+                // Register the compute layer handler wrapped in a Raft-aware
+                // handler that intercepts CreateVm for scheduler routing.
+                let inner_compute_handler: Arc<dyn syfrah_api::handler::LayerHandler> = Arc::new(
+                    syfrah_compute::ComputeLayerHandler::new(Arc::clone(&vm_manager)),
+                );
+                let raft_compute_handler =
+                    Arc::new(crate::raft_compute_handler::RaftComputeHandler::new(
+                        inner_compute_handler,
+                        my_record.name.clone(),
+                    ));
+                raft_compute_handler_ref = Some(Arc::clone(&raft_compute_handler));
+                router.register("compute", raft_compute_handler);
 
                 info!("compute layer initialised");
                 shared_vm_manager = Some(vm_manager);
@@ -1534,6 +1544,110 @@ pub async fn run_daemon(
                     handler.set_raft_client(client).await;
                     info!("raft: injected Raft client into org handler");
                 });
+            }
+
+            // Inject the Raft client and scheduler into the compute handler
+            // so CreateVm goes through the scheduler and can target remote nodes.
+            if let Some(ref handler) = raft_compute_handler_ref {
+                let handler = Arc::clone(handler);
+                let client = raft_client.clone();
+                let local_node = my_record.name.clone();
+                let local_addr = my_record.mesh_ipv6.to_string();
+                tokio::spawn(async move {
+                    handler.set_raft_client(client).await;
+                    let scheduler = syfrah_controlplane::Scheduler::new(local_node, local_addr);
+                    handler.set_scheduler(scheduler).await;
+                    info!("raft: injected Raft client + scheduler into compute handler");
+                });
+            }
+
+            // -- Gossip agent --------------------------------------------------------
+            //
+            // Start the SWIM gossip agent so the scheduler has capacity data
+            // from all hypervisors in the cluster.
+            {
+                let gossip_cluster = if let Some(ref handler) = raft_compute_handler_ref {
+                    handler.gossip_cluster().clone()
+                } else {
+                    syfrah_controlplane::GossipCluster::new()
+                };
+
+                let region = my_record.region.as_deref().unwrap_or("default").to_string();
+                let zone = my_record.zone.as_deref().unwrap_or("default").to_string();
+                let gossip_bind_addr = std::net::SocketAddrV6::new(
+                    my_record.mesh_ipv6,
+                    syfrah_controlplane::gossip::GOSSIP_PORT,
+                    0,
+                    0,
+                );
+
+                // Collect seed addresses from fabric peers.
+                let gossip_seeds: Vec<std::net::SocketAddrV6> = {
+                    match crate::store::load() {
+                        Ok(state) => state
+                            .peers
+                            .iter()
+                            .map(|p| {
+                                std::net::SocketAddrV6::new(
+                                    p.mesh_ipv6,
+                                    syfrah_controlplane::gossip::GOSSIP_PORT,
+                                    0,
+                                    0,
+                                )
+                            })
+                            .collect(),
+                        Err(_) => vec![],
+                    }
+                };
+
+                let gossip_config = syfrah_controlplane::GossipConfig {
+                    bind_addr: gossip_bind_addr,
+                    seeds: gossip_seeds,
+                    local_node_name: my_record.name.clone(),
+                    local_hypervisor_id: my_record.mesh_ipv6.to_string(),
+                    local_region: region,
+                    local_zone: zone,
+                };
+
+                // Capacity function — reads system info for gossip reports.
+                let capacity_fn: Arc<dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync> =
+                    Arc::new(|| {
+                        // Read CPU count from /proc/cpuinfo or nproc equivalent.
+                        let alloc_vcpus = std::thread::available_parallelism()
+                            .map(|n| n.get() as u32)
+                            .unwrap_or(1);
+                        // Read total memory from /proc/meminfo.
+                        let alloc_memory = std::fs::read_to_string("/proc/meminfo")
+                            .ok()
+                            .and_then(|content| {
+                                content.lines().find_map(|line| {
+                                    if line.starts_with("MemTotal:") {
+                                        let parts: Vec<&str> = line.split_whitespace().collect();
+                                        parts.get(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or(1024);
+                        // Used resources: 0 for now (gossip report updates periodically).
+                        (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
+                    });
+
+                let gossip_shutdown_rx = raft_shutdown_rx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
+                        gossip_config,
+                        gossip_cluster,
+                        capacity_fn,
+                        gossip_shutdown_rx,
+                    )
+                    .await
+                    {
+                        warn!("gossip agent failed to start: {e}");
+                    }
+                });
+                info!("gossip: SWIM gossip agent starting");
             }
 
             let raft_state = syfrah_controlplane::server::RaftServerState { raft };
