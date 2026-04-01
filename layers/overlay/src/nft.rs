@@ -34,15 +34,15 @@ const PEERING_PORT: u16 = 51821;
 /// `forward` chain if they do not already exist.
 pub fn generate_table_setup() -> String {
     let mut buf = String::new();
-    writeln!(buf, "create table inet {TABLE_NAME}").unwrap();
+    writeln!(buf, "add table inet {TABLE_NAME}").unwrap();
     writeln!(
         buf,
-        "create chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+        "add chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
     )
     .unwrap();
     writeln!(
         buf,
-        "create chain inet {TABLE_NAME} {INPUT_CHAIN} {{ type filter hook input priority 0; policy accept; }}"
+        "add chain inet {TABLE_NAME} {INPUT_CHAIN} {{ type filter hook input priority 0; policy accept; }}"
     )
     .unwrap();
     buf
@@ -351,8 +351,8 @@ mod tests {
     #[test]
     fn table_setup_is_idempotent() {
         let setup = generate_table_setup();
-        assert!(setup.contains("create table inet syfrah"));
-        assert!(setup.contains("create chain inet syfrah forward"));
+        assert!(setup.contains("add table inet syfrah"));
+        assert!(setup.contains("add chain inet syfrah forward"));
     }
 
     #[test]
@@ -493,9 +493,9 @@ mod tests {
     fn infra_protection_includes_table_setup() {
         let rules = generate_infra_protection();
         // Must include table and both chains
-        assert!(rules.contains("create table inet syfrah"));
-        assert!(rules.contains("create chain inet syfrah forward"));
-        assert!(rules.contains("create chain inet syfrah input"));
+        assert!(rules.contains("add table inet syfrah"));
+        assert!(rules.contains("add chain inet syfrah forward"));
+        assert!(rules.contains("add chain inet syfrah input"));
     }
 
     #[test]
