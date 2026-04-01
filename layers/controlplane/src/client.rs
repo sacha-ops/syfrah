@@ -121,4 +121,26 @@ impl RaftClient {
     pub fn raft(&self) -> &SyfrahRaft {
         &self.raft
     }
+
+    /// Check if this node is the Raft leader.
+    pub fn is_leader(&self) -> bool {
+        use openraft::rt::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        metrics.current_leader == Some(metrics.id)
+    }
+
+    /// Get the leader's address from the membership config.
+    /// Returns `None` if no leader is known.
+    pub fn leader_addr(&self) -> Option<String> {
+        use openraft::rt::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let leader_id = metrics.current_leader?;
+
+        for (node_id, node) in metrics.membership_config.membership().nodes() {
+            if *node_id == leader_id {
+                return Some(node.addr.clone());
+            }
+        }
+        None
+    }
 }

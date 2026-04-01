@@ -11,9 +11,11 @@ categories.workspace = true
 [dependencies]
 syfrah-api = { path = "../api" }
 syfrah-compute = { path = "../compute" }
+syfrah-controlplane = { path = "../controlplane" }
 syfrah-org = { path = "../org" }
 syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 axum = "0.8"
 hyper = "1"
