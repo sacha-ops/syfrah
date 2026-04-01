@@ -10,6 +10,10 @@ categories.workspace = true
 
 [dependencies]
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
+foca = { version = "1.0.0", features = ["std", "bincode-codec"] }
+rand = "0.9"
+bincode = "2"
+bytes = "1"
 syfrah-org = { path = "../org" }
 syfrah-state = { path = "../state" }
 async-trait = "0.1"
