@@ -339,19 +339,11 @@ async fn status_handler(State(state): State<Arc<ForgeState>>) -> impl IntoRespon
 }
 
 /// GET /v1/hypervisor/capacity (alias: /v1/node/capacity)
+/// Returns full breakdown: physical, reserved, overcommit, allocatable, used, available, disk.
 async fn capacity_handler(State(state): State<Arc<ForgeState>>) -> impl IntoResponse {
     if let Some(ref cap) = state.capacity {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "allocatable_vcpus": cap.allocatable_vcpus(),
-                "allocatable_memory_mb": cap.allocatable_memory_mb(),
-                "available_vcpus": cap.available_vcpus(),
-                "available_memory_mb": cap.available_memory_mb(),
-                "used_vcpus": cap.allocatable_vcpus().saturating_sub(cap.available_vcpus()),
-                "used_memory_mb": cap.allocatable_memory_mb().saturating_sub(cap.available_memory_mb()),
-            })),
-        )
+        let snap = cap.snapshot();
+        (StatusCode::OK, Json(serde_json::to_value(snap).unwrap()))
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
