@@ -1662,7 +1662,10 @@ pub async fn run_daemon(
                 info!("gossip: SWIM gossip agent starting");
             }
 
-            let raft_state = syfrah_controlplane::server::RaftServerState { raft };
+            let raft_state = syfrah_controlplane::server::RaftServerState {
+                raft,
+                max_voters: syfrah_controlplane::server::DEFAULT_MAX_VOTERS,
+            };
 
             // -- FDB cold rebuild from Raft-derived placements ------------------
             //
