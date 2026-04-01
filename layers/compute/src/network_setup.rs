@@ -77,6 +77,10 @@ pub struct NetworkSetup<B: NetworkBackend + ?Sized> {
     local_node: String,
     /// SG rule store — when present, SG-based nftables rules are applied.
     sg_rule_store: Option<Arc<SgRuleStore>>,
+    /// Optional Raft placement hook for cross-node FDB distribution.
+    /// Args: (vm_id, hypervisor_id, subnet_id, ip, mac, generation, is_add).
+    #[allow(clippy::type_complexity)]
+    raft_placement_hook: Option<Arc<dyn Fn(&str, &str, &str, &str, &str, u64, bool) + Send + Sync>>,
 }
 
 impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
@@ -95,6 +99,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             backend,
             local_node,
             sg_rule_store: None,
+            raft_placement_hook: None,
         }
     }
 
@@ -102,6 +107,16 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
     /// for VMs with security groups.
     pub fn with_sg_rule_store(mut self, store: Arc<SgRuleStore>) -> Self {
         self.sg_rule_store = Some(store);
+        self
+    }
+
+    /// Set the Raft placement hook for cross-node FDB distribution.
+    #[allow(clippy::type_complexity)]
+    pub fn with_raft_placement_hook(
+        mut self,
+        hook: Arc<dyn Fn(&str, &str, &str, &str, &str, u64, bool) + Send + Sync>,
+    ) -> Self {
+        self.raft_placement_hook = Some(hook);
         self
     }
 
@@ -386,6 +401,11 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         self.placement_store
             .add_placement(&placement)
             .map_err(|e| ComputeError::NetworkSetup(format!("placement store failed: {e}")))?;
+
+        // Replicate placement through Raft so remote nodes can populate FDB.
+        if let Some(ref hook) = self.raft_placement_hook {
+            hook(vm_id, &self.local_node, subnet_id, ip, mac, 1, true);
+        }
 
         // -- 9. Create NIC record ------------------------------------------------
         // Build security group list: use specified SGs or default to "default".
