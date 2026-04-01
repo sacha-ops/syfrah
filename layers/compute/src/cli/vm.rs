@@ -390,8 +390,16 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             } else {
                 let tw = super::term_width();
                 let header = format!(
-                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10}",
-                    "NAME", "IMAGE", "PHASE", "IP", "RUNTIME", "vCPUs", "MEMORY", "UPTIME"
+                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10} {:<15}",
+                    "NAME",
+                    "IMAGE",
+                    "PHASE",
+                    "IP",
+                    "RUNTIME",
+                    "vCPUs",
+                    "MEMORY",
+                    "UPTIME",
+                    "HYPERVISOR"
                 );
                 if console::Term::stdout().is_term() {
                     let truncated = &header[..header.len().min(tw)];
@@ -416,10 +424,15 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .and_then(|u| u.as_u64())
                             .map(format_uptime)
                             .unwrap_or_else(|| "-".to_string());
+                        let hypervisor = vm
+                            .get("hypervisor_id")
+                            .and_then(|h| h.as_str())
+                            .unwrap_or("-");
                         let name = super::truncate(name, 19);
                         let image = super::truncate(image, 19);
                         let ip = super::truncate(ip, 15);
-                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10}");
+                        let hypervisor = super::truncate(hypervisor, 14);
+                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10} {hypervisor:<15}");
                         println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
@@ -495,6 +508,15 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 println!("  Subnet:    {subnet_val}");
                 println!("  VPC:       {vpc_val}");
                 println!("  SGs:       {sgs}");
+                let hv_id = v
+                    .get("hypervisor_id")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("-");
+                let hv_region = v.get("region").and_then(|r| r.as_str()).unwrap_or("-");
+                let hv_zone = v.get("zone").and_then(|z| z.as_str()).unwrap_or("-");
+                println!("  Hypervisor: {hv_id}");
+                println!("  Region:    {hv_region}");
+                println!("  Zone:      {hv_zone}");
             }
             Ok(())
         }

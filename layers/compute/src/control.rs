@@ -133,6 +133,9 @@ fn vm_status_to_json(s: &crate::types::VmStatus) -> serde_json::Value {
         "subnet": s.subnet,
         "vpc": s.vpc,
         "security_groups": s.security_groups,
+        "hypervisor_id": serde_json::Value::Null,
+        "region": serde_json::Value::Null,
+        "zone": serde_json::Value::Null,
     })
 }
 
