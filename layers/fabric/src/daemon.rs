@@ -1451,6 +1451,59 @@ pub async fn run_daemon(
 
             let raft_state = syfrah_controlplane::server::RaftServerState { raft };
 
+            // -- FDB cold rebuild from Raft-derived placements ------------------
+            //
+            // After the Raft state machine is loaded, the placement store
+            // reflects the global placement map. Rebuild local FDB + ARP proxy
+            // entries for all remote VMs in VPCs that have local VMs on this
+            // hypervisor. This is O(total VMs in local VPCs) and runs once at
+            // startup.
+            if let Some(ref placement) = shared_placement_store {
+                let local_node = my_record.mesh_ipv6.to_string();
+                match placement.list_all() {
+                    Ok(placements) => {
+                        // Convert org::types::VmPlacement to overlay::VmPlacement
+                        let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
+                            .iter()
+                            .map(|p| syfrah_overlay::VmPlacement {
+                                vpc_id: p.vpc_id.clone(),
+                                vm_id: p.vm_id.clone(),
+                                vm_mac: p.vm_mac.clone(),
+                                vm_ip: p.vm_ip.clone(),
+                                subnet_id: p.subnet_id.clone(),
+                                hypervisor_id: p.hypervisor_id.clone(),
+                                action: syfrah_overlay::PlacementAction::Add,
+                                placement_generation: p.placement_generation,
+                            })
+                            .collect();
+                        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                            Arc::new(syfrah_overlay::LinuxBackend::new());
+                        match syfrah_overlay::rebuild_fdb(
+                            backend.as_ref(),
+                            &overlay_placements,
+                            &local_node,
+                        )
+                        .await
+                        {
+                            Ok(summary) => {
+                                info!(
+                                    rebuilt = summary.rebuilt,
+                                    skipped_local = summary.skipped_local,
+                                    errors = summary.errors,
+                                    "FDB cold rebuild from Raft placements complete"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("FDB cold rebuild failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("FDB cold rebuild: failed to list placements: {e}");
+                    }
+                }
+            }
+
             info!("raft: control plane server starting on {raft_bind_addr} (node_id={node_id})");
 
             tokio::spawn(async move {
