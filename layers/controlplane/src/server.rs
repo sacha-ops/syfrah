@@ -56,7 +56,10 @@ pub fn raft_router(state: Arc<RaftServerState>) -> Router {
         .route("/raft/vote", post(vote_handler))
         .route("/raft/install_snapshot", post(install_snapshot_handler))
         .route("/raft/write", post(client_write_handler))
+        .route("/raft/join", post(join_handler))
+        .route("/raft/promote", post(promote_handler))
         .route("/raft/status", get(status_handler))
+        .route("/raft/members", get(members_handler))
         .with_state(state)
 }
 
@@ -127,6 +130,120 @@ async fn install_snapshot_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Json(resp))
+}
+
+/// Request to join the Raft cluster as a learner.
+#[derive(Deserialize)]
+pub struct JoinRequest {
+    pub node_id: u64,
+    pub addr: String,
+}
+
+/// Request to promote a learner to voter.
+#[derive(Deserialize)]
+pub struct PromoteRequest {
+    pub node_id: u64,
+}
+
+/// Handle a join request: add the node as a learner.
+async fn join_handler(
+    State(state): State<Arc<RaftServerState>>,
+    Json(req): Json<JoinRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::types::SyfrahNode;
+
+    info!(
+        "raft: join request from node {} at {}",
+        req.node_id, req.addr
+    );
+
+    let node = SyfrahNode {
+        addr: req.addr.clone(),
+    };
+
+    // Add as learner (non-blocking — replication starts immediately).
+    state
+        .raft
+        .add_learner(req.node_id, node, false)
+        .await
+        .map_err(|e| {
+            warn!("join (add_learner) failed: {e:?}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    info!("raft: node {} added as learner", req.node_id);
+    Ok(Json(
+        serde_json::json!({ "status": "joined", "node_id": req.node_id }),
+    ))
+}
+
+/// Handle a promote request: promote learner to voter.
+async fn promote_handler(
+    State(state): State<Arc<RaftServerState>>,
+    Json(req): Json<PromoteRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use openraft::ChangeMembers;
+
+    info!("raft: promote request for node {}", req.node_id);
+
+    // Promote the learner to voter (retain=true keeps existing learners).
+    state
+        .raft
+        .change_membership(
+            ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([req.node_id])),
+            true,
+        )
+        .await
+        .map_err(|e| {
+            warn!("promote failed: {e:?}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    info!("raft: node {} promoted to voter", req.node_id);
+    Ok(Json(
+        serde_json::json!({ "status": "promoted", "node_id": req.node_id }),
+    ))
+}
+
+/// Member info in the members response.
+#[derive(Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub node_id: u64,
+    pub addr: String,
+    pub role: String, // "voter" or "learner"
+}
+
+/// Members response — list all Raft members with roles.
+#[derive(Serialize, Deserialize)]
+pub struct MembersResponse {
+    pub members: Vec<MemberInfo>,
+}
+
+async fn members_handler(
+    State(state): State<Arc<RaftServerState>>,
+) -> Result<Json<MembersResponse>, StatusCode> {
+    use openraft::rt::watch::WatchReceiver;
+    let metrics = state.raft.metrics().borrow_watched().clone();
+
+    let voter_ids: std::collections::HashSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+
+    let members: Vec<MemberInfo> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, node)| MemberInfo {
+            node_id: *id,
+            addr: node.addr.clone(),
+            role: if voter_ids.contains(id) {
+                "voter".to_string()
+            } else {
+                "learner".to_string()
+            },
+        })
+        .collect();
+
+    Ok(Json(MembersResponse { members }))
 }
 
 /// Status response for the Raft cluster.
