@@ -31,7 +31,9 @@ pub use scheduler::{
     MAX_ADMISSION_RETRIES,
 };
 pub use server::RaftServer;
-pub use state_machine::{PlacementEvent, RedbStateMachine};
+pub use state_machine::{
+    FullSnapshotData, PlacementEvent, RedbStateMachine, DEFAULT_SNAPSHOT_THRESHOLD,
+};
 pub use types::{SyfrahNode, SyfrahRaftConfig};
 
 /// The concrete Raft type for Syfrah.

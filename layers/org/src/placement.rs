@@ -20,6 +20,16 @@ impl PlacementStore {
         Self { db }
     }
 
+    /// Get a reference to the underlying database for export/import operations.
+    pub fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
+    /// All table names used by this store (for snapshot export/import).
+    pub fn table_names() -> &'static [&'static str] {
+        &[TABLE]
+    }
+
     /// Build the composite key for a placement entry.
     fn key(vpc_id: &str, vm_id: &str) -> String {
         format!("{vpc_id}/{vm_id}")

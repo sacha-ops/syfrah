@@ -60,6 +60,10 @@ pub async fn run() -> Result<()> {
 
     let config = Arc::new(openraft::Config {
         cluster_name: "syfrah-raft".to_string(),
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            syfrah_controlplane::state_machine::DEFAULT_SNAPSHOT_THRESHOLD,
+        ),
+        max_in_snapshot_log_to_keep: 100,
         ..Default::default()
     });
 
