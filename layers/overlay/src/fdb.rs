@@ -30,6 +30,9 @@ pub struct VmPlacement {
     pub subnet_id: String,
     pub hypervisor_id: String,
     pub action: PlacementAction,
+    /// Monotonically increasing generation for fencing.
+    #[serde(default)]
+    pub placement_generation: u64,
 }
 
 /// Summary returned by [`rebuild_fdb`].
@@ -281,6 +284,7 @@ mod tests {
             subnet_id: "sub-1".to_string(),
             hypervisor_id: hypervisor_id.to_string(),
             action,
+            placement_generation: 0,
         }
     }
 
@@ -357,6 +361,7 @@ mod tests {
             subnet_id: "sub-1".to_string(),
             hypervisor_id: node.to_string(),
             action: PlacementAction::Add,
+            placement_generation: 0,
         }
     }
 

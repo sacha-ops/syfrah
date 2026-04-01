@@ -380,6 +380,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             hypervisor_id: self.local_node.clone(),
             action: PlacementAction::Add,
             created_at: now,
+            placement_generation: 1,
         };
 
         self.placement_store
