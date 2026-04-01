@@ -184,6 +184,14 @@ pub enum StateMachineCommand {
     DeleteNic {
         nic_id: String,
     },
+
+    // -- Composite Transaction --
+    /// Atomic batch of commands applied in a single Raft log entry.
+    /// All sub-commands succeed or all fail. Used for placement transactions
+    /// that must atomically AllocateIp + CreateNic + PlaceVm.
+    Composite {
+        commands: Vec<StateMachineCommand>,
+    },
 }
 
 impl std::fmt::Display for StateMachineCommand {
@@ -197,6 +205,7 @@ impl std::fmt::Display for StateMachineCommand {
             Self::DeleteVpc { name } => write!(f, "DeleteVpc({name})"),
             Self::RegisterHypervisor { name, .. } => write!(f, "RegisterHypervisor({name})"),
             Self::EnableHypervisor { name } => write!(f, "EnableHypervisor({name})"),
+            Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
     }
@@ -214,6 +223,8 @@ pub enum StateMachineResponse {
     Error(String),
     /// IP allocation result.
     AllocatedIp { ip: String, mac: String },
+    /// Composite transaction result — contains results from each sub-command.
+    Composite(Vec<StateMachineResponse>),
 }
 
 #[cfg(test)]
