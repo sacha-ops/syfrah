@@ -484,7 +484,7 @@ The reconciliation engine computes the diff and drives actual state toward desir
 **Phase 2+ (application-level authenticated identity)**:
 - Control plane signs operation requests with its Raft leader key. Forge verifies signatures before executing.
 - mTLS optional but recommended for defense in depth.
-- Role separation: only the Raft leader (or nodes acting on its behalf) can call mutation endpoints. Other nodes can only call read-only endpoints (`/v1/node/*`, `GET` on any resource).
+- Role separation: only the Raft leader (or nodes acting on its behalf) can call mutation endpoints. Other nodes can only call read-only endpoints (`/v1/hypervisor/*`, `GET` on any resource).
 - All mutation requests carry a `raft_term` and `raft_index` to prevent stale commands from a deposed leader.
 
 ### API/task/reconciliation contract
@@ -645,15 +645,15 @@ The API writes the intent and returns a `task_id`. The reconciler then executes 
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v1/node/status` | Node health (composite of 4 health categories), uptime, pending operations |
-| `GET` | `/v1/node/health` | Detailed health checks (4 categories, each with independent status) |
-| `GET` | `/v1/node/capacity` | Total vs used vs reserved resources |
-| `GET` | `/v1/node/metrics` | CPU, memory, disk, network utilization |
-| `GET` | `/v1/node/resources` | Summary of all managed resources by type and state |
-| `POST` | `/v1/node/drain` | Start draining (stop accepting new VMs) |
-| `POST` | `/v1/node/undrain` | Resume accepting VMs |
-| `POST` | `/v1/node/reconcile` | Trigger immediate reconciliation cycle (debug) |
-| `GET` | `/v1/node/reconcile/status` | Last reconciliation result (drift detected, changes applied) |
+| `GET` | `/v1/hypervisor/status` | Node health (composite of 4 health categories), uptime, pending operations |
+| `GET` | `/v1/hypervisor/health` | Detailed health checks (4 categories, each with independent status) |
+| `GET` | `/v1/hypervisor/capacity` | Total vs used vs reserved resources |
+| `GET` | `/v1/hypervisor/metrics` | CPU, memory, disk, network utilization |
+| `GET` | `/v1/hypervisor/resources` | Summary of all managed resources by type and state |
+| `POST` | `/v1/hypervisor/drain` | Start draining (stop accepting new VMs) |
+| `POST` | `/v1/hypervisor/undrain` | Resume accepting VMs |
+| `POST` | `/v1/hypervisor/reconcile` | Trigger immediate reconciliation cycle (debug) |
+| `GET` | `/v1/hypervisor/reconcile/status` | Last reconciliation result (drift detected, changes applied) |
 
 #### Tasks (for async operations)
 
@@ -1061,7 +1061,7 @@ Functional health validation is the tenant's responsibility (or a future monitor
 
 ### Health endpoint
 
-`GET /v1/node/health` returns:
+`GET /v1/hypervisor/health` returns:
 
 ```json
 {
@@ -1140,7 +1140,7 @@ Forge does NOT go fully read-only when control is degraded. It continues to main
 
 Drain is the standard mechanism for planned maintenance (OS upgrade, hardware replacement, Forge upgrade on cautious deployments).
 
-1. Operator (or control plane automation) sends `POST /v1/node/drain` to Forge.
+1. Operator (or control plane automation) sends `POST /v1/hypervisor/drain` to Forge.
 2. Forge marks itself as draining: `draining = true`.
 3. Forge rejects all new instance creation requests with `503 Service Unavailable` (body: "node is draining").
 4. Forge reports `draining: true` via gossip.
@@ -1152,14 +1152,14 @@ Drain is the standard mechanism for planned maintenance (OS upgrade, hardware re
 
 ### Node undrain
 
-1. Operator sends `POST /v1/node/undrain`.
+1. Operator sends `POST /v1/hypervisor/undrain`.
 2. Forge clears the draining flag.
 3. Forge reports `draining: false` via gossip.
 4. The scheduler can place new VMs here again.
 
 ### Drain with force
 
-`POST /v1/node/drain` with `{"force": true}` skips waiting for graceful migration. VMs are stopped immediately (via the shutdown chain). Use only when the node is being decommissioned.
+`POST /v1/hypervisor/drain` with `{"force": true}` skips waiting for graceful migration. VMs are stopped immediately (via the shutdown chain). Use only when the node is being decommissioned.
 
 ### Drain timeout
 
@@ -1597,9 +1597,9 @@ The migration is incremental. Each phase adds functionality without breaking exi
 **Step 1 — Add HTTP API scaffold**
 
 Add an axum HTTP server to the existing daemon, bound to `syfrah0:7100`. Start with read-only endpoints:
-- `GET /v1/node/status` — node health
-- `GET /v1/node/capacity` — resource summary
-- `GET /v1/node/health` — detailed health checks (4 categories)
+- `GET /v1/hypervisor/status` — node health
+- `GET /v1/hypervisor/capacity` — resource summary
+- `GET /v1/hypervisor/health` — detailed health checks (4 categories)
 - `GET /metrics` — Prometheus metrics
 
 This can be done without changing any existing functionality.
