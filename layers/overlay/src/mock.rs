@@ -262,6 +262,14 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
+    async fn link_exists(&self, name: &str) -> bool {
+        self.record(format!("link_exists({name})"));
+        self.interfaces
+            .lock()
+            .expect("lock poisoned")
+            .contains(name)
+    }
+
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
         self.record(format!("list_interfaces({prefix})"));
         let interfaces = self.interfaces.lock().expect("lock poisoned");
@@ -355,6 +363,7 @@ mod tests {
         b.remove_nat(&br100, "10.1.1.0/24").await.unwrap();
         b.apply_peering_rules(&br100, &br200).await.unwrap();
         b.remove_peering_rules(&br100, &br200).await.unwrap();
+        b.link_exists(&br100).await;
         b.list_interfaces(crate::naming::BRIDGE_PREFIX)
             .await
             .unwrap();
@@ -362,7 +371,7 @@ mod tests {
         b.list_arp_entries(&vx100).await.unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 25, "expected one call per trait method");
+        assert_eq!(calls.len(), 26, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));
@@ -387,7 +396,8 @@ mod tests {
         assert!(calls[19].starts_with("remove_nat("));
         assert!(calls[20].starts_with("apply_peering_rules("));
         assert!(calls[21].starts_with("remove_peering_rules("));
-        assert!(calls[22].starts_with("list_interfaces("));
+        assert!(calls[22].starts_with("link_exists("));
+        assert!(calls[23].starts_with("list_interfaces("));
 
         // Test reset
         b.reset();
