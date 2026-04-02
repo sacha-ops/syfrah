@@ -257,6 +257,9 @@ pub struct ApplySgRequest {
     /// Map of SG name -> list of IPs for SG reference resolution.
     #[serde(default)]
     pub sg_ip_map: HashMap<String, Vec<String>>,
+    /// Host-side interface name (TAP or veth). Defaults to tap_name(vm_id).
+    #[serde(default)]
+    pub iface_name: Option<String>,
 }
 
 /// Input format for a security group rule.
@@ -284,6 +287,9 @@ fn default_priority() -> u32 {
 pub struct RemoveSgRequest {
     /// VM identifier whose chains should be flushed.
     pub vm_id: String,
+    /// Host-side interface name (TAP or veth). Defaults to tap_name(vm_id).
+    #[serde(default)]
+    pub iface_name: Option<String>,
 }
 
 /// NAT gateway state.
@@ -1967,6 +1973,10 @@ async fn apply_sg_handler(
         }
     };
 
+    let iface_name = req
+        .iface_name
+        .clone()
+        .unwrap_or_else(|| syfrah_overlay::naming::tap_name(&req.vm_id));
     let nic = syfrah_overlay::sg_nft::NetworkInterface {
         id: syfrah_overlay::sg_nft::NicId(format!("nic-{}", req.vm_id)),
         vm_id: req.vm_id.clone(),
@@ -1988,6 +1998,7 @@ async fn apply_sg_handler(
             .iter()
             .map(|s| syfrah_overlay::sg::SecurityGroupId(s.clone()))
             .collect(),
+        iface_name,
     };
 
     let rules: Vec<syfrah_overlay::sg::SecurityGroupRule> =
@@ -2040,7 +2051,12 @@ async fn remove_sg_handler(
         }
     };
 
-    if let Err(e) = syfrah_overlay::sg_nft::remove_sg_for_vm(&req.vm_id) {
+    let iface_name = req
+        .iface_name
+        .as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| syfrah_overlay::naming::tap_name(&req.vm_id));
+    if let Err(e) = syfrah_overlay::sg_nft::remove_sg_for_vm(&req.vm_id, &iface_name) {
         warn!(vm_id = %req.vm_id, error = %e, "failed to remove SG chains");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -369,6 +369,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
                         .iter()
                         .map(|id| syfrah_overlay::sg::SecurityGroupId(id.0.clone()))
                         .collect(),
+                    iface_name: host_iface.clone(),
                 };
 
                 let sg_ip_map = std::collections::HashMap::new();

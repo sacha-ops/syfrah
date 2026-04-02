@@ -1208,6 +1208,13 @@ pub async fn run_daemon(
                             warn!("compute: failed to apply infra protection rules: {e}");
                         }
 
+                        // Initialize the SG nftables table with the base
+                        // forward chain and dispatch vmaps so that per-VM
+                        // chains are reachable once VMs are created.
+                        if let Err(e) = backend.apply_sg_base_chain().await {
+                            warn!("compute: failed to apply SG base chain: {e}");
+                        }
+
                         vm_manager.set_network(
                             Arc::clone(&backend),
                             bridge_counter,

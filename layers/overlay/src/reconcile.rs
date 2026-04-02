@@ -187,6 +187,13 @@ pub async fn reconcile_network(
             .push(format!("infra protection re-apply failed: {e}"));
     }
 
+    // 3a-bis. Re-apply SG base chain (forward chain + dispatch vmaps)
+    if let Err(e) = backend.apply_sg_base_chain().await {
+        report
+            .warnings
+            .push(format!("SG base chain re-apply failed: {e}"));
+    }
+
     // 3b. Re-apply nftables rules (they don't survive reboot)
     reapply_rules(backend, expected_state, &mut report).await;
 

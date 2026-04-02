@@ -79,6 +79,10 @@ pub trait NetworkBackend: Send + Sync {
     /// Must be called once during init, before any per-VM rules are applied.
     async fn apply_infra_protection(&self) -> Result<()>;
 
+    /// Initialize the SG nftables table with a base forward chain and
+    /// dispatch vmaps. Idempotent — safe to call multiple times.
+    async fn apply_sg_base_chain(&self) -> Result<()>;
+
     /// Apply anti-spoofing + default ingress/egress rules for a VM.
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
 
