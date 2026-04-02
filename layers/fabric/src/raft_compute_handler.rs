@@ -180,6 +180,8 @@ impl RaftComputeHandler {
         };
 
         // If not leader, forward the request to the leader.
+        // Include the zone constraint so the leader's scheduler places
+        // the VM in the correct zone (bug #1127 fix).
         if !client.is_leader() {
             debug!("raft compute: not leader, forwarding CreateVm to leader");
             return self
@@ -193,6 +195,7 @@ impl RaftComputeHandler {
                     disk_size_mb,
                     subnet.as_ref(),
                     &security_groups,
+                    zone.as_deref(),
                 )
                 .await;
         }
@@ -275,6 +278,7 @@ impl RaftComputeHandler {
                         ssh_key: ssh_key.clone(),
                         disk_size_mb,
                         security_groups: security_groups.clone(),
+                        zone: None, // Don't pass zone to target — it creates locally.
                     };
 
                     match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req).await {
@@ -334,6 +338,9 @@ impl RaftComputeHandler {
     }
 
     /// Forward a CreateVm request to the leader by calling its Forge HTTP API.
+    ///
+    /// The zone constraint is forwarded so the leader's Forge API can route
+    /// through the scheduler to place the VM in the correct zone.
     #[allow(clippy::too_many_arguments)]
     async fn forward_create_to_leader(
         &self,
@@ -346,6 +353,7 @@ impl RaftComputeHandler {
         disk_size_mb: Option<u32>,
         subnet: Option<&syfrah_compute::types::SubnetInfo>,
         security_groups: &[String],
+        zone: Option<&str>,
     ) -> Vec<u8> {
         let leader_raft_addr = match client.leader_addr() {
             Some(addr) => addr,
@@ -371,9 +379,13 @@ impl RaftComputeHandler {
             ssh_key: ssh_key.map(|s| s.to_string()),
             disk_size_mb,
             security_groups: security_groups.to_vec(),
+            zone: zone.map(|s| s.to_string()),
         };
 
-        match syfrah_controlplane::create_vm_on_remote(&leader_forge_addr, &remote_req).await {
+        // Forward to leader WITHOUT ?direct=true so the leader runs the
+        // scheduler with the zone constraint (vs create_vm_on_remote which
+        // uses ?direct=true for placement on a specific target hypervisor).
+        match syfrah_controlplane::forward_create_to_leader(&leader_forge_addr, &remote_req).await {
             Ok(resp) if resp.success => {
                 info!(
                     "forwarded CreateVm '{}' to leader at {}: success",

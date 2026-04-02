@@ -1461,6 +1461,9 @@ pub async fn run_daemon(
             )),
             raft_client: Arc::clone(&forge_raft_client),
             gossip_cluster: Arc::clone(&forge_gossip_cluster),
+            hypervisor_store: shared_hypervisor_store.clone(),
+            local_node_name: my_record.name.clone(),
+            local_fabric_ipv6: my_record.mesh_ipv6.to_string(),
         });
 
         let bind_addr: std::net::SocketAddr =

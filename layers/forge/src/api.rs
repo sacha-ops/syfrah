@@ -54,6 +54,14 @@ pub struct ForgeState {
     /// Gossip cluster state for metrics export.
     /// Injected after Raft init (alongside raft_client).
     pub gossip_cluster: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::GossipCluster>>>,
+    /// Hypervisor store for scheduler-based placement when zone is specified.
+    /// The scheduler reads from this store (Raft-replicated) to pick a
+    /// hypervisor in the requested zone.
+    pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
+    /// Local node name for scheduler (to identify "this" hypervisor).
+    pub local_node_name: String,
+    /// Local fabric IPv6 for scheduler.
+    pub local_fabric_ipv6: String,
 }
 
 /// Stored NIC record for the in-memory registry.
@@ -145,6 +153,10 @@ pub struct CreateInstanceRequest {
     pub disk_size_mb: Option<u32>,
     #[serde(default)]
     pub security_groups: Vec<String>,
+    /// Placement zone constraint. When specified on the leader, the Forge API
+    /// runs the scheduler to place the VM on a hypervisor in the requested zone.
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 fn default_vcpus() -> u32 {
@@ -938,6 +950,120 @@ async fn create_instance_handler(
             match forward_post_to_leader(&leader_addr, "/v1/instances", &req).await {
                 Ok(resp) => return resp,
                 Err(resp) => return resp,
+            }
+        }
+    }
+
+    // Scheduler routing: if zone is specified and we have a hypervisor store,
+    // run the scheduler to pick a hypervisor in the requested zone. If the
+    // selected hypervisor is not this node, forward to the target.
+    if let Some(ref zone) = req.zone {
+        if let Some(ref hv_store) = state.hypervisor_store {
+            let scheduler = syfrah_controlplane::Scheduler::new(
+                state.local_node_name.clone(),
+                state.local_fabric_ipv6.clone(),
+            );
+            let constraints = syfrah_controlplane::PlacementConstraints::from_cli(
+                Some(zone.clone()),
+                &[],
+                None,
+                None,
+            );
+            let existing: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            match scheduler.schedule_from_store(
+                req.vcpus,
+                req.memory_mb as u64,
+                &constraints,
+                hv_store,
+                &[],
+                &existing,
+            ) {
+                Ok(decision) => {
+                    if !decision.is_local_fallback
+                        && decision.hypervisor_id != state.local_node_name
+                    {
+                        // Forward to the target hypervisor with ?direct=true.
+                        let forge_addr = syfrah_controlplane::forge_addr_from_fabric_ipv6(
+                            &decision.hypervisor_addr,
+                        );
+                        let remote_req = syfrah_controlplane::RemoteCreateVmRequest {
+                            name: req.name.clone(),
+                            image: req.image.clone(),
+                            vcpus: req.vcpus,
+                            memory_mb: req.memory_mb,
+                            subnet: req.subnet.clone(),
+                            project: req.project.clone(),
+                            org: req.org.clone(),
+                            ssh_key: req.ssh_key.clone(),
+                            disk_size_mb: req.disk_size_mb,
+                            security_groups: req.security_groups.clone(),
+                            zone: None, // Don't forward zone to target — it creates locally.
+                        };
+                        match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req)
+                            .await
+                        {
+                            Ok(resp) if resp.success => {
+                                info!(
+                                    "scheduler placed VM '{}' on '{}' (zone={})",
+                                    req.name, decision.hypervisor_id, zone
+                                );
+                                return (
+                                    StatusCode::CREATED,
+                                    Json(serde_json::json!({
+                                        "id": resp.vm_id.unwrap_or_else(|| req.name.clone()),
+                                        "name": req.name,
+                                        "image": req.image,
+                                        "vcpus": req.vcpus,
+                                        "memory_mb": req.memory_mb,
+                                        "ip": resp.ip,
+                                        "hypervisor": decision.hypervisor_id,
+                                        "zone": zone,
+                                        "status": "Created",
+                                    })),
+                                );
+                            }
+                            Ok(resp) => {
+                                let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({
+                                        "code": "FORGE_CREATE_FAILED",
+                                        "message": format!(
+                                            "scheduler placed VM on '{}' but creation failed: {}",
+                                            decision.hypervisor_id, msg
+                                        ),
+                                    })),
+                                );
+                            }
+                            Err(e) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({
+                                        "code": "FORGE_CREATE_FAILED",
+                                        "message": format!(
+                                            "scheduler placed VM on '{}' but unreachable: {}",
+                                            decision.hypervisor_id, e
+                                        ),
+                                    })),
+                                );
+                            }
+                        }
+                    }
+                    // If local fallback or this node was selected, continue to create locally.
+                    info!(
+                        "scheduler selected local node for VM '{}' (zone={})",
+                        req.name, zone
+                    );
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "code": "FORGE_SCHEDULER_ERROR",
+                            "message": format!("scheduler error: {e}"),
+                        })),
+                    );
+                }
             }
         }
     }
@@ -2410,6 +2536,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         })
     }
 
@@ -2436,6 +2565,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         });
         (dir, state)
     }
@@ -2665,6 +2797,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         });
         let app = forge_router(state);
 
@@ -2704,6 +2839,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         })
     }
 
