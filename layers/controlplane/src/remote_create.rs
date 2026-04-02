@@ -19,6 +19,10 @@ pub struct RemoteCreateVmRequest {
     pub ssh_key: Option<String>,
     pub disk_size_mb: Option<u32>,
     pub security_groups: Vec<String>,
+    /// Placement zone constraint. Forwarded to the leader's Forge API
+    /// so the scheduler can place the VM in the correct zone.
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// Response from a remote VM creation.
@@ -102,6 +106,71 @@ pub async fn create_vm_on_remote(
     })
 }
 
+/// Forward a VM creation request to the Raft leader's Forge API.
+///
+/// Unlike `create_vm_on_remote` (which uses `?direct=true` for placement on
+/// a specific hypervisor), this does NOT use `?direct=true` so the leader
+/// can run the scheduler with the zone constraint.
+pub async fn forward_create_to_leader(
+    leader_addr: &str,
+    request: &RemoteCreateVmRequest,
+) -> Result<RemoteCreateVmResponse, String> {
+    let url = format!("http://{leader_addr}/v1/instances");
+    info!(
+        "forward_to_leader: sending VM '{}' to leader at {}",
+        request.name, leader_addr
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let resp = client
+        .post(&url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| format!("failed to reach leader at {leader_addr}: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        warn!(
+            "forward_to_leader: leader at {} returned {}: {}",
+            leader_addr, status, body
+        );
+        return Ok(RemoteCreateVmResponse {
+            success: false,
+            vm_id: None,
+            ip: None,
+            error: Some(format!("Forge returned {status}: {body}")),
+        });
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse leader response: {e}"))?;
+
+    let vm_id = body
+        .get("id")
+        .or_else(|| body.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let ip = body
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Ok(RemoteCreateVmResponse {
+        success: true,
+        vm_id,
+        ip,
+        error: None,
+    })
+}
+
 /// Look up a hypervisor's Forge address from its name.
 ///
 /// The Forge HTTP API runs on port 7100 on the hypervisor's fabric IPv6 address.
@@ -138,6 +207,7 @@ mod tests {
             ssh_key: None,
             disk_size_mb: None,
             security_groups: vec!["default".to_string()],
+            zone: Some("fsn1".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let _: RemoteCreateVmRequest = serde_json::from_str(&json).unwrap();

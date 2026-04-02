@@ -26,7 +26,8 @@ pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;
 pub use network::{SyfrahNetwork, SyfrahNetworkFactory};
 pub use remote_create::{
-    create_vm_on_remote, forge_addr_from_fabric_ipv6, RemoteCreateVmRequest, RemoteCreateVmResponse,
+    create_vm_on_remote, forge_addr_from_fabric_ipv6, forward_create_to_leader,
+    RemoteCreateVmRequest, RemoteCreateVmResponse,
 };
 pub use reschedule::{RescheduleOutcome, RescheduleSummary, Rescheduler, VmPlacementInfo};
 pub use scheduler::{
