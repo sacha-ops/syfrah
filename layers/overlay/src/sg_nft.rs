@@ -241,6 +241,11 @@ const EGRESS_DISPATCH_CHAIN: &str = "dispatch_egress";
 pub fn build_sg_base_chain() -> String {
     let mut buf = String::new();
     writeln!(buf, "add table inet {SG_TABLE}").unwrap();
+    // Dispatch chains must be created before the forward chain rules that
+    // reference them via `goto`, otherwise `nft -f -` will reject the rules.
+    writeln!(buf, "add chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
+    writeln!(buf, "add chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
+    // Base forward chain with default-drop policy.
     writeln!(
         buf,
         "add chain inet {SG_TABLE} {SG_FORWARD_CHAIN} {{ type filter hook forward priority 0; policy drop; }}"
@@ -268,9 +273,6 @@ pub fn build_sg_base_chain() -> String {
         r#"add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} iifname != "lo" goto {EGRESS_DISPATCH_CHAIN}"#
     )
     .unwrap();
-    // Dispatch chains: created idempotently; populated per-VM.
-    writeln!(buf, "add chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
-    writeln!(buf, "add chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
     buf
 }
 
