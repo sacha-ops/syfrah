@@ -1670,6 +1670,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let h1 = compute_spec_hash(&spec);
         let h2 = compute_spec_hash(&spec);

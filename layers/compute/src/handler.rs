@@ -265,6 +265,8 @@ async fn create_vm(
         disk_size_mb: None,
         subnet: None,
         security_groups: vec![],
+        pre_allocated_ip: None,
+        pre_allocated_mac: None,
     };
 
     match mgr.create_vm(spec).await {

@@ -27,8 +27,8 @@ pub use fdb::{
 pub use linux::LinuxBackend;
 pub use mock::MockBackend;
 pub use reconcile::{
-    reconcile_network, AllocationState, ExpectedBridge, ExpectedFdbEntry, ExpectedVm, IpAllocation,
-    NetworkState, ReconcileReport,
+    reconcile_network, AllocationState, ExpectedBridge, ExpectedFdbEntry, ExpectedPeering,
+    ExpectedVm, IpAllocation, NetworkState, ReconcileReport,
 };
 pub use recovery::{
     recover_network, RecoveryPlacement, RecoveryReport, RecoverySubnet, RecoveryVpc,

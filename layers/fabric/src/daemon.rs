@@ -1032,6 +1032,19 @@ pub async fn run_daemon(
                     Arc::clone(&store),
                 ));
                 raft_org_handler = Some(Arc::clone(&raft_handler));
+
+                // Wire the network backend into the Raft org handler for
+                // VPC peering data plane side effects (veth pair + nftables).
+                {
+                    let handler = Arc::clone(&raft_handler);
+                    let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                        Arc::new(syfrah_overlay::LinuxBackend::new());
+                    tokio::spawn(async move {
+                        handler.set_network_backend(backend).await;
+                        tracing::info!("org: network backend wired for peering data plane");
+                    });
+                }
+
                 router.register("org", raft_handler);
 
                 info!("org layer initialised (Raft-aware)");
@@ -1382,6 +1395,19 @@ pub async fn run_daemon(
             });
         }
 
+        // Wire the org store into the Raft compute handler so it can resolve
+        // subnets for Raft-based IP allocation before remote VM dispatch.
+        if let Some(ref handler) = raft_compute_handler_ref {
+            if let Some(ref org_store) = shared_org_store {
+                let handler = Arc::clone(handler);
+                let store = Arc::clone(org_store);
+                tokio::spawn(async move {
+                    handler.set_org_store(store).await;
+                    info!("compute: org store wired into Raft compute handler for IPAM");
+                });
+            }
+        }
+
         info!("hypervisor layer initialised");
     }
 
@@ -1411,6 +1437,10 @@ pub async fn run_daemon(
     // (fabric/org/compute handlers), while new API consumers use HTTP on
     // syfrah0:7100. The daemon is Forge's process entry point.
     let (forge_shutdown_tx, forge_shutdown_rx) = tokio::sync::watch::channel(false);
+    // Initialize capacity tracker outside the forge_task block so the periodic
+    // Raft capacity update loop can access it after ForgeState takes ownership.
+    let forge_capacity = Arc::new(syfrah_forge::capacity::CapacityTracker::new());
+    let capacity_for_raft = Arc::clone(&forge_capacity);
     let forge_task = {
         // Open the task store for Forge operations.
         let forge_task_store = match syfrah_state::LayerDb::open("forge_tasks") {
@@ -1425,8 +1455,6 @@ pub async fn run_daemon(
             }
         };
 
-        // Initialize capacity tracker.
-        let forge_capacity = Arc::new(syfrah_forge::capacity::CapacityTracker::new());
         info!(
             "forge: capacity tracker initialised (vcpus={}, memory={}MB)",
             forge_capacity.allocatable_vcpus(),
@@ -1731,37 +1759,29 @@ pub async fn run_daemon(
                 let cap_client = raft_client.clone();
                 let cap_node_name = my_record.name.clone();
                 let mut cap_shutdown = raft_shutdown_rx.clone();
+                let cap_tracker: Arc<syfrah_forge::capacity::CapacityTracker> =
+                    Arc::clone(&capacity_for_raft);
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             _ = cap_shutdown.wait_for(|v| *v) => break,
                             _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {},
                         }
-                        // Read current system capacity.
-                        let alloc_vcpus = std::thread::available_parallelism()
-                            .map(|n| n.get() as u32)
-                            .unwrap_or(1);
-                        let alloc_memory = std::fs::read_to_string("/proc/meminfo")
-                            .ok()
-                            .and_then(|content| {
-                                content.lines().find_map(|line| {
-                                    if line.starts_with("MemTotal:") {
-                                        let parts: Vec<&str> = line.split_whitespace().collect();
-                                        parts.get(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .unwrap_or(1024);
+                        // Read current system capacity from the Forge capacity tracker.
+                        // This reflects actual VM allocations (committed + reserved),
+                        // so the scheduler sees real utilization across all nodes.
+                        let alloc_vcpus = cap_tracker.allocatable_vcpus();
+                        let alloc_memory = cap_tracker.allocatable_memory_mb();
+                        let used_v = cap_tracker.used_vcpus();
+                        let used_m = cap_tracker.used_memory_mb();
 
                         let cmd =
                             syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
                                 name: cap_node_name.clone(),
                                 allocatable_vcpus: alloc_vcpus,
                                 allocatable_memory_mb: alloc_memory,
-                                used_vcpus: 0,
-                                used_memory_mb: 0,
+                                used_vcpus: used_v,
+                                used_memory_mb: used_m,
                             };
                         if let Err(e) = cap_client.write(cmd).await {
                             tracing::debug!(

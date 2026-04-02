@@ -105,6 +105,8 @@ impl ComputeRuntime for ChRuntime {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
 
         // Step 1: validate

@@ -82,6 +82,17 @@ pub struct ExpectedFdbEntry {
     pub ip: String,
 }
 
+/// Expected VPC peering that should have data plane wiring (veth + nftables).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedPeering {
+    /// Unique peering ID (used for veth naming).
+    pub peering_id: String,
+    /// Bridge name for VPC A.
+    pub bridge_a: String,
+    /// Bridge name for VPC B.
+    pub bridge_b: String,
+}
+
 /// Snapshot of expected network state gathered from redb.
 ///
 /// Passed to [`reconcile_network`] so it can compare against the kernel.
@@ -104,6 +115,11 @@ pub struct NetworkState {
     /// Only entries for REMOTE VMs (not local) should be listed here.
     #[serde(default)]
     pub fdb_entries: Vec<ExpectedFdbEntry>,
+    /// VPC peerings whose data plane (veth pair + nftables FORWARD rules)
+    /// should be wired on this hypervisor. Only peerings where BOTH VPCs
+    /// have local VMs need data plane wiring.
+    #[serde(default)]
+    pub peerings: Vec<ExpectedPeering>,
 }
 
 // ── Reconcile report ───────────────────────────────────────────────────
@@ -126,6 +142,9 @@ pub struct ReconcileReport {
     /// Stale FDB entries that were removed.
     #[serde(default)]
     pub fdb_entries_removed: usize,
+    /// VPC peering data plane connections wired (veth + nftables).
+    #[serde(default)]
+    pub peerings_wired: usize,
     /// Warnings emitted (orphaned TAPs, orphaned kernel interfaces, etc.).
     pub warnings: Vec<String>,
 }
@@ -183,12 +202,17 @@ pub async fn reconcile_network(
     // 7. Reconcile FDB entries — add missing, remove stale.
     reconcile_fdb_entries(backend, expected_state, &mut report).await;
 
+    // 8. Reconcile VPC peering data plane — create veth pairs + nftables
+    //    FORWARD rules for peered VPCs that both have VMs on this node.
+    reconcile_peerings(backend, expected_state, &mut report).await;
+
     if report.bridges_fixed > 0
         || report.rules_reapplied > 0
         || report.orphans_reclaimed > 0
         || report.sg_chains_reapplied > 0
         || report.fdb_entries_added > 0
         || report.fdb_entries_removed > 0
+        || report.peerings_wired > 0
         || !report.warnings.is_empty()
     {
         info!(
@@ -198,6 +222,7 @@ pub async fn reconcile_network(
             sg_chains_reapplied = report.sg_chains_reapplied,
             fdb_added = report.fdb_entries_added,
             fdb_removed = report.fdb_entries_removed,
+            peerings_wired = report.peerings_wired,
             warnings = report.warnings.len(),
             "reconciliation complete"
         );
@@ -500,6 +525,70 @@ async fn reconcile_fdb_entries(
                         .push(format!("ARP reconcile: remove failed for {ip}: {e}"));
                 } else {
                     report.fdb_entries_removed += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Reconcile VPC peering data plane connections.
+///
+/// For each expected peering, ensure the veth pair exists between the two
+/// VPC bridges and that nftables FORWARD rules allow traffic. Uses
+/// `create_veth_peer` from the `veth_peer` module which is idempotent
+/// (re-applying on existing interfaces is safe).
+async fn reconcile_peerings(
+    backend: &dyn NetworkBackend,
+    state: &NetworkState,
+    report: &mut ReconcileReport,
+) {
+    for peering in &state.peerings {
+        // Check if the veth peer interface already exists.
+        let peer_a = naming::peer_name_a(&peering.peering_id);
+        let existing = match backend
+            .list_interfaces(&peer_a[..peer_a.len().min(4)])
+            .await
+        {
+            Ok(list) => list.contains(&peer_a),
+            Err(_) => false,
+        };
+
+        if existing {
+            // Veth already exists; just re-apply the peering rules (nftables
+            // FORWARD rules don't survive reboot).
+            if let Err(e) = backend
+                .apply_peering_rules(&peering.bridge_a, &peering.bridge_b)
+                .await
+            {
+                report.warnings.push(format!(
+                    "peering {}: failed to re-apply rules: {e}",
+                    peering.peering_id
+                ));
+            }
+        } else {
+            // Create the full veth peer connection.
+            match crate::veth_peer::create_veth_peer(
+                backend,
+                &peering.peering_id,
+                &peering.bridge_a,
+                &peering.bridge_b,
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(
+                        peering_id = %peering.peering_id,
+                        bridge_a = %peering.bridge_a,
+                        bridge_b = %peering.bridge_b,
+                        "VPC peering data plane wired"
+                    );
+                    report.peerings_wired += 1;
+                }
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "peering {}: failed to create veth peer: {e}",
+                        peering.peering_id
+                    ));
                 }
             }
         }

@@ -157,6 +157,14 @@ pub struct CreateInstanceRequest {
     /// runs the scheduler to place the VM on a hypervisor in the requested zone.
     #[serde(default)]
     pub zone: Option<String>,
+    /// Pre-allocated IP from Raft IPAM (set by leader before dispatching to remote).
+    /// When set, the target Forge uses this IP instead of allocating locally,
+    /// preventing duplicate IP assignments across nodes.
+    #[serde(default)]
+    pub pre_allocated_ip: Option<String>,
+    /// Pre-allocated MAC from Raft IPAM (set by leader before dispatching to remote).
+    #[serde(default)]
+    pub pre_allocated_mac: Option<String>,
 }
 
 fn default_vcpus() -> u32 {
@@ -998,6 +1006,8 @@ async fn create_instance_handler(
                             disk_size_mb: req.disk_size_mb,
                             security_groups: req.security_groups.clone(),
                             zone: None, // Don't forward zone to target — it creates locally.
+                            pre_allocated_ip: None,
+                            pre_allocated_mac: None,
                         };
                         match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req)
                             .await
@@ -1192,12 +1202,28 @@ async fn create_instance_handler(
         } else {
             req.security_groups
         },
+        pre_allocated_ip: req.pre_allocated_ip,
+        pre_allocated_mac: req.pre_allocated_mac,
     };
 
     match vm_manager.create_vm(spec).await {
         Ok(status) => {
             if let Some(ref capacity) = state.capacity {
                 capacity.commit(&req.name, req.vcpus, req.memory_mb as u64);
+                // Immediate Raft capacity update so the scheduler sees increased
+                // utilization right away (not just at the next 10s tick).
+                if let Some(raft_client) = state.raft_client.read().await.as_ref() {
+                    let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                        name: state.local_node_name.clone(),
+                        allocatable_vcpus: capacity.allocatable_vcpus(),
+                        allocatable_memory_mb: capacity.allocatable_memory_mb(),
+                        used_vcpus: capacity.used_vcpus(),
+                        used_memory_mb: capacity.used_memory_mb(),
+                    };
+                    if let Err(e) = raft_client.write(cmd).await {
+                        debug!("immediate capacity update after create failed: {e}");
+                    }
+                }
             }
             if let Some(ref task_store) = state.task_store {
                 let _ = task_store.complete_task(&task_id);
@@ -1357,7 +1383,9 @@ async fn delete_instance_handler(
     // All cleanup steps are best-effort — errors are logged, not propagated.
     match vm_manager.delete_vm(&id).await {
         Ok(()) => {
-            // Release capacity tracking.
+            // Release capacity tracking and immediately propagate to Raft
+            // so the scheduler sees freed capacity without waiting for the
+            // next periodic update tick.
             if let (Some(ref capacity), Some(ref info)) = (&state.capacity, &vm_info) {
                 capacity.release(&id, info.vcpus, info.memory_mb as u64);
                 info!(
@@ -1366,6 +1394,19 @@ async fn delete_instance_handler(
                     memory_mb = info.memory_mb,
                     "capacity released"
                 );
+                // Immediate Raft capacity update.
+                if let Some(raft_client) = state.raft_client.read().await.as_ref() {
+                    let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                        name: state.local_node_name.clone(),
+                        allocatable_vcpus: capacity.allocatable_vcpus(),
+                        allocatable_memory_mb: capacity.allocatable_memory_mb(),
+                        used_vcpus: capacity.used_vcpus(),
+                        used_memory_mb: capacity.used_memory_mb(),
+                    };
+                    if let Err(e) = raft_client.write(cmd).await {
+                        debug!("immediate capacity update after delete failed: {e}");
+                    }
+                }
             }
             if let Some(ref task_store) = state.task_store {
                 let _ = task_store.complete_task(&task_id);

@@ -16,7 +16,7 @@ use syfrah_api::handler::LayerHandler;
 use syfrah_compute::control::{ComputeRequest, ComputeResponse};
 use syfrah_controlplane::{
     GossipCluster, HypervisorGossipReport, PlacementConstraints, RaftClient, RemoteCreateVmRequest,
-    Scheduler,
+    Scheduler, StateMachineCommand, StateMachineResponse,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -36,6 +36,8 @@ pub struct RaftComputeHandler {
     /// Hypervisor store — used to populate scheduler candidates from
     /// registered hypervisors when gossip reports are not yet available.
     hypervisor_store: RwLock<Option<Arc<syfrah_org::HypervisorStore>>>,
+    /// Org store — used to resolve subnets for Raft-based IP allocation.
+    org_store: RwLock<Option<Arc<syfrah_org::OrgStore>>>,
 }
 
 impl RaftComputeHandler {
@@ -48,6 +50,7 @@ impl RaftComputeHandler {
             scheduler: RwLock::new(None),
             local_node_name,
             hypervisor_store: RwLock::new(None),
+            org_store: RwLock::new(None),
         }
     }
 
@@ -66,6 +69,12 @@ impl RaftComputeHandler {
     /// Set the hypervisor store (called during daemon init).
     pub async fn set_hypervisor_store(&self, store: Arc<syfrah_org::HypervisorStore>) {
         let mut guard = self.hypervisor_store.write().await;
+        *guard = Some(store);
+    }
+
+    /// Set the org store (called during daemon init for Raft IP allocation).
+    pub async fn set_org_store(&self, store: Arc<syfrah_org::OrgStore>) {
+        let mut guard = self.org_store.write().await;
         *guard = Some(store);
     }
 
@@ -257,13 +266,102 @@ impl RaftComputeHandler {
                 if decision.hypervisor_id == self.local_node_name || decision.is_local_fallback {
                     // Create locally.
                     debug!("raft compute: creating VM locally (scheduler picked this node)");
-                    self.inner.handle(request.to_vec(), caller_uid).await
+                    let result = self.inner.handle(request.to_vec(), caller_uid).await;
+
+                    // After local create succeeds, submit NIC record to Raft so all
+                    // nodes can resolve VM -> NIC for sg check and other queries.
+                    if let Ok(resp) = serde_json::from_slice::<ComputeResponse>(&result) {
+                        if !matches!(resp, ComputeResponse::Error(_)) {
+                            if let Some(subnet_info) = subnet.as_ref() {
+                                // Resolve subnet ID for NIC.
+                                let org_guard = self.org_store.read().await;
+                                if let Some(ref store) = *org_guard {
+                                    if let Ok(matches) =
+                                        store.find_subnets_by_name(&subnet_info.name)
+                                    {
+                                        if let Some((sid, _)) = matches.into_iter().next() {
+                                            // Find the NIC that was just created locally.
+                                            if let Ok(Some(nic)) = store.find_nic_by_vm(&name) {
+                                                let cmd = StateMachineCommand::CreateNic {
+                                                    vm_id: name.clone(),
+                                                    subnet_id: sid,
+                                                    ip: nic.private_ip.clone(),
+                                                    mac: nic.mac.clone(),
+                                                };
+                                                if let Err(e) = client.write(cmd).await {
+                                                    debug!("NIC replication via Raft failed: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                drop(org_guard);
+                            }
+                        }
+                    }
+
+                    result
                 } else {
                     // Create on remote hypervisor.
+                    // Step 1: Allocate IP through Raft BEFORE dispatching to remote.
+                    // This ensures globally unique IPs — the remote Forge uses the
+                    // pre-allocated IP instead of allocating from its local IPAM.
                     debug!(
                         "raft compute: creating VM on remote hypervisor '{}'",
                         decision.hypervisor_id
                     );
+
+                    let mut pre_ip: Option<String> = None;
+                    let mut pre_mac: Option<String> = None;
+
+                    if let Some(subnet_info) = subnet.as_ref() {
+                        // Resolve subnet ID from the org store.
+                        let org_guard = self.org_store.read().await;
+                        let subnet_id = if let Some(ref store) = *org_guard {
+                            store
+                                .find_subnets_by_name(&subnet_info.name)
+                                .ok()
+                                .and_then(|matches| matches.into_iter().next().map(|(id, _)| id))
+                        } else {
+                            None
+                        };
+                        drop(org_guard);
+
+                        if let Some(sid) = subnet_id {
+                            // Allocate IP through Raft (globally consistent).
+                            let alloc_cmd = StateMachineCommand::AllocateIp {
+                                subnet_id: sid.clone(),
+                            };
+                            match client.write(alloc_cmd).await {
+                                Ok(StateMachineResponse::AllocatedIp { ip, mac }) => {
+                                    info!(
+                                        "raft compute: pre-allocated IP {ip} (mac {mac}) via Raft for remote VM '{}'",
+                                        name
+                                    );
+                                    pre_ip = Some(ip);
+                                    pre_mac = Some(mac);
+                                }
+                                Ok(StateMachineResponse::Error(e)) => {
+                                    warn!("raft compute: Raft IP allocation failed: {e}");
+                                    let compute_resp = ComputeResponse::Error(format!(
+                                        "IP allocation via Raft failed: {e}"
+                                    ));
+                                    return serde_json::to_vec(&compute_resp).unwrap_or_default();
+                                }
+                                Ok(_) => {
+                                    warn!("raft compute: unexpected Raft response for AllocateIp");
+                                }
+                                Err(e) => {
+                                    warn!("raft compute: Raft write failed for IP allocation: {e}");
+                                    let compute_resp = ComputeResponse::Error(format!(
+                                        "Raft IP allocation write failed: {e}"
+                                    ));
+                                    return serde_json::to_vec(&compute_resp).unwrap_or_default();
+                                }
+                            }
+                        }
+                    }
+
                     let forge_addr =
                         syfrah_controlplane::forge_addr_from_fabric_ipv6(&decision.hypervisor_addr);
 
@@ -279,6 +377,8 @@ impl RaftComputeHandler {
                         disk_size_mb,
                         security_groups: security_groups.clone(),
                         zone: None, // Don't pass zone to target — it creates locally.
+                        pre_allocated_ip: pre_ip.clone(),
+                        pre_allocated_mac: pre_mac.clone(),
                     };
 
                     match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req).await {
@@ -287,6 +387,33 @@ impl RaftComputeHandler {
                                 "remote create succeeded: VM '{}' on '{}' (ip={:?})",
                                 name, decision.hypervisor_id, resp.ip
                             );
+
+                            // Submit NIC record to Raft so all nodes can resolve
+                            // VM -> NIC for sg check and other cross-node queries.
+                            if let (Some(ref ip), Some(ref mac)) = (&pre_ip, &pre_mac) {
+                                if let Some(subnet_info) = subnet.as_ref() {
+                                    let org_guard = self.org_store.read().await;
+                                    if let Some(ref store) = *org_guard {
+                                        if let Ok(matches) =
+                                            store.find_subnets_by_name(&subnet_info.name)
+                                        {
+                                            if let Some((sid, _)) = matches.into_iter().next() {
+                                                let cmd = StateMachineCommand::CreateNic {
+                                                    vm_id: name.clone(),
+                                                    subnet_id: sid,
+                                                    ip: ip.clone(),
+                                                    mac: mac.clone(),
+                                                };
+                                                if let Err(e) = client.write(cmd).await {
+                                                    debug!("NIC replication via Raft failed: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    drop(org_guard);
+                                }
+                            }
+
                             // Build a compute response mimicking local create.
                             let vm_json = serde_json::json!({
                                 "id": resp.vm_id.unwrap_or_else(|| name.clone()),
@@ -294,7 +421,7 @@ impl RaftComputeHandler {
                                 "image": image,
                                 "vcpus": vcpus,
                                 "memory_mb": memory_mb,
-                                "ip": resp.ip,
+                                "ip": resp.ip.as_deref().or(pre_ip.as_deref()),
                                 "hypervisor": decision.hypervisor_id,
                                 "zone": zone,
                                 "status": "Created",
@@ -380,6 +507,8 @@ impl RaftComputeHandler {
             disk_size_mb,
             security_groups: security_groups.to_vec(),
             zone: zone.map(|s| s.to_string()),
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
 
         // Forward to leader WITHOUT ?direct=true so the leader runs the

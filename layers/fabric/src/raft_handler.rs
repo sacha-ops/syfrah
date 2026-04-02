@@ -28,6 +28,8 @@ pub struct RaftOrgHandler {
     org_store: Arc<OrgStore>,
     /// Optional Raft client — set when controlplane is initialized.
     raft_client: RwLock<Option<RaftClient>>,
+    /// Optional network backend for peering data plane side effects.
+    network_backend: RwLock<Option<Arc<dyn syfrah_overlay::NetworkBackend>>>,
 }
 
 impl RaftOrgHandler {
@@ -37,7 +39,14 @@ impl RaftOrgHandler {
             inner,
             org_store,
             raft_client: RwLock::new(None),
+            network_backend: RwLock::new(None),
         }
+    }
+
+    /// Set the network backend for peering data plane side effects.
+    pub async fn set_network_backend(&self, backend: Arc<dyn syfrah_overlay::NetworkBackend>) {
+        let mut guard = self.network_backend.write().await;
+        *guard = Some(backend);
     }
 
     /// Set the Raft client (called when controlplane is initialized).
@@ -432,7 +441,49 @@ impl LayerHandler for RaftOrgHandler {
 
         // Standard path: convert to Raft command and submit.
         match to_raft_command(&req) {
-            Some(cmd) => submit_raft_command(client, &req, cmd, &self.org_store).await,
+            Some(cmd) => {
+                let result = submit_raft_command(client, &req, cmd, &self.org_store).await;
+
+                // Post-Raft side effect: wire VPC peering data plane.
+                // When PeerVpc succeeds, create veth pair + nftables FORWARD rules
+                // between the two VPC bridges on this node.
+                if let OrgRequest::VpcPeer { from, to } = &req {
+                    // Check if the Raft command succeeded.
+                    let resp: OrgResponse = serde_json::from_slice(&result)
+                        .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
+                    if !matches!(resp, OrgResponse::Error(_)) {
+                        // Resolve VPC IDs to bridge names.
+                        let vpc_a = self.org_store.get_vpc(from);
+                        let vpc_b = self.org_store.get_vpc(to);
+                        if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
+                            let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
+                            let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
+                            let peering_id = format!("{}-{}", va.id.0, vb.id.0);
+                            let backend_guard = self.network_backend.read().await;
+                            if let Some(ref backend) = *backend_guard {
+                                if let Err(e) = syfrah_overlay::veth_peer::create_veth_peer(
+                                    backend.as_ref(),
+                                    &peering_id,
+                                    &bridge_a,
+                                    &bridge_b,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "peering data plane wiring failed for {from}<->{to}: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "peering data plane wired: {from}<->{to} ({bridge_a}<->{bridge_b})"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                result
+            }
             None => {
                 // No Raft mapping — fall through to direct handling.
                 debug!("no raft mapping for request, using direct handler");

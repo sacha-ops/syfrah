@@ -55,6 +55,14 @@ pub struct VmSpec {
     /// Defaults to `["default"]` if empty.
     #[serde(default)]
     pub security_groups: Vec<String>,
+    /// Pre-allocated IP from Raft IPAM (for remote placement).
+    /// When set, the local IPAM allocation is skipped — the IP was already
+    /// allocated through the Raft state machine on the leader.
+    #[serde(default)]
+    pub pre_allocated_ip: Option<String>,
+    /// Pre-allocated MAC from Raft IPAM (for remote placement).
+    #[serde(default)]
+    pub pre_allocated_mac: Option<String>,
 }
 
 /// Resolved subnet information passed through to the VM creation flow.
@@ -244,6 +252,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -265,6 +275,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -403,6 +415,8 @@ mod tests {
             disk_size_mb: Some(20480),
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();

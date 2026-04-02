@@ -219,6 +219,8 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 disk_size_mb,
                 subnet,
                 security_groups,
+                pre_allocated_ip: None,
+                pre_allocated_mac: None,
             };
             match mgr.create_vm(spec).await {
                 Ok(status) => ComputeResponse::Vm(vm_status_to_json(&status)),
