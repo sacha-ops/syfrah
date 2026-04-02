@@ -1880,10 +1880,21 @@ pub async fn run_daemon(
             // -- FDB incremental update task ------------------------------------------
             //
             // Listen for PlaceVm/RemoveVm events from the Raft state machine and
-            // apply incremental FDB + ARP proxy updates. This is O(1) per event.
+            // apply incremental FDB + ARP proxy updates.
+            //
+            // Two cases on PlacementEvent::Added:
+            //  1. Remote VM (hypervisor_id != local_node): add FDB entry pointing
+            //     to the remote hypervisor. This is O(1).
+            //  2. Local VM (hypervisor_id == local_node): a new VM was just placed
+            //     on THIS node. The VXLAN interface for its VPC now exists, but
+            //     FDB entries for OTHER remote VMs in the same VPC may be missing
+            //     (their PlacementEvents arrived before the VXLAN existed here).
+            //     Fix: query the placement store for all remote peers in this VPC
+            //     and add their FDB + ARP entries. This is O(VMs in VPC).
             {
                 let local_node = my_record.mesh_ipv6.to_string();
                 let mut rx = placement_event_rx;
+                let fdb_placement_store = shared_placement_store.clone();
                 tokio::spawn(async move {
                     let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
                         Arc::new(syfrah_overlay::LinuxBackend::new());
@@ -1925,23 +1936,90 @@ pub async fn run_daemon(
                                         placement_generation: 0,
                                     },
                                 };
-                                if let Err(e) = syfrah_overlay::sync_placement(
-                                    backend.as_ref(),
-                                    &placement,
-                                    &local_node,
-                                )
-                                .await
+
+                                // Case 1: Remote VM — add single FDB entry.
+                                if placement.hypervisor_id != local_node {
+                                    if let Err(e) = syfrah_overlay::sync_placement(
+                                        backend.as_ref(),
+                                        &placement,
+                                        &local_node,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            vm_id = %placement.vm_id,
+                                            "FDB incremental update failed: {e}"
+                                        );
+                                    } else {
+                                        debug!(
+                                            vm_id = %placement.vm_id,
+                                            action = ?placement.action,
+                                            "FDB incremental update applied"
+                                        );
+                                    }
+                                }
+
+                                // Case 2: Local VM placed — backfill FDB for
+                                // all remote peers in the same VPC whose
+                                // PlacementEvents may have arrived before this
+                                // node had a VXLAN interface for the VPC.
+                                if placement.hypervisor_id == local_node
+                                    && placement.action == syfrah_overlay::PlacementAction::Add
                                 {
-                                    warn!(
-                                        vm_id = %placement.vm_id,
-                                        "FDB incremental update failed: {e}"
-                                    );
-                                } else {
-                                    debug!(
-                                        vm_id = %placement.vm_id,
-                                        action = ?placement.action,
-                                        "FDB incremental update applied"
-                                    );
+                                    if let Some(ref ps) = fdb_placement_store {
+                                        match ps.list_by_vpc(&placement.vpc_id) {
+                                            Ok(peers) => {
+                                                let mut backfilled = 0usize;
+                                                for p in &peers {
+                                                    if p.hypervisor_id == local_node {
+                                                        continue; // skip local VMs
+                                                    }
+                                                    let peer_placement =
+                                                        syfrah_overlay::VmPlacement {
+                                                            vpc_id: p.vpc_id.clone(),
+                                                            vm_id: p.vm_id.clone(),
+                                                            vm_mac: p.vm_mac.clone(),
+                                                            vm_ip: p.vm_ip.clone(),
+                                                            subnet_id: p.subnet_id.clone(),
+                                                            hypervisor_id: p.hypervisor_id.clone(),
+                                                            action:
+                                                                syfrah_overlay::PlacementAction::Add,
+                                                            placement_generation: p
+                                                                .placement_generation,
+                                                        };
+                                                    if let Err(e) = syfrah_overlay::sync_placement(
+                                                        backend.as_ref(),
+                                                        &peer_placement,
+                                                        &local_node,
+                                                    )
+                                                    .await
+                                                    {
+                                                        warn!(
+                                                            vm_id = %p.vm_id,
+                                                            vpc_id = %placement.vpc_id,
+                                                            "FDB backfill failed: {e}"
+                                                        );
+                                                    } else {
+                                                        backfilled += 1;
+                                                    }
+                                                }
+                                                if backfilled > 0 {
+                                                    info!(
+                                                        vpc_id = %placement.vpc_id,
+                                                        vm_id = %placement.vm_id,
+                                                        backfilled,
+                                                        "FDB backfill: added entries for remote VPC peers"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    vpc_id = %placement.vpc_id,
+                                                    "FDB backfill: failed to list VPC placements: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
