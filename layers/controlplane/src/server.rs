@@ -180,34 +180,11 @@ async fn join_handler(
 
     info!("raft: node {} added as learner", req.node_id);
 
-    // Auto-promote to voter if under the max_voters limit.
-    // First, wait for any pending membership changes to be fully applied.
-    // Without this, the 3rd node join fails with 503 because
-    // change_membership rejects when last_applied < last_log (pending config).
-    {
-        use openraft::rt::watch::WatchReceiver;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let metrics = state.raft.metrics().borrow_watched().clone();
-            let last_log = metrics.last_log_index.unwrap_or(0);
-            let last_applied = metrics
-                .last_applied
-                .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index())
-                .unwrap_or(0);
-            if last_applied >= last_log {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    "raft: timed out waiting for log to be applied (applied={}, log={})",
-                    last_applied, last_log
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
+    // Schedule background auto-promotion to voter once the learner is
+    // reachable and caught up. We must NOT promote synchronously because
+    // change_membership waits for the new voter to replicate the membership
+    // entry — but the new node's Raft server is not running yet (it starts
+    // after this join returns and the daemon restarts).
     let current_voters = {
         use openraft::rt::watch::WatchReceiver;
         let metrics = state.raft.metrics().borrow_watched().clone();
@@ -215,32 +192,72 @@ async fn join_handler(
     };
 
     if current_voters < state.max_voters {
-        use openraft::ChangeMembers;
-        match state
-            .raft
-            .change_membership(
-                ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([req.node_id])),
-                true,
-            )
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    "raft: node {} auto-promoted to voter ({}/{} voters)",
-                    req.node_id,
-                    current_voters + 1,
-                    state.max_voters
-                );
-                return Ok(Json(serde_json::json!({
-                    "status": "joined_as_voter",
-                    "node_id": req.node_id,
-                    "role": "voter"
-                })));
+        let raft = state.raft.clone();
+        let max_voters = state.max_voters;
+        let node_id = req.node_id;
+        tokio::spawn(async move {
+            // Wait for the learner to become reachable and replicate
+            // (up to 60s). The learner needs time to restart its daemon
+            // and start its Raft server.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                // Check that all pending log entries are applied (no pending
+                // membership change) before attempting promotion.
+                let (last_log, last_applied) = {
+                    use openraft::rt::watch::WatchReceiver;
+                    let metrics = raft.metrics().borrow_watched().clone();
+                    let log = metrics.last_log_index.unwrap_or(0);
+                    let applied = metrics
+                        .last_applied
+                        .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index())
+                        .unwrap_or(0);
+                    (log, applied)
+                };
+
+                if last_applied < last_log {
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            "raft: timed out waiting to promote node {} (applied={}, log={})",
+                            node_id, last_applied, last_log
+                        );
+                        return;
+                    }
+                    continue;
+                }
+
+                // Attempt promotion.
+                use openraft::ChangeMembers;
+                match raft
+                    .change_membership(
+                        ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([node_id])),
+                        true,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "raft: node {} auto-promoted to voter (bg, {}/{} voters)",
+                            node_id,
+                            current_voters + 1,
+                            max_voters
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            warn!("raft: auto-promote of node {} timed out: {e:?}", node_id);
+                            return;
+                        }
+                        info!(
+                            "raft: auto-promote of node {} not ready, retrying: {e:?}",
+                            node_id
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                warn!("raft: auto-promote failed (node stays as learner): {e:?}");
-            }
-        }
+        });
     } else {
         info!(
             "raft: voter limit reached ({}/{}), node {} stays as learner",
@@ -263,6 +280,32 @@ async fn promote_handler(
     use openraft::ChangeMembers;
 
     info!("raft: promote request for node {}", req.node_id);
+
+    // Wait for any pending membership changes to be fully applied before
+    // attempting promotion. Without this, concurrent promotions fail.
+    {
+        use openraft::rt::watch::WatchReceiver;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let metrics = state.raft.metrics().borrow_watched().clone();
+            let last_log = metrics.last_log_index.unwrap_or(0);
+            let last_applied = metrics
+                .last_applied
+                .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index())
+                .unwrap_or(0);
+            if last_applied >= last_log {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "raft: timed out waiting for log to be applied before promote (applied={}, log={})",
+                    last_applied, last_log
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
     // Promote the learner to voter (retain=true keeps existing learners).
     state

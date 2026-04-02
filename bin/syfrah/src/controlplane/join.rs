@@ -1,7 +1,5 @@
 //! `syfrah controlplane join` — join this node to an existing Raft cluster.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 
 /// Join an existing Raft cluster by contacting the leader.
@@ -39,22 +37,40 @@ pub async fn run() -> Result<()> {
         anyhow::bail!("No fabric peers found. Join the fabric first with 'syfrah fabric join'.");
     }
 
-    let client = reqwest::Client::builder()
+    // Use a short timeout for status probes but a longer one for the
+    // actual join request (the leader may wait up to 10s for pending
+    // membership changes to be applied before promoting).
+    let probe_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Failed to build HTTP client")?;
 
     let mut leader_addr = None;
     for peer in peers {
         let peer_raft_url = format!("http://[{}]:7200/raft/status", peer.mesh_ipv6);
-        if let Ok(resp) = client.get(&peer_raft_url).send().await {
+        if let Ok(resp) = probe_client.get(&peer_raft_url).send().await {
             if resp.status().is_success() {
                 if let Ok(status) = resp
                     .json::<syfrah_controlplane::server::RaftStatusResponse>()
                     .await
                 {
-                    if status.current_leader.is_some() {
-                        leader_addr = Some(format!("[{}]:7200", peer.mesh_ipv6));
+                    if let Some(leader_id) = status.current_leader {
+                        // Find the actual leader's address from member_details
+                        // (the peer we probed might be a follower, not the leader).
+                        if let Some(detail) = status
+                            .member_details
+                            .iter()
+                            .find(|d| d.node_id == leader_id)
+                        {
+                            leader_addr = Some(detail.addr.clone());
+                        } else {
+                            // Fallback: use the probed peer (might be the leader itself).
+                            leader_addr = Some(format!("[{}]:7200", peer.mesh_ipv6));
+                        }
                         break;
                     }
                 }
@@ -73,10 +89,15 @@ pub async fn run() -> Result<()> {
     println!("  Address:  {node_addr}");
     println!("  Leader:   {leader_addr}");
 
-    // Initialize local Raft storage first.
-    let log_db =
-        syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
-    let _log_store = Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
+    // Initialize local Raft storage. Open and immediately close so the
+    // database file exists but the lock is released before we restart the
+    // daemon (redb's file lock prevents concurrent opens).
+    {
+        let log_db =
+            syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
+        let _log_store = syfrah_controlplane::RedbLogStore::new(log_db);
+        // _log_store and log_db dropped here, releasing the file lock.
+    }
 
     // Send join request to the leader.
     let join_url = format!("http://{leader_addr}/raft/join");
