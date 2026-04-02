@@ -181,6 +181,33 @@ async fn join_handler(
     info!("raft: node {} added as learner", req.node_id);
 
     // Auto-promote to voter if under the max_voters limit.
+    // First, wait for any pending membership changes to be fully applied.
+    // Without this, the 3rd node join fails with 503 because
+    // change_membership rejects when last_applied < last_log (pending config).
+    {
+        use openraft::rt::watch::WatchReceiver;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let metrics = state.raft.metrics().borrow_watched().clone();
+            let last_log = metrics.last_log_index.unwrap_or(0);
+            let last_applied = metrics
+                .last_applied
+                .map(|l: openraft::alias::LogIdOf<SyfrahRaftConfig>| l.index())
+                .unwrap_or(0);
+            if last_applied >= last_log {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "raft: timed out waiting for log to be applied (applied={}, log={})",
+                    last_applied, last_log
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     let current_voters = {
         use openraft::rt::watch::WatchReceiver;
         let metrics = state.raft.metrics().borrow_watched().clone();
