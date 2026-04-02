@@ -1,7 +1,5 @@
 //! `syfrah controlplane join` — join this node to an existing Raft cluster.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 
 /// Join an existing Raft cluster by contacting the leader.
@@ -60,8 +58,19 @@ pub async fn run() -> Result<()> {
                     .json::<syfrah_controlplane::server::RaftStatusResponse>()
                     .await
                 {
-                    if status.current_leader.is_some() {
-                        leader_addr = Some(format!("[{}]:7200", peer.mesh_ipv6));
+                    if let Some(leader_id) = status.current_leader {
+                        // Find the actual leader's address from member_details
+                        // (the peer we probed might be a follower, not the leader).
+                        if let Some(detail) = status
+                            .member_details
+                            .iter()
+                            .find(|d| d.node_id == leader_id)
+                        {
+                            leader_addr = Some(detail.addr.clone());
+                        } else {
+                            // Fallback: use the probed peer (might be the leader itself).
+                            leader_addr = Some(format!("[{}]:7200", peer.mesh_ipv6));
+                        }
                         break;
                     }
                 }
@@ -80,10 +89,15 @@ pub async fn run() -> Result<()> {
     println!("  Address:  {node_addr}");
     println!("  Leader:   {leader_addr}");
 
-    // Initialize local Raft storage first.
-    let log_db =
-        syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
-    let _log_store = Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
+    // Initialize local Raft storage. Open and immediately close so the
+    // database file exists but the lock is released before we restart the
+    // daemon (redb's file lock prevents concurrent opens).
+    {
+        let log_db =
+            syfrah_state::LayerDb::open("raft_log").context("Failed to open raft_log database")?;
+        let _log_store = syfrah_controlplane::RedbLogStore::new(log_db);
+        // _log_store and log_db dropped here, releasing the file lock.
+    }
 
     // Send join request to the leader.
     let join_url = format!("http://{leader_addr}/raft/join");
