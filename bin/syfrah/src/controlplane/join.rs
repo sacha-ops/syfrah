@@ -39,15 +39,22 @@ pub async fn run() -> Result<()> {
         anyhow::bail!("No fabric peers found. Join the fabric first with 'syfrah fabric join'.");
     }
 
-    let client = reqwest::Client::builder()
+    // Use a short timeout for status probes but a longer one for the
+    // actual join request (the leader may wait up to 10s for pending
+    // membership changes to be applied before promoting).
+    let probe_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Failed to build HTTP client")?;
 
     let mut leader_addr = None;
     for peer in peers {
         let peer_raft_url = format!("http://[{}]:7200/raft/status", peer.mesh_ipv6);
-        if let Ok(resp) = client.get(&peer_raft_url).send().await {
+        if let Ok(resp) = probe_client.get(&peer_raft_url).send().await {
             if resp.status().is_success() {
                 if let Ok(status) = resp
                     .json::<syfrah_controlplane::server::RaftStatusResponse>()
