@@ -1032,6 +1032,19 @@ pub async fn run_daemon(
                     Arc::clone(&store),
                 ));
                 raft_org_handler = Some(Arc::clone(&raft_handler));
+
+                // Wire the network backend into the Raft org handler for
+                // VPC peering data plane side effects (veth pair + nftables).
+                {
+                    let handler = Arc::clone(&raft_handler);
+                    let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                        Arc::new(syfrah_overlay::LinuxBackend::new());
+                    tokio::spawn(async move {
+                        handler.set_network_backend(backend).await;
+                        tracing::info!("org: network backend wired for peering data plane");
+                    });
+                }
+
                 router.register("org", raft_handler);
 
                 info!("org layer initialised (Raft-aware)");
