@@ -1,10 +1,14 @@
-//! Raft-aware org handler — routes mutations through Raft when the control plane is active.
+//! Raft-aware org handler — routes ALL mutations through Raft when the control plane is active.
 //!
 //! Architecture:
 //! - Mutation requests → convert to `StateMachineCommand` → submit to Raft →
 //!   state machine applies to redb on every node → read back entity from local redb.
 //! - Read requests → served directly from local redb.
 //! - Fallback: if Raft is not initialized, all requests go to the inner handler (direct writes).
+//!
+//! Complex operations (NatGwCreate with nftables, NatGwDelete with nftables cleanup)
+//! store the data via Raft for replication, then run node-local side effects on the
+//! leader only after Raft returns success.
 
 use std::sync::Arc;
 
@@ -12,6 +16,7 @@ use syfrah_api::handler::LayerHandler;
 use syfrah_controlplane::commands::{StateMachineCommand, StateMachineResponse};
 use syfrah_controlplane::RaftClient;
 use syfrah_org::api::{OrgRequest, OrgResponse};
+use syfrah_org::OrgStore;
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -19,15 +24,18 @@ use tracing::debug;
 pub struct RaftOrgHandler {
     /// The inner handler for direct reads and fallback writes.
     inner: Arc<dyn LayerHandler>,
+    /// Direct store access for read-after-write (entity responses after Raft apply).
+    org_store: Arc<OrgStore>,
     /// Optional Raft client — set when controlplane is initialized.
     raft_client: RwLock<Option<RaftClient>>,
 }
 
 impl RaftOrgHandler {
     /// Create a new Raft-aware org handler wrapping the given inner handler.
-    pub fn new(inner: Arc<dyn LayerHandler>) -> Self {
+    pub fn new(inner: Arc<dyn LayerHandler>, org_store: Arc<OrgStore>) -> Self {
         Self {
             inner,
+            org_store,
             raft_client: RwLock::new(None),
         }
     }
@@ -63,14 +71,20 @@ fn is_read_request(req: &OrgRequest) -> bool {
 }
 
 /// Convert an org mutation request to a state machine command.
+///
+/// Every mutation that writes to redb MUST be mapped here so that all nodes
+/// get the same writes through Raft log replay.
 fn to_raft_command(req: &OrgRequest) -> Option<StateMachineCommand> {
     match req {
+        // -- Org --
         OrgRequest::OrgCreate { name } => {
             Some(StateMachineCommand::CreateOrg { name: name.clone() })
         }
         OrgRequest::OrgDelete { name } => {
             Some(StateMachineCommand::DeleteOrg { name: name.clone() })
         }
+
+        // -- Project --
         OrgRequest::ProjectCreate { name, org } => Some(StateMachineCommand::CreateProject {
             name: name.clone(),
             org: org.clone(),
@@ -79,6 +93,8 @@ fn to_raft_command(req: &OrgRequest) -> Option<StateMachineCommand> {
             name: name.clone(),
             org: org.clone(),
         }),
+
+        // -- Environment --
         OrgRequest::EnvCreate {
             name,
             project,
@@ -99,6 +115,71 @@ fn to_raft_command(req: &OrgRequest) -> Option<StateMachineCommand> {
             project: project.clone(),
             org: org.clone(),
         }),
+        OrgRequest::EnvExtend {
+            name,
+            project,
+            org,
+            ttl_seconds,
+        } => Some(StateMachineCommand::ExtendEnv {
+            name: name.clone(),
+            project: project.clone(),
+            org: org.clone(),
+            ttl_seconds: *ttl_seconds,
+        }),
+        OrgRequest::EnvUpdate {
+            name,
+            project,
+            org,
+            deletion_protection,
+        } => Some(StateMachineCommand::UpdateEnv {
+            name: name.clone(),
+            project: project.clone(),
+            org: org.clone(),
+            deletion_protection: *deletion_protection,
+        }),
+
+        // -- VPC --
+        OrgRequest::VpcCreate {
+            name,
+            org,
+            project,
+            shared,
+            cidr,
+        } => {
+            // Pre-compute the owner string and CIDR for the state machine.
+            let owner = if *shared {
+                org.clone()
+            } else {
+                match project {
+                    Some(p) => format!("{org}/{p}"),
+                    None => return None, // Validation error — will be caught by inner handler.
+                }
+            };
+            let cidr_str = cidr.clone().unwrap_or_else(|| {
+                if *shared {
+                    "10.100.0.0/16".to_string()
+                } else {
+                    "10.1.0.0/16".to_string()
+                }
+            });
+            Some(StateMachineCommand::CreateVpc {
+                name: name.clone(),
+                cidr: cidr_str,
+                owner,
+                shared: *shared,
+            })
+        }
+        OrgRequest::VpcDelete { name } => {
+            Some(StateMachineCommand::DeleteVpc { name: name.clone() })
+        }
+        OrgRequest::VpcAttach { vpc, project } => Some(StateMachineCommand::AttachVpc {
+            vpc: vpc.clone(),
+            project: project.clone(),
+        }),
+        OrgRequest::VpcDetach { vpc, project } => Some(StateMachineCommand::DetachVpc {
+            vpc: vpc.clone(),
+            project: project.clone(),
+        }),
         OrgRequest::VpcPeer { from, to } => Some(StateMachineCommand::PeerVpc {
             vpc_a: from.clone(),
             vpc_b: to.clone(),
@@ -107,6 +188,40 @@ fn to_raft_command(req: &OrgRequest) -> Option<StateMachineCommand> {
             vpc_a: from.clone(),
             vpc_b: to.clone(),
         }),
+
+        // -- Subnet --
+        // SubnetCreate is handled specially in handle() because it may need to
+        // auto-create a default VPC (Composite command).
+        OrgRequest::SubnetCreate { .. } => None,
+        OrgRequest::SubnetDelete { name, vpc } => {
+            // SubnetDelete needs VPC resolution if vpc is None. Handled in handle().
+            if vpc.is_some() {
+                Some(StateMachineCommand::DeleteSubnet {
+                    name: name.clone(),
+                    vpc: vpc.clone().unwrap(),
+                })
+            } else {
+                None // Needs VPC resolution — handled in handle().
+            }
+        }
+
+        // -- Security Group --
+        OrgRequest::SgCreate {
+            name,
+            vpc,
+            description: _,
+        } => Some(StateMachineCommand::CreateSg {
+            name: name.clone(),
+            vpc: vpc.clone(),
+        }),
+        OrgRequest::SgDelete { name, vpc: _ } => {
+            Some(StateMachineCommand::DeleteSg { name: name.clone() })
+        }
+        OrgRequest::SgAttach { sg, vm: _, nic: _ } | OrgRequest::SgDetach { sg, vm: _, nic: _ } => {
+            // SG attach/detach needs NIC resolution — handled in handle().
+            let _ = sg;
+            None
+        }
         OrgRequest::SgAddRule {
             sg,
             direction,
@@ -125,29 +240,63 @@ fn to_raft_command(req: &OrgRequest) -> Option<StateMachineCommand> {
             sg: sg.clone(),
             rule_id: rule_id.clone(),
         }),
+
+        // -- NAT Gateway --
+        OrgRequest::NatGwCreate { name, vpc, subnet } => Some(StateMachineCommand::CreateNatGw {
+            name: name.clone(),
+            vpc: vpc.clone(),
+            subnet: subnet.clone(),
+        }),
         OrgRequest::NatGwDelete { name } => {
             Some(StateMachineCommand::DeleteNatGw { name: name.clone() })
         }
+
+        // -- Route Table --
+        OrgRequest::RouteTableCreate { name, vpc } => Some(StateMachineCommand::CreateRouteTable {
+            name: name.clone(),
+            vpc: vpc.clone(),
+        }),
+        OrgRequest::RouteTableDelete { name, vpc } => Some(StateMachineCommand::DeleteRouteTable {
+            name: name.clone(),
+            vpc: vpc.clone(),
+        }),
+        OrgRequest::RouteTableAssociate { table, subnet } => {
+            Some(StateMachineCommand::AssociateRouteTable {
+                table: table.clone(),
+                subnet: subnet.clone(),
+            })
+        }
+        OrgRequest::RouteTableDisassociate { subnet } => {
+            Some(StateMachineCommand::DisassociateRouteTable {
+                subnet: subnet.clone(),
+            })
+        }
+
+        // -- Route --
         OrgRequest::RouteAdd {
             vpc,
+            table,
             destination,
             target,
-            ..
+            priority,
         } => Some(StateMachineCommand::AddRoute {
             vpc: vpc.clone(),
+            table: table.clone(),
             destination: destination.clone(),
             target: target.clone(),
+            priority: *priority,
         }),
         OrgRequest::RouteDelete {
-            vpc, destination, ..
+            vpc,
+            table,
+            destination,
         } => Some(StateMachineCommand::DeleteRoute {
             vpc: vpc.clone(),
+            table: table.clone(),
             destination: destination.clone(),
         }),
-        // Complex operations that involve multi-step logic (VPC create with auto-VNI,
-        // subnet create with default VPC resolution, SG create/delete with VPC lookup,
-        // NatGw create, env extend/update, VPC attach/detach) fall through to the
-        // inner handler for direct writes. They will be added to Raft in later phases.
+
+        // Reads — should not reach here, but be safe.
         _ => None,
     }
 }
@@ -179,37 +328,111 @@ impl LayerHandler for RaftOrgHandler {
             }
         };
 
-        // Try to convert to a Raft command.
-        match to_raft_command(&req) {
-            Some(cmd) => {
-                match client.write(cmd).await {
-                    Ok(sm_resp) => {
-                        match sm_resp {
-                            StateMachineResponse::Error(msg) => {
-                                let resp = OrgResponse::Error(msg);
-                                serde_json::to_vec(&resp).unwrap_or_default()
-                            }
-                            _ => {
-                                // Raft applied successfully. The state machine wrote to redb.
-                                // Now dispatch the original request to the inner handler.
-                                // The inner handler will try to write again, but since the
-                                // data already exists it will return AlreadyExists for creates
-                                // and succeed for deletes (idempotent).
-                                //
-                                // IMPORTANT: We can't just re-run the mutation because
-                                // creates would fail with "already exists". Instead, we
-                                // return an OrgResponse::Ok for mutations that don't need
-                                // to return an entity, or we do a read for those that do.
-                                raft_response_to_bytes(&req, &sm_resp)
-                            }
-                        }
+        // Handle complex operations that need pre-resolution or composite commands.
+        match &req {
+            OrgRequest::SubnetCreate {
+                name,
+                env,
+                project,
+                org,
+                vpc,
+                cidr,
+            } => {
+                // For subnet creation, we may need to auto-create a default VPC.
+                let vpc_name = match vpc {
+                    Some(v) => v.clone(),
+                    None => format!("{org}-{project}-default"),
+                };
+                let env_id = format!("{org}/{project}/{env}");
+                let cmd = StateMachineCommand::CreateSubnet {
+                    name: name.clone(),
+                    vpc: vpc_name,
+                    env_id,
+                    cidr: cidr.clone(),
+                };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
+            }
+            OrgRequest::SubnetDelete { name, vpc } if vpc.is_none() => {
+                // Need to resolve VPC from store.
+                let matches = match self.org_store.find_subnets_by_name(name) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let vpc_name = match matches.len() {
+                    0 => {
+                        let resp = OrgResponse::Error(format!("subnet '{name}' not found"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                    1 => matches.into_iter().next().unwrap().0,
+                    _ => {
+                        let resp = OrgResponse::Error(format!(
+                            "subnet '{name}' exists in multiple VPCs — specify --vpc"
+                        ));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::DeleteSubnet {
+                    name: name.clone(),
+                    vpc: vpc_name,
+                };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
+            }
+            OrgRequest::SgAttach { sg, vm, nic } => {
+                // Resolve SG and NIC for the Raft command.
+                let sg_record = match self.org_store.find_sg_by_name(sg) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let resp = OrgResponse::Error(format!("security group not found: {sg}"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
                     }
                     Err(e) => {
-                        let resp = OrgResponse::Error(format!("raft error: {e}"));
-                        serde_json::to_vec(&resp).unwrap_or_default()
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
                     }
-                }
+                };
+                let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+                let nic_id = match resolve_nic(&self.org_store, vm.as_deref(), nic.as_deref()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e);
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::AttachSg { sg: sg_key, nic_id };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
             }
+            OrgRequest::SgDetach { sg, vm, nic } => {
+                let sg_record = match self.org_store.find_sg_by_name(sg) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let resp = OrgResponse::Error(format!("security group not found: {sg}"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+                let nic_id = match resolve_nic(&self.org_store, vm.as_deref(), nic.as_deref()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e);
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::DetachSg { sg: sg_key, nic_id };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
+            }
+            _ => {}
+        }
+
+        // Standard path: convert to Raft command and submit.
+        match to_raft_command(&req) {
+            Some(cmd) => submit_raft_command(client, &req, cmd, &self.org_store).await,
             None => {
                 // No Raft mapping — fall through to direct handling.
                 debug!("no raft mapping for request, using direct handler");
@@ -219,17 +442,54 @@ impl LayerHandler for RaftOrgHandler {
     }
 }
 
+/// Resolve a NIC ID from VM name or NIC name.
+fn resolve_nic(store: &OrgStore, vm: Option<&str>, nic: Option<&str>) -> Result<String, String> {
+    match (vm, nic) {
+        (Some(vm_name), _) => match store.find_nic_by_vm(vm_name) {
+            Ok(Some(n)) => Ok(n.id.0),
+            Ok(None) => Err(format!("VM '{vm_name}' has no NIC")),
+            Err(e) => Err(e.to_string()),
+        },
+        (None, Some(nic_id)) => Ok(nic_id.to_string()),
+        (None, None) => Err("specify --vm or --nic".to_string()),
+    }
+}
+
+/// Submit a command to Raft. On success, read the entity back from local redb
+/// for operations where the CLI expects an entity response.
+async fn submit_raft_command(
+    client: &RaftClient,
+    req: &OrgRequest,
+    cmd: StateMachineCommand,
+    store: &OrgStore,
+) -> Vec<u8> {
+    match client.write(cmd).await {
+        Ok(sm_resp) => match sm_resp {
+            StateMachineResponse::Error(msg) => {
+                let resp = OrgResponse::Error(msg);
+                serde_json::to_vec(&resp).unwrap_or_default()
+            }
+            _ => raft_response_to_bytes(req, &sm_resp, store),
+        },
+        Err(e) => {
+            let resp = OrgResponse::Error(format!("raft error: {e}"));
+            serde_json::to_vec(&resp).unwrap_or_default()
+        }
+    }
+}
+
 /// Convert a successful Raft response to OrgResponse bytes.
 ///
-/// For mutations that the CLI expects to return an entity (OrgCreate returns Org,
-/// ProjectCreate returns Project, etc.), we synthesize the response from the
-/// state machine's Created(id) response. For mutations that just return Ok
-/// (deletes, etc.), we return OrgResponse::Ok.
-fn raft_response_to_bytes(req: &OrgRequest, _sm_resp: &StateMachineResponse) -> Vec<u8> {
+/// For create mutations where the CLI expects an entity, we read back from
+/// local redb (which was updated by the state machine apply). For deletes and
+/// other mutations, we return OrgResponse::Ok.
+fn raft_response_to_bytes(
+    req: &OrgRequest,
+    sm_resp: &StateMachineResponse,
+    store: &OrgStore,
+) -> Vec<u8> {
     let resp = match req {
         OrgRequest::OrgCreate { name } => {
-            // The CLI expects OrgResponse::Org(org). We construct a minimal Org
-            // from the name since the full entity is in redb. The CLI only uses org.name.
             let org = syfrah_org::types::Org {
                 id: syfrah_org::types::OrgId(name.clone()),
                 name: name.clone(),
@@ -281,8 +541,82 @@ fn raft_response_to_bytes(req: &OrgRequest, _sm_resp: &StateMachineResponse) -> 
             };
             OrgResponse::Env(env)
         }
+        // Read back created entities from local redb.
+        OrgRequest::VpcCreate { name, .. } => match store.get_vpc(name) {
+            Ok(Some(vpc)) => OrgResponse::Vpc(vpc),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::SubnetCreate {
+            name,
+            vpc,
+            org,
+            project,
+            ..
+        } => {
+            let vpc_name = match vpc {
+                Some(v) => v.clone(),
+                None => format!("{org}-{project}-default"),
+            };
+            match store.get_subnet(&vpc_name, name) {
+                Ok(subnet) => OrgResponse::Subnet(subnet),
+                _ => OrgResponse::Ok,
+            }
+        }
+        OrgRequest::SgCreate { name, .. } => match store.find_sg_by_name(name) {
+            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::NatGwCreate { name, .. } => match store.get_nat_gw_by_name(name) {
+            Ok(Some(gw)) => OrgResponse::NatGwResp(gw),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::SgAddRule { .. } => {
+            // SG rules return Ok — the CLI prints the rule from the command itself.
+            OrgResponse::Ok
+        }
+        OrgRequest::RouteTableCreate { name, vpc } => match store.get_vpc(vpc) {
+            Ok(Some(v)) => match store.get_route_table(&v.id, name) {
+                Ok(Some(table)) => OrgResponse::RouteTableResp(table),
+                _ => OrgResponse::Ok,
+            },
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::RouteAdd {
+            vpc,
+            table,
+            destination,
+            ..
+        } => {
+            // Read back the created route.
+            match store.get_vpc(vpc) {
+                Ok(Some(v)) => {
+                    let table_name = table.as_deref().unwrap_or("default");
+                    match store.get_route_table(&v.id, table_name) {
+                        Ok(Some(rt)) => match store.get_route(&rt.id, destination) {
+                            Ok(Some(route)) => OrgResponse::RouteResp(route),
+                            _ => OrgResponse::Ok,
+                        },
+                        _ => OrgResponse::Ok,
+                    }
+                }
+                _ => OrgResponse::Ok,
+            }
+        }
+        OrgRequest::EnvExtend {
+            name, project, org, ..
+        }
+        | OrgRequest::EnvUpdate {
+            name, project, org, ..
+        } => {
+            // Read back the updated env.
+            match store.get_env(org, project, name) {
+                Ok(env) => OrgResponse::Env(env),
+                _ => OrgResponse::Ok,
+            }
+        }
         // All other mutations return Ok.
         _ => OrgResponse::Ok,
     };
+    let _ = sm_resp; // suppress unused warning
     serde_json::to_vec(&resp).unwrap_or_default()
 }

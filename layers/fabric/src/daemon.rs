@@ -1027,8 +1027,10 @@ pub async fn run_daemon(
                 // mutations through Raft when the control plane is active.
                 let inner_handler: Arc<dyn syfrah_api::handler::LayerHandler> =
                     Arc::new(org_handler);
-                let raft_handler =
-                    Arc::new(crate::raft_handler::RaftOrgHandler::new(inner_handler));
+                let raft_handler = Arc::new(crate::raft_handler::RaftOrgHandler::new(
+                    inner_handler,
+                    Arc::clone(&store),
+                ));
                 raft_org_handler = Some(Arc::clone(&raft_handler));
                 router.register("org", raft_handler);
 
@@ -1502,6 +1504,12 @@ pub async fn run_daemon(
             if let Some(ref placement) = shared_placement_store {
                 sm_builder = sm_builder.with_placement_store(Arc::clone(placement));
                 info!("raft: placement store wired into state machine");
+            }
+
+            // Wire shared SG rule store into the state machine for SG rule replication.
+            if let Some(ref sg_rules) = shared_sg_rule_store {
+                sm_builder = sm_builder.with_sg_rule_store(Arc::clone(sg_rules));
+                info!("raft: SG rule store wired into state machine");
             }
 
             let sm = std::sync::Arc::new(sm_builder);

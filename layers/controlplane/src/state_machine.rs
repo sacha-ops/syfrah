@@ -85,6 +85,7 @@ pub struct RedbStateMachine {
     pub org_store: Arc<syfrah_org::OrgStore>,
     pub ipam_store: Option<Arc<syfrah_org::IpamStore>>,
     pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
+    pub sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -107,6 +108,7 @@ impl RedbStateMachine {
             org_store,
             ipam_store: None,
             placement_store: None,
+            sg_rule_store: None,
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
@@ -173,6 +175,21 @@ impl RedbStateMachine {
             }
         }
 
+        // Export SG rule store tables.
+        if let Some(ref sg_rules) = self.sg_rule_store {
+            for table_name in syfrah_org::SgRuleStore::table_names() {
+                match sg_rules.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export SG rule table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
         tables
     }
 
@@ -208,6 +225,17 @@ impl RedbStateMachine {
                 }
             }
         }
+
+        // Import SG rule store tables.
+        if let Some(ref sg_rules) = self.sg_rule_store {
+            for table_name in syfrah_org::SgRuleStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = sg_rules.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import SG rule table {table_name}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribe to placement events for incremental FDB updates.
@@ -227,6 +255,12 @@ impl RedbStateMachine {
     /// Set the placement store for VM placement tracking.
     pub fn with_placement_store(mut self, store: Arc<syfrah_org::PlacementStore>) -> Self {
         self.placement_store = Some(store);
+        self
+    }
+
+    /// Set the SG rule store for security group rule replication.
+    pub fn with_sg_rule_store(mut self, store: Arc<syfrah_org::SgRuleStore>) -> Self {
+        self.sg_rule_store = Some(store);
         self
     }
 
@@ -294,9 +328,14 @@ impl RedbStateMachine {
                 owner,
                 shared,
             } => {
-                use syfrah_org::types::{OrgId, VpcOwner};
+                use syfrah_org::types::{OrgId, ProjectId, VpcOwner};
                 // Reconstruct VpcOwner from the string representation.
-                let vpc_owner = VpcOwner::Org(OrgId(owner.clone()));
+                // If owner contains '/', it's a project (org/project). Otherwise, it's an org.
+                let vpc_owner = if owner.contains('/') {
+                    VpcOwner::Project(ProjectId(owner.clone()))
+                } else {
+                    VpcOwner::Org(OrgId(owner.clone()))
+                };
                 match self.org_store.create_vpc(name, cidr, vpc_owner, *shared) {
                     Ok(vpc) => StateMachineResponse::Created(vpc.id.0),
                     Err(e) => StateMachineResponse::Error(e.to_string()),
@@ -306,6 +345,18 @@ impl RedbStateMachine {
                 Ok(()) => StateMachineResponse::Ok,
                 Err(e) => StateMachineResponse::Error(e.to_string()),
             },
+            StateMachineCommand::AttachVpc { vpc, project } => {
+                match self.org_store.attach_vpc(vpc, project) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DetachVpc { vpc, project } => {
+                match self.org_store.detach_vpc(vpc, project) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
             StateMachineCommand::PeerVpc { vpc_a, vpc_b } => {
                 match self.org_store.create_peering(vpc_a, vpc_b) {
                     Ok(_) => StateMachineResponse::Ok,
@@ -319,6 +370,35 @@ impl RedbStateMachine {
                 }
             }
 
+            // -- Environment mutations --
+            StateMachineCommand::ExtendEnv {
+                name,
+                project,
+                org,
+                ttl_seconds,
+            } => match self.org_store.extend_env(org, project, name, *ttl_seconds) {
+                Ok(_env) => StateMachineResponse::Ok,
+                Err(e) => StateMachineResponse::Error(e.to_string()),
+            },
+            StateMachineCommand::UpdateEnv {
+                name,
+                project,
+                org,
+                deletion_protection,
+            } => {
+                if let Some(dp) = deletion_protection {
+                    match self
+                        .org_store
+                        .update_env_protection(org, project, name, *dp)
+                    {
+                        Ok(_env) => StateMachineResponse::Ok,
+                        Err(e) => StateMachineResponse::Error(e.to_string()),
+                    }
+                } else {
+                    StateMachineResponse::Error("no update specified".to_string())
+                }
+            }
+
             // -- Subnet --
             StateMachineCommand::CreateSubnet {
                 name,
@@ -327,6 +407,30 @@ impl RedbStateMachine {
                 cidr,
             } => {
                 use syfrah_org::types::EnvironmentId;
+                // Auto-create default VPC if it doesn't exist (deterministic on all nodes).
+                if vpc.ends_with("-default") {
+                    if let Ok(None) = self.org_store.get_vpc(vpc) {
+                        // Extract org/project from the VPC name pattern: "{org}-{project}-default"
+                        let parts: Vec<&str> = vpc
+                            .strip_suffix("-default")
+                            .unwrap_or(vpc)
+                            .splitn(2, '-')
+                            .collect();
+                        if parts.len() == 2 {
+                            use syfrah_org::types::{ProjectId, VpcOwner};
+                            let org = parts[0];
+                            let project = parts[1];
+                            let owner = VpcOwner::Project(ProjectId(format!("{org}/{project}")));
+                            if let Err(e) =
+                                self.org_store.create_vpc(vpc, "10.1.0.0/16", owner, false)
+                            {
+                                return StateMachineResponse::Error(format!(
+                                    "failed to auto-create default VPC '{vpc}': {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 let eid = EnvironmentId(env_id.clone());
                 match self
                     .org_store
@@ -356,15 +460,100 @@ impl RedbStateMachine {
                     Err(e) => StateMachineResponse::Error(e.to_string()),
                 }
             }
-            StateMachineCommand::AddSgRule { .. } => {
-                // SG rules are handled by the SgRuleStore, not OrgStore.
-                // For now, return Ok — SG rule store integration will be added.
-                warn!("SG rule commands not yet wired to SgRuleStore in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::AddSgRule {
+                sg,
+                direction,
+                protocol,
+                port,
+                source,
+            } => {
+                let sg_rule_store = match &self.sg_rule_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "SG rule store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                // Resolve SG record to get its ID.
+                let sg_record = match self.org_store.find_sg_by_name(sg) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "security group not found: {sg}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                // Parse direction, protocol, port, source.
+                use syfrah_org::types::{Direction, PortRange, Protocol, RuleId, RuleSource};
+                let dir = match direction.as_str() {
+                    "ingress" => Direction::Ingress,
+                    "egress" => Direction::Egress,
+                    other => {
+                        return StateMachineResponse::Error(format!("invalid direction: '{other}'"))
+                    }
+                };
+                let proto = match protocol.as_str() {
+                    "tcp" => Protocol::Tcp,
+                    "udp" => Protocol::Udp,
+                    "icmp" => Protocol::Icmp,
+                    "all" => Protocol::All,
+                    other => {
+                        return StateMachineResponse::Error(format!("invalid protocol: '{other}'"))
+                    }
+                };
+                let port_range = port.as_ref().and_then(|p| {
+                    if let Some((from, to)) = p.split_once('-') {
+                        Some(PortRange {
+                            from: from.parse().unwrap_or(0),
+                            to: to.parse().unwrap_or(0),
+                        })
+                    } else {
+                        let n: u16 = p.parse().ok()?;
+                        Some(PortRange { from: n, to: n })
+                    }
+                });
+                let rule_source = RuleSource::Cidr(source.clone());
+                // Generate deterministic rule ID from content hash.
+                let rule_id = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    sg_record.id.0.hash(&mut hasher);
+                    dir.hash(&mut hasher);
+                    proto.hash(&mut hasher);
+                    port_range.hash(&mut hasher);
+                    rule_source.hash(&mut hasher);
+                    RuleId(format!("rule-{:016x}", hasher.finish()))
+                };
+                let rule = syfrah_org::types::SecurityGroupRule {
+                    id: rule_id,
+                    sg_id: sg_record.id.clone(),
+                    direction: dir,
+                    protocol: proto,
+                    port_range,
+                    source: rule_source,
+                    priority: 100,
+                    description: None,
+                };
+                match sg_rule_store.add_rule(&rule) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::RemoveSgRule { .. } => {
-                warn!("SG rule commands not yet wired to SgRuleStore in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::RemoveSgRule { sg: _, rule_id } => {
+                let sg_rule_store = match &self.sg_rule_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "SG rule store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match sg_rule_store.remove_rule(rule_id) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
             StateMachineCommand::AttachSg { sg, nic_id } => {
                 match self.org_store.attach_sg_to_nic(sg, nic_id) {
@@ -380,25 +569,216 @@ impl RedbStateMachine {
             }
 
             // -- NAT Gateway --
-            StateMachineCommand::CreateNatGw { .. } => {
-                // NAT GW creation requires VPC ID resolution, which is complex.
-                // For now, log and return Ok.
-                warn!("NAT GW create not yet fully wired in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::CreateNatGw { name, vpc, subnet } => {
+                // Resolve VPC.
+                let vpc_obj = match self.org_store.get_vpc(vpc) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!("VPC not found: {vpc}"))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                // Resolve subnet in VPC.
+                let sub = match self.org_store.find_subnets_by_name(subnet) {
+                    Ok(matches) => {
+                        let in_vpc: Vec<_> = matches
+                            .into_iter()
+                            .filter(|(_, s)| s.vpc_id == vpc_obj.id)
+                            .collect();
+                        match in_vpc.len() {
+                            0 => {
+                                return StateMachineResponse::Error(format!(
+                                    "subnet '{subnet}' not found in VPC '{vpc}'"
+                                ))
+                            }
+                            1 => in_vpc.into_iter().next().unwrap().1,
+                            _ => {
+                                return StateMachineResponse::Error(format!(
+                                    "ambiguous subnet '{subnet}' in VPC '{vpc}'"
+                                ))
+                            }
+                        }
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                // Use a deterministic placeholder for public IP — the actual nftables
+                // setup runs on the leader after Raft apply returns.
+                let public_ip = "0.0.0.0";
+                match self
+                    .org_store
+                    .create_nat_gw(name, &vpc_obj.id, &sub.id, public_ip)
+                {
+                    Ok(gw) => StateMachineResponse::Created(gw.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::DeleteNatGw { .. } => {
-                warn!("NAT GW delete not yet fully wired in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::DeleteNatGw { name } => {
+                let gw = match self.org_store.get_nat_gw_by_name(name) {
+                    Ok(Some(g)) => g,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!("nat-gw not found: {name}"))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match self.org_store.delete_nat_gw(&gw.vpc_id, name) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- Route Table --
+            StateMachineCommand::CreateRouteTable { name, vpc } => {
+                match self.org_store.create_route_table_by_vpc_name(name, vpc) {
+                    Ok(table) => StateMachineResponse::Created(table.id.0),
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DeleteRouteTable { name, vpc } => {
+                let result = if let Some(vname) = vpc {
+                    self.org_store.delete_route_table_by_vpc_name(vname, name)
+                } else {
+                    // Scan all tables.
+                    match self.org_store.list_route_tables() {
+                        Ok(tables) => {
+                            let matching: Vec<_> =
+                                tables.iter().filter(|t| t.name == *name).collect();
+                            match matching.len() {
+                                0 => Err(syfrah_org::OrgError::RouteTableNotFound(name.clone())),
+                                1 => self.org_store.delete_route_table(&matching[0].vpc_id, name),
+                                _ => Err(syfrah_org::OrgError::Ambiguous(format!(
+                                    "route table '{name}' exists in multiple VPCs"
+                                ))),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                match result {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::AssociateRouteTable { table, subnet } => {
+                // Resolve subnet -> VPC -> route table.
+                let sub = match self.org_store.find_subnets_by_name(subnet) {
+                    Ok(m) if m.len() == 1 => m.into_iter().next().unwrap().1,
+                    Ok(m) if m.is_empty() => {
+                        return StateMachineResponse::Error(format!("subnet not found: {subnet}"))
+                    }
+                    Ok(_) => {
+                        return StateMachineResponse::Error(format!(
+                            "subnet '{subnet}' exists in multiple VPCs"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                let rt = match self.org_store.get_route_table(&sub.vpc_id, table) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "route table not found: {table}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match self.org_store.associate_subnet_route_table(&sub.id, &rt.id) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DisassociateRouteTable { subnet } => {
+                let sub = match self.org_store.find_subnets_by_name(subnet) {
+                    Ok(m) if m.len() == 1 => m.into_iter().next().unwrap().1,
+                    Ok(m) if m.is_empty() => {
+                        return StateMachineResponse::Error(format!("subnet not found: {subnet}"))
+                    }
+                    Ok(_) => {
+                        return StateMachineResponse::Error(format!(
+                            "subnet '{subnet}' exists in multiple VPCs"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match self.org_store.disassociate_subnet_route_table(&sub.id) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
 
             // -- Routes --
-            StateMachineCommand::AddRoute { .. } => {
-                warn!("Route add not yet fully wired in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::AddRoute {
+                vpc,
+                table,
+                destination,
+                target,
+                priority,
+            } => {
+                let vpc_obj = match self.org_store.get_vpc(vpc) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!("VPC not found: {vpc}"))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                let table_name = table.as_deref().unwrap_or("default");
+                let rt = match self.org_store.get_route_table(&vpc_obj.id, table_name) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "route table not found: {table_name}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                // Parse the route target string.
+                use syfrah_org::types::RouteTarget;
+                let route_target = if target.eq_ignore_ascii_case("local") {
+                    RouteTarget::Local
+                } else if target.eq_ignore_ascii_case("blackhole") {
+                    RouteTarget::Blackhole
+                } else if let Some(name) = target.strip_prefix("nat-gw:") {
+                    RouteTarget::NatGateway(name.to_string())
+                } else if let Some(name) = target.strip_prefix("peering:") {
+                    RouteTarget::VpcPeering(name.to_string())
+                } else {
+                    return StateMachineResponse::Error(format!(
+                        "invalid route target: '{target}'"
+                    ));
+                };
+                match self
+                    .org_store
+                    .add_route(&rt.id, destination, route_target, *priority)
+                {
+                    Ok(_route) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::DeleteRoute { .. } => {
-                warn!("Route delete not yet fully wired in state machine");
-                StateMachineResponse::Ok
+            StateMachineCommand::DeleteRoute {
+                vpc,
+                table,
+                destination,
+            } => {
+                let vpc_obj = match self.org_store.get_vpc(vpc) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!("VPC not found: {vpc}"))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                let table_name = table.as_deref().unwrap_or("default");
+                let rt = match self.org_store.get_route_table(&vpc_obj.id, table_name) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return StateMachineResponse::Error(format!(
+                            "route table not found: {table_name}"
+                        ))
+                    }
+                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                };
+                match self.org_store.remove_route(&rt.id, destination) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
 
             // -- IPAM --

@@ -347,6 +347,11 @@ pub async fn run_add_rule(
             }
             Ok(())
         }
+        OrgResponse::Ok => {
+            // Raft path returns Ok without the rule entity.
+            println!("Rule added to security group '{sg}'.");
+            Ok(())
+        }
         OrgResponse::Error(msg) => anyhow::bail!("{msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
