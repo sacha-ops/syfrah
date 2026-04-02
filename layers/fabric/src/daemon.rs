@@ -1504,6 +1504,12 @@ pub async fn run_daemon(
                 info!("raft: placement store wired into state machine");
             }
 
+            // Wire shared SG rule store into the state machine for SG rule replication.
+            if let Some(ref sg_rules) = shared_sg_rule_store {
+                sm_builder = sm_builder.with_sg_rule_store(Arc::clone(sg_rules));
+                info!("raft: SG rule store wired into state machine");
+            }
+
             let sm = std::sync::Arc::new(sm_builder);
 
             // Subscribe to placement events for incremental FDB updates.

@@ -22,6 +22,16 @@ impl SgRuleStore {
         Self { db }
     }
 
+    /// Return the underlying database handle (for snapshot export/import).
+    pub fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
+    /// Table names managed by this store (for snapshot export/import).
+    pub fn table_names() -> &'static [&'static str] {
+        &[TABLE]
+    }
+
     /// Validate a security group rule before persisting.
     fn validate(rule: &SecurityGroupRule) -> Result<()> {
         if let Some(ref pr) = rule.port_range {

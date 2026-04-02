@@ -120,14 +120,58 @@ pub enum StateMachineCommand {
         name: String,
     },
 
+    // -- VPC Attach/Detach --
+    AttachVpc {
+        vpc: String,
+        project: String,
+    },
+    DetachVpc {
+        vpc: String,
+        project: String,
+    },
+
+    // -- Environment mutations --
+    ExtendEnv {
+        name: String,
+        project: String,
+        org: String,
+        ttl_seconds: u64,
+    },
+    UpdateEnv {
+        name: String,
+        project: String,
+        org: String,
+        deletion_protection: Option<bool>,
+    },
+
+    // -- Route Table --
+    CreateRouteTable {
+        name: String,
+        vpc: String,
+    },
+    DeleteRouteTable {
+        name: String,
+        vpc: Option<String>,
+    },
+    AssociateRouteTable {
+        table: String,
+        subnet: String,
+    },
+    DisassociateRouteTable {
+        subnet: String,
+    },
+
     // -- Routes --
     AddRoute {
         vpc: String,
+        table: Option<String>,
         destination: String,
         target: String,
+        priority: Option<u32>,
     },
     DeleteRoute {
         vpc: String,
+        table: Option<String>,
         destination: String,
     },
 
@@ -205,6 +249,9 @@ impl std::fmt::Display for StateMachineCommand {
             Self::DeleteVpc { name } => write!(f, "DeleteVpc({name})"),
             Self::RegisterHypervisor { name, .. } => write!(f, "RegisterHypervisor({name})"),
             Self::EnableHypervisor { name } => write!(f, "EnableHypervisor({name})"),
+            Self::AttachVpc { vpc, project } => write!(f, "AttachVpc({vpc}@{project})"),
+            Self::DetachVpc { vpc, project } => write!(f, "DetachVpc({vpc}@{project})"),
+            Self::CreateRouteTable { name, vpc } => write!(f, "CreateRouteTable({name}@{vpc})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -358,13 +405,49 @@ mod tests {
                 subnet: "s".into(),
             },
             StateMachineCommand::DeleteNatGw { name: "nat".into() },
+            StateMachineCommand::AttachVpc {
+                vpc: "v".into(),
+                project: "p".into(),
+            },
+            StateMachineCommand::DetachVpc {
+                vpc: "v".into(),
+                project: "p".into(),
+            },
+            StateMachineCommand::ExtendEnv {
+                name: "dev".into(),
+                project: "b".into(),
+                org: "a".into(),
+                ttl_seconds: 7200,
+            },
+            StateMachineCommand::UpdateEnv {
+                name: "dev".into(),
+                project: "b".into(),
+                org: "a".into(),
+                deletion_protection: Some(true),
+            },
+            StateMachineCommand::CreateRouteTable {
+                name: "rt".into(),
+                vpc: "v".into(),
+            },
+            StateMachineCommand::DeleteRouteTable {
+                name: "rt".into(),
+                vpc: Some("v".into()),
+            },
+            StateMachineCommand::AssociateRouteTable {
+                table: "rt".into(),
+                subnet: "s".into(),
+            },
+            StateMachineCommand::DisassociateRouteTable { subnet: "s".into() },
             StateMachineCommand::AddRoute {
                 vpc: "v".into(),
+                table: None,
                 destination: "0.0.0.0/0".into(),
                 target: "nat".into(),
+                priority: Some(100),
             },
             StateMachineCommand::DeleteRoute {
                 vpc: "v".into(),
+                table: None,
                 destination: "0.0.0.0/0".into(),
             },
             StateMachineCommand::PlaceVm {
