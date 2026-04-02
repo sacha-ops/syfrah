@@ -266,7 +266,41 @@ impl RaftComputeHandler {
                 if decision.hypervisor_id == self.local_node_name || decision.is_local_fallback {
                     // Create locally.
                     debug!("raft compute: creating VM locally (scheduler picked this node)");
-                    self.inner.handle(request.to_vec(), caller_uid).await
+                    let result = self.inner.handle(request.to_vec(), caller_uid).await;
+
+                    // After local create succeeds, submit NIC record to Raft so all
+                    // nodes can resolve VM -> NIC for sg check and other queries.
+                    if let Ok(resp) = serde_json::from_slice::<ComputeResponse>(&result) {
+                        if !matches!(resp, ComputeResponse::Error(_)) {
+                            if let Some(subnet_info) = subnet.as_ref() {
+                                // Resolve subnet ID for NIC.
+                                let org_guard = self.org_store.read().await;
+                                if let Some(ref store) = *org_guard {
+                                    if let Ok(matches) =
+                                        store.find_subnets_by_name(&subnet_info.name)
+                                    {
+                                        if let Some((sid, _)) = matches.into_iter().next() {
+                                            // Find the NIC that was just created locally.
+                                            if let Ok(Some(nic)) = store.find_nic_by_vm(&name) {
+                                                let cmd = StateMachineCommand::CreateNic {
+                                                    vm_id: name.clone(),
+                                                    subnet_id: sid,
+                                                    ip: nic.private_ip.clone(),
+                                                    mac: nic.mac.clone(),
+                                                };
+                                                if let Err(e) = client.write(cmd).await {
+                                                    debug!("NIC replication via Raft failed: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                drop(org_guard);
+                            }
+                        }
+                    }
+
+                    result
                 } else {
                     // Create on remote hypervisor.
                     // Step 1: Allocate IP through Raft BEFORE dispatching to remote.
@@ -355,6 +389,35 @@ impl RaftComputeHandler {
                                 "remote create succeeded: VM '{}' on '{}' (ip={:?})",
                                 name, decision.hypervisor_id, resp.ip
                             );
+
+                            // Submit NIC record to Raft so all nodes can resolve
+                            // VM -> NIC for sg check and other cross-node queries.
+                            if let (Some(ref ip), Some(ref mac)) = (&pre_ip, &pre_mac) {
+                                if let Some(subnet_info) = subnet.as_ref() {
+                                    let org_guard = self.org_store.read().await;
+                                    if let Some(ref store) = *org_guard {
+                                        if let Ok(matches) =
+                                            store.find_subnets_by_name(&subnet_info.name)
+                                        {
+                                            if let Some((sid, _)) = matches.into_iter().next() {
+                                                let cmd = StateMachineCommand::CreateNic {
+                                                    vm_id: name.clone(),
+                                                    subnet_id: sid,
+                                                    ip: ip.clone(),
+                                                    mac: mac.clone(),
+                                                };
+                                                if let Err(e) = client.write(cmd).await {
+                                                    debug!(
+                                                        "NIC replication via Raft failed: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    drop(org_guard);
+                                }
+                            }
+
                             // Build a compute response mimicking local create.
                             let vm_json = serde_json::json!({
                                 "id": resp.vm_id.unwrap_or_else(|| name.clone()),

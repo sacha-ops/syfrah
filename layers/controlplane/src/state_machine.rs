@@ -868,9 +868,58 @@ impl RedbStateMachine {
             }
 
             // -- NIC --
-            StateMachineCommand::CreateNic { .. } => {
-                warn!("NIC commands will be wired in later issues");
-                StateMachineResponse::Ok
+            StateMachineCommand::CreateNic {
+                vm_id,
+                subnet_id,
+                ip,
+                mac,
+            } => {
+                // Resolve the subnet to get VPC ID for the NIC record.
+                let vpc_id = match self.org_store.get_subnet_by_id(subnet_id) {
+                    Ok(Some(subnet)) => subnet.vpc_id.0.clone(),
+                    Ok(None) => {
+                        // If subnet not found, use a fallback (subnet may have been deleted).
+                        warn!("CreateNic: subnet '{subnet_id}' not found, using empty vpc_id");
+                        String::new()
+                    }
+                    Err(e) => {
+                        return StateMachineResponse::Error(format!(
+                            "CreateNic: failed to resolve subnet: {e}"
+                        ))
+                    }
+                };
+
+                // Generate a deterministic NIC ID from VM + subnet.
+                let nic_id = format!("nic-{}-{}", vm_id, subnet_id.replace('/', "-"));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let nic = syfrah_org::types::NetworkInterface {
+                    id: syfrah_org::types::NicId(nic_id.clone()),
+                    name: format!("{vm_id}-eth0"),
+                    vm_id: Some(vm_id.clone()),
+                    subnet_id: subnet_id.clone(),
+                    vpc_id: vpc_id.clone(),
+                    private_ip: ip.clone(),
+                    mac: mac.clone(),
+                    security_groups: vec![],
+                    state: syfrah_org::types::ResourceState::Active,
+                    created_at: now,
+                };
+
+                match self.org_store.create_nic(&nic) {
+                    Ok(()) => StateMachineResponse::Created(nic_id),
+                    Err(e) => {
+                        // If NIC already exists (idempotent retry), treat as success.
+                        if e.to_string().contains("already exists") {
+                            StateMachineResponse::Created(nic_id)
+                        } else {
+                            StateMachineResponse::Error(e.to_string())
+                        }
+                    }
+                }
             }
             StateMachineCommand::DeleteNic { nic_id } => match self.org_store.delete_nic(nic_id) {
                 Ok(()) => StateMachineResponse::Ok,
