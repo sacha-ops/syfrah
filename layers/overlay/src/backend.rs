@@ -73,6 +73,13 @@ pub trait NetworkBackend: Send + Sync {
 
     // ── Firewall ───────────────────────────────────────────────────────
 
+    /// Load the `br_netfilter` kernel module and enable nftables hooks on
+    /// bridged packets so that SG rules are enforced for same-bridge VMs.
+    ///
+    /// Must be called once at daemon startup, before any bridge or nftables
+    /// setup. Errors are non-fatal — the module may already be built in.
+    async fn enable_br_netfilter(&self) -> Result<()>;
+
     /// Apply infrastructure protection rules that block VMs from reaching
     /// host overlay/fabric ports (VXLAN 4789, WireGuard 51820, peering 51821).
     ///
@@ -80,7 +87,7 @@ pub trait NetworkBackend: Send + Sync {
     async fn apply_infra_protection(&self) -> Result<()>;
 
     /// Initialize the SG nftables table with a base forward chain and
-    /// dispatch vmaps. Idempotent — safe to call multiple times.
+    /// physdev dispatch chains. Idempotent — safe to call multiple times.
     async fn apply_sg_base_chain(&self) -> Result<()>;
 
     /// Apply anti-spoofing + default ingress/egress rules for a VM.

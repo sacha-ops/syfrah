@@ -216,6 +216,11 @@ impl NetworkBackend for MockBackend {
 
     // ── Firewall ───────────────────────────────────────────────────────
 
+    async fn enable_br_netfilter(&self) -> Result<()> {
+        self.record("enable_br_netfilter()".to_string());
+        Ok(())
+    }
+
     async fn apply_infra_protection(&self) -> Result<()> {
         self.record("apply_infra_protection()".to_string());
         Ok(())

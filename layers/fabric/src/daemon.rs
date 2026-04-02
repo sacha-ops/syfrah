@@ -1201,6 +1201,13 @@ pub async fn run_daemon(
                                 .map_err(|e| e.to_string())
                         });
 
+                        // Enable bridge netfilter hooks so nftables sees
+                        // bridged VM traffic (same-bridge VM-to-VM).  Must
+                        // run before any bridge or nftables setup.
+                        if let Err(e) = backend.enable_br_netfilter().await {
+                            warn!("compute: failed to enable br_netfilter: {e}");
+                        }
+
                         // Apply infrastructure protection rules before any
                         // VM rules — blocks VMs from reaching VXLAN, WireGuard
                         // and peering ports on the host and in forwarded traffic.
@@ -1209,8 +1216,8 @@ pub async fn run_daemon(
                         }
 
                         // Initialize the SG nftables table with the base
-                        // forward chain and dispatch vmaps so that per-VM
-                        // chains are reachable once VMs are created.
+                        // forward chain and physdev dispatch chains so that
+                        // per-VM chains are reachable once VMs are created.
                         if let Err(e) = backend.apply_sg_base_chain().await {
                             warn!("compute: failed to apply SG base chain: {e}");
                         }
