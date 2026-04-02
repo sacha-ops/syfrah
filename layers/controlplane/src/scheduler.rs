@@ -131,6 +131,40 @@ pub struct HypervisorCandidate {
 }
 
 impl HypervisorCandidate {
+    /// Build from a Raft-replicated Hypervisor record.
+    ///
+    /// This is the preferred path: capacity data flows through Raft (strongly
+    /// consistent) so the scheduler sees all hypervisors in the cluster.
+    pub fn from_hypervisor(hv: &syfrah_org::Hypervisor) -> Self {
+        Self {
+            name: hv.name.clone(),
+            region: hv.region.clone(),
+            zone: hv.zone.clone(),
+            state: hv.state.to_string(),
+            labels: hv.labels.clone(),
+            taints: hv
+                .taints
+                .iter()
+                .map(|t| {
+                    let effect = match t.effect {
+                        syfrah_org::TaintEffect::NoSchedule => "NoSchedule",
+                        syfrah_org::TaintEffect::NoExecute => "NoExecute",
+                    };
+                    match &t.value {
+                        Some(v) => format!("{}={}:{}", t.key, v, effect),
+                        None => format!("{}:{}", t.key, effect),
+                    }
+                })
+                .collect(),
+            allocatable_vcpus: hv.capacity.allocatable_vcpus,
+            allocatable_memory_mb: hv.capacity.allocatable_memory_mb,
+            used_vcpus: hv.capacity.used_vcpus,
+            used_memory_mb: hv.capacity.used_memory_mb,
+            instance_count: 0,
+            fabric_ipv6: hv.fabric_ipv6.clone(),
+        }
+    }
+
     /// Build from a gossip report.
     pub fn from_gossip_report(report: &HypervisorGossipReport, fabric_ipv6: String) -> Self {
         Self {
@@ -196,6 +230,86 @@ impl Scheduler {
             local_node,
             local_addr,
         }
+    }
+
+    /// Schedule a VM placement using Raft-replicated hypervisor records.
+    ///
+    /// This reads from the HypervisorStore (backed by redb, replicated via Raft)
+    /// so the scheduler sees ALL hypervisors in the cluster. Capacity data may be
+    /// up to 10s stale (periodic Raft write interval) but is globally visible.
+    pub fn schedule_from_store(
+        &self,
+        vcpus: u32,
+        memory_mb: u64,
+        constraints: &PlacementConstraints,
+        hypervisor_store: &syfrah_org::HypervisorStore,
+        excluded: &[String],
+        existing_placements: &HashMap<String, u32>,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let hypervisors = match hypervisor_store.list() {
+            Ok(hvs) => hvs,
+            Err(e) => {
+                warn!("scheduler: failed to list hypervisors from store: {e}");
+                return Ok(PlacementDecision {
+                    hypervisor_id: self.local_node.clone(),
+                    hypervisor_addr: self.local_addr.clone(),
+                    score: 0.0,
+                    is_local_fallback: true,
+                });
+            }
+        };
+
+        if hypervisors.is_empty() {
+            info!("scheduler: no hypervisors in store, falling back to local placement");
+            return Ok(PlacementDecision {
+                hypervisor_id: self.local_node.clone(),
+                hypervisor_addr: self.local_addr.clone(),
+                score: 0.0,
+                is_local_fallback: true,
+            });
+        }
+
+        let candidates: Vec<HypervisorCandidate> = hypervisors
+            .iter()
+            .map(HypervisorCandidate::from_hypervisor)
+            .collect();
+
+        let filtered = self.filter(candidates, vcpus, memory_mb, constraints, excluded);
+
+        if filtered.is_empty() {
+            let summary = constraints.summary();
+            return Err(SchedulerError {
+                message: format!("no hypervisor matches constraints: {summary}"),
+                constraints_summary: summary,
+            });
+        }
+
+        let mut scored: Vec<(HypervisorCandidate, f64)> = filtered
+            .into_iter()
+            .map(|c| {
+                let score = self.score(&c, constraints, existing_placements);
+                (c, score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+
+        let (winner, score) = scored.into_iter().next().unwrap();
+        info!(
+            "scheduler: selected hypervisor '{}' (zone={}, score={:.2}) [from store]",
+            winner.name, winner.zone, score
+        );
+
+        Ok(PlacementDecision {
+            hypervisor_id: winner.name,
+            hypervisor_addr: winner.fabric_ipv6,
+            score,
+            is_local_fallback: false,
+        })
     }
 
     /// Schedule a VM placement.

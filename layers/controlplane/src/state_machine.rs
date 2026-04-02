@@ -86,6 +86,7 @@ pub struct RedbStateMachine {
     pub ipam_store: Option<Arc<syfrah_org::IpamStore>>,
     pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
     pub sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
+    pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -109,6 +110,7 @@ impl RedbStateMachine {
             ipam_store: None,
             placement_store: None,
             sg_rule_store: None,
+            hypervisor_store: None,
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
@@ -190,6 +192,21 @@ impl RedbStateMachine {
             }
         }
 
+        // Export hypervisor store tables.
+        if let Some(ref hv_store) = self.hypervisor_store {
+            for table_name in syfrah_org::HypervisorStore::table_names() {
+                match hv_store.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export hypervisor table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
         tables
     }
 
@@ -236,6 +253,17 @@ impl RedbStateMachine {
                 }
             }
         }
+
+        // Import hypervisor store tables.
+        if let Some(ref hv_store) = self.hypervisor_store {
+            for table_name in syfrah_org::HypervisorStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = hv_store.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import hypervisor table {table_name}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribe to placement events for incremental FDB updates.
@@ -261,6 +289,12 @@ impl RedbStateMachine {
     /// Set the SG rule store for security group rule replication.
     pub fn with_sg_rule_store(mut self, store: Arc<syfrah_org::SgRuleStore>) -> Self {
         self.sg_rule_store = Some(store);
+        self
+    }
+
+    /// Set the hypervisor store for Raft-replicated hypervisor registration.
+    pub fn with_hypervisor_store(mut self, store: Arc<syfrah_org::HypervisorStore>) -> Self {
+        self.hypervisor_store = Some(store);
         self
     }
 
@@ -844,20 +878,216 @@ impl RedbStateMachine {
             },
 
             // -- Hypervisor --
-            StateMachineCommand::RegisterHypervisor { .. } => {
-                warn!("Hypervisor commands use separate HypervisorStore — pass-through");
-                StateMachineResponse::Ok
+            // All hypervisor mutations go through Raft so every node gets the
+            // same set of hypervisor records. The scheduler reads from this
+            // store (strongly consistent) for placement decisions.
+            StateMachineCommand::RegisterHypervisor {
+                name,
+                region,
+                zone,
+                fabric_ipv6,
+            } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                // If already exists, update region/zone/fabric_ipv6.
+                match hv_store.get(name) {
+                    Ok(Some(mut hv)) => {
+                        hv.region = region.clone();
+                        hv.zone = zone.clone();
+                        if !fabric_ipv6.is_empty() {
+                            hv.fabric_ipv6 = fabric_ipv6.clone();
+                        }
+                        match hv_store.update(&hv) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e.to_string()),
+                        }
+                    }
+                    Ok(None) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let hv = syfrah_org::Hypervisor {
+                            id: syfrah_org::HypervisorId(format!("hv-{name}")),
+                            name: name.clone(),
+                            region: region.clone(),
+                            zone: zone.clone(),
+                            state: syfrah_org::HypervisorState::NotReady,
+                            fabric_node_id: name.clone(),
+                            public_ip: String::new(),
+                            fabric_ipv6: fabric_ipv6.clone(),
+                            hardware: syfrah_org::HardwareSpec {
+                                cpu_model: String::new(),
+                                cpu_cores_physical: 0,
+                                cpu_threads_logical: 0,
+                                memory_gb: 0,
+                                local_disk_type: syfrah_org::DiskType::SSD,
+                                local_disk_gb: 0,
+                                gpu: None,
+                                network_bandwidth_gbps: 0,
+                                architecture: syfrah_org::CpuArchitecture::X86_64,
+                            },
+                            capacity: syfrah_org::AllocatableCapacity::default(),
+                            labels: std::collections::HashMap::new(),
+                            taints: Vec::new(),
+                            created_at: now,
+                        };
+                        match hv_store.create(&hv) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e.to_string()),
+                        }
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::EnableHypervisor { .. }
-            | StateMachineCommand::DrainHypervisor { .. }
-            | StateMachineCommand::DecommissionHypervisor { .. } => {
-                warn!("Hypervisor state commands use separate HypervisorStore — pass-through");
-                StateMachineResponse::Ok
+            StateMachineCommand::EnableHypervisor { name } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.update_state(name, syfrah_org::HypervisorState::Available) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
-            StateMachineCommand::UpdateHypervisorLabels { .. }
-            | StateMachineCommand::UpdateHypervisorTaints { .. } => {
-                warn!("Hypervisor metadata commands use separate HypervisorStore — pass-through");
-                StateMachineResponse::Ok
+            StateMachineCommand::DrainHypervisor { name } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.update_state(name, syfrah_org::HypervisorState::Draining) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::DecommissionHypervisor { name } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.update_state(name, syfrah_org::HypervisorState::Decommissioned) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::UpdateHypervisorLabels { name, labels } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.get(name) {
+                    Ok(Some(mut hv)) => {
+                        hv.labels = labels.clone();
+                        match hv_store.update(&hv) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e.to_string()),
+                        }
+                    }
+                    Ok(None) => {
+                        StateMachineResponse::Error(format!("hypervisor '{name}' not found"))
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::UpdateHypervisorTaints { name, taints } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.get(name) {
+                    Ok(Some(mut hv)) => {
+                        hv.taints = taints
+                            .iter()
+                            .map(|t| {
+                                // Parse taint string "key=value:Effect"
+                                let (kv, effect_str) =
+                                    t.rsplit_once(':').unwrap_or((t, "NoSchedule"));
+                                let effect = match effect_str {
+                                    "NoExecute" => syfrah_org::TaintEffect::NoExecute,
+                                    _ => syfrah_org::TaintEffect::NoSchedule,
+                                };
+                                let (key, value) = if let Some((k, v)) = kv.split_once('=') {
+                                    (k.to_string(), Some(v.to_string()))
+                                } else {
+                                    (kv.to_string(), None)
+                                };
+                                syfrah_org::Taint { key, value, effect }
+                            })
+                            .collect();
+                        match hv_store.update(&hv) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e.to_string()),
+                        }
+                    }
+                    Ok(None) => {
+                        StateMachineResponse::Error(format!("hypervisor '{name}' not found"))
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+            StateMachineCommand::UpdateHypervisorCapacity {
+                name,
+                allocatable_vcpus,
+                allocatable_memory_mb,
+                used_vcpus,
+                used_memory_mb,
+            } => {
+                let hv_store = match &self.hypervisor_store {
+                    Some(s) => s,
+                    None => {
+                        return StateMachineResponse::Error(
+                            "hypervisor store not available in state machine".to_string(),
+                        )
+                    }
+                };
+                match hv_store.get(name) {
+                    Ok(Some(mut hv)) => {
+                        hv.capacity.allocatable_vcpus = *allocatable_vcpus;
+                        hv.capacity.allocatable_memory_mb = *allocatable_memory_mb;
+                        hv.capacity.used_vcpus = *used_vcpus;
+                        hv.capacity.used_memory_mb = *used_memory_mb;
+                        hv.capacity.available_vcpus = allocatable_vcpus.saturating_sub(*used_vcpus);
+                        hv.capacity.available_memory_mb =
+                            allocatable_memory_mb.saturating_sub(*used_memory_mb);
+                        match hv_store.update(&hv) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e.to_string()),
+                        }
+                    }
+                    Ok(None) => {
+                        // Hypervisor not registered yet — skip silently.
+                        // This can happen during startup when capacity updates arrive
+                        // before registration is replicated.
+                        StateMachineResponse::Ok
+                    }
+                    Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
             }
 
             // -- VM Placement --
@@ -1281,16 +1511,62 @@ mod tests {
     }
 
     #[test]
-    fn apply_passthrough_commands_return_ok() {
+    fn apply_hypervisor_commands_with_store() {
         let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        // Hypervisor commands use a separate store and are pass-through.
+        // Create a hypervisor store and wire it into the state machine.
+        let hv_db = syfrah_state::LayerDb::open_at(&_dir.path().join("hv.redb")).unwrap();
+        let hv_store = std::sync::Arc::new(syfrah_org::HypervisorStore::new(hv_db));
+        let sm = RedbStateMachine::new(store).with_hypervisor_store(hv_store.clone());
+
+        // RegisterHypervisor should create a record in the store.
         let resp = sm.apply_command(&StateMachineCommand::RegisterHypervisor {
             name: "hv1".to_string(),
             region: "eu".to_string(),
             zone: "az1".to_string(),
+            fabric_ipv6: "fd00::1".to_string(),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Verify the hypervisor was created.
+        let hv = hv_store.get("hv1").unwrap().unwrap();
+        assert_eq!(hv.region, "eu");
+        assert_eq!(hv.zone, "az1");
+        assert_eq!(hv.fabric_ipv6, "fd00::1");
+
+        // EnableHypervisor should update state to Available.
+        let resp = sm.apply_command(&StateMachineCommand::EnableHypervisor {
+            name: "hv1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        let hv = hv_store.get("hv1").unwrap().unwrap();
+        assert_eq!(hv.state, syfrah_org::HypervisorState::Available);
+
+        // UpdateHypervisorCapacity should update capacity fields.
+        let resp = sm.apply_command(&StateMachineCommand::UpdateHypervisorCapacity {
+            name: "hv1".to_string(),
+            allocatable_vcpus: 16,
+            allocatable_memory_mb: 65536,
+            used_vcpus: 4,
+            used_memory_mb: 8192,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        let hv = hv_store.get("hv1").unwrap().unwrap();
+        assert_eq!(hv.capacity.allocatable_vcpus, 16);
+        assert_eq!(hv.capacity.used_vcpus, 4);
+    }
+
+    #[test]
+    fn apply_hypervisor_commands_without_store_returns_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Without hypervisor store wired, commands should return error.
+        let resp = sm.apply_command(&StateMachineCommand::RegisterHypervisor {
+            name: "hv1".to_string(),
+            region: "eu".to_string(),
+            zone: "az1".to_string(),
+            fabric_ipv6: "fd00::1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
     }
 
     #[tokio::test]
