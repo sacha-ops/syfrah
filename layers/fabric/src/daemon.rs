@@ -1027,8 +1027,10 @@ pub async fn run_daemon(
                 // mutations through Raft when the control plane is active.
                 let inner_handler: Arc<dyn syfrah_api::handler::LayerHandler> =
                     Arc::new(org_handler);
-                let raft_handler =
-                    Arc::new(crate::raft_handler::RaftOrgHandler::new(inner_handler));
+                let raft_handler = Arc::new(crate::raft_handler::RaftOrgHandler::new(
+                    inner_handler,
+                    Arc::clone(&store),
+                ));
                 raft_org_handler = Some(Arc::clone(&raft_handler));
                 router.register("org", raft_handler);
 

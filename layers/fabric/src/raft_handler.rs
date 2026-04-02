@@ -16,6 +16,7 @@ use syfrah_api::handler::LayerHandler;
 use syfrah_controlplane::commands::{StateMachineCommand, StateMachineResponse};
 use syfrah_controlplane::RaftClient;
 use syfrah_org::api::{OrgRequest, OrgResponse};
+use syfrah_org::OrgStore;
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -23,15 +24,18 @@ use tracing::debug;
 pub struct RaftOrgHandler {
     /// The inner handler for direct reads and fallback writes.
     inner: Arc<dyn LayerHandler>,
+    /// Direct store access for read-after-write (entity responses after Raft apply).
+    org_store: Arc<OrgStore>,
     /// Optional Raft client — set when controlplane is initialized.
     raft_client: RwLock<Option<RaftClient>>,
 }
 
 impl RaftOrgHandler {
     /// Create a new Raft-aware org handler wrapping the given inner handler.
-    pub fn new(inner: Arc<dyn LayerHandler>) -> Self {
+    pub fn new(inner: Arc<dyn LayerHandler>, org_store: Arc<OrgStore>) -> Self {
         Self {
             inner,
+            org_store,
             raft_client: RwLock::new(None),
         }
     }
@@ -335,7 +339,6 @@ impl LayerHandler for RaftOrgHandler {
                 cidr,
             } => {
                 // For subnet creation, we may need to auto-create a default VPC.
-                // Submit a Composite command if the default VPC doesn't exist.
                 let vpc_name = match vpc {
                     Some(v) => v.clone(),
                     None => format!("{org}-{project}-default"),
@@ -347,24 +350,89 @@ impl LayerHandler for RaftOrgHandler {
                     env_id,
                     cidr: cidr.clone(),
                 };
-                return submit_raft_command(client, &req, cmd).await;
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
             }
             OrgRequest::SubnetDelete { name, vpc } if vpc.is_none() => {
-                // Need to resolve VPC from inner handler since we don't have store access.
-                // Fall through to inner handler for resolution.
-                return self.inner.handle(request, caller_uid).await;
+                // Need to resolve VPC from store.
+                let matches = match self.org_store.find_subnets_by_name(name) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let vpc_name = match matches.len() {
+                    0 => {
+                        let resp = OrgResponse::Error(format!("subnet '{name}' not found"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                    1 => matches.into_iter().next().unwrap().0,
+                    _ => {
+                        let resp = OrgResponse::Error(format!(
+                            "subnet '{name}' exists in multiple VPCs — specify --vpc"
+                        ));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::DeleteSubnet {
+                    name: name.clone(),
+                    vpc: vpc_name,
+                };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
             }
-            OrgRequest::SgAttach { .. } | OrgRequest::SgDetach { .. } => {
-                // SG attach/detach needs NIC resolution from store.
-                // Fall through to inner handler.
-                return self.inner.handle(request, caller_uid).await;
+            OrgRequest::SgAttach { sg, vm, nic } => {
+                // Resolve SG and NIC for the Raft command.
+                let sg_record = match self.org_store.find_sg_by_name(sg) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let resp = OrgResponse::Error(format!("security group not found: {sg}"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+                let nic_id = match resolve_nic(&self.org_store, vm.as_deref(), nic.as_deref()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e);
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::AttachSg { sg: sg_key, nic_id };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
+            }
+            OrgRequest::SgDetach { sg, vm, nic } => {
+                let sg_record = match self.org_store.find_sg_by_name(sg) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let resp = OrgResponse::Error(format!("security group not found: {sg}"));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e.to_string());
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let sg_key = format!("{}/{}", sg_record.vpc_id.0, sg_record.name);
+                let nic_id = match resolve_nic(&self.org_store, vm.as_deref(), nic.as_deref()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(e);
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
+                let cmd = StateMachineCommand::DetachSg { sg: sg_key, nic_id };
+                return submit_raft_command(client, &req, cmd, &self.org_store).await;
             }
             _ => {}
         }
 
         // Standard path: convert to Raft command and submit.
         match to_raft_command(&req) {
-            Some(cmd) => submit_raft_command(client, &req, cmd).await,
+            Some(cmd) => submit_raft_command(client, &req, cmd, &self.org_store).await,
             None => {
                 // No Raft mapping — fall through to direct handling.
                 debug!("no raft mapping for request, using direct handler");
@@ -374,11 +442,26 @@ impl LayerHandler for RaftOrgHandler {
     }
 }
 
-/// Submit a command to Raft and convert the response to OrgResponse bytes.
+/// Resolve a NIC ID from VM name or NIC name.
+fn resolve_nic(store: &OrgStore, vm: Option<&str>, nic: Option<&str>) -> Result<String, String> {
+    match (vm, nic) {
+        (Some(vm_name), _) => match store.find_nic_by_vm(vm_name) {
+            Ok(Some(n)) => Ok(n.id.0),
+            Ok(None) => Err(format!("VM '{vm_name}' has no NIC")),
+            Err(e) => Err(e.to_string()),
+        },
+        (None, Some(nic_id)) => Ok(nic_id.to_string()),
+        (None, None) => Err("specify --vm or --nic".to_string()),
+    }
+}
+
+/// Submit a command to Raft. On success, read the entity back from local redb
+/// for operations where the CLI expects an entity response.
 async fn submit_raft_command(
     client: &RaftClient,
     req: &OrgRequest,
     cmd: StateMachineCommand,
+    store: &OrgStore,
 ) -> Vec<u8> {
     match client.write(cmd).await {
         Ok(sm_resp) => match sm_resp {
@@ -386,7 +469,7 @@ async fn submit_raft_command(
                 let resp = OrgResponse::Error(msg);
                 serde_json::to_vec(&resp).unwrap_or_default()
             }
-            _ => raft_response_to_bytes(req, &sm_resp),
+            _ => raft_response_to_bytes(req, &sm_resp, store),
         },
         Err(e) => {
             let resp = OrgResponse::Error(format!("raft error: {e}"));
@@ -397,11 +480,14 @@ async fn submit_raft_command(
 
 /// Convert a successful Raft response to OrgResponse bytes.
 ///
-/// For mutations that the CLI expects to return an entity (OrgCreate returns Org,
-/// ProjectCreate returns Project, etc.), we synthesize the response from the
-/// state machine's Created(id) response. For mutations that just return Ok
-/// (deletes, etc.), we return OrgResponse::Ok.
-fn raft_response_to_bytes(req: &OrgRequest, _sm_resp: &StateMachineResponse) -> Vec<u8> {
+/// For create mutations where the CLI expects an entity, we read back from
+/// local redb (which was updated by the state machine apply). For deletes and
+/// other mutations, we return OrgResponse::Ok.
+fn raft_response_to_bytes(
+    req: &OrgRequest,
+    sm_resp: &StateMachineResponse,
+    store: &OrgStore,
+) -> Vec<u8> {
     let resp = match req {
         OrgRequest::OrgCreate { name } => {
             let org = syfrah_org::types::Org {
@@ -455,8 +541,82 @@ fn raft_response_to_bytes(req: &OrgRequest, _sm_resp: &StateMachineResponse) -> 
             };
             OrgResponse::Env(env)
         }
+        // Read back created entities from local redb.
+        OrgRequest::VpcCreate { name, .. } => match store.get_vpc(name) {
+            Ok(Some(vpc)) => OrgResponse::Vpc(vpc),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::SubnetCreate {
+            name,
+            vpc,
+            org,
+            project,
+            ..
+        } => {
+            let vpc_name = match vpc {
+                Some(v) => v.clone(),
+                None => format!("{org}-{project}-default"),
+            };
+            match store.get_subnet(&vpc_name, name) {
+                Ok(subnet) => OrgResponse::Subnet(subnet),
+                _ => OrgResponse::Ok,
+            }
+        }
+        OrgRequest::SgCreate { name, .. } => match store.find_sg_by_name(name) {
+            Ok(Some(sg)) => OrgResponse::Sg(sg),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::NatGwCreate { name, .. } => match store.get_nat_gw_by_name(name) {
+            Ok(Some(gw)) => OrgResponse::NatGwResp(gw),
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::SgAddRule { .. } => {
+            // SG rules return Ok — the CLI prints the rule from the command itself.
+            OrgResponse::Ok
+        }
+        OrgRequest::RouteTableCreate { name, vpc } => match store.get_vpc(vpc) {
+            Ok(Some(v)) => match store.get_route_table(&v.id, name) {
+                Ok(Some(table)) => OrgResponse::RouteTableResp(table),
+                _ => OrgResponse::Ok,
+            },
+            _ => OrgResponse::Ok,
+        },
+        OrgRequest::RouteAdd {
+            vpc,
+            table,
+            destination,
+            ..
+        } => {
+            // Read back the created route.
+            match store.get_vpc(vpc) {
+                Ok(Some(v)) => {
+                    let table_name = table.as_deref().unwrap_or("default");
+                    match store.get_route_table(&v.id, table_name) {
+                        Ok(Some(rt)) => match store.get_route(&rt.id, destination) {
+                            Ok(Some(route)) => OrgResponse::RouteResp(route),
+                            _ => OrgResponse::Ok,
+                        },
+                        _ => OrgResponse::Ok,
+                    }
+                }
+                _ => OrgResponse::Ok,
+            }
+        }
+        OrgRequest::EnvExtend {
+            name, project, org, ..
+        }
+        | OrgRequest::EnvUpdate {
+            name, project, org, ..
+        } => {
+            // Read back the updated env.
+            match store.get_env(org, project, name) {
+                Ok(env) => OrgResponse::Env(env),
+                _ => OrgResponse::Ok,
+            }
+        }
         // All other mutations return Ok.
         _ => OrgResponse::Ok,
     };
+    let _ = sm_resp; // suppress unused warning
     serde_json::to_vec(&resp).unwrap_or_default()
 }
