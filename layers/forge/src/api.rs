@@ -2536,6 +2536,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         })
     }
 
@@ -2562,6 +2565,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         });
         (dir, state)
     }
@@ -2791,6 +2797,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         });
         let app = forge_router(state);
 
@@ -2830,6 +2839,9 @@ mod tests {
             metrics_collector: None,
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
+            hypervisor_store: None,
+            local_node_name: String::new(),
+            local_fabric_ipv6: String::new(),
         })
     }
 
