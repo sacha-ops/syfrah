@@ -545,7 +545,10 @@ async fn reconcile_peerings(
     for peering in &state.peerings {
         // Check if the veth peer interface already exists.
         let peer_a = naming::peer_name_a(&peering.peering_id);
-        let existing = match backend.list_interfaces(&peer_a[..peer_a.len().min(4)]).await {
+        let existing = match backend
+            .list_interfaces(&peer_a[..peer_a.len().min(4)])
+            .await
+        {
             Ok(list) => list.contains(&peer_a),
             Err(_) => false,
         };

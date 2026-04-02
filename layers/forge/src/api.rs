@@ -1212,15 +1212,14 @@ async fn create_instance_handler(
                 capacity.commit(&req.name, req.vcpus, req.memory_mb as u64);
                 // Immediate Raft capacity update so the scheduler sees increased
                 // utilization right away (not just at the next 10s tick).
-                if let Some(ref raft_client) = state.raft_client.read().await.as_ref() {
-                    let cmd =
-                        syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
-                            name: state.local_node_name.clone(),
-                            allocatable_vcpus: capacity.allocatable_vcpus(),
-                            allocatable_memory_mb: capacity.allocatable_memory_mb(),
-                            used_vcpus: capacity.used_vcpus(),
-                            used_memory_mb: capacity.used_memory_mb(),
-                        };
+                if let Some(raft_client) = state.raft_client.read().await.as_ref() {
+                    let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                        name: state.local_node_name.clone(),
+                        allocatable_vcpus: capacity.allocatable_vcpus(),
+                        allocatable_memory_mb: capacity.allocatable_memory_mb(),
+                        used_vcpus: capacity.used_vcpus(),
+                        used_memory_mb: capacity.used_memory_mb(),
+                    };
                     if let Err(e) = raft_client.write(cmd).await {
                         debug!("immediate capacity update after create failed: {e}");
                     }
@@ -1396,15 +1395,14 @@ async fn delete_instance_handler(
                     "capacity released"
                 );
                 // Immediate Raft capacity update.
-                if let Some(ref raft_client) = state.raft_client.read().await.as_ref() {
-                    let cmd =
-                        syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
-                            name: state.local_node_name.clone(),
-                            allocatable_vcpus: capacity.allocatable_vcpus(),
-                            allocatable_memory_mb: capacity.allocatable_memory_mb(),
-                            used_vcpus: capacity.used_vcpus(),
-                            used_memory_mb: capacity.used_memory_mb(),
-                        };
+                if let Some(raft_client) = state.raft_client.read().await.as_ref() {
+                    let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                        name: state.local_node_name.clone(),
+                        allocatable_vcpus: capacity.allocatable_vcpus(),
+                        allocatable_memory_mb: capacity.allocatable_memory_mb(),
+                        used_vcpus: capacity.used_vcpus(),
+                        used_memory_mb: capacity.used_memory_mb(),
+                    };
                     if let Err(e) = raft_client.write(cmd).await {
                         debug!("immediate capacity update after delete failed: {e}");
                     }

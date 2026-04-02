@@ -1759,7 +1759,8 @@ pub async fn run_daemon(
                 let cap_client = raft_client.clone();
                 let cap_node_name = my_record.name.clone();
                 let mut cap_shutdown = raft_shutdown_rx.clone();
-                let cap_tracker: Arc<syfrah_forge::capacity::CapacityTracker> = Arc::clone(&capacity_for_raft);
+                let cap_tracker: Arc<syfrah_forge::capacity::CapacityTracker> =
+                    Arc::clone(&capacity_for_raft);
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {

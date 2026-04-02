@@ -321,9 +321,7 @@ impl RaftComputeHandler {
                             store
                                 .find_subnets_by_name(&subnet_info.name)
                                 .ok()
-                                .and_then(|matches| {
-                                    matches.into_iter().next().map(|(id, _)| id)
-                                })
+                                .and_then(|matches| matches.into_iter().next().map(|(id, _)| id))
                         } else {
                             None
                         };
@@ -407,9 +405,7 @@ impl RaftComputeHandler {
                                                     mac: mac.clone(),
                                                 };
                                                 if let Err(e) = client.write(cmd).await {
-                                                    debug!(
-                                                        "NIC replication via Raft failed: {e}"
-                                                    );
+                                                    debug!("NIC replication via Raft failed: {e}");
                                                 }
                                             }
                                         }

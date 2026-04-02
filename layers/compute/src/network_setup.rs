@@ -204,9 +204,7 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             let allocation = self
                 .ipam_store
                 .reserve_ip(&subnet_id, &subnet_cidr)
-                .map_err(|e| {
-                    ComputeError::NetworkSetup(format!("IPAM reservation failed: {e}"))
-                })?;
+                .map_err(|e| ComputeError::NetworkSetup(format!("IPAM reservation failed: {e}")))?;
             info!(vm_id, ip = %allocation.ip, mac = %allocation.mac, "IP reserved from local IPAM");
             (allocation.ip.clone(), allocation.mac.clone(), true)
         };

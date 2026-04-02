@@ -442,27 +442,22 @@ impl LayerHandler for RaftOrgHandler {
         // Standard path: convert to Raft command and submit.
         match to_raft_command(&req) {
             Some(cmd) => {
-                let result =
-                    submit_raft_command(client, &req, cmd, &self.org_store).await;
+                let result = submit_raft_command(client, &req, cmd, &self.org_store).await;
 
                 // Post-Raft side effect: wire VPC peering data plane.
                 // When PeerVpc succeeds, create veth pair + nftables FORWARD rules
                 // between the two VPC bridges on this node.
                 if let OrgRequest::VpcPeer { from, to } = &req {
                     // Check if the Raft command succeeded.
-                    let resp: OrgResponse =
-                        serde_json::from_slice(&result).unwrap_or(OrgResponse::Error(
-                            "deserialization failed".to_string(),
-                        ));
+                    let resp: OrgResponse = serde_json::from_slice(&result)
+                        .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
                     if !matches!(resp, OrgResponse::Error(_)) {
                         // Resolve VPC IDs to bridge names.
                         let vpc_a = self.org_store.get_vpc(from);
                         let vpc_b = self.org_store.get_vpc(to);
                         if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
-                            let bridge_a =
-                                syfrah_overlay::naming::bridge_name(&va.id.0);
-                            let bridge_b =
-                                syfrah_overlay::naming::bridge_name(&vb.id.0);
+                            let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
+                            let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
                             let peering_id = format!("{}-{}", va.id.0, vb.id.0);
                             let backend_guard = self.network_backend.read().await;
                             if let Some(ref backend) = *backend_guard {
