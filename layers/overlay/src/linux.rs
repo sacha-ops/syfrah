@@ -333,6 +333,23 @@ impl NetworkBackend for LinuxBackend {
 
     // ── Firewall ───────────────────────────────────────────────────
 
+    async fn enable_br_netfilter(&self) -> Result<()> {
+        // Load the module — ignore error if already loaded or built-in.
+        let _ = std::process::Command::new("modprobe")
+            .arg("br_netfilter")
+            .output();
+
+        // Enable nftables/iptables hooks on bridged packets so that the
+        // forward chain sees VM-to-VM traffic crossing the same bridge.
+        for path in &[
+            "/proc/sys/net/bridge/bridge-nf-call-iptables",
+            "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+        ] {
+            let _ = std::fs::write(path, "1");
+        }
+        Ok(())
+    }
+
     async fn apply_infra_protection(&self) -> Result<()> {
         let ruleset = crate::nft::generate_infra_protection();
         crate::nft::apply_ruleset(&ruleset)

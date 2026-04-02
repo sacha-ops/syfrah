@@ -180,14 +180,21 @@ pub async fn reconcile_network(
     // 2. Check expected TAPs exist — warn if missing
     check_taps(backend, expected_state, &mut report).await;
 
-    // 3a. Re-apply infrastructure protection rules (they don't survive reboot)
+    // 3a. Re-enable br_netfilter (sysctl values don't survive reboot)
+    if let Err(e) = backend.enable_br_netfilter().await {
+        report
+            .warnings
+            .push(format!("br_netfilter re-enable failed: {e}"));
+    }
+
+    // 3b. Re-apply infrastructure protection rules (they don't survive reboot)
     if let Err(e) = backend.apply_infra_protection().await {
         report
             .warnings
             .push(format!("infra protection re-apply failed: {e}"));
     }
 
-    // 3a-bis. Re-apply SG base chain (forward chain + dispatch vmaps)
+    // 3b-bis. Re-apply SG base chain (forward chain + physdev dispatch chains)
     if let Err(e) = backend.apply_sg_base_chain().await {
         report
             .warnings

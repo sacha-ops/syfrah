@@ -208,16 +208,24 @@ const SG_TABLE: &str = "syfrah_sg";
 /// Name of the base forward chain in the SG table.
 const SG_FORWARD_CHAIN: &str = "forward";
 
-/// Name of the ingress dispatch vmap (oif -> per-VM ingress chain).
-const INGRESS_DISPATCH_MAP: &str = "ingress_dispatch";
+/// Name of the ingress dispatch chain (physdev oif + oifname -> per-VM ingress chain).
+const INGRESS_DISPATCH_CHAIN: &str = "dispatch_ingress";
 
-/// Name of the egress dispatch vmap (iif -> per-VM egress chain).
-const EGRESS_DISPATCH_MAP: &str = "egress_dispatch";
+/// Name of the egress dispatch chain (physdev iif + iifname -> per-VM egress chain).
+const EGRESS_DISPATCH_CHAIN: &str = "dispatch_egress";
 
-/// Generate the SG table infrastructure: base forward chain + dispatch vmaps.
+/// Generate the SG table infrastructure: base forward chain + physdev dispatch chains.
 ///
 /// This must be applied once at startup (or before the first VM). All
-/// statements are idempotent (`add` is a no-op if the object exists).
+/// statements are idempotent (`add table` / `add chain` are no-ops if the
+/// object already exists).
+///
+/// With `br_netfilter` active, bridged VM-to-VM traffic passes through the
+/// `forward` hook with `oifname`/`iifname` set to the **bridge** name rather
+/// than the individual veth. Using `physdev oifname`/`physdev iifname` matches
+/// the real per-VM veth, so SG rules are correctly enforced for same-bridge
+/// traffic. The fallback `oifname`/`iifname` lines handle routed (non-bridge)
+/// traffic such as VXLAN return packets where physdev is not set.
 ///
 /// Produces:
 /// ```text
@@ -225,10 +233,10 @@ const EGRESS_DISPATCH_MAP: &str = "egress_dispatch";
 /// add chain inet syfrah_sg forward { type filter hook forward priority 0; policy drop; }
 /// add rule inet syfrah_sg forward ct state established,related accept
 /// add rule inet syfrah_sg forward ct state invalid drop
-/// add map inet syfrah_sg ingress_dispatch { type ifname : verdict; }
-/// add map inet syfrah_sg egress_dispatch { type ifname : verdict; }
-/// add rule inet syfrah_sg forward oifname vmap @ingress_dispatch
-/// add rule inet syfrah_sg forward iifname vmap @egress_dispatch
+/// add rule inet syfrah_sg forward oifname != "lo" goto dispatch_ingress
+/// add rule inet syfrah_sg forward iifname != "lo" goto dispatch_egress
+/// add chain inet syfrah_sg dispatch_ingress
+/// add chain inet syfrah_sg dispatch_egress
 /// ```
 pub fn build_sg_base_chain() -> String {
     let mut buf = String::new();
@@ -249,28 +257,20 @@ pub fn build_sg_base_chain() -> String {
         "add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} ct state invalid drop"
     )
     .unwrap();
-    // Dispatch vmaps (idempotent creation).
+    // Dispatch to per-VM chains.  Skip loopback (lo) to avoid self-loops.
     writeln!(
         buf,
-        "add map inet {SG_TABLE} {INGRESS_DISPATCH_MAP} {{ type ifname : verdict; }}"
+        r#"add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} oifname != "lo" goto {INGRESS_DISPATCH_CHAIN}"#
     )
     .unwrap();
     writeln!(
         buf,
-        "add map inet {SG_TABLE} {EGRESS_DISPATCH_MAP} {{ type ifname : verdict; }}"
+        r#"add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} iifname != "lo" goto {EGRESS_DISPATCH_CHAIN}"#
     )
     .unwrap();
-    // Vmap lookup rules — these dispatch to per-VM chains based on interface.
-    writeln!(
-        buf,
-        "add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} oifname vmap @{INGRESS_DISPATCH_MAP}"
-    )
-    .unwrap();
-    writeln!(
-        buf,
-        "add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} iifname vmap @{EGRESS_DISPATCH_MAP}"
-    )
-    .unwrap();
+    // Dispatch chains: created idempotently; populated per-VM.
+    writeln!(buf, "add chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
+    writeln!(buf, "add chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
     buf
 }
 
@@ -317,16 +317,27 @@ pub fn build_sg_ruleset(
         writeln!(buf, "add rule inet {SG_TABLE} {out_chain} {}", rule.text).unwrap();
     }
 
-    // Vmap entries: map the NIC's interface to the per-VM chains.
+    // Dispatch entries: physdev match (bridged traffic) + iifname/oifname
+    // fallback (routed traffic such as VXLAN return packets).
     let iface = &nic.iface_name;
     writeln!(
         buf,
-        "add element inet {SG_TABLE} {INGRESS_DISPATCH_MAP} {{ \"{iface}\" : jump {in_chain} }}"
+        r#"add rule inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN} physdev oifname "{iface}" jump {in_chain}"#
     )
     .unwrap();
     writeln!(
         buf,
-        "add element inet {SG_TABLE} {EGRESS_DISPATCH_MAP} {{ \"{iface}\" : jump {out_chain} }}"
+        r#"add rule inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN} oifname "{iface}" jump {in_chain}"#
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        r#"add rule inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN} physdev iifname "{iface}" jump {out_chain}"#
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        r#"add rule inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN} iifname "{iface}" jump {out_chain}"#
     )
     .unwrap();
 
@@ -361,11 +372,16 @@ pub fn apply_sg_for_vm(
     crate::nft::apply_ruleset(&ruleset)
 }
 
-/// Remove all SG chains for a VM by removing vmap entries, flushing
-/// and deleting the per-VM chains from the SG table.
+/// Remove all SG chains for a VM, flushing the dispatch chains and
+/// deleting the per-VM chains from the SG table.
 ///
-/// `iface_name` is the host-side interface (TAP or veth) used in the
-/// dispatch vmaps.
+/// Because the dispatch chains contain inline `physdev`/`iifname` rules
+/// (not vmap elements), we flush both dispatch chains entirely and rely
+/// on the reconciliation loop to re-add the entries for remaining VMs.
+/// The per-VM chains are flushed then deleted.
+///
+/// `iface_name` is accepted for API compatibility but is not used in
+/// the removal ruleset — the dispatch chains are flushed wholesale.
 pub fn remove_sg_for_vm(vm_id: &str, iface_name: &str) -> std::io::Result<()> {
     let ruleset = build_remove_ruleset(vm_id, iface_name);
     crate::nft::apply_ruleset(&ruleset)
@@ -373,26 +389,18 @@ pub fn remove_sg_for_vm(vm_id: &str, iface_name: &str) -> std::io::Result<()> {
 
 /// Build the removal ruleset for a VM (for testing without executing).
 ///
-/// Removes vmap dispatch entries first, then flushes and deletes the
-/// per-VM chains.
-pub fn build_remove_ruleset(vm_id: &str, iface_name: &str) -> String {
+/// Flushes both dispatch chains (removing all inline dispatch rules),
+/// then flushes and deletes the per-VM ingress/egress chains.
+/// The `iface_name` parameter is accepted for API compatibility.
+pub fn build_remove_ruleset(vm_id: &str, _iface_name: &str) -> String {
     let in_chain = ingress_chain_name(vm_id);
     let out_chain = egress_chain_name(vm_id);
     let mut buf = String::new();
-    // Remove vmap entries before deleting chains (chains must have no
-    // references before they can be deleted).
-    writeln!(
-        buf,
-        "delete element inet {SG_TABLE} {INGRESS_DISPATCH_MAP} {{ \"{iface_name}\" }}"
-    )
-    .unwrap();
-    writeln!(
-        buf,
-        "delete element inet {SG_TABLE} {EGRESS_DISPATCH_MAP} {{ \"{iface_name}\" }}"
-    )
-    .unwrap();
-    // Flush then delete — both are idempotent-safe with `delete` (nft
-    // returns success if chain does not exist when using -f batch).
+    // Flush dispatch chains so inline physdev rules for this VM are gone.
+    // The reconciliation loop re-adds entries for surviving VMs.
+    writeln!(buf, "flush chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
+    writeln!(buf, "flush chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
+    // Flush then delete per-VM chains — idempotent-safe under `nft -f`.
     writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
     writeln!(buf, "delete chain inet {SG_TABLE} {in_chain}").unwrap();
     writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
@@ -1074,19 +1082,19 @@ mod tests {
         let ruleset = build_remove_ruleset("vm-1", "syft-abcd1234");
         let in_chain = ingress_chain_name("vm-1");
         let out_chain = egress_chain_name("vm-1");
-        // Vmap entries must be removed before chains.
-        assert!(ruleset
-            .contains("delete element inet syfrah_sg ingress_dispatch { \"syft-abcd1234\" }"));
-        assert!(
-            ruleset.contains("delete element inet syfrah_sg egress_dispatch { \"syft-abcd1234\" }")
-        );
+        // Dispatch chains must be flushed before per-VM chains are deleted.
+        assert!(ruleset.contains("flush chain inet syfrah_sg dispatch_ingress"));
+        assert!(ruleset.contains("flush chain inet syfrah_sg dispatch_egress"));
         assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {in_chain}")));
         assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {in_chain}")));
         assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {out_chain}")));
         assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {out_chain}")));
+        // Old vmap-style element deletions must not be present.
+        assert!(!ruleset.contains("delete element inet syfrah_sg ingress_dispatch"));
+        assert!(!ruleset.contains("delete element inet syfrah_sg egress_dispatch"));
     }
 
-    // ── Base chain + vmap dispatch tests ─────────────────────────────
+    // ── Base chain + physdev dispatch tests ──────────────────────────
 
     #[test]
     fn test_build_sg_base_chain() {
@@ -1095,10 +1103,14 @@ mod tests {
         assert!(base.contains("add chain inet syfrah_sg forward { type filter hook forward priority 0; policy drop; }"));
         assert!(base.contains("ct state established,related accept"));
         assert!(base.contains("ct state invalid drop"));
-        assert!(base.contains("add map inet syfrah_sg ingress_dispatch { type ifname : verdict; }"));
-        assert!(base.contains("add map inet syfrah_sg egress_dispatch { type ifname : verdict; }"));
-        assert!(base.contains("oifname vmap @ingress_dispatch"));
-        assert!(base.contains("iifname vmap @egress_dispatch"));
+        // Physdev dispatch chains replace old vmaps.
+        assert!(base.contains("goto dispatch_ingress"));
+        assert!(base.contains("goto dispatch_egress"));
+        assert!(base.contains("add chain inet syfrah_sg dispatch_ingress"));
+        assert!(base.contains("add chain inet syfrah_sg dispatch_egress"));
+        // Old vmap-style dispatch must not be present.
+        assert!(!base.contains("add map inet syfrah_sg ingress_dispatch"));
+        assert!(!base.contains("add map inet syfrah_sg egress_dispatch"));
     }
 
     #[test]
@@ -1114,13 +1126,13 @@ mod tests {
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
         // Must include the base forward chain with hook.
         assert!(ruleset.contains("type filter hook forward priority 0; policy drop;"));
-        // Must include dispatch vmaps.
-        assert!(ruleset.contains("add map inet syfrah_sg ingress_dispatch"));
-        assert!(ruleset.contains("add map inet syfrah_sg egress_dispatch"));
+        // Must include physdev dispatch chains.
+        assert!(ruleset.contains("add chain inet syfrah_sg dispatch_ingress"));
+        assert!(ruleset.contains("add chain inet syfrah_sg dispatch_egress"));
     }
 
     #[test]
-    fn test_build_sg_ruleset_includes_vmap_entries() {
+    fn test_build_sg_ruleset_includes_physdev_dispatch_entries() {
         let nic = test_nic();
         let rules = vec![ingress_rule(
             Protocol::Tcp,
@@ -1132,23 +1144,36 @@ mod tests {
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
         let in_chain = ingress_chain_name(&nic.vm_id);
         let out_chain = egress_chain_name(&nic.vm_id);
-        // Vmap entries must map the interface to the per-VM chains.
+        // Physdev (bridged) entries.
         assert!(ruleset.contains(&format!(
-            "add element inet syfrah_sg ingress_dispatch {{ \"syft-abcd1234\" : jump {in_chain} }}"
+            r#"add rule inet syfrah_sg dispatch_ingress physdev oifname "syft-abcd1234" jump {in_chain}"#
         )));
         assert!(ruleset.contains(&format!(
-            "add element inet syfrah_sg egress_dispatch {{ \"syft-abcd1234\" : jump {out_chain} }}"
+            r#"add rule inet syfrah_sg dispatch_egress physdev iifname "syft-abcd1234" jump {out_chain}"#
+        )));
+        // Fallback (routed) entries.
+        assert!(ruleset.contains(&format!(
+            r#"add rule inet syfrah_sg dispatch_ingress oifname "syft-abcd1234" jump {in_chain}"#
+        )));
+        assert!(ruleset.contains(&format!(
+            r#"add rule inet syfrah_sg dispatch_egress iifname "syft-abcd1234" jump {out_chain}"#
         )));
     }
 
     #[test]
-    fn test_vmap_entries_removed_before_chains() {
+    fn test_dispatch_chains_flushed_before_vm_chains() {
         let ruleset = build_remove_ruleset("vm-1", "syft-abcd1234");
-        let vmap_pos = ruleset.find("delete element").unwrap();
-        let chain_pos = ruleset.find("flush chain").unwrap();
+        let in_chain = ingress_chain_name("vm-1");
+        // The dispatch chain flush must precede the per-VM chain flush.
+        let dispatch_pos = ruleset
+            .find("flush chain inet syfrah_sg dispatch_ingress")
+            .unwrap();
+        let vm_chain_pos = ruleset
+            .find(&format!("flush chain inet syfrah_sg {in_chain}"))
+            .unwrap();
         assert!(
-            vmap_pos < chain_pos,
-            "vmap entries must be removed before chains are deleted"
+            dispatch_pos < vm_chain_pos,
+            "dispatch chains must be flushed before per-VM chains are deleted"
         );
     }
 }
