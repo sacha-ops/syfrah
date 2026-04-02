@@ -104,9 +104,68 @@ pub async fn run() -> Result<()> {
     std::fs::write(&sentinel, format!("{node_id}"))
         .context("Failed to write raft_initialized sentinel")?;
 
+    // Automatically restart the daemon so the Raft server starts immediately.
+    // Without this, the daemon's one-shot sentinel check at startup misses
+    // the newly created file and Raft never starts until a manual restart.
     println!();
-    println!("Control plane joined. Restart the daemon to activate:");
-    println!("  syfrah fabric stop && syfrah fabric start");
+    println!("Restarting daemon to activate Raft...");
+
+    // Stop the running daemon via SIGTERM.
+    if let Some(pid) = syfrah_fabric::store::daemon_running() {
+        if syfrah_fabric::store::is_syfrah_process(pid) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            // Wait for graceful shutdown (up to 10s).
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if syfrah_fabric::store::daemon_running().is_none() {
+                    break;
+                }
+            }
+            if syfrah_fabric::store::daemon_running().is_some() {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            syfrah_fabric::store::remove_pid();
+            println!("  Daemon stopped (pid {pid}).");
+        }
+    }
+
+    // Re-exec the daemon in the background via the syfrah binary.
+    // This mirrors the double-fork pattern used by `syfrah fabric start`.
+    let exe = std::env::current_exe().context("Failed to find syfrah binary")?;
+    let child = std::process::Command::new(&exe)
+        .args(["fabric", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match child {
+        Ok(_) => {
+            // Wait briefly for the daemon to start and write its PID file.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if syfrah_fabric::store::daemon_running().is_some() {
+                    break;
+                }
+            }
+            if syfrah_fabric::store::daemon_running().is_some() {
+                println!("  Daemon restarted with Raft enabled.");
+            } else {
+                println!("  Daemon spawned but not yet ready. Check: syfrah fabric status");
+            }
+        }
+        Err(e) => {
+            eprintln!("  Warning: failed to restart daemon: {e}");
+            println!("  Restart manually: syfrah fabric stop && syfrah fabric start");
+        }
+    }
 
     Ok(())
 }
