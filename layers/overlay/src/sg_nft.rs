@@ -205,72 +205,99 @@ pub fn render_egress_chain(vm_id: &str, rules: &[NftRule]) -> String {
 /// The nftables table name used for SG chains.
 const SG_TABLE: &str = "syfrah_sg";
 
+/// The nftables address family for the SG table.
+///
+/// We use the `bridge` family so that `oifname`/`iifname` inside the forward
+/// chain resolve to the **actual bridge port** (the per-VM veth), not the
+/// bridge device itself. In the `inet` family, with `br_netfilter` active,
+/// bridged packets report the bridge name in `oifname`/`iifname`, making
+/// per-VM dispatch impossible without `physdev` matching (which requires
+/// `xt_physdev` — an iptables extension not available in pure nftables).
+/// Using the `bridge` family gives correct per-port matching natively.
+const SG_FAMILY: &str = "bridge";
+
 /// Name of the base forward chain in the SG table.
 const SG_FORWARD_CHAIN: &str = "forward";
 
-/// Name of the ingress dispatch chain (physdev oif + oifname -> per-VM ingress chain).
+/// Name of the ingress dispatch chain (oifname -> per-VM ingress chain).
 const INGRESS_DISPATCH_CHAIN: &str = "dispatch_ingress";
 
-/// Name of the egress dispatch chain (physdev iif + iifname -> per-VM egress chain).
+/// Name of the egress dispatch chain (iifname -> per-VM egress chain).
 const EGRESS_DISPATCH_CHAIN: &str = "dispatch_egress";
 
-/// Generate the SG table infrastructure: base forward chain + physdev dispatch chains.
+/// Generate the SG table infrastructure: base forward chain + dispatch chains.
 ///
 /// This must be applied once at startup (or before the first VM). All
 /// statements are idempotent (`add table` / `add chain` are no-ops if the
 /// object already exists).
 ///
-/// With `br_netfilter` active, bridged VM-to-VM traffic passes through the
-/// `forward` hook with `oifname`/`iifname` set to the **bridge** name rather
-/// than the individual veth. Using `physdev oifname`/`physdev iifname` matches
-/// the real per-VM veth, so SG rules are correctly enforced for same-bridge
-/// traffic. The fallback `oifname`/`iifname` lines handle routed (non-bridge)
-/// traffic such as VXLAN return packets where physdev is not set.
+/// The table lives in the `bridge` address family so that `oifname`/`iifname`
+/// in the forward chain resolve to the actual veth bridge port rather than
+/// the bridge device.  This correctly enforces SG rules for same-bridge
+/// VM-to-VM traffic without requiring `xt_physdev` or `br_netfilter` sysctl.
+/// `ether type arp accept` ensures ARP (Layer 2, no IP header) passes through
+/// so that VM address resolution is not blocked by the `policy drop`.
 ///
 /// Produces:
 /// ```text
-/// add table inet syfrah_sg
-/// add chain inet syfrah_sg forward { type filter hook forward priority 0; policy drop; }
-/// add rule inet syfrah_sg forward ct state established,related accept
-/// add rule inet syfrah_sg forward ct state invalid drop
-/// add rule inet syfrah_sg forward oifname != "lo" goto dispatch_ingress
-/// add rule inet syfrah_sg forward iifname != "lo" goto dispatch_egress
-/// add chain inet syfrah_sg dispatch_ingress
-/// add chain inet syfrah_sg dispatch_egress
+/// add table bridge syfrah_sg
+/// add chain bridge syfrah_sg dispatch_ingress
+/// add chain bridge syfrah_sg dispatch_egress
+/// add chain bridge syfrah_sg forward { type filter hook forward priority 0; policy drop; }
+/// add rule bridge syfrah_sg forward ether type arp accept
+/// add rule bridge syfrah_sg forward ct state established,related accept
+/// add rule bridge syfrah_sg forward ct state invalid drop
+/// add rule bridge syfrah_sg forward oifname != "lo" goto dispatch_ingress
+/// add rule bridge syfrah_sg forward iifname != "lo" goto dispatch_egress
 /// ```
 pub fn build_sg_base_chain() -> String {
     let mut buf = String::new();
-    writeln!(buf, "add table inet {SG_TABLE}").unwrap();
+    writeln!(buf, "add table {SG_FAMILY} {SG_TABLE}").unwrap();
     // Dispatch chains must be created before the forward chain rules that
     // reference them via `goto`, otherwise `nft -f -` will reject the rules.
-    writeln!(buf, "add chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
-    writeln!(buf, "add chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
+    writeln!(
+        buf,
+        "add chain {SG_FAMILY} {SG_TABLE} {INGRESS_DISPATCH_CHAIN}"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add chain {SG_FAMILY} {SG_TABLE} {EGRESS_DISPATCH_CHAIN}"
+    )
+    .unwrap();
     // Base forward chain with default-drop policy.
     writeln!(
         buf,
-        "add chain inet {SG_TABLE} {SG_FORWARD_CHAIN} {{ type filter hook forward priority 0; policy drop; }}"
+        "add chain {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} {{ type filter hook forward priority 0; policy drop; }}"
+    )
+    .unwrap();
+    // ARP passthrough: ARP is Layer 2 and has no IP header; it must be
+    // allowed unconditionally so VM address resolution is not blocked.
+    writeln!(
+        buf,
+        "add rule {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} ether type arp accept"
     )
     .unwrap();
     // Conntrack: allow established/related, drop invalid.
     writeln!(
         buf,
-        "add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} ct state established,related accept"
+        "add rule {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} ct state established,related accept"
     )
     .unwrap();
     writeln!(
         buf,
-        "add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} ct state invalid drop"
+        "add rule {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} ct state invalid drop"
     )
     .unwrap();
     // Dispatch to per-VM chains.  Skip loopback (lo) to avoid self-loops.
     writeln!(
         buf,
-        r#"add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} oifname != "lo" goto {INGRESS_DISPATCH_CHAIN}"#
+        r#"add rule {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} oifname != "lo" goto {INGRESS_DISPATCH_CHAIN}"#
     )
     .unwrap();
     writeln!(
         buf,
-        r#"add rule inet {SG_TABLE} {SG_FORWARD_CHAIN} iifname != "lo" goto {EGRESS_DISPATCH_CHAIN}"#
+        r#"add rule {SG_FAMILY} {SG_TABLE} {SG_FORWARD_CHAIN} iifname != "lo" goto {EGRESS_DISPATCH_CHAIN}"#
     )
     .unwrap();
     buf
@@ -304,42 +331,43 @@ pub fn build_sg_ruleset(
     // Ingress chain: create (idempotent) then flush then populate.
     let ingress_rules = generate_ingress_chain(nic, rules);
     let in_chain = ingress_chain_name(&nic.vm_id);
-    writeln!(buf, "add chain inet {SG_TABLE} {in_chain}").unwrap();
-    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "add chain {SG_FAMILY} {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "flush chain {SG_FAMILY} {SG_TABLE} {in_chain}").unwrap();
     for rule in &ingress_rules {
-        writeln!(buf, "add rule inet {SG_TABLE} {in_chain} {}", rule.text).unwrap();
+        writeln!(
+            buf,
+            "add rule {SG_FAMILY} {SG_TABLE} {in_chain} {}",
+            rule.text
+        )
+        .unwrap();
     }
 
     // Egress chain: create (idempotent) then flush then populate.
     let egress_rules = generate_egress_chain(nic, rules);
     let out_chain = egress_chain_name(&nic.vm_id);
-    writeln!(buf, "add chain inet {SG_TABLE} {out_chain}").unwrap();
-    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "add chain {SG_FAMILY} {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "flush chain {SG_FAMILY} {SG_TABLE} {out_chain}").unwrap();
     for rule in &egress_rules {
-        writeln!(buf, "add rule inet {SG_TABLE} {out_chain} {}", rule.text).unwrap();
+        writeln!(
+            buf,
+            "add rule {SG_FAMILY} {SG_TABLE} {out_chain} {}",
+            rule.text
+        )
+        .unwrap();
     }
 
-    // Dispatch entries: physdev match (bridged traffic) + iifname/oifname
-    // fallback (routed traffic such as VXLAN return packets).
+    // Dispatch entries: in the bridge family, oifname/iifname already resolve
+    // to the real veth port, so simple name matching is sufficient for both
+    // bridged (same-subnet VM-to-VM) and routed traffic.
     let iface = &nic.iface_name;
     writeln!(
         buf,
-        r#"add rule inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN} physdev oifname "{iface}" jump {in_chain}"#
+        r#"add rule {SG_FAMILY} {SG_TABLE} {INGRESS_DISPATCH_CHAIN} oifname "{iface}" jump {in_chain}"#
     )
     .unwrap();
     writeln!(
         buf,
-        r#"add rule inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN} oifname "{iface}" jump {in_chain}"#
-    )
-    .unwrap();
-    writeln!(
-        buf,
-        r#"add rule inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN} physdev iifname "{iface}" jump {out_chain}"#
-    )
-    .unwrap();
-    writeln!(
-        buf,
-        r#"add rule inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN} iifname "{iface}" jump {out_chain}"#
+        r#"add rule {SG_FAMILY} {SG_TABLE} {EGRESS_DISPATCH_CHAIN} iifname "{iface}" jump {out_chain}"#
     )
     .unwrap();
 
@@ -350,11 +378,15 @@ pub fn build_sg_ruleset(
 fn generate_named_set_in_table(sg_name: &str, ips: &[String]) -> String {
     let name = sg_set_name(sg_name);
     let mut buf = String::new();
-    writeln!(buf, "add set inet {SG_TABLE} {name} {{ type ipv4_addr; }}").unwrap();
+    writeln!(
+        buf,
+        "add set {SG_FAMILY} {SG_TABLE} {name} {{ type ipv4_addr; }}"
+    )
+    .unwrap();
     if !ips.is_empty() {
         writeln!(
             buf,
-            "add element inet {SG_TABLE} {name} {{ {} }}",
+            "add element {SG_FAMILY} {SG_TABLE} {name} {{ {} }}",
             ips.join(", ")
         )
         .unwrap();
@@ -398,15 +430,23 @@ pub fn build_remove_ruleset(vm_id: &str, _iface_name: &str) -> String {
     let in_chain = ingress_chain_name(vm_id);
     let out_chain = egress_chain_name(vm_id);
     let mut buf = String::new();
-    // Flush dispatch chains so inline physdev rules for this VM are gone.
+    // Flush dispatch chains so the dispatch rules for this VM are gone.
     // The reconciliation loop re-adds entries for surviving VMs.
-    writeln!(buf, "flush chain inet {SG_TABLE} {INGRESS_DISPATCH_CHAIN}").unwrap();
-    writeln!(buf, "flush chain inet {SG_TABLE} {EGRESS_DISPATCH_CHAIN}").unwrap();
+    writeln!(
+        buf,
+        "flush chain {SG_FAMILY} {SG_TABLE} {INGRESS_DISPATCH_CHAIN}"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "flush chain {SG_FAMILY} {SG_TABLE} {EGRESS_DISPATCH_CHAIN}"
+    )
+    .unwrap();
     // Flush then delete per-VM chains — idempotent-safe under `nft -f`.
-    writeln!(buf, "flush chain inet {SG_TABLE} {in_chain}").unwrap();
-    writeln!(buf, "delete chain inet {SG_TABLE} {in_chain}").unwrap();
-    writeln!(buf, "flush chain inet {SG_TABLE} {out_chain}").unwrap();
-    writeln!(buf, "delete chain inet {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "flush chain {SG_FAMILY} {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "delete chain {SG_FAMILY} {SG_TABLE} {in_chain}").unwrap();
+    writeln!(buf, "flush chain {SG_FAMILY} {SG_TABLE} {out_chain}").unwrap();
+    writeln!(buf, "delete chain {SG_FAMILY} {SG_TABLE} {out_chain}").unwrap();
     buf
 }
 
@@ -1010,7 +1050,7 @@ mod tests {
         )];
         let sg_map = std::collections::HashMap::new();
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
-        assert!(ruleset.contains("add table inet syfrah_sg"));
+        assert!(ruleset.contains("add table bridge syfrah_sg"));
     }
 
     #[test]
@@ -1026,8 +1066,8 @@ mod tests {
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
         let in_chain = ingress_chain_name(&nic.vm_id);
         let out_chain = egress_chain_name(&nic.vm_id);
-        assert!(ruleset.contains(&format!("add chain inet syfrah_sg {in_chain}")));
-        assert!(ruleset.contains(&format!("add chain inet syfrah_sg {out_chain}")));
+        assert!(ruleset.contains(&format!("add chain bridge syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("add chain bridge syfrah_sg {out_chain}")));
     }
 
     #[test]
@@ -1049,7 +1089,7 @@ mod tests {
         );
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
         let set_name = sg_set_name("web-sg");
-        assert!(ruleset.contains(&format!("add set inet syfrah_sg {set_name}")));
+        assert!(ruleset.contains(&format!("add set bridge syfrah_sg {set_name}")));
         assert!(ruleset.contains("10.1.0.5, 10.1.0.6"));
     }
 
@@ -1085,34 +1125,37 @@ mod tests {
         let in_chain = ingress_chain_name("vm-1");
         let out_chain = egress_chain_name("vm-1");
         // Dispatch chains must be flushed before per-VM chains are deleted.
-        assert!(ruleset.contains("flush chain inet syfrah_sg dispatch_ingress"));
-        assert!(ruleset.contains("flush chain inet syfrah_sg dispatch_egress"));
-        assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {in_chain}")));
-        assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {in_chain}")));
-        assert!(ruleset.contains(&format!("flush chain inet syfrah_sg {out_chain}")));
-        assert!(ruleset.contains(&format!("delete chain inet syfrah_sg {out_chain}")));
-        // Old vmap-style element deletions must not be present.
-        assert!(!ruleset.contains("delete element inet syfrah_sg ingress_dispatch"));
-        assert!(!ruleset.contains("delete element inet syfrah_sg egress_dispatch"));
+        assert!(ruleset.contains("flush chain bridge syfrah_sg dispatch_ingress"));
+        assert!(ruleset.contains("flush chain bridge syfrah_sg dispatch_egress"));
+        assert!(ruleset.contains(&format!("flush chain bridge syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("delete chain bridge syfrah_sg {in_chain}")));
+        assert!(ruleset.contains(&format!("flush chain bridge syfrah_sg {out_chain}")));
+        assert!(ruleset.contains(&format!("delete chain bridge syfrah_sg {out_chain}")));
+        // No old vmap-style element deletions.
+        assert!(!ruleset.contains("delete element"));
     }
 
-    // ── Base chain + physdev dispatch tests ──────────────────────────
+    // ── Base chain + bridge dispatch tests ───────────────────────────
 
     #[test]
     fn test_build_sg_base_chain() {
         let base = build_sg_base_chain();
-        assert!(base.contains("add table inet syfrah_sg"));
-        assert!(base.contains("add chain inet syfrah_sg forward { type filter hook forward priority 0; policy drop; }"));
+        // Must use bridge family (not inet) for correct per-port matching.
+        assert!(base.contains("add table bridge syfrah_sg"));
+        assert!(base.contains("add chain bridge syfrah_sg forward { type filter hook forward priority 0; policy drop; }"));
+        // ARP passthrough before conntrack rules.
+        assert!(base.contains("ether type arp accept"));
         assert!(base.contains("ct state established,related accept"));
         assert!(base.contains("ct state invalid drop"));
-        // Physdev dispatch chains replace old vmaps.
+        // Dispatch chains.
         assert!(base.contains("goto dispatch_ingress"));
         assert!(base.contains("goto dispatch_egress"));
-        assert!(base.contains("add chain inet syfrah_sg dispatch_ingress"));
-        assert!(base.contains("add chain inet syfrah_sg dispatch_egress"));
-        // Old vmap-style dispatch must not be present.
-        assert!(!base.contains("add map inet syfrah_sg ingress_dispatch"));
-        assert!(!base.contains("add map inet syfrah_sg egress_dispatch"));
+        assert!(base.contains("add chain bridge syfrah_sg dispatch_ingress"));
+        assert!(base.contains("add chain bridge syfrah_sg dispatch_egress"));
+        // No old vmap-style maps.
+        assert!(!base.contains("add map"));
+        // No inet family references.
+        assert!(!base.contains("inet syfrah_sg"));
     }
 
     #[test]
@@ -1126,15 +1169,16 @@ mod tests {
         )];
         let sg_map = std::collections::HashMap::new();
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
-        // Must include the base forward chain with hook.
+        // Must include the base forward chain with hook (bridge family).
         assert!(ruleset.contains("type filter hook forward priority 0; policy drop;"));
-        // Must include physdev dispatch chains.
-        assert!(ruleset.contains("add chain inet syfrah_sg dispatch_ingress"));
-        assert!(ruleset.contains("add chain inet syfrah_sg dispatch_egress"));
+        assert!(ruleset.contains("ether type arp accept"));
+        // Must include bridge dispatch chains.
+        assert!(ruleset.contains("add chain bridge syfrah_sg dispatch_ingress"));
+        assert!(ruleset.contains("add chain bridge syfrah_sg dispatch_egress"));
     }
 
     #[test]
-    fn test_build_sg_ruleset_includes_physdev_dispatch_entries() {
+    fn test_build_sg_ruleset_includes_bridge_dispatch_entries() {
         let nic = test_nic();
         let rules = vec![ingress_rule(
             Protocol::Tcp,
@@ -1146,20 +1190,16 @@ mod tests {
         let ruleset = build_sg_ruleset(&nic, &rules, &sg_map);
         let in_chain = ingress_chain_name(&nic.vm_id);
         let out_chain = egress_chain_name(&nic.vm_id);
-        // Physdev (bridged) entries.
+        // In the bridge family, oifname/iifname resolve to the real veth port
+        // directly — no physdev matching required.
         assert!(ruleset.contains(&format!(
-            r#"add rule inet syfrah_sg dispatch_ingress physdev oifname "syft-abcd1234" jump {in_chain}"#
+            r#"add rule bridge syfrah_sg dispatch_ingress oifname "syft-abcd1234" jump {in_chain}"#
         )));
         assert!(ruleset.contains(&format!(
-            r#"add rule inet syfrah_sg dispatch_egress physdev iifname "syft-abcd1234" jump {out_chain}"#
+            r#"add rule bridge syfrah_sg dispatch_egress iifname "syft-abcd1234" jump {out_chain}"#
         )));
-        // Fallback (routed) entries.
-        assert!(ruleset.contains(&format!(
-            r#"add rule inet syfrah_sg dispatch_ingress oifname "syft-abcd1234" jump {in_chain}"#
-        )));
-        assert!(ruleset.contains(&format!(
-            r#"add rule inet syfrah_sg dispatch_egress iifname "syft-abcd1234" jump {out_chain}"#
-        )));
+        // Bridge family — no physdev rules should be present.
+        assert!(!ruleset.contains("physdev"));
     }
 
     #[test]
@@ -1168,10 +1208,10 @@ mod tests {
         let in_chain = ingress_chain_name("vm-1");
         // The dispatch chain flush must precede the per-VM chain flush.
         let dispatch_pos = ruleset
-            .find("flush chain inet syfrah_sg dispatch_ingress")
+            .find("flush chain bridge syfrah_sg dispatch_ingress")
             .unwrap();
         let vm_chain_pos = ruleset
-            .find(&format!("flush chain inet syfrah_sg {in_chain}"))
+            .find(&format!("flush chain bridge syfrah_sg {in_chain}"))
             .unwrap();
         assert!(
             dispatch_pos < vm_chain_pos,
