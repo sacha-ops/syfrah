@@ -157,6 +157,14 @@ pub struct CreateInstanceRequest {
     /// runs the scheduler to place the VM on a hypervisor in the requested zone.
     #[serde(default)]
     pub zone: Option<String>,
+    /// Pre-allocated IP from Raft IPAM (set by leader before dispatching to remote).
+    /// When set, the target Forge uses this IP instead of allocating locally,
+    /// preventing duplicate IP assignments across nodes.
+    #[serde(default)]
+    pub pre_allocated_ip: Option<String>,
+    /// Pre-allocated MAC from Raft IPAM (set by leader before dispatching to remote).
+    #[serde(default)]
+    pub pre_allocated_mac: Option<String>,
 }
 
 fn default_vcpus() -> u32 {
@@ -998,6 +1006,8 @@ async fn create_instance_handler(
                             disk_size_mb: req.disk_size_mb,
                             security_groups: req.security_groups.clone(),
                             zone: None, // Don't forward zone to target — it creates locally.
+                            pre_allocated_ip: None,
+                            pre_allocated_mac: None,
                         };
                         match syfrah_controlplane::create_vm_on_remote(&forge_addr, &remote_req)
                             .await
@@ -1192,6 +1202,8 @@ async fn create_instance_handler(
         } else {
             req.security_groups
         },
+        pre_allocated_ip: req.pre_allocated_ip,
+        pre_allocated_mac: req.pre_allocated_mac,
     };
 
     match vm_manager.create_vm(spec).await {

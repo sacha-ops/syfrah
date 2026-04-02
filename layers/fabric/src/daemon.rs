@@ -1382,6 +1382,19 @@ pub async fn run_daemon(
             });
         }
 
+        // Wire the org store into the Raft compute handler so it can resolve
+        // subnets for Raft-based IP allocation before remote VM dispatch.
+        if let Some(ref handler) = raft_compute_handler_ref {
+            if let Some(ref org_store) = shared_org_store {
+                let handler = Arc::clone(handler);
+                let store = Arc::clone(org_store);
+                tokio::spawn(async move {
+                    handler.set_org_store(store).await;
+                    info!("compute: org store wired into Raft compute handler for IPAM");
+                });
+            }
+        }
+
         info!("hypervisor layer initialised");
     }
 

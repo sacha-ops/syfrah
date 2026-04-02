@@ -559,12 +559,20 @@ impl VmManager {
                     ns = ns.with_raft_placement_hook(Arc::clone(hook));
                 }
                 let is_container = self.runtime.name().starts_with("container");
+                let pre_allocated = match (
+                    spec.pre_allocated_ip.as_deref(),
+                    spec.pre_allocated_mac.as_deref(),
+                ) {
+                    (Some(ip), Some(mac)) => Some((ip, mac)),
+                    _ => None,
+                };
                 match ns
-                    .setup_with_sg(
+                    .setup_with_sg_and_ip(
                         &vm_id_str,
                         &subnet_name,
                         is_container,
                         &spec.security_groups,
+                        pre_allocated,
                     )
                     .await
                 {

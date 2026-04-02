@@ -371,6 +371,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         }
     }
 
@@ -402,6 +404,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         }
     }
 
@@ -555,6 +559,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let errors = validate(&spec).unwrap_err();
         // Should have at least 5 errors: vcpus, memory, image, bdf, volume, tap
@@ -724,6 +730,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -743,6 +751,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -798,6 +808,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let errors = validate(&spec).unwrap_err();
         assert!(
@@ -838,6 +850,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let validated = validate(&spec).unwrap();
         let resolved = resolve(
@@ -1038,6 +1052,8 @@ mod tests {
             disk_size_mb: None,
             subnet: None,
             security_groups: vec![],
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
 
         // Step 1: validate

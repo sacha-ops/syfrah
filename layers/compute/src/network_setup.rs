@@ -157,6 +157,27 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         is_container: bool,
         security_groups: &[String],
     ) -> Result<NetworkSetupResult, ComputeError> {
+        self.setup_with_sg_and_ip(vm_id, subnet_name, is_container, security_groups, None)
+            .await
+    }
+
+    /// Run network setup with a pre-allocated IP from Raft.
+    ///
+    /// When `pre_allocated` is `Some((ip, mac))`, the local IPAM allocation is
+    /// skipped — the IP was already allocated through the Raft state machine to
+    /// ensure global uniqueness across all nodes. This is the path used for
+    /// remote VM creation (scheduler placed the VM on this node).
+    ///
+    /// When `pre_allocated` is `None`, falls back to local IPAM allocation
+    /// (single-node mode or backward compatibility).
+    pub async fn setup_with_sg_and_ip(
+        &self,
+        vm_id: &str,
+        subnet_name: &str,
+        is_container: bool,
+        security_groups: &[String],
+        pre_allocated: Option<(&str, &str)>,
+    ) -> Result<NetworkSetupResult, ComputeError> {
         // -- 1. Resolve subnet ------------------------------------------------
         let (subnet, vpc) = self.resolve_subnet(subnet_name)?;
         let subnet_id = subnet.id.0.clone();
@@ -174,17 +195,23 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         );
 
         // -- 2. Allocate IP ---------------------------------------------------
-        let allocation = self
-            .ipam_store
-            .reserve_ip(&subnet_id, &subnet_cidr)
-            .map_err(|e| ComputeError::NetworkSetup(format!("IPAM reservation failed: {e}")))?;
+        // If a pre-allocated IP was provided (from Raft), use it directly.
+        // Otherwise, allocate locally (single-node mode).
+        let (ip, mac, locally_allocated) = if let Some((pre_ip, pre_mac)) = pre_allocated {
+            info!(vm_id, ip = %pre_ip, mac = %pre_mac, "using Raft-allocated IP");
+            (pre_ip.to_string(), pre_mac.to_string(), false)
+        } else {
+            let allocation = self
+                .ipam_store
+                .reserve_ip(&subnet_id, &subnet_cidr)
+                .map_err(|e| {
+                    ComputeError::NetworkSetup(format!("IPAM reservation failed: {e}"))
+                })?;
+            info!(vm_id, ip = %allocation.ip, mac = %allocation.mac, "IP reserved from local IPAM");
+            (allocation.ip.clone(), allocation.mac.clone(), true)
+        };
 
-        let ip = allocation.ip.clone();
-        let mac = allocation.mac.clone();
-
-        info!(vm_id, %ip, %mac, "IP reserved from IPAM");
-
-        // From here on, any failure must release the IP.
+        // From here on, any failure must release the IP (only if locally allocated).
         match self
             .setup_network_resources(
                 vm_id,
@@ -202,15 +229,18 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
         {
             Ok(result) => Ok(result),
             Err(e) => {
-                // Rollback: release IP allocation.
-                warn!(vm_id, %ip, error = %e, "network setup failed, rolling back IP");
-                if let Err(release_err) = self.ipam_store.release_ip(&subnet_id, &subnet_cidr, &ip)
-                {
-                    warn!(
-                        vm_id, %ip,
-                        error = %release_err,
-                        "failed to release IP during rollback"
-                    );
+                // Rollback: release IP allocation only if we allocated it locally.
+                if locally_allocated {
+                    warn!(vm_id, %ip, error = %e, "network setup failed, rolling back IP");
+                    if let Err(release_err) =
+                        self.ipam_store.release_ip(&subnet_id, &subnet_cidr, &ip)
+                    {
+                        warn!(
+                            vm_id, %ip,
+                            error = %release_err,
+                            "failed to release IP during rollback"
+                        );
+                    }
                 }
                 Err(e)
             }

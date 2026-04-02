@@ -23,6 +23,14 @@ pub struct RemoteCreateVmRequest {
     /// so the scheduler can place the VM in the correct zone.
     #[serde(default)]
     pub zone: Option<String>,
+    /// Pre-allocated IP from Raft IPAM (set by leader before dispatching).
+    /// When set, the target Forge uses this IP instead of allocating locally,
+    /// preventing duplicate IP assignments across nodes.
+    #[serde(default)]
+    pub pre_allocated_ip: Option<String>,
+    /// Pre-allocated MAC from Raft IPAM (set by leader before dispatching).
+    #[serde(default)]
+    pub pre_allocated_mac: Option<String>,
 }
 
 /// Response from a remote VM creation.
@@ -208,6 +216,8 @@ mod tests {
             disk_size_mb: None,
             security_groups: vec!["default".to_string()],
             zone: Some("fsn1".to_string()),
+            pre_allocated_ip: None,
+            pre_allocated_mac: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let _: RemoteCreateVmRequest = serde_json::from_str(&json).unwrap();
