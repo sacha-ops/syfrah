@@ -497,6 +497,12 @@ impl Scheduler {
         let avg_util = (candidate.cpu_utilization() + candidate.memory_utilization()) / 2.0;
         score += (1.0 - avg_util) * 100.0;
 
+        // Small penalty for placing on the local node (leader) to distribute
+        // VMs across hypervisors and avoid hotspotting the leader.
+        if candidate.name == self.local_node {
+            score -= 5.0;
+        }
+
         // Spread bonus: if spread_topology is set, prefer hypervisors with
         // fewer VMs in the same group.
         if constraints.spread_topology.is_some() || constraints.anti_affinity_group.is_some() {
@@ -507,6 +513,10 @@ impl Scheduler {
             // Penalty: -20 per existing VM on this hypervisor.
             score -= count as f64 * 20.0;
         }
+
+        // Instance count penalty: prefer hypervisors with fewer VMs even
+        // without anti-affinity constraints. This ensures distribution.
+        score -= candidate.instance_count as f64 * 2.0;
 
         score
     }
