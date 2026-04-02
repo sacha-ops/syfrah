@@ -20,6 +20,16 @@ impl HypervisorStore {
         Self { db }
     }
 
+    /// Get a reference to the underlying database.
+    pub fn db(&self) -> &LayerDb {
+        &self.db
+    }
+
+    /// Table names used by this store (for snapshot export/import).
+    pub fn table_names() -> &'static [&'static str] {
+        &[TABLE]
+    }
+
     /// Create a new hypervisor record. Fails if the name is already taken.
     pub fn create(&self, hv: &Hypervisor) -> Result<()> {
         if self.db.exists(TABLE, &hv.name)? {

@@ -1111,6 +1111,9 @@ pub async fn run_daemon(
     let shared_vm_manager: Option<Arc<syfrah_compute::VmManager>>;
     let mut raft_compute_handler_ref: Option<Arc<crate::raft_compute_handler::RaftComputeHandler>> =
         None;
+    let mut raft_hv_handler_ref: Option<
+        Arc<crate::raft_hypervisor_handler::RaftHypervisorHandler>,
+    > = None;
     {
         // Pre-create prerequisite directories so VmManager::new() succeeds
         // even on a fresh node (join path) where install.sh was not run.
@@ -1357,10 +1360,16 @@ pub async fn run_daemon(
             &public_ip,
             &fabric_ipv6,
         );
-        // Register the hypervisor layer handler for CLI commands.
-        let hv_handler =
-            syfrah_org::HypervisorLayerHandler::new(Arc::clone(hv_store), my_record.name.clone());
-        router.register("hypervisor", Arc::new(hv_handler));
+        // Register the hypervisor layer handler for CLI commands,
+        // wrapped in a Raft-aware handler that routes mutations through Raft.
+        let inner_hv_handler: Arc<dyn syfrah_api::handler::LayerHandler> = Arc::new(
+            syfrah_org::HypervisorLayerHandler::new(Arc::clone(hv_store), my_record.name.clone()),
+        );
+        let raft_hv_handler = Arc::new(crate::raft_hypervisor_handler::RaftHypervisorHandler::new(
+            inner_hv_handler,
+        ));
+        raft_hv_handler_ref = Some(Arc::clone(&raft_hv_handler));
+        router.register("hypervisor", raft_hv_handler);
 
         // Wire the hypervisor store into the Raft compute handler so the
         // scheduler can populate candidates from registered hypervisors.
@@ -1512,6 +1521,14 @@ pub async fn run_daemon(
                 info!("raft: SG rule store wired into state machine");
             }
 
+            // Wire shared hypervisor store into the state machine so
+            // RegisterHypervisor/EnableHypervisor/UpdateHypervisorCapacity
+            // commands are applied to the shared redb, visible to all nodes.
+            if let Some(ref hv_store) = shared_hypervisor_store {
+                sm_builder = sm_builder.with_hypervisor_store(Arc::clone(hv_store));
+                info!("raft: hypervisor store wired into state machine");
+            }
+
             let sm = std::sync::Arc::new(sm_builder);
 
             // Subscribe to placement events for incremental FDB updates.
@@ -1573,6 +1590,17 @@ pub async fn run_daemon(
                 tokio::spawn(async move {
                     handler.set_raft_client(client).await;
                     info!("raft: injected Raft client into org handler");
+                });
+            }
+
+            // Inject the Raft client into the hypervisor handler so
+            // register/enable/drain go through Raft.
+            if let Some(ref handler) = raft_hv_handler_ref {
+                let handler = Arc::clone(handler);
+                let client = raft_client.clone();
+                tokio::spawn(async move {
+                    handler.set_raft_client(client).await;
+                    info!("raft: injected Raft client into hypervisor handler");
                 });
             }
 
@@ -1691,6 +1719,58 @@ pub async fn run_daemon(
                 info!("gossip: SWIM gossip agent starting");
             }
 
+            // -- Periodic hypervisor capacity update via Raft ----------------------
+            //
+            // Every 10s, submit this node's current capacity to Raft so all nodes
+            // have up-to-date capacity data for the scheduler. This replaces the
+            // gossip-based capacity exchange (bug #1127).
+            {
+                let cap_client = raft_client.clone();
+                let cap_node_name = my_record.name.clone();
+                let mut cap_shutdown = raft_shutdown_rx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cap_shutdown.wait_for(|v| *v) => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {},
+                        }
+                        // Read current system capacity.
+                        let alloc_vcpus = std::thread::available_parallelism()
+                            .map(|n| n.get() as u32)
+                            .unwrap_or(1);
+                        let alloc_memory = std::fs::read_to_string("/proc/meminfo")
+                            .ok()
+                            .and_then(|content| {
+                                content.lines().find_map(|line| {
+                                    if line.starts_with("MemTotal:") {
+                                        let parts: Vec<&str> = line.split_whitespace().collect();
+                                        parts.get(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or(1024);
+
+                        let cmd =
+                            syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                                name: cap_node_name.clone(),
+                                allocatable_vcpus: alloc_vcpus,
+                                allocatable_memory_mb: alloc_memory,
+                                used_vcpus: 0,
+                                used_memory_mb: 0,
+                            };
+                        if let Err(e) = cap_client.write(cmd).await {
+                            tracing::debug!(
+                                "capacity update via raft failed (may not be leader): {e}"
+                            );
+                        }
+                    }
+                    tracing::debug!("capacity update loop stopped");
+                });
+                info!("raft: periodic hypervisor capacity update started (every 10s)");
+            }
+
             let raft_state = syfrah_controlplane::server::RaftServerState {
                 raft,
                 max_voters: syfrah_controlplane::server::DEFAULT_MAX_VOTERS,
@@ -1745,6 +1825,31 @@ pub async fn run_daemon(
                     }
                     Err(e) => {
                         warn!("FDB cold rebuild: failed to list placements: {e}");
+                    }
+                }
+            }
+
+            // -- Post-Raft VM reconnect (bug #1128) -----------------------------------
+            //
+            // After the Raft state machine is loaded and the stores are caught up,
+            // re-run VM reconnect to recover any VMs whose state depends on
+            // Raft-replicated data (placement records, hypervisor records).
+            // The first reconnect (before Raft) recovers runtime state (PIDs);
+            // this second pass ensures consistency with the replicated state.
+            if let Some(ref vm_manager) = shared_vm_manager {
+                match vm_manager.reconnect().await {
+                    Ok(summary) => {
+                        if summary.recovered_count > 0 || !summary.failed.is_empty() {
+                            info!(
+                                recovered = summary.recovered_count,
+                                failed = summary.failed.len(),
+                                orphans = summary.orphans_cleaned.len(),
+                                "compute: post-Raft VM reconnect complete"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("compute: post-Raft reconnect failed: {e}");
                     }
                 }
             }

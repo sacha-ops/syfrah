@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod peering;
 pub mod raft_compute_handler;
 pub mod raft_handler;
+pub mod raft_hypervisor_handler;
 pub mod sanitize;
 pub mod sd_watchdog;
 pub mod store;

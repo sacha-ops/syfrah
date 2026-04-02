@@ -197,11 +197,9 @@ impl RaftComputeHandler {
                 .await;
         }
 
-        // We are the leader. Populate gossip cluster from fabric peers
-        // so the scheduler has candidate data even if gossip hasn't converged yet.
-        self.populate_cluster_from_fabric_peers();
-
-        // Run the scheduler.
+        // Run the scheduler using Raft-replicated hypervisor records.
+        // This is strongly consistent: every node has the same set of hypervisors
+        // via Raft state machine replication.
         let constraints = PlacementConstraints::from_cli(
             zone.clone(),
             &node_selector,
@@ -219,16 +217,34 @@ impl RaftComputeHandler {
             }
         };
 
-        // Run the scheduler.
+        // Prefer the Raft-replicated HypervisorStore for scheduling.
+        // Falls back to gossip cluster if store is not wired.
+        let hv_store_guard = self.hypervisor_store.read().await;
         let existing_placements: HashMap<String, u32> = HashMap::new();
-        match scheduler.schedule(
-            vcpus,
-            memory_mb as u64,
-            &constraints,
-            &self.gossip_cluster,
-            &[],
-            &existing_placements,
-        ) {
+        let schedule_result = if let Some(ref hv_store) = *hv_store_guard {
+            scheduler.schedule_from_store(
+                vcpus,
+                memory_mb as u64,
+                &constraints,
+                hv_store,
+                &[],
+                &existing_placements,
+            )
+        } else {
+            // Fallback: populate gossip cluster from fabric peers.
+            self.populate_cluster_from_fabric_peers();
+            scheduler.schedule(
+                vcpus,
+                memory_mb as u64,
+                &constraints,
+                &self.gossip_cluster,
+                &[],
+                &existing_placements,
+            )
+        };
+        drop(hv_store_guard);
+
+        match schedule_result {
             Ok(decision) => {
                 info!(
                     "scheduler: placed VM '{}' on '{}' (score={:.2}, local_fallback={})",

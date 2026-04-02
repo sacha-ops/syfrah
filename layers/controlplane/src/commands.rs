@@ -199,6 +199,7 @@ pub enum StateMachineCommand {
         name: String,
         region: String,
         zone: String,
+        fabric_ipv6: String,
     },
     EnableHypervisor {
         name: String,
@@ -216,6 +217,13 @@ pub enum StateMachineCommand {
     UpdateHypervisorTaints {
         name: String,
         taints: Vec<String>,
+    },
+    UpdateHypervisorCapacity {
+        name: String,
+        allocatable_vcpus: u32,
+        allocatable_memory_mb: u64,
+        used_vcpus: u32,
+        used_memory_mb: u64,
     },
 
     // -- NIC --
@@ -252,6 +260,9 @@ impl std::fmt::Display for StateMachineCommand {
             Self::AttachVpc { vpc, project } => write!(f, "AttachVpc({vpc}@{project})"),
             Self::DetachVpc { vpc, project } => write!(f, "DetachVpc({vpc}@{project})"),
             Self::CreateRouteTable { name, vpc } => write!(f, "CreateRouteTable({name}@{vpc})"),
+            Self::UpdateHypervisorCapacity { name, .. } => {
+                write!(f, "UpdateHypervisorCapacity({name})")
+            }
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -471,6 +482,7 @@ mod tests {
                 name: "hv1".into(),
                 region: "eu".into(),
                 zone: "az1".into(),
+                fabric_ipv6: "fd00::1".into(),
             },
             StateMachineCommand::EnableHypervisor { name: "hv1".into() },
             StateMachineCommand::DrainHypervisor { name: "hv1".into() },
@@ -482,6 +494,13 @@ mod tests {
             StateMachineCommand::UpdateHypervisorTaints {
                 name: "hv1".into(),
                 taints: vec!["gpu=true:NoSchedule".into()],
+            },
+            StateMachineCommand::UpdateHypervisorCapacity {
+                name: "hv1".into(),
+                allocatable_vcpus: 16,
+                allocatable_memory_mb: 65536,
+                used_vcpus: 4,
+                used_memory_mb: 8192,
             },
             StateMachineCommand::CreateNic {
                 vm_id: "vm1".into(),
