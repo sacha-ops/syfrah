@@ -110,6 +110,12 @@ pub trait NetworkBackend: Send + Sync {
 
     // ── Query / Discovery ──────────────────────────────────────────────
 
+    /// Check whether a named kernel network interface exists on this node.
+    ///
+    /// Used before creating veth peering pairs to skip hypervisors that have
+    /// no local VMs in either of the peered VPCs (i.e., neither bridge exists).
+    async fn link_exists(&self, name: &str) -> bool;
+
     /// List kernel network interfaces matching a given prefix.
     ///
     /// Used by the reconciliation loop and daemon restart recovery to

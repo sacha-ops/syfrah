@@ -619,6 +619,10 @@ impl NetworkBackend for LinuxBackend {
         Ok(())
     }
 
+    async fn link_exists(&self, name: &str) -> bool {
+        Self::interface_exists(name).await
+    }
+
     async fn list_interfaces(&self, prefix: &str) -> Result<Vec<String>> {
         let output = Self::run("ip", &["-o", "link", "show"]).await?;
         let mut names = Vec::new();
