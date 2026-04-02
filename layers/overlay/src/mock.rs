@@ -221,6 +221,11 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
+    async fn apply_sg_base_chain(&self) -> Result<()> {
+        self.record("apply_sg_base_chain()".to_string());
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         self.record(format!("apply_vm_rules({tap}, {mac}, {ip})"));
         Ok(())

@@ -340,6 +340,13 @@ impl NetworkBackend for LinuxBackend {
         Ok(())
     }
 
+    async fn apply_sg_base_chain(&self) -> Result<()> {
+        let ruleset = crate::sg_nft::build_sg_base_chain();
+        crate::nft::apply_ruleset(&ruleset)
+            .map_err(|e| OverlayError::CommandFailed(e.to_string()))?;
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         // Ensure table and chain exist (ignore errors if already present)
         Self::run("nft", &["add", "table", "inet", "syfrah"])
