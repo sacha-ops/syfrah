@@ -26,7 +26,7 @@ pub enum VolumeType {
 /// - The `encryption_passphrase` is NOT stored in Raft. It is kept locally on
 ///   each hypervisor (file with 0600 permissions) and never replicated via
 ///   consensus. See ADR-006 §9.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     /// S3-compatible endpoint URL (e.g. "https://s3.par.io.cloud.ovh.net").
     pub s3_endpoint: String,
@@ -42,6 +42,49 @@ pub struct StorageConfig {
     pub cache_disk_size_gb: u32,
     /// Maximum memory cache size in gigabytes.
     pub cache_memory_size_gb: u32,
+}
+
+// SECURITY: Custom Debug impl to prevent S3 secret key from appearing in logs
+// or error messages. The access key is partially redacted and the secret key
+// is fully redacted.
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key", &"[REDACTED]")
+            .field("s3_secret_key", &"[REDACTED]")
+            .field("cache_disk_path", &self.cache_disk_path)
+            .field("cache_disk_size_gb", &self.cache_disk_size_gb)
+            .field("cache_memory_size_gb", &self.cache_memory_size_gb)
+            .finish()
+    }
+}
+
+impl StorageConfig {
+    /// Validate the storage configuration.
+    ///
+    /// Returns `Ok(())` if the config is valid, or an error message describing
+    /// what is wrong. Validation rules:
+    /// - `s3_endpoint` must start with `https://` or `http://`
+    /// - `s3_bucket` must not be empty
+    /// - `s3_access_key` must not be empty
+    /// - `s3_secret_key` must not be empty
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.s3_endpoint.starts_with("https://") && !self.s3_endpoint.starts_with("http://") {
+            return Err("s3_endpoint must start with https:// or http://".to_string());
+        }
+        if self.s3_bucket.is_empty() {
+            return Err("s3_bucket must not be empty".to_string());
+        }
+        if self.s3_access_key.is_empty() {
+            return Err("s3_access_key must not be empty".to_string());
+        }
+        if self.s3_secret_key.is_empty() {
+            return Err("s3_secret_key must not be empty".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Scope for storage quotas — either per-org or per-project.
@@ -429,6 +472,8 @@ pub enum StateMachineResponse {
     Error(String),
     /// IP allocation result.
     AllocatedIp { ip: String, mac: String },
+    /// Storage configuration for a region.
+    StorageConfig(Box<StorageConfig>),
     /// Composite transaction result — contains results from each sub-command.
     Composite(Vec<StateMachineResponse>),
 }
@@ -736,6 +781,15 @@ mod tests {
                 ip: "10.0.0.1".into(),
                 mac: "02:00:00:00:00:01".into(),
             },
+            StateMachineResponse::StorageConfig(Box::new(StorageConfig {
+                s3_endpoint: "https://s3.example.com".into(),
+                s3_bucket: "bucket".into(),
+                s3_access_key: "AKID".into(),
+                s3_secret_key: "secret".into(),
+                cache_disk_path: "/dev/nvme0".into(),
+                cache_disk_size_gb: 100,
+                cache_memory_size_gb: 4,
+            })),
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize failed");
@@ -749,5 +803,106 @@ mod tests {
             StateMachineResponse::default(),
             StateMachineResponse::Ok
         ));
+    }
+
+    #[test]
+    fn storage_config_validate_valid() {
+        let config = StorageConfig {
+            s3_endpoint: "https://s3.example.com".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn storage_config_validate_http_endpoint() {
+        let config = StorageConfig {
+            s3_endpoint: "http://minio:9000".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn storage_config_validate_rejects_ftp_endpoint() {
+        let config = StorageConfig {
+            s3_endpoint: "ftp://bad.example.com".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("s3_endpoint must start with https:// or http://"));
+    }
+
+    #[test]
+    fn storage_config_validate_rejects_empty_bucket() {
+        let config = StorageConfig {
+            s3_endpoint: "https://s3.example.com".into(),
+            s3_bucket: "".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        assert!(config.validate().unwrap_err().contains("s3_bucket"));
+    }
+
+    #[test]
+    fn storage_config_validate_rejects_empty_access_key() {
+        let config = StorageConfig {
+            s3_endpoint: "https://s3.example.com".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        assert!(config.validate().unwrap_err().contains("s3_access_key"));
+    }
+
+    #[test]
+    fn storage_config_validate_rejects_empty_secret_key() {
+        let config = StorageConfig {
+            s3_endpoint: "https://s3.example.com".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        assert!(config.validate().unwrap_err().contains("s3_secret_key"));
+    }
+
+    #[test]
+    fn storage_config_serde_roundtrip() {
+        let config = StorageConfig {
+            s3_endpoint: "https://s3.example.com".into(),
+            s3_bucket: "bucket".into(),
+            s3_access_key: "AKID".into(),
+            s3_secret_key: "secret".into(),
+            cache_disk_path: "/dev/nvme0".into(),
+            cache_disk_size_gb: 100,
+            cache_memory_size_gb: 4,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: StorageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, deserialized);
     }
 }
