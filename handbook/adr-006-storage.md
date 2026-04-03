@@ -60,7 +60,38 @@ ZeroFS is an open-source Rust project that turns S3-compatible object storage in
 
 The NBD device is a standard Linux block device. Cloud Hypervisor attaches it via `virtio-block`. The guest VM sees `/dev/vda` or `/dev/vdb` and formats it with whatever filesystem it wants. The guest has no knowledge of ZeroFS, S3, or caching.
 
-## 3. Volume resource model
+## 3. Durability Contract
+
+### Definitions
+
+- **Write acknowledged**: ZeroFS accepted the write into its memory buffer. The VM's write syscall returned. Data is NOT durable yet.
+- **Write durable**: The write has been persisted to the S3 WAL (Write-Ahead Log). Survives ZeroFS crash, hypervisor crash, memory loss.
+- **Write committed**: The write has been compacted from WAL into permanent SST chunks on S3. Survives S3 WAL expiry/rotation.
+
+### Guarantees
+
+| Operation | Guarantee |
+|-----------|-----------|
+| `write()` without fsync | Acknowledged but NOT durable. Lost on crash. Equivalent to write-back cache semantics. |
+| `write()` + `fsync()` | Durable after fsync returns. WAL entry persisted to S3. Survives hypervisor crash. |
+| `detach` returns success | ALL durable writes (fsynced) have reached S3. Non-fsynced writes may be lost. |
+| Hypervisor crash | Non-fsynced writes since last fsync are LOST. Fsynced writes are recoverable from S3 WAL. |
+| ZeroFS crash | Same as hypervisor crash — WAL replay recovers fsynced data. |
+| S3 outage during write | fsync BLOCKS until S3 is reachable. If timeout exceeded: fsync returns EIO to guest. |
+
+### What this means for workloads
+
+This is **asynchronous durability** — NOT synchronous replicated block storage.
+
+- **Write-back semantics**: like a disk with a write cache and battery backup, EXCEPT the "battery" is the S3 WAL, not a capacitor. fsync flushes to WAL.
+- **NOT equivalent to**: AWS EBS (synchronous replication to multiple AZs), local NVMe (persistent on write), or Ceph RBD (synchronous quorum write).
+- **Equivalent to**: a local SSD with write-back cache where fsync goes to a remote WAL.
+
+### Honest statement
+
+"Syfrah volumes provide block device emulation over object storage with asynchronous durability semantics. Durability is guaranteed only for writes explicitly fsynced by the guest. Non-fsynced writes may be lost on crash. This is a deliberate trade-off: operator simplicity and zero-infrastructure storage in exchange for weaker durability guarantees compared to synchronous replicated block storage."
+
+## 4. Volume resource model
 
 A volume is a first-class resource managed by the control plane (Raft) and executed by Forge (local ZeroFS).
 
@@ -76,8 +107,8 @@ struct Volume {
     /// Size in gigabytes. Set at creation, can be resized (requires detach).
     size_gb: u32,
 
-    /// Current state in the volume lifecycle.
-    state: VolumeState,
+    /// Current desired state in the volume lifecycle.
+    desired_state: VolumeDesiredState,
 
     /// The VM this volume is attached to, if any.
     attached_to: Option<VmId>,
@@ -87,7 +118,7 @@ struct Volume {
     hypervisor_id: Option<HypervisorId>,
 
     /// S3 key prefix where this volume's data lives.
-    /// Format: volumes/{id}/
+    /// Format: volumes/{id}/gen-{generation}/
     /// All SST files, WAL segments, and metadata for this volume
     /// are stored under this prefix in the configured S3 bucket.
     s3_prefix: String,
@@ -106,7 +137,7 @@ struct Volume {
     env_id: EnvId,
 
     /// Placement generation. Incremented on every attach/detach/reschedule.
-    /// Used for fencing (see §11).
+    /// Used for fencing (see §12) and S3 prefix isolation.
     placement_generation: u64,
 
     /// Whether this volume is a root volume (auto-created with a VM)
@@ -139,13 +170,66 @@ enum VolumeType {
 | Snapshot record (id, SST file list) | Raft (redb materialized view) | Must be consistent across the cluster |
 | S3 configuration (endpoint, bucket, keys) | Raft (redb materialized view) | Per-region config, set by operator |
 
-## 4. Volume state machine
+## 5. Volume State — Desired vs Observed
+
+### Desired state (in Raft)
+
+```rust
+enum VolumeDesiredState {
+    /// Volume should exist and be available for attachment.
+    Available,
+    /// Volume should be attached to the specified VM on the specified hypervisor.
+    AttachedTo { vm_id: VmId, hypervisor_id: HypervisorId },
+    /// Volume should be deleted. All data removed from S3.
+    Deleted,
+}
+
+struct VolumeDesiredRecord {
+    target: VolumeDesiredState,
+    generation: u64,
+}
+```
+
+### Observed state (per-hypervisor, in Forge)
+
+```rust
+struct VolumeObservedState {
+    /// Whether the NBD device is connected and serving I/O.
+    nbd_connected: bool,
+    /// Bytes currently in the local cache (memory + SSD).
+    cache_bytes: u64,
+    /// Bytes written but not yet flushed to S3 WAL.
+    dirty_bytes: u64,
+    /// Whether Cloud Hypervisor has the device attached as virtio-block.
+    ch_attached: bool,
+    /// Timestamp of last observation.
+    last_observed: u64,
+}
+```
+
+### Reported state (to API/CLI)
+
+The reported state is derived from the combination of desired and observed state:
+
+| Reported state | Meaning |
+|----------------|---------|
+| Creating | Desired: Available, Observed: not yet initialized on S3 |
+| Available | Desired: Available, Observed: NBD disconnected, no dirty data |
+| Attaching | Desired: Attached, Observed: NBD connecting or CH not yet attached |
+| Attached | Desired: Attached, Observed: NBD connected AND CH attached |
+| Detaching | Desired: Available, Observed: flushing cache, disconnecting NBD |
+| Resizing | Desired: Available with new size, Observed: resize in progress |
+| Deleting | Desired: Deleted, Observed: S3 objects being removed |
+| Deleted | Desired: Deleted, Observed: all S3 data removed. Record retained for audit (TTL-based cleanup). |
+| Error | Desired != Observed AND reconciliation failed after N retries |
+
+### State diagram
 
 ```
-Creating ──► Available ──► Attached ──► Detaching ──► Available
-    │                          │                          │
-    ▼                          ▼                          ▼
-  Error                      Error                     Error
+Creating ──► Available ──► Attaching ──► Attached ──► Detaching ──► Available
+    │                                       │                          │
+    ▼                                       ▼                          ▼
+  Error                                   Error                      Error
 
 Available ──► Deleting ──► Deleted
 
@@ -155,34 +239,33 @@ Available ──► Resizing ──► Available
                Error
 ```
 
-### States
-
-| State | Meaning | Allowed transitions |
-|---|---|---|
-| `Creating` | ZeroFS is initializing the volume on S3 (sparse file, initial SST) | → `Available`, → `Error` |
-| `Available` | Volume exists and is ready to attach. Not attached to any VM. NBD device is not active. | → `Attached`, → `Deleting`, → `Resizing` |
-| `Attached` | Volume is attached to a VM. NBD device is active. Cloud Hypervisor has it as a virtio-block device. | → `Detaching`, → `Error` |
-| `Detaching` | Cache is being flushed to S3, NBD device is being disconnected, Cloud Hypervisor is removing the block device. | → `Available`, → `Error` |
-| `Resizing` | Volume is being resized (S3 metadata update, ZeroFS sparse file resize). Requires `Available` state. | → `Available`, → `Error` |
-| `Deleting` | S3 objects are being removed. Requires `Available` state (must detach first). | → `Deleted`, → `Error` |
-| `Deleted` | Terminal. All S3 data removed. Volume record is retained for audit (TTL-based cleanup). | (none) |
-| `Error` | An operation failed. The volume may be in an inconsistent state. Operator intervention may be required. | → `Available` (retry/recover), → `Deleting` |
-
 ### Transition rules
 
 1. **Attach requires `Available`**. You cannot attach a volume that is already attached, being deleted, or in error.
 2. **Detach requires `Attached`**. Detaching an available volume is a no-op (idempotent).
 3. **Delete requires `Available`**. You must detach before deleting. This is deliberate — no "force delete while attached" to prevent accidental data loss.
-4. **Resize requires `Available`**. No live resize in v1. Detach → resize → reattach.
-5. **Error recovery**: an `Error` volume can transition to `Available` (if the underlying issue is resolved) or `Deleting` (to clean up).
+4. **Delete is blocked during in-flight snapshot or restore operations**. The volume cannot transition to Deleting while a snapshot create or snapshot restore references it.
+5. **Resize requires `Available`**. No live resize in v1. Detach → resize → reattach.
+6. **Error recovery**: an `Error` volume can transition to `Available` (if the underlying issue is resolved) or `Deleting` (to clean up).
 
 ### Invalid transitions are rejected
 
 Any transition not listed above returns a `VolumeTransitionError` with the current state and the attempted target state. The state machine is enforced in the Raft state machine's `apply` handler — not in Forge, not in the API layer. Raft is the single point of enforcement.
 
-## 5. Snapshot model
+## 6. Snapshot Protocol
 
-Since ZeroFS stores data as immutable SST files in S3, snapshots are metadata-only operations. No data is copied.
+### Crash-consistent only (v1)
+
+Snapshots are crash-consistent, NOT application-consistent. Equivalent to pulling the power cord — the filesystem will be in whatever state the last fsync left it.
+
+For app-consistent snapshots, the guest must:
+1. Freeze I/O (e.g., `fsfreeze --freeze`)
+2. Request snapshot via API
+3. Thaw I/O
+
+Syfrah does NOT automatically freeze/thaw. This is the tenant's responsibility.
+
+### Snapshot resource model
 
 ```rust
 struct Snapshot {
@@ -224,13 +307,20 @@ enum SnapshotState {
 }
 ```
 
-### How snapshots work
+### Snapshot creation protocol
 
-1. **Create**: ZeroFS flushes all pending writes (memtable → WAL → SST) to S3. The current set of SST files is recorded as the snapshot. No data copy — just a metadata record of which SST files constitute this point-in-time state.
+1. ZeroFS pauses new compactions (but continues accepting writes to WAL)
+2. ZeroFS records the current manifest: list of SST files + WAL position
+3. Manifest is committed to Raft as `SnapshotManifest { volume_id, generation, sst_files: Vec<String>, wal_position: u64 }`
+4. ZeroFS resumes compactions
+5. Snapshot is "taken" at the WAL position — data before that position is in the snapshot, data after is not
 
-2. **Restore**: A new volume is created that points at the snapshot's SST files. ZeroFS treats these as the initial state. New writes go to new SST files. The restored volume is independent of the original — changes to either do not affect the other.
+### Snapshot restore protocol
 
-3. **Delete**: The snapshot record is removed. SST files that are only referenced by this snapshot (not by any volume or other snapshot) are garbage-collected from S3. SST files still referenced by other volumes or snapshots are retained.
+1. Create a new volume with a new generation
+2. Initialize ZeroFS with the snapshot's manifest (SST files + WAL position)
+3. New volume reads from the snapshot's SST files (shared, not copied)
+4. New writes go to the new volume's own prefix
 
 ### Why this is cheap
 
@@ -238,11 +328,62 @@ In a traditional block storage system, a snapshot requires either a full copy or
 
 - SST files are immutable once written to S3
 - A snapshot is a list of SST file keys — tens of bytes per entry
-- Creating a snapshot costs one S3 LIST + one metadata write
+- Creating a snapshot costs one metadata write + Raft commit
 - Restoring a snapshot costs one metadata read + one ZeroFS init
 - Storage cost: zero additional bytes (SST files are shared until divergence)
 
-## 6. Attachment model (single-writer, hot-plug)
+## 7. Garbage Collection
+
+### What gets garbage collected
+
+- SST files no longer referenced by any volume or snapshot manifest
+- WAL segments older than the oldest active manifest
+- Orphaned writes from fenced generations
+
+### GC safety invariant
+
+**An S3 object (SST file) must NOT be deleted if any active volume or snapshot references it in its manifest.**
+
+### GC safety rules
+
+1. **Never delete an SST referenced by ANY manifest** (volume or snapshot)
+2. **Never delete during in-flight operations** (snapshot create, restore, compaction)
+3. **GC is monotonic**: once an SST is marked unreachable, it stays unreachable (no resurrection)
+4. **GC runs on the Raft leader only** (single writer to Raft metadata)
+5. **Physical deletion is asynchronous**: mark as deletable in Raft, background worker removes from S3
+6. **Two-phase delete**: mark → wait grace period (1 hour) → delete. This protects against Raft metadata lag.
+
+### Reference counting
+
+Implementation:
+- Maintain a reference count per SST file in Raft metadata
+- When a volume/snapshot is created: increment refcounts for all referenced SSTs
+- When a volume/snapshot is deleted: decrement refcounts
+- GC runs periodically: delete SSTs where refcount == 0 AND no in-flight operations reference them
+- GC is ALWAYS safe to delay. Never safe to run early.
+- Raft metadata is the source of truth for refcounts, not S3 object listing
+
+### Reachability graph
+
+```
+Volume A (manifest) → [sst-001, sst-002, sst-003]
+Snapshot X (manifest) → [sst-001, sst-002]  (shared with Volume A)
+Volume B (restored from X) → [sst-001, sst-002, sst-004]  (shared SSTs + new)
+
+Reachable: sst-001 (refcount 3), sst-002 (refcount 3), sst-003 (refcount 1), sst-004 (refcount 1)
+
+Delete Snapshot X:
+  sst-001 refcount 3→2, sst-002 refcount 3→2
+  No SSTs become unreachable.
+
+Delete Volume A:
+  sst-001 refcount 2→1, sst-002 refcount 2→1, sst-003 refcount 1→0
+  sst-003 is now unreachable → mark for GC
+
+GC runs: delete sst-003 from S3 (after grace period)
+```
+
+## 8. Attachment model (single-writer, hot-plug)
 
 ### Single-writer invariant
 
@@ -263,14 +404,12 @@ Control plane (Raft leader)           Forge (target hypervisor)
 1. Validate: volume is Available,
    VM exists and is on this HV
 2. Commit AttachVolume to Raft
-   (volume.state → Attached,
-    volume.attached_to → vm_id,
-    volume.hypervisor_id → hv_id,
+   (volume.desired → AttachedTo(vm, hv),
     volume.placement_generation++)
                                       3. Reconciler sees: volume should
                                          be Attached on this HV
                                       4. ZeroFS: create NBD device
-                                         pointing to s3://{bucket}/{prefix}
+                                         pointing to s3://{bucket}/volumes/{id}/gen-{generation}/
                                       5. NBD device appears as /dev/nbdN
                                       6. Cloud Hypervisor: PUT /vm.add-disk
                                          { path: "/dev/nbdN" }
@@ -286,16 +425,15 @@ Control plane (Raft leader)           Forge (target hypervisor)
 
 1. Validate: volume is Attached
 2. Commit DetachVolume to Raft
-   (volume.state → Detaching)
+   (volume.desired → Available)
                                       3. Cloud Hypervisor: PUT /vm.remove-device
                                          (guest loses /dev/vdX)
                                       4. ZeroFS: flush cache to S3
                                          (all dirty data written)
                                       5. ZeroFS: disconnect NBD device
                                       6. Report: detach complete
-7. State machine marks volume
-   Available (via reconciliation
-   or Forge callback)
+7. Observed state converges to
+   Available (via reconciliation)
 ```
 
 ### Root volumes vs. data volumes
@@ -314,7 +452,7 @@ Data volumes can be attached and detached while the VM is running. Cloud Hypervi
 
 Root volumes are attached at VM boot (part of the initial Cloud Hypervisor config) and detached only when the VM stops.
 
-## 7. S3 configuration
+## 9. S3 configuration
 
 ```rust
 struct StorageConfig {
@@ -371,7 +509,7 @@ The recommended default is **one bucket per region**. It provides the best balan
 
 `StorageConfig` records are stored in Raft (minus the encryption passphrase, which is stored locally on each hypervisor in a file with 0600 permissions — never replicated via Raft). The S3 credentials and endpoint are replicated so that all nodes know which bucket to use for each region. The encryption passphrase is an operator secret that never leaves the node.
 
-## 8. Cache architecture (memory + SSD, LRU, write-back)
+## 10. Cache architecture (memory + SSD, LRU, write-back)
 
 ### Two-tier cache
 
@@ -437,9 +575,9 @@ ZeroFS uses **write-back** caching:
 - Durability is achieved asynchronously via WAL flush to S3 (on fsync) and SST compaction (background)
 - This means: a node crash between a write and the next fsync can lose data that the VM believes is written
 
-This is the same trade-off as a local disk with a write cache enabled. Applications that require durability guarantees must call `fsync()` — which triggers ZeroFS to flush the WAL to S3 before returning.
+This is the same trade-off as a local disk with a write cache enabled. Applications that require durability guarantees must call `fsync()` — which triggers ZeroFS to flush the WAL to S3 before returning. See §3 (Durability Contract) for the formal guarantees.
 
-## 9. Volume migration (zero-copy cross-node)
+## 11. Volume migration (zero-copy cross-node)
 
 When a VM is rescheduled to a different hypervisor (operator-initiated or automatic on failure), its volumes follow with zero data copy. This is the key advantage of S3-backed storage.
 
@@ -460,7 +598,8 @@ Node A (source)                        Node B (target)
                                        5. Forge reconciler sees:
                                           volume should be on this HV
                                        6. ZeroFS connects NBD
-                                          to same S3 prefix
+                                          to gen-{N+1}/ prefix,
+                                          reads from gen-N/ + gen-{N+1}/
                                        7. /dev/nbdN appears
                                        8. Cloud Hypervisor starts VM
                                           with /dev/nbdN as disk
@@ -493,126 +632,40 @@ During warmup, the VM is fully operational. Reads are slower (S3 latency instead
 | Local disk + rsync | Full disk | Minutes to hours | High — full data transfer |
 | Live migration (QEMU) | Memory + dirty pages | Milliseconds | High — convergence issues |
 
-## 10. Integration with Raft (metadata in Raft, data in S3)
-
-Volume metadata goes through Raft for consistency. Volume data goes directly to S3 (not through Raft — the data volume would overwhelm the consensus protocol).
-
-### What Raft manages
-
-| Resource | Raft commands | Why in Raft |
-|---|---|---|
-| Volume CRUD | `CreateVolume`, `DeleteVolume`, `ResizeVolume` | Must be consistent — no duplicate IDs, no double-create |
-| Attachment state | `AttachVolume`, `DetachVolume` | Single-writer invariant — Raft enforces exclusive attachment |
-| Snapshot records | `CreateSnapshot`, `DeleteSnapshot`, `RestoreSnapshot` | Must be consistent — snapshot IDs unique, source volume valid |
-| Storage config | `SetStorageConfig` | Per-region S3 config, replicated to all nodes |
-| Storage quotas | `SetStorageQuota`, `CheckQuota` | Per-org/project limits, enforced at commit time |
-| Placement generation | Incremented on `AttachVolume`, `DetachVolume`, reschedule | Fencing (see §11) |
-
-### What ZeroFS manages (locally, not through Raft)
-
-| Concern | Managed by | Why local |
-|---|---|---|
-| NBD device lifecycle | ZeroFS on the hypervisor | Runtime artifact — only relevant on the node where the volume is attached |
-| Cache contents | ZeroFS on the hypervisor | Ephemeral — rebuilt on demand from S3 |
-| S3 read/write operations | ZeroFS on the hypervisor | Data plane — too much throughput for consensus |
-| Chunk management (split, compress, encrypt) | ZeroFS on the hypervisor | Implementation detail of the storage engine |
-| WAL flush and SST compaction | ZeroFS on the hypervisor | Background maintenance, local to each volume instance |
-
-### Raft commands for storage
-
-```rust
-enum StorageCommand {
-    CreateVolume {
-        id: VolumeId,
-        name: String,
-        size_gb: u32,
-        org_id: OrgId,
-        project_id: ProjectId,
-        env_id: EnvId,
-        volume_type: VolumeType,
-    },
-    DeleteVolume {
-        volume_id: VolumeId,
-    },
-    AttachVolume {
-        volume_id: VolumeId,
-        vm_id: VmId,
-        hypervisor_id: HypervisorId,
-    },
-    DetachVolume {
-        volume_id: VolumeId,
-    },
-    ResizeVolume {
-        volume_id: VolumeId,
-        new_size_gb: u32,
-    },
-    CreateSnapshot {
-        id: SnapshotId,
-        source_volume_id: VolumeId,
-    },
-    DeleteSnapshot {
-        snapshot_id: SnapshotId,
-    },
-    RestoreSnapshot {
-        snapshot_id: SnapshotId,
-        new_volume_id: VolumeId,
-        new_volume_name: String,
-    },
-    SetStorageConfig {
-        region: String,
-        config: StorageConfig,
-    },
-    SetStorageQuota {
-        scope: QuotaScope,  // Org or Project
-        max_volumes: u32,
-        max_total_gb: u64,
-        max_snapshots: u32,
-    },
-}
-```
-
-Each command is validated by the Raft state machine before committing:
-
-- `CreateVolume`: check quota, check name uniqueness within environment
-- `AttachVolume`: check volume is `Available`, check VM exists and is on the target HV, increment `placement_generation`
-- `DetachVolume`: check volume is `Attached`, set state to `Detaching`
-- `DeleteVolume`: check volume is `Available` (not attached), set state to `Deleting`
-- `ResizeVolume`: check volume is `Available`, check new size >= current size (no shrink in v1)
-
-## 11. Volume fencing (prevent split-brain writes)
-
-Volume fencing reuses the `placement_generation` mechanism from ADR-005 (§9). The same invariant applies: a stale Forge must never write to a volume that has been reassigned.
+## 12. Volume Fencing
 
 ### The problem
 
-When a hypervisor becomes unreachable and a VM is rescheduled:
+When a VM is rescheduled, the old hypervisor's ZeroFS may still be writing to S3. The new hypervisor's ZeroFS must not read corrupted/interleaved data.
 
-1. Raft leader commits `DetachVolume` on old HV, `AttachVolume` on new HV, increments `placement_generation`
-2. New HV connects ZeroFS to the same S3 prefix
-3. Old HV comes back online — its ZeroFS instance may still have dirty cache data it wants to flush to S3
+### Hard fencing via S3 prefix rotation
 
-If both ZeroFS instances write to S3 simultaneously, data is corrupted. Immutable SST files are safe (they have unique keys), but WAL segments and compaction operations could conflict.
-
-### The solution
-
-ZeroFS on each hypervisor is configured with the volume's `placement_generation`. On every S3 write, ZeroFS includes the generation in the object key prefix or metadata:
+Each volume attachment uses a unique **S3 write prefix** derived from the placement generation:
 
 ```
-s3://bucket/volumes/{vol-id}/gen-{generation}/wal/...
-s3://bucket/volumes/{vol-id}/gen-{generation}/sst/...
+s3://bucket/volumes/{volume_id}/gen-{generation}/
 ```
 
-When Forge starts ZeroFS for a volume, it passes the current `placement_generation` from the Raft materialized view. ZeroFS refuses to write if:
+When a volume is attached with generation N, ZeroFS writes to `gen-N/`. When the volume is rescheduled to generation N+1:
 
-1. The local generation is older than the generation in the Raft materialized view (Forge checks on every reconciliation cycle)
-2. Forge detects a generation mismatch → stops ZeroFS for that volume → cleans up NBD device
+1. New writer uses prefix `gen-{N+1}/`
+2. New writer reads from BOTH `gen-N/` and `gen-{N+1}/` (merge view)
+3. Old writer's prefix `gen-N/` is NEVER written to by the new writer
+4. Old writer's writes to `gen-N/` after the reschedule are IGNORED by the new writer (they read from their own manifest)
 
-Additionally, on the old hypervisor:
+### Why this is hard fencing
 
-1. Forge's reconciliation loop reads the Raft materialized view
-2. Sees the volume is no longer assigned to this HV (or generation has advanced)
-3. Stops the local ZeroFS instance for that volume
-4. Discards any unflushed local cache (data is already flushed to S3 before reschedule, or is lost — the same trade-off as a disk crash)
+The old writer CAN still write to S3 (we can't revoke S3 credentials instantly). But:
+- The old writer writes to `gen-N/` prefix
+- The new writer reads from its OWN manifest which starts at `gen-{N+1}/`
+- The old writer's late writes are orphaned — they never appear in any active manifest
+- The GC eventually cleans them up
+
+This is **manifest-based fencing**: the commit point is the manifest, not the individual S3 objects. Only the active generation's manifest is authoritative.
+
+### Alternative: short-lived S3 credentials (future)
+
+For even harder fencing, each attachment could use short-lived S3 credentials (STS tokens) that expire on detach. The old writer physically cannot write after credential expiry. This is Phase 5+ hardening.
 
 ### Fencing timeline
 
@@ -621,6 +674,7 @@ Time    Event                                  Node A          Node B
 ────    ─────                                  ──────          ──────
 t=0     Node A is healthy                      ZeroFS active   -
                                                gen=41
+                                               prefix: gen-41/
 t=1     Node A becomes unreachable             (unreachable)   -
 t=2     Gossip detects failure (~15s)           (unreachable)   -
 t=3     Raft reschedules VM                    (unreachable)   -
@@ -628,6 +682,8 @@ t=3     Raft reschedules VM                    (unreachable)   -
         AttachVolume(gen=42, hv=B)
 t=4     Node B starts ZeroFS                   (unreachable)   ZeroFS active
                                                                gen=42
+                                                               prefix: gen-42/
+                                                               reads: gen-41/ + gen-42/
 t=5     Node A recovers                        Forge reads     ZeroFS active
                                                Raft: gen=42,   gen=42
                                                hv=B
@@ -635,9 +691,41 @@ t=5     Node A recovers                        Forge reads     ZeroFS active
                                                → FENCED
                                                → stop ZeroFS
                                                → discard cache
+                                               Late writes to
+                                               gen-41/ are
+                                               orphaned
 ```
 
-## 12. ZeroFS integration (NBD, SlateDB, chunks, encryption)
+## 13. ZeroFS Dependency Boundary
+
+### What Syfrah guarantees (control plane)
+
+- Volume CRUD lifecycle (Raft)
+- Attachment ownership (single-writer invariant)
+- Fencing (generation-based prefix isolation)
+- Snapshot manifest management (refcounting, GC)
+- API contract (CLI, REST, gRPC)
+
+### What Syfrah assumes ZeroFS provides (data plane)
+
+- WAL correctness (fsync → WAL → durable)
+- Cache coherency (memory + SSD layers consistent)
+- NBD protocol correctness (block device semantics)
+- Compaction safety (SST files immutable after write)
+- Crash recovery (WAL replay produces consistent state)
+- Encryption correctness (XChaCha20-Poly1305)
+
+### What must be validated before GA
+
+- Power loss tests (kill -9 during write + fsync)
+- S3 outage simulation (network partition to S3)
+- Concurrent attach/detach under load
+- Snapshot/restore/delete churn
+- Long-running compaction stress
+- Cache overflow behavior
+- Multi-generation prefix isolation
+
+## 14. ZeroFS integration (NBD, SlateDB, chunks, encryption)
 
 ### ZeroFS binary management
 
@@ -665,7 +753,7 @@ ZeroFS instance
     │
     ├── NBD server: listening on /dev/nbd0
     ├── Cache: memory (2GB) + SSD (/mnt/cache/vol-abc123/)
-    ├── SlateDB engine: s3://bucket/volumes/vol-abc123/
+    ├── SlateDB engine: s3://bucket/volumes/vol-abc123/gen-{N}/
     └── Encryption: XChaCha20-Poly1305 (region key)
     │
     ▼
@@ -692,7 +780,7 @@ The operator controls the encryption key. Even if the S3 provider is compromised
 ### Chunk layout in S3
 
 ```
-s3://bucket/volumes/{vol-id}/
+s3://bucket/volumes/{vol-id}/gen-{generation}/
     ├── manifest.json               # Current state: active SST files, WAL position
     ├── wal/
     │   ├── 000001.wal              # Write-ahead log segments
@@ -709,7 +797,7 @@ s3://bucket/volumes/{vol-id}/
 
 Each SST file contains multiple 256KB chunks, compressed with LZ4 and encrypted with XChaCha20-Poly1305. SST files are immutable once written — they are never modified, only replaced during compaction.
 
-## 13. Cloud Hypervisor integration (virtio-block, rate limiting)
+## 15. Cloud Hypervisor integration (virtio-block, rate limiting)
 
 ### Block device attachment
 
@@ -755,7 +843,98 @@ Default rate limits (configurable per VM tier):
 - **Attach**: `PUT /vm.add-disk` with the NBD device path. Guest kernel detects new PCI device.
 - **Detach**: `PUT /vm.remove-device` with the device ID. Guest kernel removes the block device. The guest should unmount first — removing a mounted device causes I/O errors in the guest (expected behavior, same as unplugging a physical disk).
 
-## 14. CLI
+## 16. Integration with Raft (metadata in Raft, data in S3)
+
+Volume metadata goes through Raft for consistency. Volume data goes directly to S3 (not through Raft — the data volume would overwhelm the consensus protocol).
+
+### What Raft manages
+
+| Resource | Raft commands | Why in Raft |
+|---|---|---|
+| Volume CRUD | `CreateVolume`, `DeleteVolume`, `ResizeVolume` | Must be consistent — no duplicate IDs, no double-create |
+| Attachment state | `AttachVolume`, `DetachVolume` | Single-writer invariant — Raft enforces exclusive attachment |
+| Snapshot records | `CreateSnapshot`, `DeleteSnapshot`, `RestoreSnapshot` | Must be consistent — snapshot IDs unique, source volume valid |
+| SST refcounts | Updated on snapshot/volume create/delete | GC safety — Raft is source of truth for reachability |
+| Storage config | `SetStorageConfig` | Per-region S3 config, replicated to all nodes |
+| Storage quotas | `SetStorageQuota`, `CheckQuota` | Per-org/project limits, enforced at commit time |
+| Placement generation | Incremented on `AttachVolume`, `DetachVolume`, reschedule | Fencing (see §12) |
+
+### What ZeroFS manages (locally, not through Raft)
+
+| Concern | Managed by | Why local |
+|---|---|---|
+| NBD device lifecycle | ZeroFS on the hypervisor | Runtime artifact — only relevant on the node where the volume is attached |
+| Cache contents | ZeroFS on the hypervisor | Ephemeral — rebuilt on demand from S3 |
+| S3 read/write operations | ZeroFS on the hypervisor | Data plane — too much throughput for consensus |
+| Chunk management (split, compress, encrypt) | ZeroFS on the hypervisor | Implementation detail of the storage engine |
+| WAL flush and SST compaction | ZeroFS on the hypervisor | Background maintenance, local to each volume instance |
+
+### Raft commands for storage
+
+```rust
+enum StorageCommand {
+    CreateVolume {
+        id: VolumeId,
+        name: String,
+        size_gb: u32,
+        org_id: OrgId,
+        project_id: ProjectId,
+        env_id: EnvId,
+        volume_type: VolumeType,
+    },
+    DeleteVolume {
+        volume_id: VolumeId,
+    },
+    AttachVolume {
+        volume_id: VolumeId,
+        vm_id: VmId,
+        hypervisor_id: HypervisorId,
+    },
+    DetachVolume {
+        volume_id: VolumeId,
+    },
+    ResizeVolume {
+        volume_id: VolumeId,
+        new_size_gb: u32,
+    },
+    CreateSnapshot {
+        id: SnapshotId,
+        source_volume_id: VolumeId,
+        sst_files: Vec<String>,
+        wal_position: u64,
+    },
+    DeleteSnapshot {
+        snapshot_id: SnapshotId,
+    },
+    RestoreSnapshot {
+        snapshot_id: SnapshotId,
+        new_volume_id: VolumeId,
+        new_volume_name: String,
+    },
+    SetStorageConfig {
+        region: String,
+        config: StorageConfig,
+    },
+    SetStorageQuota {
+        scope: QuotaScope,  // Org or Project
+        max_volumes: u32,
+        max_total_gb: u64,
+        max_snapshots: u32,
+    },
+}
+```
+
+Each command is validated by the Raft state machine before committing:
+
+- `CreateVolume`: check quota, check name uniqueness within environment
+- `AttachVolume`: check volume is `Available`, check VM exists and is on the target HV, increment `placement_generation`
+- `DetachVolume`: check volume is `Attached`, set desired state to `Available`
+- `DeleteVolume`: check volume is `Available` (not attached), check no in-flight snapshot/restore operations reference it, set desired state to `Deleted`. Physical S3 deletion happens after a tombstone period — Raft marks the intent, Forge executes the cleanup.
+- `ResizeVolume`: check volume is `Available`, check new size >= current size (no shrink in v1)
+- `CreateSnapshot`: increment refcounts for all referenced SST files
+- `DeleteSnapshot`: decrement refcounts for all referenced SST files, check no in-progress restore references this snapshot
+
+## 17. CLI
 
 ```bash
 # Volume lifecycle
@@ -824,7 +1003,7 @@ syfrah volume snapshot restore pgdata-pre-upgrade --name pgdata-restored
 syfrah volume attach pgdata-restored --vm web-1
 ```
 
-## 15. Forge integration
+## 18. Forge integration
 
 Forge on each hypervisor manages local ZeroFS through the `VolumeMgr` subsystem (defined in ADR-003).
 
@@ -871,35 +1050,37 @@ On every reconciliation cycle, Forge's storage reconciler:
 3. Network (remove TAP, nftables, FDB)
 ```
 
-## 16. Performance characteristics
+## 19. Performance Expectations
 
-Honest numbers based on the ZeroFS architecture and S3 latency characteristics.
+These are **design targets, not SLA commitments**. Actual performance depends on workload, cache hit rate, S3 endpoint latency, and local hardware. Validation benchmarks are required before GA.
 
 ### Latency
 
-| Operation | Latency | Bottleneck |
-|---|---|---|
-| Hot read (memory cache) | < 10μs | Memory bandwidth |
-| Warm read (SSD cache) | 100-200μs | NVMe/SSD latency |
-| Cold read (S3 fetch) | 10-100ms | S3 GET latency + network |
-| Write (buffered, no fsync) | < 10μs | Memory bandwidth |
-| Write (fsync to WAL on S3) | 5-50ms | S3 PUT latency |
-| Snapshot create | 1-5s | S3 flush + manifest write |
-| Snapshot restore | 1-3s | Manifest read + ZeroFS init |
-| Volume create | 2-5s | S3 init + NBD setup |
-| Volume attach (hot-plug) | 1-3s | NBD connect + CH add-disk |
-| Volume detach | 2-10s | Cache flush + NBD disconnect |
+| Operation | Expected range | Bottleneck | Benchmark required |
+|-----------|---------------|------------|-------------------|
+| Hot read (memory cache) | 1-10 us | Memory bandwidth | Yes |
+| Warm read (SSD cache) | 50-200 us | NVMe/SSD latency | Yes |
+| Cold read (S3 fetch) | 10-100 ms | S3 GET latency + network | Yes |
+| Write (buffered, no fsync) | 1-10 us | Memory bandwidth | Yes |
+| Write (fsync to WAL on S3) | 5-50 ms | S3 PUT latency | Yes |
+| Snapshot create (metadata) | < 1s | Raft commit | Yes |
+| Snapshot restore | 1-3s | Manifest read + ZeroFS init | Yes |
+| Volume create | 2-5s | S3 init + NBD setup | Yes |
+| Volume attach (hot-plug) | 1-3s | NBD connect + CH add-disk | Yes |
+| Volume detach | 2-10s | Cache flush + NBD disconnect | Yes |
 
 ### Throughput
 
-| Scenario | Throughput | Bottleneck |
-|---|---|---|
-| Sequential read (cached) | NVMe speed (2-7 GB/s) | Local SSD bandwidth |
-| Sequential read (cold) | 100-500 MB/s | S3 bandwidth (parallel GETs) |
-| Sequential write (buffered) | Memory speed (10+ GB/s) | Memory bandwidth |
-| Sequential write (fsync) | 50-200 MB/s | S3 PUT throughput |
-| Random 4K read (cached) | 100K-500K IOPS | NVMe random read |
-| Random 4K read (cold) | 100-1000 IOPS | S3 GET per chunk |
+| Scenario | Expected range | Bottleneck | Benchmark required |
+|----------|---------------|------------|-------------------|
+| Sequential read (cached) | 2-7 GB/s | Local NVMe bandwidth | Yes |
+| Sequential read (cold) | 100-500 MB/s | S3 bandwidth (parallel GETs) | Yes |
+| Sequential write (buffered) | Memory speed | Memory bandwidth | Yes |
+| Sequential write (fsync) | 50-200 MB/s | S3 PUT throughput | Yes |
+| Random 4K read (cached) | 100K-500K IOPS | NVMe random read | Yes |
+| Random 4K read (cold) | 100-1000 IOPS | S3 GET per chunk | Yes |
+
+All numbers are subject to validation. They are not SLA figures and must not be marketed as guarantees.
 
 ### Cache hit rate expectations
 
@@ -907,7 +1088,32 @@ For most VM workloads, >95% of I/O hits the local cache. The working set of a ty
 
 Workloads with very large working sets (data warehouses, large media processing) will have lower cache hit rates and experience more S3 latency. These workloads should use hypervisors with larger SSD cache allocations.
 
-## 17. Capacity management (local cache + S3 quotas)
+## 20. Supported Workloads
+
+### Well-suited (validated targets for v1)
+
+| Workload | Why it works |
+|----------|-------------|
+| Web servers, APIs | Mostly read-heavy, working set fits in cache, infrequent fsync |
+| Dev/test environments | Durability loss on crash is acceptable |
+| CI/CD runners | Ephemeral, no fsync expectations |
+| Root disks | OS data, infrequent writes, cache-friendly |
+| Application data (moderate write) | Write-back semantics acceptable if app handles its own consistency |
+
+### Not recommended (v1 limitations)
+
+| Workload | Why it's risky |
+|----------|---------------|
+| Transactional databases (Postgres, MySQL) under heavy load | Frequent fsync → high S3 WAL latency (5-50ms per fsync) |
+| Write-ahead-log-heavy systems (etcd, Kafka, Raft stores) | fsync-per-write kills throughput |
+| High-frequency trading / ultra-low-latency | S3 tail latency unpredictable |
+| Large random read workloads (cold data) | Cache misses → S3 latency (10-100ms) |
+
+### Honest positioning
+
+"Syfrah volumes are NOT equivalent to local NVMe or synchronous replicated block storage. They are designed for workloads where operator simplicity outweighs raw storage performance. For latency-critical databases, use dedicated database nodes with local storage or a managed database product."
+
+## 21. Capacity management (local cache + S3 quotas)
 
 ### Local cache capacity
 
@@ -916,8 +1122,9 @@ Each hypervisor has a finite SSD cache. Forge tracks and reports:
 - `cache_total_gb`: total SSD allocated for cache
 - `cache_used_gb`: currently used by all volumes' cached chunks
 - `cache_hit_rate`: rolling 5-minute average (reported via gossip)
+- `dirty_bytes`: total unflushed bytes across all volumes (reported via gossip)
 
-The scheduler does NOT use cache capacity for placement decisions. Volumes are S3-backed and can be attached to any hypervisor in the region. However, operators should monitor cache utilization and resize the cache allocation if hit rates drop.
+The scheduler does NOT use cache capacity for placement decisions in v1. Volumes are S3-backed and can be attached to any hypervisor in the region. However, cache pressure and dirty bytes should be surfaced to the operator, and soft storage signals (cache pressure, dirty byte ratio) should be considered as scheduler hints in a future release (see §28, Future Work).
 
 ### S3 storage quotas
 
@@ -930,7 +1137,7 @@ Quotas are enforced at the Raft level (before commit):
 
 The state machine sums all volume sizes and counts within the scope before committing a `CreateVolume` or `CreateSnapshot`. If the quota would be exceeded, the command is rejected.
 
-## 18. Operator setup
+## 22. Operator setup
 
 ### Initial setup (per region)
 
@@ -974,7 +1181,7 @@ syfrah storage configure \
 
 S3 endpoint and bucket are per-region (shared by all hypervisors). Cache config is per-hypervisor.
 
-## 19. Deletion guards
+## 23. Deletion guards
 
 ### Volume deletion guards
 
@@ -984,6 +1191,7 @@ A volume cannot be deleted if:
 2. **It has snapshots** — must delete all snapshots first (or use `--cascade` to delete snapshots too).
 3. **It is a root volume for a running VM** — must stop and delete the VM first.
 4. **Deletion protection is enabled** — must explicitly remove protection first.
+5. **A snapshot create or restore is in-flight** — must wait for the operation to complete. Deletion while a snapshot references this volume in an active operation could violate GC refcount invariants.
 
 ```bash
 # Enable deletion protection
@@ -1005,15 +1213,17 @@ A snapshot cannot be deleted if:
 1. **It is the source for an in-progress restore** — wait for restore to complete
 2. **Deletion protection is inherited from the volume** — remove volume deletion protection first
 
-### S3 object lifecycle
+### Volume deletion protocol (tombstone before physical delete)
 
 When a volume is deleted:
-1. Raft marks volume as `Deleting`
-2. Forge on the last known hypervisor (or any hypervisor in the region) deletes S3 objects under the volume's prefix
-3. Once all S3 objects are confirmed deleted, Raft marks the volume as `Deleted`
-4. `Deleted` volume records are retained for 30 days (audit trail), then garbage-collected
+1. Raft marks the volume's desired state as `Deleted` (tombstone). The volume record remains in Raft with this tombstone for a grace period.
+2. SST refcounts for the volume's manifest are decremented.
+3. Forge on the last known hypervisor (or any hypervisor in the region) deletes S3 objects under the volume's prefix — but only after GC confirms no other volume/snapshot references those SSTs.
+4. `Deleted` volume records are retained for 30 days (audit trail), then garbage-collected from Raft.
 
-## 20. Security (encryption at rest, key management)
+Physical S3 object deletion NEVER happens before the Raft tombstone is written and refcounts are updated. This ensures that a crash during deletion does not leave orphaned references.
+
+## 24. Security (encryption at rest, key management)
 
 ### Encryption at rest
 
@@ -1042,18 +1252,18 @@ All volume data is encrypted before leaving the hypervisor. The S3 provider neve
 | Network interception (S3 traffic) | HTTPS to S3 endpoint + data encrypted at rest |
 | Rogue hypervisor joins mesh | Fabric peering requires operator approval; rogue node cannot join without explicit PIN acceptance |
 
-## 21. Failure scenarios (S3 outage, cache full, node crash)
+## 25. Failure scenarios — contractual invariants
 
 ### S3 outage
 
-| Duration | Impact | Behavior |
-|---|---|---|
-| < 30 seconds | None | ZeroFS retries S3 operations with exponential backoff. All I/O served from cache. |
-| 30s - 5 min | Minimal | Reads: fully served from cache (for cached data). Cold reads: stall until S3 returns. Writes: buffered in memory. fsync stalls. |
-| 5 - 30 min | Moderate | Write buffer fills up. New writes start blocking. Read cache continues serving. Existing VMs keep running but write-heavy workloads slow down. |
-| > 30 min | Severe | Memory buffer exhausted. All writes block. VMs with I/O-heavy workloads may appear frozen. VMs with read-only or low-I/O workloads continue normally. |
+| Duration | Impact | Invariant |
+|----------|--------|-----------|
+| < 30s | fsync blocks, guest may see latency spike | No data loss. Fsynced writes queued in memory. All previously fsynced data safe in S3. |
+| 30s - 5min | fsync returns EIO. Guest sees write errors. | Fsynced-before-outage data is safe. In-flight fsyncs may fail — guest receives EIO and must retry. |
+| > 5min | Volume transitions to Degraded. New writes rejected. | Cache dirty data preserved locally. Recovery on S3 return. No data loss if hypervisor stays up. |
+| > 30min | Volume transitions to Error. Cache may overflow. | Best-effort preservation. Operator intervention required. |
 
-Recovery: when S3 returns, ZeroFS flushes buffered writes and resumes normal operation. No data loss unless the hypervisor crashes while writes are buffered and unflushed.
+**Invariant: data that was fsynced and acknowledged BEFORE the outage is NEVER lost, regardless of outage duration.** It already reached S3 before the outage began.
 
 ### Cache disk full
 
@@ -1065,11 +1275,13 @@ Recovery: when S3 returns, ZeroFS flushes buffered writes and resumes normal ope
 
 ### Node crash (unclean shutdown)
 
+**Invariant**: fsynced data is recoverable. Non-fsynced data is lost.
+
 1. ZeroFS processes die with the node
 2. Data in memory buffer that was not fsync'd to S3 WAL is lost (same as local disk power loss)
 3. Data in S3 (WAL + SST files) is durable and intact
-4. On recovery: ZeroFS replays WAL from S3, reconstructs state
-5. If the VM was rescheduled during the outage: fencing prevents the old node from touching the volume (§11)
+4. On recovery: ZeroFS replays WAL from S3, reconstructs state up to the last successful fsync
+5. If the VM was rescheduled during the outage: fencing prevents the old node from touching the volume (§12)
 
 ### NBD device failure
 
@@ -1087,7 +1299,7 @@ Recovery: when S3 returns, ZeroFS flushes buffered writes and resumes normal ope
 4. If corruption persists: I/O error returned to guest, volume enters `Error` state
 5. Recovery: restore from the most recent snapshot
 
-## 22. Limitations
+## 26. Limitations
 
 These are deliberate choices for v1, not missing features:
 
@@ -1102,19 +1314,70 @@ These are deliberate choices for v1, not missing features:
 | **No cross-region volume move** | Volume stays in its creation region | Cross-region requires S3-to-S3 copy + re-encryption. Future enhancement. |
 | **No volume shrink** | Can only grow, not shrink | Shrinking requires data relocation + filesystem cooperation. Not worth the risk. |
 | **fsync latency = S3 PUT latency** | 5-50ms per fsync | Inherent to S3-backed WAL. Applications that fsync frequently will feel this. |
+| **Crash-consistent snapshots only** | No application-consistent snapshots without guest cooperation | App-consistent requires guest agent or fsfreeze. Tenant responsibility. |
 
-## 23. Implementation phases
+## 27. Validation Plan
+
+The following tests MUST pass before GA. No exceptions.
+
+### Correctness tests
+
+| Test | Method | Pass criteria |
+|------|--------|--------------|
+| Power loss during write | kill -9 ZeroFS during active writes | WAL replay recovers all fsynced data, no corruption |
+| Power loss during fsync | kill -9 during S3 PUT (WAL flush) | Either the fsync completed (data durable) or it did not (data lost, no corruption) |
+| S3 outage simulation | Network partition to S3 endpoint | fsync blocks or returns EIO. No data corruption. Recovery on reconnect. |
+| Concurrent attach/detach | Rapid attach/detach cycles under load | No state machine violations. No orphaned NBD devices. |
+| Fencing correctness | Old writer attempts S3 writes after reschedule | Old writes are orphaned in gen-N/. New writer never sees them. |
+| Multi-generation isolation | Multiple reschedules in sequence | Each generation's data is isolated. Merge reads are correct. |
+| Snapshot/restore/delete churn | Create, restore, delete snapshots rapidly | Refcounts are correct. No SSTs deleted while referenced. |
+| GC safety | Delete volumes and snapshots, run GC | Only unreferenced SSTs are deleted. Referenced SSTs survive. |
+
+### Performance benchmarks
+
+| Benchmark | Tool | What to measure |
+|-----------|------|----------------|
+| Hot read latency | fio (randread, 4K) | p50, p99, p999 latency with warm cache |
+| Cold read latency | fio after cache flush | p50, p99 latency hitting S3 |
+| Buffered write latency | fio (randwrite, 4K, no fsync) | p50, p99 latency |
+| fsync latency | fio (randwrite, 4K, fsync=1) | p50, p99 latency |
+| Sequential throughput | fio (read/write, 1M, queue depth 32) | MB/s cached vs cold |
+| Cache hit rate under load | Custom workload (90/10 read/write) | Hit rate over time |
+
+### Stress tests
+
+| Test | Duration | What to verify |
+|------|----------|---------------|
+| Long-running compaction | 24h continuous write | No SST corruption, no memory leak, no cache bloat |
+| Cache overflow | Write more data than cache capacity | LRU eviction works, no OOM, performance degrades gracefully |
+| S3 latency spike | Inject 500ms latency on S3 | fsync latency increases but no timeouts, no corruption |
+| Rapid migration | Reschedule VM every 60s for 1h | Fencing works every time, no data loss, no stale writes |
+
+## 28. Future work
+
+Items explicitly deferred from v1, tracked for future phases:
+
+- **Scheduler storage signals**: soft hints based on cache pressure and dirty byte ratio for smarter VM placement. The scheduler should prefer hypervisors with lower cache pressure when all other factors are equal.
+- **Short-lived S3 credentials (STS)**: per-attachment credentials that expire on detach for physically hard fencing.
+- **Per-volume encryption keys**: separate key per volume, key rotation support, external KMS integration.
+- **Application-consistent snapshots**: guest agent integration for fsfreeze/thaw automation.
+- **Cross-region volume copy**: S3-to-S3 copy with re-encryption for disaster recovery.
+- **Live resize**: online volume expansion without detach (requires guest filesystem cooperation).
+- **Cache pre-warming**: predictive cache loading after migration based on historical access patterns.
+
+## 29. Implementation phases
 
 ### Phase 1 — Volume CRUD + Raft state (~8 issues)
 
 - Volume and Snapshot types in `syfrah-core`
+- `VolumeDesiredState` and `VolumeObservedState` types
 - Raft commands: `CreateVolume`, `DeleteVolume`, `ResizeVolume`
-- Raft state machine: volume state transitions, quota checks
+- Raft state machine: desired/observed state reconciliation, quota checks
 - Volume CLI: `syfrah volume create/list/get/delete`
 - S3 configuration: `StorageConfig` type, `SetStorageConfig` command
 - Volume state machine enforcement (invalid transition → error)
-- redb tables for volumes, snapshots, storage config
-- Unit tests: state machine transitions, quota enforcement
+- redb tables for volumes, snapshots, storage config, SST refcounts
+- Unit tests: state machine transitions, quota enforcement, refcount invariants
 
 ### Phase 2 — ZeroFS integration (~8 issues)
 
@@ -1122,8 +1385,9 @@ These are deliberate choices for v1, not missing features:
 - `VolumeMgr` in Forge: start/stop ZeroFS processes
 - NBD device lifecycle: create, connect, disconnect, destroy
 - Cache configuration: pass SSD path, memory limit, disk limit to ZeroFS
+- Generation-based S3 prefix (`gen-{N}/`) for all ZeroFS instances
 - Volume create flow: Raft commit → Forge reconciler → ZeroFS init → NBD ready
-- Volume delete flow: Forge stops ZeroFS → deletes S3 objects → Raft marks Deleted
+- Volume delete flow: tombstone in Raft → refcount update → Forge stops ZeroFS → deletes S3 objects → Raft marks Deleted
 - Storage health check: `syfrah storage health` (S3 latency probe)
 - Integration tests: volume create/delete with real ZeroFS + mock S3
 
@@ -1138,12 +1402,12 @@ These are deliberate choices for v1, not missing features:
 
 ### Phase 4 — Snapshots + migration (~6 issues)
 
-- Snapshot create: ZeroFS flush → record SST file list → Raft commit
-- Snapshot restore: create new volume from snapshot SST files
-- Snapshot delete: remove references, garbage-collect orphaned SST files
+- Snapshot create: ZeroFS pause compaction → record manifest → Raft commit with SST refcount increments
+- Snapshot restore: create new volume from snapshot SST files, new generation prefix
+- Snapshot delete: Raft commit with SST refcount decrements → GC marks unreachable SSTs
 - `syfrah volume snapshot create/list/restore/delete` CLI
-- Volume migration on VM reschedule: flush → disconnect → reconnect on new HV
-- Fencing with `placement_generation`: stale ZeroFS instance stopped
+- Volume migration on VM reschedule: flush → disconnect → reconnect on new HV with new generation prefix
+- Hard fencing with generation-based S3 prefix isolation
 
 ### Phase 5 — Production hardening (~4 issues)
 
@@ -1151,10 +1415,12 @@ These are deliberate choices for v1, not missing features:
 - S3 health checks: periodic latency probe, alert on degradation
 - Quota enforcement: per-org and per-project limits
 - Graceful degradation on S3 outage: buffer management, backpressure to VMs
+- GC implementation: two-phase delete, grace period, orphan cleanup
+- Validation plan execution (see §27)
 
 **Total: ~32 issues**
 
-## 24. Commercial value
+## 30. Commercial value
 
 ### Why this matters for operators
 
@@ -1165,12 +1431,12 @@ These are deliberate choices for v1, not missing features:
 
 ### Why this matters for tenants
 
-- **Persistent storage that survives machine failure.** Data is durable in S3 even if the hypervisor hardware fails.
+- **Persistent storage that survives machine failure.** Fsynced data is durable in S3 even if the hypervisor hardware fails. See §3 for the durability contract.
 - **Standard block device interface.** `/dev/vda`, `/dev/vdb` — format with ext4, XFS, or any filesystem. No proprietary API.
 - **Fast snapshots.** Create a snapshot in seconds, restore in seconds. Useful for backups before deployments, database point-in-time recovery, cloning environments.
-- **Predictable performance.** With proper cache sizing, >95% of I/O is served from local NVMe at sub-millisecond latency. S3 latency is invisible for typical workloads.
+- **Predictable performance for cache-friendly workloads.** With proper cache sizing, >95% of I/O is served from local NVMe at sub-millisecond latency. S3 latency is invisible for typical workloads. See §20 for workload fit guidance.
 
-## 25. Rejected alternatives
+## 31. Rejected alternatives
 
 ### Ceph
 
@@ -1213,7 +1479,7 @@ Using NFS to share local disks between nodes. Rejected because:
 - **No encryption.** NFS traffic is unencrypted (without Kerberos, which adds complexity).
 - **Performance.** NFS adds network latency to every I/O operation, with no local cache to absorb it.
 
-## 26. References
+## 32. References
 
 - [ZeroFS](https://github.com/Barre/ZeroFS) — S3-backed block storage engine (Rust)
 - [SlateDB](https://github.com/slatedb/slatedb) — LSM-tree engine used by ZeroFS
