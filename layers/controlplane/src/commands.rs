@@ -54,6 +54,17 @@ pub enum QuotaScope {
     Project { org_id: String, project_id: String },
 }
 
+impl std::fmt::Display for QuotaScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuotaScope::Org { org_id } => write!(f, "Org({org_id})"),
+            QuotaScope::Project { org_id, project_id } => {
+                write!(f, "Project({project_id}@{org_id})")
+            }
+        }
+    }
+}
+
 /// A command that is replicated through Raft and applied to the state machine.
 ///
 /// Each variant maps to an existing store method in the org/hypervisor/ipam layers.
@@ -345,7 +356,7 @@ pub enum StateMachineCommand {
     /// every node in the region can reach the bucket.
     SetStorageConfig {
         region: String,
-        config: StorageConfig,
+        config: Box<StorageConfig>,
     },
     /// Set storage quotas for an org or project.
     SetStorageQuota {
@@ -399,7 +410,7 @@ impl std::fmt::Display for StateMachineCommand {
                 ..
             } => write!(f, "RestoreSnapshot({snapshot_id}→{new_volume_id})"),
             Self::SetStorageConfig { region, .. } => write!(f, "SetStorageConfig({region})"),
-            Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope:?})"),
+            Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -689,7 +700,7 @@ mod tests {
             },
             StateMachineCommand::SetStorageConfig {
                 region: "eu-west".into(),
-                config: StorageConfig {
+                config: Box::new(StorageConfig {
                     s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
                     s3_bucket: "syfrah-storage-eu-west".into(),
                     s3_access_key: "AKID".into(),
@@ -697,7 +708,7 @@ mod tests {
                     cache_disk_path: "/dev/nvme1n1".into(),
                     cache_disk_size_gb: 200,
                     cache_memory_size_gb: 8,
-                },
+                }),
             },
             StateMachineCommand::SetStorageQuota {
                 scope: QuotaScope::Org {
