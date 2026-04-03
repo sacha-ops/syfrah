@@ -198,6 +198,29 @@ jobs:
             echo "No SHA256 checksum file available — skipping verification"
           fi
 
+      - name: Download ZeroFS binary (Linux only)
+        if: contains(matrix.target, 'linux')
+        run: |
+          set -euo pipefail
+          ZEROFS_VERSION=$(cat ZEROFS_VERSION | tr -d '[:space:]')
+          echo "ZeroFS version: ${ZEROFS_VERSION}"
+
+          # Determine architecture for download
+          if [[ "${{ matrix.target }}" == aarch64-* ]]; then
+            ZEROFS_ARCH="aarch64"
+          else
+            ZEROFS_ARCH="x86_64"
+          fi
+
+          ZEROFS_URL="https://github.com/nicholasgasior/zerofs/releases/download/${ZEROFS_VERSION}/zerofs-${ZEROFS_ARCH}-unknown-linux-musl"
+          echo "Downloading ${ZEROFS_URL}"
+          if curl -fsSL -o "target/${{ matrix.target }}/release/zerofs" "${ZEROFS_URL}"; then
+            chmod +x "target/${{ matrix.target }}/release/zerofs"
+            echo "ZeroFS downloaded successfully"
+          else
+            echo "::warning::Failed to download ZeroFS from ${ZEROFS_URL} — release will not include zerofs"
+          fi
+
       - name: Download kernel (Linux only)
         if: contains(matrix.target, 'linux')
         run: |
@@ -301,6 +324,7 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/syfrah
             target/${{ matrix.target }}/release/cloud-hypervisor
+            target/${{ matrix.target }}/release/zerofs
             target/${{ matrix.target }}/release/vmlinux
             target/${{ matrix.target }}/release/crun
             target/${{ matrix.target }}/release/runsc
@@ -335,6 +359,10 @@ jobs:
               TARBALL_FILES="syfrah cloud-hypervisor"
               if [ -f "${target_dir}vmlinux" ]; then
                 TARBALL_FILES="${TARBALL_FILES} vmlinux"
+              fi
+              if [ -f "${target_dir}zerofs" ]; then
+                chmod +x "${target_dir}zerofs"
+                TARBALL_FILES="${TARBALL_FILES} zerofs"
               fi
               if [ -f "${target_dir}crun" ]; then
                 chmod +x "${target_dir}crun"

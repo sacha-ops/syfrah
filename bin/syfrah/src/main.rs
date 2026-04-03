@@ -89,6 +89,11 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::HypervisorCommand,
     },
+    /// Manage storage layer (ZeroFS version, diagnostics)
+    Storage {
+        #[command(subcommand)]
+        command: syfrah_storage::StorageCommand,
+    },
     /// Manage block storage volumes
     Volume {
         #[command(subcommand)]
@@ -981,6 +986,7 @@ async fn run() -> Result<()> {
         Commands::NatGw { command } => syfrah_org::cli::run_nat_gw(command).await,
         Commands::Route { command } => syfrah_org::cli::run_route(command).await,
         Commands::Hypervisor { command } => syfrah_org::cli::run_hypervisor(command).await,
+        Commands::Storage { command } => syfrah_storage::cli::run_storage(command).await,
         Commands::Volume { command } => syfrah_storage::cli::run(command).await,
         Commands::ControlPlane { command } => controlplane::run(command).await,
         Commands::Completions { shell } => {
