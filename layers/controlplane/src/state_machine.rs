@@ -70,6 +70,21 @@ pub struct SnapshotRecord {
     pub org_id: String,
     /// project_id inherited from the source volume at creation time.
     pub project_id: String,
+    /// Size in GB of the source volume at snapshot time.
+    /// Used by RestoreSnapshot so the restored volume gets the correct size
+    /// even if the source volume has been deleted or resized since.
+    #[serde(default)]
+    pub size_gb: u32,
+    /// env_id inherited from the source volume at creation time.
+    #[serde(default)]
+    pub env_id: String,
+    /// volume_type inherited from the source volume at creation time.
+    #[serde(default = "default_volume_type")]
+    pub volume_type: VolumeType,
+}
+
+fn default_volume_type() -> VolumeType {
+    VolumeType::Data
 }
 
 /// SST file reference count for garbage collection.
@@ -408,12 +423,15 @@ impl RedbStateMachine {
         }
     }
 
-    /// Look up the effective quota for a given org + project.
+    /// Look up the effective quota for a given org + project from an already-locked storage.
     ///
     /// Returns the project-level quota if set, otherwise the org-level quota.
     /// Returns `None` if no quota is set (meaning unlimited).
-    fn effective_quota(&self, org_id: &str, project_id: &str) -> Option<StorageQuota> {
-        let storage = self.storage.read().unwrap();
+    fn effective_quota_from(
+        storage: &StorageState,
+        org_id: &str,
+        project_id: &str,
+    ) -> Option<StorageQuota> {
         // Check project-level first.
         let project_key = Self::quota_key(&QuotaScope::Project {
             org_id: org_id.to_string(),
@@ -429,25 +447,54 @@ impl RedbStateMachine {
         storage.quotas.get(&org_key).cloned()
     }
 
+    /// Determine which scope is effective for quota from an already-locked storage.
+    fn effective_quota_scope_from(
+        storage: &StorageState,
+        org_id: &str,
+        project_id: &str,
+    ) -> QuotaScope {
+        let project_key = Self::quota_key(&QuotaScope::Project {
+            org_id: org_id.to_string(),
+            project_id: project_id.to_string(),
+        });
+        if storage.quotas.contains_key(&project_key) {
+            QuotaScope::Project {
+                org_id: org_id.to_string(),
+                project_id: project_id.to_string(),
+            }
+        } else {
+            QuotaScope::Org {
+                org_id: org_id.to_string(),
+            }
+        }
+    }
+
     /// Check volume quotas for a CreateVolume operation.
     ///
     /// Returns `Ok(())` if quota is not exceeded, or an error with usage details.
+    ///
+    /// # TOCTOU safety
+    ///
+    /// There is no time-of-check-to-time-of-use race here because all
+    /// `apply_command` calls are serialized by Raft — only one command is
+    /// applied at a time on each node, so the quota read and the subsequent
+    /// volume insert are effectively atomic.
     fn check_volume_quota(
         &self,
         org_id: &str,
         project_id: &str,
         new_size_gb: u32,
     ) -> Result<(), QuotaExceededError> {
-        let quota = match self.effective_quota(org_id, project_id) {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
             Some(q) => q,
             None => return Ok(()), // No quota = unlimited.
         };
-        let scope = self.effective_quota_scope(org_id, project_id);
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
 
-        let storage = self.storage.read().unwrap();
         // TODO: For v1 we scan all volumes. Add index by org_id/project_id if this
         // becomes a hot path.
-        let (count, total_gb) = Self::compute_volume_usage(&storage, org_id, project_id, &scope);
+        let (count, total_gb) = Self::compute_volume_usage(&storage, &scope);
 
         // Check volume count.
         if count >= quota.max_volumes as u64 {
@@ -470,20 +517,49 @@ impl RedbStateMachine {
         Ok(())
     }
 
+    /// Check total_gb quota for a ResizeVolume operation (delta only, no volume count check).
+    ///
+    /// # TOCTOU safety
+    ///
+    /// Same as `check_volume_quota` — Raft serializes all applies.
+    fn check_resize_quota(
+        &self,
+        org_id: &str,
+        project_id: &str,
+        delta_gb: u32,
+    ) -> Result<(), QuotaExceededError> {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
+            Some(q) => q,
+            None => return Ok(()), // No quota = unlimited.
+        };
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
+        let (_count, total_gb) = Self::compute_volume_usage(&storage, &scope);
+
+        if total_gb + delta_gb as u64 > quota.max_total_gb {
+            return Err(QuotaExceededError {
+                scope,
+                resource: "total_gb".to_string(),
+                current: total_gb,
+                limit: quota.max_total_gb,
+            });
+        }
+        Ok(())
+    }
+
     /// Check snapshot quota for a CreateSnapshot operation.
     fn check_snapshot_quota(
         &self,
         org_id: &str,
         project_id: &str,
     ) -> Result<(), QuotaExceededError> {
-        let quota = match self.effective_quota(org_id, project_id) {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
             Some(q) => q,
             None => return Ok(()), // No quota = unlimited.
         };
-        let scope = self.effective_quota_scope(org_id, project_id);
-
-        let storage = self.storage.read().unwrap();
-        let count = Self::compute_snapshot_count(&storage, org_id, project_id, &scope);
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
+        let count = Self::compute_snapshot_count(&storage, &scope);
 
         if count >= quota.max_snapshots as u64 {
             return Err(QuotaExceededError {
@@ -496,32 +572,8 @@ impl RedbStateMachine {
         Ok(())
     }
 
-    /// Determine which scope is effective for quota (project if set, else org).
-    fn effective_quota_scope(&self, org_id: &str, project_id: &str) -> QuotaScope {
-        let storage = self.storage.read().unwrap();
-        let project_key = Self::quota_key(&QuotaScope::Project {
-            org_id: org_id.to_string(),
-            project_id: project_id.to_string(),
-        });
-        if storage.quotas.contains_key(&project_key) {
-            QuotaScope::Project {
-                org_id: org_id.to_string(),
-                project_id: project_id.to_string(),
-            }
-        } else {
-            QuotaScope::Org {
-                org_id: org_id.to_string(),
-            }
-        }
-    }
-
     /// Compute volume usage (count, total_gb) within the effective scope.
-    fn compute_volume_usage(
-        storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
-        scope: &QuotaScope,
-    ) -> (u64, u64) {
+    fn compute_volume_usage(storage: &StorageState, scope: &QuotaScope) -> (u64, u64) {
         let mut count = 0u64;
         let mut total_gb = 0u64;
         for vol in storage.volumes.values() {
@@ -533,8 +585,6 @@ impl RedbStateMachine {
                 } => vol.org_id == *oid && vol.project_id == *pid,
             };
             if in_scope {
-                // Also match for project-scoped if checking org-level
-                let _ = (org_id, project_id); // used via scope
                 count += 1;
                 total_gb += vol.size_gb as u64;
             }
@@ -543,12 +593,7 @@ impl RedbStateMachine {
     }
 
     /// Compute snapshot count within the effective scope.
-    fn compute_snapshot_count(
-        storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
-        scope: &QuotaScope,
-    ) -> u64 {
+    fn compute_snapshot_count(storage: &StorageState, scope: &QuotaScope) -> u64 {
         let mut count = 0u64;
         for snap in storage.snapshots.values() {
             let in_scope = match scope {
@@ -559,7 +604,6 @@ impl RedbStateMachine {
                 } => snap.org_id == *oid && snap.project_id == *pid,
             };
             if in_scope {
-                let _ = (org_id, project_id); // used via scope
                 count += 1;
             }
         }
@@ -1699,24 +1743,46 @@ impl RedbStateMachine {
                 volume_id,
                 new_size_gb,
             } => {
-                let mut storage = self.storage.write().unwrap();
-                match storage.volumes.get_mut(volume_id) {
-                    Some(vol) if vol.state == VolumeState::Available => {
-                        if *new_size_gb <= vol.size_gb {
-                            return StateMachineResponse::Error(format!(
-                                "cannot shrink volume '{}': current {}GB, requested {}GB",
-                                volume_id, vol.size_gb, new_size_gb
-                            ));
+                // Read current volume to validate state and compute delta.
+                let (org_id, project_id, old_size_gb) = {
+                    let storage = self.storage.read().unwrap();
+                    match storage.volumes.get(volume_id) {
+                        Some(vol) if vol.state == VolumeState::Available => {
+                            if *new_size_gb <= vol.size_gb {
+                                return StateMachineResponse::Error(format!(
+                                    "cannot shrink volume '{}': current {}GB, requested {}GB",
+                                    volume_id, vol.size_gb, new_size_gb
+                                ));
+                            }
+                            (vol.org_id.clone(), vol.project_id.clone(), vol.size_gb)
                         }
-                        vol.size_gb = *new_size_gb;
-                        info!(volume_id, new_size_gb, "volume resized");
-                        StateMachineResponse::Ok
+                        Some(vol) => {
+                            return StateMachineResponse::Error(format!(
+                                "volume '{volume_id}' must be available to resize (state: {:?})",
+                                vol.state
+                            ))
+                        }
+                        None => {
+                            return StateMachineResponse::Error(format!(
+                                "volume not found: {volume_id}"
+                            ))
+                        }
                     }
-                    Some(vol) => StateMachineResponse::Error(format!(
-                        "volume '{volume_id}' must be available to resize (state: {:?})",
-                        vol.state
-                    )),
-                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
+                };
+
+                // Check total_gb quota for the size delta.
+                let delta_gb = *new_size_gb - old_size_gb;
+                if let Err(e) = self.check_resize_quota(&org_id, &project_id, delta_gb) {
+                    return StateMachineResponse::Error(e.to_string());
+                }
+
+                let mut storage = self.storage.write().unwrap();
+                if let Some(vol) = storage.volumes.get_mut(volume_id) {
+                    vol.size_gb = *new_size_gb;
+                    info!(volume_id, new_size_gb, "volume resized");
+                    StateMachineResponse::Ok
+                } else {
+                    StateMachineResponse::Error(format!("volume not found: {volume_id}"))
                 }
             }
 
@@ -1726,11 +1792,17 @@ impl RedbStateMachine {
                 sst_files,
                 wal_position,
             } => {
-                // Look up source volume to get org/project for quota check.
-                let (org_id, project_id) = {
+                // Look up source volume to capture org/project/size/env/type at snapshot time.
+                let (org_id, project_id, size_gb, env_id, volume_type) = {
                     let storage = self.storage.read().unwrap();
                     match storage.volumes.get(source_volume_id) {
-                        Some(vol) => (vol.org_id.clone(), vol.project_id.clone()),
+                        Some(vol) => (
+                            vol.org_id.clone(),
+                            vol.project_id.clone(),
+                            vol.size_gb,
+                            vol.env_id.clone(),
+                            vol.volume_type.clone(),
+                        ),
                         None => {
                             return StateMachineResponse::Error(format!(
                                 "source volume not found: {source_volume_id}"
@@ -1761,9 +1833,12 @@ impl RedbStateMachine {
                     wal_position: *wal_position,
                     org_id,
                     project_id,
+                    size_gb,
+                    env_id,
+                    volume_type,
                 };
                 storage.snapshots.insert(id.clone(), record);
-                info!(id, source_volume_id, "snapshot created");
+                info!(id, source_volume_id, size_gb, "snapshot created");
                 StateMachineResponse::Created(id.clone())
             }
 
@@ -1794,22 +1869,24 @@ impl RedbStateMachine {
                 new_volume_id,
                 new_volume_name,
             } => {
-                let storage_r = self.storage.read().unwrap();
-                let snap = match storage_r.snapshots.get(snapshot_id) {
-                    Some(s) => s.clone(),
-                    None => {
-                        return StateMachineResponse::Error(format!(
-                            "snapshot not found: {snapshot_id}"
-                        ))
+                let snap = {
+                    let storage = self.storage.read().unwrap();
+                    match storage.snapshots.get(snapshot_id) {
+                        Some(s) => s.clone(),
+                        None => {
+                            return StateMachineResponse::Error(format!(
+                                "snapshot not found: {snapshot_id}"
+                            ))
+                        }
                     }
                 };
-                // Get size from source volume (or 0 if source was deleted).
-                let (size_gb, env_id, volume_type) =
-                    match storage_r.volumes.get(&snap.source_volume_id) {
-                        Some(vol) => (vol.size_gb, vol.env_id.clone(), vol.volume_type.clone()),
-                        None => (0, String::new(), VolumeType::Data),
-                    };
-                drop(storage_r);
+
+                // Use the size_gb captured at snapshot creation time — this is
+                // correct even if the source volume was subsequently resized or
+                // deleted.
+                let size_gb = snap.size_gb;
+                let env_id = snap.env_id.clone();
+                let volume_type = snap.volume_type.clone();
 
                 // Check quota for the new volume.
                 if let Err(e) = self.check_volume_quota(&snap.org_id, &snap.project_id, size_gb) {
@@ -1817,6 +1894,21 @@ impl RedbStateMachine {
                 }
 
                 let mut storage = self.storage.write().unwrap();
+
+                // Check name uniqueness within the environment (same check as CreateVolume).
+                let name_exists = storage.volumes.values().any(|v| {
+                    v.env_id == env_id
+                        && v.name == *new_volume_name
+                        && v.org_id == snap.org_id
+                        && v.project_id == snap.project_id
+                });
+                if name_exists {
+                    return StateMachineResponse::Error(format!(
+                        "volume '{}' already exists in env '{}'",
+                        new_volume_name, env_id
+                    ));
+                }
+
                 if storage.volumes.contains_key(new_volume_id) {
                     return StateMachineResponse::Error(format!(
                         "volume with id '{new_volume_id}' already exists"
@@ -1838,7 +1930,7 @@ impl RedbStateMachine {
                 storage.volumes.insert(new_volume_id.clone(), record);
                 info!(
                     snapshot_id,
-                    new_volume_id, new_volume_name, "snapshot restored"
+                    new_volume_id, new_volume_name, size_gb, "snapshot restored"
                 );
                 StateMachineResponse::Created(new_volume_id.clone())
             }
@@ -2652,5 +2744,119 @@ mod tests {
         let storage = sm.storage.read().unwrap();
         let cfg = storage.storage_configs.get("eu-west").unwrap();
         assert_eq!(cfg.s3_bucket, "bucket");
+    }
+
+    #[test]
+    fn resize_volume_checks_total_gb_quota() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 200GB total.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 100,
+            max_total_gb: 200,
+            max_snapshots: 100,
+        });
+
+        // Create a 100GB volume.
+        let resp = create_volume(&sm, "vol-1", "v1", 100, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Resize to 150GB (delta=50, total=150) — should succeed.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 150,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Resize to 300GB (delta=150, total=300 > 200 limit) — should fail.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 300,
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("quota exceeded"), "unexpected error: {msg}");
+                assert!(msg.contains("total_gb"), "should mention total_gb: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_snapshot_uses_snapshot_size_after_source_deleted() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create volume, snapshot, then delete the volume.
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+        });
+
+        // Restore — should use snapshot's stored size_gb (100), not 0.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-2").unwrap();
+        assert_eq!(
+            vol.size_gb, 100,
+            "restored volume should have snapshot's size, not 0"
+        );
+        assert_eq!(vol.env_id, "prod");
+    }
+
+    #[test]
+    fn restore_snapshot_enforces_name_uniqueness() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Create a volume with the name we want to restore into.
+        create_volume(&sm, "vol-x", "pgdata-restored", 50, "acme", "myapp", "prod");
+
+        // Restore should fail because "pgdata-restored" already exists in the env.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "should mention name conflict: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_stores_size_gb_from_source_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "v1", 250, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        let storage = sm.storage.read().unwrap();
+        let snap = storage.snapshots.get("snap-1").unwrap();
+        assert_eq!(
+            snap.size_gb, 250,
+            "snapshot should capture source volume size"
+        );
+        assert_eq!(snap.env_id, "prod");
     }
 }
