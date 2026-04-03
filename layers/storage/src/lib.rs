@@ -1,4 +1,5 @@
 pub mod api;
+pub mod binary;
 pub mod cli;
 
 pub use api::{

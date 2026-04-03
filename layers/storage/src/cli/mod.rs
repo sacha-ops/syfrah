@@ -1,8 +1,9 @@
 //! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
-//! Provides subcommands for volume lifecycle management and storage
-//! health/status inspection. Each handler communicates with the daemon
-//! via the control socket.
+//! Provides subcommands for volume lifecycle management, storage
+//! health/status inspection, and storage-layer utilities (e.g. ZeroFS
+//! version). Each handler communicates with the daemon via the control
+//! socket.
 
 pub mod fmt;
 pub mod health;
@@ -120,6 +121,9 @@ pub enum VolumeCommand {
 /// Top-level storage CLI command (`syfrah storage ...`).
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
+    /// Show ZeroFS binary version and path
+    #[command(after_help = "Examples:\n  syfrah storage version")]
+    Version,
     /// Run a health check against the S3 backend and cache subsystem
     #[command(after_help = "Examples:\n  \
             syfrah storage health\n  \
@@ -143,6 +147,31 @@ pub enum StorageCommand {
 /// Execute a storage CLI command.
 pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
     match cmd {
+        StorageCommand::Version => {
+            let pinned = crate::binary::pinned_version();
+            println!("zerofs pinned version: {pinned}");
+
+            match crate::binary::resolve_binary(None) {
+                Ok(path) => {
+                    println!("zerofs binary: {}", path.display());
+                    match crate::binary::check_version(&path) {
+                        Ok(ver) => {
+                            println!("zerofs disk version: {ver}");
+                            if let Err(msg) = crate::binary::verify_version(&path) {
+                                eprintln!("warning: {msg}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("warning: could not determine zerofs version: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("zerofs binary: not found ({e})");
+                }
+            }
+            Ok(())
+        }
         StorageCommand::Health { json } => health::run_health(json).await,
         StorageCommand::Status { json } => health::run_status(json).await,
     }

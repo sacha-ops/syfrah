@@ -225,6 +225,22 @@ if [ -f "${TMPDIR}/${CH_BIN}" ]; then
   fi
 fi
 
+# --- Install ZeroFS (if bundled) --------------------------------------------
+
+ZEROFS_BIN="zerofs"
+ZEROFS_INSTALL_DIR="/usr/local/lib/syfrah"
+
+if [ -f "${TMPDIR}/${ZEROFS_BIN}" ]; then
+  start_spinner "Installing ZeroFS to ${ZEROFS_INSTALL_DIR}/${ZEROFS_BIN}..."
+  mkdir -p "$ZEROFS_INSTALL_DIR"
+  if install -m 755 "${TMPDIR}/${ZEROFS_BIN}" "${ZEROFS_INSTALL_DIR}/${ZEROFS_BIN}"; then
+    stop_spinner "Installed ZeroFS to ${ZEROFS_INSTALL_DIR}/${ZEROFS_BIN}"
+  else
+    stop_spinner "Failed to install ZeroFS (are you root?)" fail
+    exit 1
+  fi
+fi
+
 # --- Install kernel (if bundled) -------------------------------------------
 
 KERNEL_BIN="vmlinux"
