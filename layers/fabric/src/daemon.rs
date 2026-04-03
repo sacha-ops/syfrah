@@ -2103,203 +2103,220 @@ pub async fn run_daemon(
                 // Give the mesh a few seconds to settle after startup.
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-                // Skip if raft_initialized sentinel already exists (race with
-                // manual `syfrah controlplane join`).
-                if auto_join_syfrah_dir.join("raft_initialized").exists() {
-                    info!("raft: auto-join skipped — already initialized");
-                    return;
-                }
-
-                // Load current peers from fabric state.
-                let peers = match crate::store::load() {
-                    Ok(state) => state.peers,
-                    Err(_) => {
-                        info!("raft: auto-join skipped — no fabric state");
-                        return;
-                    }
-                };
-
-                if peers.is_empty() {
-                    info!("raft: no peers in mesh — staying in bootstrap mode");
-                    return;
-                }
-
-                // Derive our node ID the same way controlplane does.
-                let node_id = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    auto_join_node_name.hash(&mut hasher);
-                    hasher.finish()
-                };
-                let node_addr = format!("[{auto_join_ipv6}]:7200");
-
-                let probe_client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("raft: auto-join failed to build HTTP client: {e}");
-                        return;
-                    }
-                };
-                let join_client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("raft: auto-join failed to build HTTP client: {e}");
-                        return;
-                    }
-                };
-
-                // Retry with exponential backoff: 5s, 10s, 20s, 40s, 80s
-                let backoffs = [5u64, 10, 20, 40, 80];
-                for (attempt, &delay) in backoffs.iter().enumerate() {
-                    if attempt > 0 {
-                        info!(
-                            "raft: auto-join attempt {}/{} (retry in {delay}s)...",
-                            attempt + 1,
-                            backoffs.len()
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-
-                        // Re-check sentinel in case manual join happened during backoff.
-                        if auto_join_syfrah_dir.join("raft_initialized").exists() {
-                            info!("raft: auto-join skipped — initialized during retry wait");
-                            return;
-                        }
+                // Outer loop: keep retrying auto-join forever so the daemon
+                // stays alive even when no Raft cluster exists yet.  When a
+                // cluster appears later, the next 30-second cycle will detect
+                // and join it.
+                loop {
+                    // Skip if raft_initialized sentinel already exists (race with
+                    // manual `syfrah controlplane join`).
+                    if auto_join_syfrah_dir.join("raft_initialized").exists() {
+                        info!("raft: auto-join skipped — already initialized");
+                        // Park forever — daemon must stay alive.
+                        std::future::pending::<()>().await;
+                        unreachable!();
                     }
 
-                    // Probe each peer for Raft status.
-                    let mut leader_addr = None;
-                    for peer in &peers {
-                        let url = format!("http://[{}]:7200/raft/status", peer.mesh_ipv6);
-                        match probe_client.get(&url).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                if let Ok(status) = resp
-                                    .json::<syfrah_controlplane::server::RaftStatusResponse>()
-                                    .await
-                                {
-                                    if let Some(leader_id) = status.current_leader {
-                                        // Find the actual leader's address.
-                                        if let Some(detail) = status
-                                            .member_details
-                                            .iter()
-                                            .find(|d| d.node_id == leader_id)
-                                        {
-                                            leader_addr = Some(detail.addr.clone());
-                                        } else {
-                                            leader_addr =
-                                                Some(format!("[{}]:7200", peer.mesh_ipv6));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            _ => continue,
-                        }
-                    }
-
-                    let leader = match leader_addr {
-                        Some(addr) => addr,
-                        None => {
-                            if attempt == 0 {
-                                info!(
-                                    "raft: no Raft cluster detected in mesh. \
-                                     Operating in bootstrap mode."
-                                );
-                            }
+                    // Load current peers from fabric state.
+                    let peers = match crate::store::load() {
+                        Ok(state) => state.peers,
+                        Err(_) => {
+                            info!("raft: auto-join — no fabric state yet, retrying in 30s");
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                             continue;
                         }
                     };
 
-                    info!(
-                        "raft: detected Raft cluster (leader: {leader}). \
-                         Auto-joining as learner..."
-                    );
-
-                    // Initialize local Raft storage before joining.
-                    if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
-                        let log_db = syfrah_state::LayerDb::open("raft_log")?;
-                        let _log_store = syfrah_controlplane::RedbLogStore::new(log_db);
-                        Ok(())
-                    })() {
-                        warn!("raft: auto-join failed to init log storage: {e}");
+                    if peers.is_empty() {
+                        info!(
+                            "raft: no peers in mesh — staying in bootstrap mode, retrying in 30s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                         continue;
                     }
 
-                    // Send join request to leader.
-                    let join_url = format!("http://{leader}/raft/join");
-                    let join_req = serde_json::json!({
-                        "node_id": node_id,
-                        "addr": node_addr,
-                    });
+                    // Derive our node ID the same way controlplane does.
+                    let node_id = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        auto_join_node_name.hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    let node_addr = format!("[{auto_join_ipv6}]:7200");
 
-                    match join_client.post(&join_url).json(&join_req).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            info!("raft: auto-join succeeded! Writing sentinel and starting Raft in-process...");
+                    let probe_client = match reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("raft: auto-join failed to build HTTP client: {e}");
+                            return;
+                        }
+                    };
+                    let join_client = match reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("raft: auto-join failed to build HTTP client: {e}");
+                            return;
+                        }
+                    };
 
-                            // Write sentinel.
-                            if let Err(e) = std::fs::write(
-                                auto_join_syfrah_dir.join("raft_initialized"),
-                                format!("{node_id}"),
-                            ) {
-                                warn!("raft: failed to write sentinel: {e}");
+                    // Retry with exponential backoff: 5s, 10s, 20s, 40s, 80s
+                    let backoffs = [5u64, 10, 20, 40, 80];
+                    for (attempt, &delay) in backoffs.iter().enumerate() {
+                        if attempt > 0 {
+                            info!(
+                                "raft: auto-join attempt {}/{} (retry in {delay}s)...",
+                                attempt + 1,
+                                backoffs.len()
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+                            // Re-check sentinel in case manual join happened during backoff.
+                            if auto_join_syfrah_dir.join("raft_initialized").exists() {
+                                info!("raft: auto-join skipped — initialized during retry wait");
                                 return;
                             }
+                        }
 
-                            // --- Start Raft in-process (no daemon restart) ---
-                            //
-                            // Initialize the Raft node dynamically within the
-                            // running daemon. This avoids the race condition
-                            // where the dying process can't reliably start its
-                            // successor.
+                        // Probe each peer for Raft status.
+                        let mut leader_addr = None;
+                        for peer in &peers {
+                            let url = format!("http://[{}]:7200/raft/status", peer.mesh_ipv6);
+                            match probe_client.get(&url).send().await {
+                                Ok(resp) if resp.status().is_success() => {
+                                    if let Ok(status) = resp
+                                        .json::<syfrah_controlplane::server::RaftStatusResponse>()
+                                        .await
+                                    {
+                                        if let Some(leader_id) = status.current_leader {
+                                            // Find the actual leader's address.
+                                            if let Some(detail) = status
+                                                .member_details
+                                                .iter()
+                                                .find(|d| d.node_id == leader_id)
+                                            {
+                                                leader_addr = Some(detail.addr.clone());
+                                            } else {
+                                                leader_addr =
+                                                    Some(format!("[{}]:7200", peer.mesh_ipv6));
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => continue,
+                            }
+                        }
 
-                            let log_db = match syfrah_state::LayerDb::open("raft_log") {
-                                Ok(db) => db,
-                                Err(e) => {
-                                    warn!("raft: in-process init failed to open raft_log: {e}");
+                        let leader = match leader_addr {
+                            Some(addr) => addr,
+                            None => {
+                                if attempt == 0 {
+                                    info!(
+                                        "raft: no Raft cluster detected in mesh. \
+                                     Operating in bootstrap mode."
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            "raft: detected Raft cluster (leader: {leader}). \
+                         Auto-joining as learner..."
+                        );
+
+                        // Initialize local Raft storage before joining.
+                        if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                            let log_db = syfrah_state::LayerDb::open("raft_log")?;
+                            let _log_store = syfrah_controlplane::RedbLogStore::new(log_db);
+                            Ok(())
+                        })() {
+                            warn!("raft: auto-join failed to init log storage: {e}");
+                            continue;
+                        }
+
+                        // Send join request to leader.
+                        let join_url = format!("http://{leader}/raft/join");
+                        let join_req = serde_json::json!({
+                            "node_id": node_id,
+                            "addr": node_addr,
+                        });
+
+                        match join_client.post(&join_url).json(&join_req).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                info!("raft: auto-join succeeded! Writing sentinel and starting Raft in-process...");
+
+                                // Write sentinel.
+                                if let Err(e) = std::fs::write(
+                                    auto_join_syfrah_dir.join("raft_initialized"),
+                                    format!("{node_id}"),
+                                ) {
+                                    warn!("raft: failed to write sentinel: {e}");
                                     return;
                                 }
-                            };
-                            let log_store =
-                                std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
 
-                            let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
-                                aj_org_store.clone().unwrap_or_else(|| {
-                                    let db = syfrah_state::LayerDb::open("org").unwrap();
-                                    std::sync::Arc::new(syfrah_org::OrgStore::new(db))
-                                }),
-                            );
+                                // --- Start Raft in-process (no daemon restart) ---
+                                //
+                                // Initialize the Raft node dynamically within the
+                                // running daemon. This avoids the race condition
+                                // where the dying process can't reliably start its
+                                // successor.
 
-                            if let Some(ref ipam) = aj_ipam_store {
-                                sm_builder = sm_builder.with_ipam_store(Arc::clone(ipam));
-                                info!("raft: IPAM store wired into state machine (in-process)");
-                            }
-                            if let Some(ref placement) = aj_placement_store {
-                                sm_builder = sm_builder.with_placement_store(Arc::clone(placement));
-                                info!(
+                                let log_db = match syfrah_state::LayerDb::open("raft_log") {
+                                    Ok(db) => db,
+                                    Err(e) => {
+                                        warn!("raft: in-process init failed to open raft_log: {e}");
+                                        return;
+                                    }
+                                };
+                                let log_store = std::sync::Arc::new(
+                                    syfrah_controlplane::RedbLogStore::new(log_db),
+                                );
+
+                                let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
+                                    aj_org_store.clone().unwrap_or_else(|| {
+                                        let db = syfrah_state::LayerDb::open("org").unwrap();
+                                        std::sync::Arc::new(syfrah_org::OrgStore::new(db))
+                                    }),
+                                );
+
+                                if let Some(ref ipam) = aj_ipam_store {
+                                    sm_builder = sm_builder.with_ipam_store(Arc::clone(ipam));
+                                    info!("raft: IPAM store wired into state machine (in-process)");
+                                }
+                                if let Some(ref placement) = aj_placement_store {
+                                    sm_builder =
+                                        sm_builder.with_placement_store(Arc::clone(placement));
+                                    info!(
                                     "raft: placement store wired into state machine (in-process)"
                                 );
-                            }
-                            if let Some(ref sg_rules) = aj_sg_rule_store {
-                                sm_builder = sm_builder.with_sg_rule_store(Arc::clone(sg_rules));
-                                info!("raft: SG rule store wired into state machine (in-process)");
-                            }
-                            if let Some(ref hv_store) = aj_hypervisor_store {
-                                sm_builder = sm_builder.with_hypervisor_store(Arc::clone(hv_store));
-                                info!(
+                                }
+                                if let Some(ref sg_rules) = aj_sg_rule_store {
+                                    sm_builder =
+                                        sm_builder.with_sg_rule_store(Arc::clone(sg_rules));
+                                    info!(
+                                        "raft: SG rule store wired into state machine (in-process)"
+                                    );
+                                }
+                                if let Some(ref hv_store) = aj_hypervisor_store {
+                                    sm_builder =
+                                        sm_builder.with_hypervisor_store(Arc::clone(hv_store));
+                                    info!(
                                     "raft: hypervisor store wired into state machine (in-process)"
                                 );
-                            }
+                                }
 
-                            let sm = std::sync::Arc::new(sm_builder);
-                            let placement_event_rx = sm.subscribe_placement_events();
-                            let network = syfrah_controlplane::SyfrahNetworkFactory::new();
+                                let sm = std::sync::Arc::new(sm_builder);
+                                let placement_event_rx = sm.subscribe_placement_events();
+                                let network = syfrah_controlplane::SyfrahNetworkFactory::new();
 
-                            let config = std::sync::Arc::new(openraft::Config {
+                                let config = std::sync::Arc::new(openraft::Config {
                                 cluster_name: "syfrah-raft".to_string(),
                                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
                                     syfrah_controlplane::state_machine::DEFAULT_SNAPSHOT_THRESHOLD,
@@ -2308,9 +2325,10 @@ pub async fn run_daemon(
                                 ..Default::default()
                             });
 
-                            let raft =
-                                match openraft::Raft::new(node_id, config, network, log_store, sm)
-                                    .await
+                                let raft = match openraft::Raft::new(
+                                    node_id, config, network, log_store, sm,
+                                )
+                                .await
                                 {
                                     Ok(r) => r,
                                     Err(e) => {
@@ -2321,217 +2339,223 @@ pub async fn run_daemon(
                                     }
                                 };
 
-                            let raft_client = syfrah_controlplane::RaftClient::new(raft.clone());
+                                let raft_client =
+                                    syfrah_controlplane::RaftClient::new(raft.clone());
 
-                            // Inject Raft client into placement hook.
-                            {
-                                let mut holder = aj_raft_client_holder.lock().unwrap();
-                                *holder = Some(raft_client.clone());
-                                info!(
+                                // Inject Raft client into placement hook.
+                                {
+                                    let mut holder = aj_raft_client_holder.lock().unwrap();
+                                    *holder = Some(raft_client.clone());
+                                    info!(
                                     "raft: injected Raft client into placement hook (in-process)"
                                 );
-                            }
+                                }
 
-                            // Inject Raft client into Forge HTTP API.
-                            {
-                                let holder = Arc::clone(&aj_forge_raft_client);
-                                let client = raft_client.clone();
-                                tokio::spawn(async move {
-                                    let mut guard = holder.write().await;
-                                    *guard = Some(client);
-                                    info!("raft: injected Raft client into Forge API (in-process)");
-                                });
-                            }
-
-                            // Inject Raft client into org handler.
-                            if let Some(ref handler) = aj_raft_org_handler {
-                                let handler = Arc::clone(handler);
-                                let client = raft_client.clone();
-                                tokio::spawn(async move {
-                                    handler.set_raft_client(client).await;
-                                    info!(
-                                        "raft: injected Raft client into org handler (in-process)"
-                                    );
-                                });
-                            }
-
-                            // Inject Raft client into hypervisor handler.
-                            if let Some(ref handler) = aj_raft_hv_handler_ref {
-                                let handler = Arc::clone(handler);
-                                let client = raft_client.clone();
-                                tokio::spawn(async move {
-                                    handler.set_raft_client(client).await;
-                                    info!("raft: injected Raft client into hypervisor handler (in-process)");
-                                });
-                            }
-
-                            // Inject Raft client + scheduler into compute handler.
-                            if let Some(ref handler) = aj_raft_compute_handler_ref {
-                                let handler = Arc::clone(handler);
-                                let client = raft_client.clone();
-                                let local_node = aj_my_record.name.clone();
-                                let local_addr = aj_my_record.mesh_ipv6.to_string();
-                                tokio::spawn(async move {
-                                    handler.set_raft_client(client).await;
-                                    let scheduler =
-                                        syfrah_controlplane::Scheduler::new(local_node, local_addr);
-                                    handler.set_scheduler(scheduler).await;
-                                    info!("raft: injected Raft client + scheduler into compute handler (in-process)");
-                                });
-                            }
-
-                            // Start gossip agent.
-                            {
-                                let gossip_cluster =
-                                    if let Some(ref handler) = aj_raft_compute_handler_ref {
-                                        handler.gossip_cluster().clone()
-                                    } else {
-                                        syfrah_controlplane::GossipCluster::new()
-                                    };
-
+                                // Inject Raft client into Forge HTTP API.
                                 {
-                                    let holder = Arc::clone(&aj_forge_gossip_cluster);
-                                    let gc = gossip_cluster.clone();
+                                    let holder = Arc::clone(&aj_forge_raft_client);
+                                    let client = raft_client.clone();
                                     tokio::spawn(async move {
                                         let mut guard = holder.write().await;
-                                        *guard = Some(gc);
-                                        info!("gossip: injected gossip cluster into Forge API (in-process)");
+                                        *guard = Some(client);
+                                        info!("raft: injected Raft client into Forge API (in-process)");
                                     });
                                 }
 
-                                let region = aj_my_record
-                                    .region
-                                    .as_deref()
-                                    .unwrap_or("default")
-                                    .to_string();
-                                let zone = aj_my_record
-                                    .zone
-                                    .as_deref()
-                                    .unwrap_or("default")
-                                    .to_string();
-                                let gossip_bind_addr = std::net::SocketAddrV6::new(
-                                    aj_my_record.mesh_ipv6,
-                                    syfrah_controlplane::gossip::GOSSIP_PORT,
-                                    0,
-                                    0,
-                                );
+                                // Inject Raft client into org handler.
+                                if let Some(ref handler) = aj_raft_org_handler {
+                                    let handler = Arc::clone(handler);
+                                    let client = raft_client.clone();
+                                    tokio::spawn(async move {
+                                        handler.set_raft_client(client).await;
+                                        info!(
+                                        "raft: injected Raft client into org handler (in-process)"
+                                    );
+                                    });
+                                }
 
-                                let gossip_seeds: Vec<std::net::SocketAddrV6> = {
-                                    match crate::store::load() {
-                                        Ok(state) => state
-                                            .peers
-                                            .iter()
-                                            .map(|p| {
-                                                std::net::SocketAddrV6::new(
-                                                    p.mesh_ipv6,
-                                                    syfrah_controlplane::gossip::GOSSIP_PORT,
-                                                    0,
-                                                    0,
-                                                )
-                                            })
-                                            .collect(),
-                                        Err(_) => vec![],
-                                    }
-                                };
+                                // Inject Raft client into hypervisor handler.
+                                if let Some(ref handler) = aj_raft_hv_handler_ref {
+                                    let handler = Arc::clone(handler);
+                                    let client = raft_client.clone();
+                                    tokio::spawn(async move {
+                                        handler.set_raft_client(client).await;
+                                        info!("raft: injected Raft client into hypervisor handler (in-process)");
+                                    });
+                                }
 
-                                let gossip_config = syfrah_controlplane::GossipConfig {
-                                    bind_addr: gossip_bind_addr,
-                                    seeds: gossip_seeds,
-                                    local_node_name: aj_my_record.name.clone(),
-                                    local_hypervisor_id: aj_my_record.mesh_ipv6.to_string(),
-                                    local_region: region,
-                                    local_zone: zone,
-                                };
+                                // Inject Raft client + scheduler into compute handler.
+                                if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                    let handler = Arc::clone(handler);
+                                    let client = raft_client.clone();
+                                    let local_node = aj_my_record.name.clone();
+                                    let local_addr = aj_my_record.mesh_ipv6.to_string();
+                                    tokio::spawn(async move {
+                                        handler.set_raft_client(client).await;
+                                        let scheduler = syfrah_controlplane::Scheduler::new(
+                                            local_node, local_addr,
+                                        );
+                                        handler.set_scheduler(scheduler).await;
+                                        info!("raft: injected Raft client + scheduler into compute handler (in-process)");
+                                    });
+                                }
 
-                                let capacity_fn: Arc<
-                                    dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync,
-                                > = Arc::new(|| {
-                                    let alloc_vcpus = std::thread::available_parallelism()
-                                        .map(|n| n.get() as u32)
-                                        .unwrap_or(1);
-                                    let alloc_memory = std::fs::read_to_string("/proc/meminfo")
-                                        .ok()
-                                        .and_then(|content| {
-                                            content.lines().find_map(|line| {
-                                                if line.starts_with("MemTotal:") {
-                                                    let parts: Vec<&str> =
-                                                        line.split_whitespace().collect();
-                                                    parts
-                                                        .get(1)?
-                                                        .parse::<u64>()
-                                                        .ok()
-                                                        .map(|kb| kb / 1024)
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                        })
-                                        .unwrap_or(1024);
-                                    (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
-                                });
+                                // Start gossip agent.
+                                {
+                                    let gossip_cluster =
+                                        if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                            handler.gossip_cluster().clone()
+                                        } else {
+                                            syfrah_controlplane::GossipCluster::new()
+                                        };
 
-                                let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
-                                        gossip_config,
-                                        gossip_cluster,
-                                        capacity_fn,
-                                        gossip_shutdown_rx,
-                                    )
-                                    .await
                                     {
-                                        warn!("gossip agent failed to start (in-process): {e}");
+                                        let holder = Arc::clone(&aj_forge_gossip_cluster);
+                                        let gc = gossip_cluster.clone();
+                                        tokio::spawn(async move {
+                                            let mut guard = holder.write().await;
+                                            *guard = Some(gc);
+                                            info!("gossip: injected gossip cluster into Forge API (in-process)");
+                                        });
                                     }
-                                });
-                                info!("gossip: SWIM gossip agent starting (in-process)");
-                            }
 
-                            // Periodic hypervisor capacity update via Raft.
-                            {
-                                let cap_client = raft_client.clone();
-                                let cap_node_name = aj_my_record.name.clone();
-                                let mut cap_shutdown = aj_raft_shutdown_rx.clone();
-                                let cap_tracker = Arc::clone(&aj_capacity_for_raft);
-                                tokio::spawn(async move {
-                                    loop {
-                                        tokio::select! {
-                                            _ = cap_shutdown.wait_for(|v| *v) => break,
-                                            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {},
+                                    let region = aj_my_record
+                                        .region
+                                        .as_deref()
+                                        .unwrap_or("default")
+                                        .to_string();
+                                    let zone = aj_my_record
+                                        .zone
+                                        .as_deref()
+                                        .unwrap_or("default")
+                                        .to_string();
+                                    let gossip_bind_addr = std::net::SocketAddrV6::new(
+                                        aj_my_record.mesh_ipv6,
+                                        syfrah_controlplane::gossip::GOSSIP_PORT,
+                                        0,
+                                        0,
+                                    );
+
+                                    let gossip_seeds: Vec<std::net::SocketAddrV6> = {
+                                        match crate::store::load() {
+                                            Ok(state) => state
+                                                .peers
+                                                .iter()
+                                                .map(|p| {
+                                                    std::net::SocketAddrV6::new(
+                                                        p.mesh_ipv6,
+                                                        syfrah_controlplane::gossip::GOSSIP_PORT,
+                                                        0,
+                                                        0,
+                                                    )
+                                                })
+                                                .collect(),
+                                            Err(_) => vec![],
                                         }
-                                        let alloc_vcpus = cap_tracker.allocatable_vcpus();
-                                        let alloc_memory = cap_tracker.allocatable_memory_mb();
-                                        let used_v = cap_tracker.used_vcpus();
-                                        let used_m = cap_tracker.used_memory_mb();
-                                        let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                                    };
+
+                                    let gossip_config = syfrah_controlplane::GossipConfig {
+                                        bind_addr: gossip_bind_addr,
+                                        seeds: gossip_seeds,
+                                        local_node_name: aj_my_record.name.clone(),
+                                        local_hypervisor_id: aj_my_record.mesh_ipv6.to_string(),
+                                        local_region: region,
+                                        local_zone: zone,
+                                    };
+
+                                    let capacity_fn: Arc<
+                                        dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync,
+                                    > = Arc::new(|| {
+                                        let alloc_vcpus = std::thread::available_parallelism()
+                                            .map(|n| n.get() as u32)
+                                            .unwrap_or(1);
+                                        let alloc_memory = std::fs::read_to_string("/proc/meminfo")
+                                            .ok()
+                                            .and_then(|content| {
+                                                content.lines().find_map(|line| {
+                                                    if line.starts_with("MemTotal:") {
+                                                        let parts: Vec<&str> =
+                                                            line.split_whitespace().collect();
+                                                        parts
+                                                            .get(1)?
+                                                            .parse::<u64>()
+                                                            .ok()
+                                                            .map(|kb| kb / 1024)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or(1024);
+                                        (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
+                                    });
+
+                                    let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            syfrah_controlplane::gossip::start_gossip_agent(
+                                                gossip_config,
+                                                gossip_cluster,
+                                                capacity_fn,
+                                                gossip_shutdown_rx,
+                                            )
+                                            .await
+                                        {
+                                            warn!("gossip agent failed to start (in-process): {e}");
+                                        }
+                                    });
+                                    info!("gossip: SWIM gossip agent starting (in-process)");
+                                }
+
+                                // Periodic hypervisor capacity update via Raft.
+                                {
+                                    let cap_client = raft_client.clone();
+                                    let cap_node_name = aj_my_record.name.clone();
+                                    let mut cap_shutdown = aj_raft_shutdown_rx.clone();
+                                    let cap_tracker = Arc::clone(&aj_capacity_for_raft);
+                                    tokio::spawn(async move {
+                                        loop {
+                                            tokio::select! {
+                                                _ = cap_shutdown.wait_for(|v| *v) => break,
+                                                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {},
+                                            }
+                                            let alloc_vcpus = cap_tracker.allocatable_vcpus();
+                                            let alloc_memory = cap_tracker.allocatable_memory_mb();
+                                            let used_v = cap_tracker.used_vcpus();
+                                            let used_m = cap_tracker.used_memory_mb();
+                                            let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
                                             name: cap_node_name.clone(),
                                             allocatable_vcpus: alloc_vcpus,
                                             allocatable_memory_mb: alloc_memory,
                                             used_vcpus: used_v,
                                             used_memory_mb: used_m,
                                         };
-                                        if let Err(e) = cap_client.write(cmd).await {
-                                            tracing::debug!(
+                                            if let Err(e) = cap_client.write(cmd).await {
+                                                tracing::debug!(
                                                 "capacity update via raft failed (may not be leader): {e}"
                                             );
+                                            }
                                         }
-                                    }
-                                    tracing::debug!("capacity update loop stopped (in-process)");
-                                });
-                                info!("raft: periodic capacity update started (in-process)");
-                            }
+                                        tracing::debug!(
+                                            "capacity update loop stopped (in-process)"
+                                        );
+                                    });
+                                    info!("raft: periodic capacity update started (in-process)");
+                                }
 
-                            let raft_state = syfrah_controlplane::server::RaftServerState {
-                                raft,
-                                max_voters: syfrah_controlplane::server::DEFAULT_MAX_VOTERS,
-                            };
+                                let raft_state = syfrah_controlplane::server::RaftServerState {
+                                    raft,
+                                    max_voters: syfrah_controlplane::server::DEFAULT_MAX_VOTERS,
+                                };
 
-                            // FDB cold rebuild from Raft placements.
-                            if let Some(ref placement) = aj_placement_store {
-                                let local_node = aj_my_record.mesh_ipv6.to_string();
-                                match placement.list_all() {
-                                    Ok(placements) => {
-                                        let overlay_placements: Vec<syfrah_overlay::VmPlacement> =
-                                            placements
+                                // FDB cold rebuild from Raft placements.
+                                if let Some(ref placement) = aj_placement_store {
+                                    let local_node = aj_my_record.mesh_ipv6.to_string();
+                                    match placement.list_all() {
+                                        Ok(placements) => {
+                                            let overlay_placements: Vec<
+                                                syfrah_overlay::VmPlacement,
+                                            > = placements
                                                 .iter()
                                                 .map(|p| syfrah_overlay::VmPlacement {
                                                     vpc_id: p.vpc_id.clone(),
@@ -2544,66 +2568,69 @@ pub async fn run_daemon(
                                                     placement_generation: p.placement_generation,
                                                 })
                                                 .collect();
-                                        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
-                                            Arc::new(syfrah_overlay::LinuxBackend::new());
-                                        match syfrah_overlay::rebuild_fdb(
-                                            backend.as_ref(),
-                                            &overlay_placements,
-                                            &local_node,
-                                        )
-                                        .await
-                                        {
-                                            Ok(summary) => {
-                                                info!(
-                                                    rebuilt = summary.rebuilt,
-                                                    skipped_local = summary.skipped_local,
-                                                    errors = summary.errors,
-                                                    "FDB cold rebuild complete (in-process)"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!("FDB cold rebuild failed (in-process): {e}");
+                                            let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                                                Arc::new(syfrah_overlay::LinuxBackend::new());
+                                            match syfrah_overlay::rebuild_fdb(
+                                                backend.as_ref(),
+                                                &overlay_placements,
+                                                &local_node,
+                                            )
+                                            .await
+                                            {
+                                                Ok(summary) => {
+                                                    info!(
+                                                        rebuilt = summary.rebuilt,
+                                                        skipped_local = summary.skipped_local,
+                                                        errors = summary.errors,
+                                                        "FDB cold rebuild complete (in-process)"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "FDB cold rebuild failed (in-process): {e}"
+                                                    );
+                                                }
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!("FDB cold rebuild: failed to list placements (in-process): {e}");
+                                        Err(e) => {
+                                            warn!("FDB cold rebuild: failed to list placements (in-process): {e}");
+                                        }
                                     }
                                 }
-                            }
 
-                            // Post-Raft VM reconnect.
-                            if let Some(ref vm_manager) = aj_shared_vm_manager {
-                                match vm_manager.reconnect().await {
-                                    Ok(summary) => {
-                                        if summary.recovered_count > 0 || !summary.failed.is_empty()
-                                        {
-                                            info!(
+                                // Post-Raft VM reconnect.
+                                if let Some(ref vm_manager) = aj_shared_vm_manager {
+                                    match vm_manager.reconnect().await {
+                                        Ok(summary) => {
+                                            if summary.recovered_count > 0
+                                                || !summary.failed.is_empty()
+                                            {
+                                                info!(
                                                 recovered = summary.recovered_count,
                                                 failed = summary.failed.len(),
                                                 orphans = summary.orphans_cleaned.len(),
                                                 "compute: post-Raft VM reconnect complete (in-process)"
                                             );
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!(
+                                        Err(e) => {
+                                            warn!(
                                             "compute: post-Raft reconnect failed (in-process): {e}"
                                         );
+                                        }
                                     }
                                 }
-                            }
 
-                            // FDB incremental update task.
-                            {
-                                let local_node = aj_my_record.mesh_ipv6.to_string();
-                                let mut rx = placement_event_rx;
-                                let fdb_placement_store = aj_placement_store.clone();
-                                tokio::spawn(async move {
-                                    let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
-                                        Arc::new(syfrah_overlay::LinuxBackend::new());
-                                    loop {
-                                        match rx.recv().await {
+                                // FDB incremental update task.
+                                {
+                                    let local_node = aj_my_record.mesh_ipv6.to_string();
+                                    let mut rx = placement_event_rx;
+                                    let fdb_placement_store = aj_placement_store.clone();
+                                    tokio::spawn(async move {
+                                        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                                            Arc::new(syfrah_overlay::LinuxBackend::new());
+                                        loop {
+                                            match rx.recv().await {
                                             Ok(event) => {
                                                 let placement = match &event {
                                                     syfrah_controlplane::PlacementEvent::Added {
@@ -2723,56 +2750,58 @@ pub async fn run_daemon(
                                                 break;
                                             }
                                         }
-                                    }
-                                });
-                            }
+                                        }
+                                    });
+                                }
 
-                            // Start the Raft HTTP server on port 7200.
-                            info!(
+                                // Start the Raft HTTP server on port 7200.
+                                info!(
                                 "raft: control plane server starting on {} (node_id={node_id}, in-process)",
                                 aj_raft_bind_addr
                             );
-                            tokio::spawn(async move {
-                                if let Err(e) = syfrah_controlplane::RaftServer::serve(
-                                    aj_raft_bind_addr,
-                                    raft_state,
-                                    aj_raft_shutdown_rx,
-                                )
-                                .await
-                                {
-                                    warn!("Raft HTTP server error (in-process): {e}");
-                                }
-                            });
+                                tokio::spawn(async move {
+                                    if let Err(e) = syfrah_controlplane::RaftServer::serve(
+                                        aj_raft_bind_addr,
+                                        raft_state,
+                                        aj_raft_shutdown_rx,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Raft HTTP server error (in-process): {e}");
+                                    }
+                                });
 
-                            info!(
+                                info!(
                                 "raft: joined and started in-process. No daemon restart needed. \
                                  PID unchanged."
                             );
 
-                            // Do NOT return — the auto-join task is the `raft_task`
-                            // in the main `tokio::select!` loop. If it completes,
-                            // the daemon interprets it as an unexpected exit and
-                            // shuts down. Instead, park this task forever (it will
-                            // be cancelled when the daemon shuts down normally).
-                            std::future::pending::<()>().await;
-                            unreachable!();
-                        }
-                        Ok(resp) => {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            warn!("raft: auto-join request failed: {status} — {body}");
-                        }
-                        Err(e) => {
-                            warn!("raft: auto-join request error: {e}");
+                                // Do NOT return — the auto-join task is the `raft_task`
+                                // in the main `tokio::select!` loop. If it completes,
+                                // the daemon interprets it as an unexpected exit and
+                                // shuts down. Instead, park this task forever (it will
+                                // be cancelled when the daemon shuts down normally).
+                                std::future::pending::<()>().await;
+                                unreachable!();
+                            }
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                warn!("raft: auto-join request failed: {status} — {body}");
+                            }
+                            Err(e) => {
+                                warn!("raft: auto-join request error: {e}");
+                            }
                         }
                     }
-                }
 
-                warn!(
-                    "raft: could not auto-join Raft after {} attempts. \
-                     Run 'syfrah controlplane join' manually.",
-                    backoffs.len()
-                );
+                    warn!(
+                        "raft: could not auto-join Raft after {} attempts. \
+                     Will retry in 30s. Run 'syfrah controlplane join' to skip.",
+                        backoffs.len()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                } // end of outer loop
             })
         }
     };
@@ -3573,6 +3602,110 @@ pub async fn run_daemon(
                     peerings_wired = report.peerings_wired,
                     "overlay reconcile: VPC peering data plane wired"
                 );
+            }
+
+            // --- NAT Gateway activation ---
+            // Detect NAT Gateways stuck in Pending state and activate them by
+            // applying nftables masquerade rules and updating the record.
+            let nat_gws = match org_store.list_nat_gws() {
+                Ok(gws) => gws,
+                Err(e) => {
+                    warn!(error = %e, "overlay reconcile: failed to list NAT gateways");
+                    Vec::new()
+                }
+            };
+            for gw in &nat_gws {
+                if gw.state != syfrah_org::types::ResourceState::Pending {
+                    continue;
+                }
+                // Detect public IP via default route.
+                let public_ip = {
+                    let output = std::process::Command::new("ip")
+                        .args(["route", "get", "8.8.8.8"])
+                        .output();
+                    match output {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            stdout
+                                .find(" src ")
+                                .and_then(|idx| {
+                                    stdout[idx + 5..]
+                                        .split_whitespace()
+                                        .next()
+                                        .map(String::from)
+                                })
+                                .unwrap_or_else(|| "0.0.0.0".to_string())
+                        }
+                        Err(_) => "0.0.0.0".to_string(),
+                    }
+                };
+
+                // Resolve VPC name from VPC ID for subnet listing.
+                let vpc = match org_store.get_vpc_by_id(&gw.vpc_id) {
+                    Ok(Some(v)) => v,
+                    _ => {
+                        warn!(
+                            nat_gw = %gw.name, vpc_id = %gw.vpc_id,
+                            "overlay reconcile: cannot resolve VPC for pending NAT GW"
+                        );
+                        continue;
+                    }
+                };
+
+                // Collect subnet CIDRs for masquerade rules.
+                let subnet_cidrs: Vec<String> = match org_store.list_subnets(&vpc.name) {
+                    Ok(subs) => subs.into_iter().map(|s| s.cidr).collect(),
+                    Err(e) => {
+                        warn!(
+                            error = %e, nat_gw = %gw.name,
+                            "overlay reconcile: failed to list subnets for NAT GW"
+                        );
+                        continue;
+                    }
+                };
+
+                // Apply masquerade for each subnet via the overlay backend.
+                let bridge = syfrah_overlay::naming::bridge_name(&vpc.id.0);
+                let mut nft_ok = true;
+                for cidr in &subnet_cidrs {
+                    if let Err(e) = backend.apply_nat(&bridge, cidr).await {
+                        warn!(
+                            error = %e, nat_gw = %gw.name, cidr = %cidr,
+                            "overlay reconcile: failed to apply NAT masquerade"
+                        );
+                        nft_ok = false;
+                        break;
+                    }
+                }
+
+                if nft_ok {
+                    // Update public IP on the record first (it was stored as 0.0.0.0 by Raft).
+                    // Then transition to Active.
+                    match org_store.update_nat_gw_state(
+                        &gw.vpc_id,
+                        &gw.name,
+                        syfrah_org::types::ResourceState::Active,
+                    ) {
+                        Ok(_active_gw) => {
+                            info!(
+                                nat_gw = %gw.name, public_ip = %public_ip,
+                                "overlay reconcile: NAT GW activated"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e, nat_gw = %gw.name,
+                                "overlay reconcile: failed to update NAT GW state"
+                            );
+                        }
+                    }
+                } else {
+                    let _ = org_store.update_nat_gw_state(
+                        &gw.vpc_id,
+                        &gw.name,
+                        syfrah_org::types::ResourceState::Failed,
+                    );
+                }
             }
         }
     };
