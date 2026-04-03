@@ -1,6 +1,6 @@
 # ADR-006: Storage — S3-Backed Block Devices via ZeroFS
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-01
 **Decided by**: Sacha + team
 **Depends on**: ADR-003 (Forge), ADR-004 (hypervisor model), ADR-005 (control plane — Raft state, fencing, reschedule safety)
