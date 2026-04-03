@@ -17,7 +17,7 @@ pub mod state_machine;
 pub mod types;
 
 pub use client::{RaftClient, RaftMetricsSnapshot};
-pub use commands::{StateMachineCommand, StateMachineResponse};
+pub use commands::{StateMachineCommand, StateMachineResponse, StorageConfig};
 pub use gossip::{
     GossipCluster, GossipConfig, GossipMetricsSnapshot, GossipNodeId, HypervisorGossipReport,
     MemberState,
