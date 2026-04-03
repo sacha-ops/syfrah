@@ -2932,6 +2932,7 @@ dependencies = [
  "syfrah-org",
  "syfrah-overlay",
  "syfrah-state",
+ "syfrah-storage",
  "tempfile",
  "terminal_size",
  "thiserror 2.0.18",
