@@ -143,4 +143,10 @@ pub trait NetworkBackend: Send + Sync {
     /// Returns `(ip, mac)` pairs from `ip neigh show dev <vxlan>` where
     /// state is `PERMANENT`.
     async fn list_arp_entries(&self, vxlan: &str) -> Result<Vec<(String, String)>>;
+
+    /// Return the master (bridge) device for a given interface, if any.
+    ///
+    /// Used during stale peering teardown to discover which bridges a
+    /// peering veth is attached to before deleting it.
+    async fn get_interface_master(&self, iface: &str) -> Result<Option<String>>;
 }

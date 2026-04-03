@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::backend::NetworkBackend;
@@ -18,6 +18,8 @@ pub struct MockBackend {
     fdb_entries: Mutex<Vec<(String, String, String)>>,
     /// Simulated ARP proxy entries per VXLAN: (ip, mac).
     arp_entries: Mutex<Vec<(String, String, String)>>,
+    /// Simulated interface-to-master (bridge) mappings.
+    masters: Mutex<HashMap<String, String>>,
 }
 
 impl MockBackend {
@@ -28,6 +30,7 @@ impl MockBackend {
             interfaces: Mutex::new(HashSet::new()),
             fdb_entries: Mutex::new(Vec::new()),
             arp_entries: Mutex::new(Vec::new()),
+            masters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -74,6 +77,14 @@ impl MockBackend {
             mac.to_string(),
             dst.to_string(),
         ));
+    }
+
+    /// Set the master (bridge) for an interface (for `get_interface_master`).
+    pub fn set_master(&self, iface: &str, master: &str) {
+        self.masters
+            .lock()
+            .expect("lock poisoned")
+            .insert(iface.to_string(), master.to_string());
     }
 
     /// Add a simulated ARP proxy entry for testing list_arp_entries.
@@ -306,6 +317,12 @@ impl NetworkBackend for MockBackend {
             .map(|(_, ip, mac)| (ip.clone(), mac.clone()))
             .collect())
     }
+
+    async fn get_interface_master(&self, iface: &str) -> Result<Option<String>> {
+        self.record(format!("get_interface_master({iface})"));
+        let masters = self.masters.lock().expect("lock poisoned");
+        Ok(masters.get(iface).cloned())
+    }
 }
 
 #[cfg(test)]
@@ -374,9 +391,10 @@ mod tests {
             .unwrap();
         b.list_fdb_entries(&vx100).await.unwrap();
         b.list_arp_entries(&vx100).await.unwrap();
+        b.get_interface_master(&tap).await.unwrap();
 
         let calls = b.calls();
-        assert_eq!(calls.len(), 26, "expected one call per trait method");
+        assert_eq!(calls.len(), 27, "expected one call per trait method");
 
         // Verify each method was recorded
         assert!(calls[0].starts_with("create_vxlan("));

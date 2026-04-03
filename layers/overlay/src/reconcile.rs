@@ -145,6 +145,9 @@ pub struct ReconcileReport {
     /// VPC peering data plane connections wired (veth + nftables).
     #[serde(default)]
     pub peerings_wired: usize,
+    /// Stale VPC peering data plane connections removed (veth + nftables).
+    #[serde(default)]
+    pub peerings_removed: usize,
     /// Warnings emitted (orphaned TAPs, orphaned kernel interfaces, etc.).
     pub warnings: Vec<String>,
 }
@@ -234,6 +237,7 @@ pub async fn reconcile_network(
         || report.fdb_entries_added > 0
         || report.fdb_entries_removed > 0
         || report.peerings_wired > 0
+        || report.peerings_removed > 0
         || !report.warnings.is_empty()
     {
         info!(
@@ -244,6 +248,7 @@ pub async fn reconcile_network(
             fdb_added = report.fdb_entries_added,
             fdb_removed = report.fdb_entries_removed,
             peerings_wired = report.peerings_wired,
+            peerings_removed = report.peerings_removed,
             warnings = report.warnings.len(),
             "reconciliation complete"
         );
@@ -634,6 +639,63 @@ async fn reconcile_peerings(
             }
         }
     }
+
+    // ── Remove stale peerings ─────────────────────────────────────────
+    // List actual peering interfaces in the kernel and remove any that
+    // are not in the expected state. We only look at "syfpa*" (end A)
+    // since deleting one end of a veth pair removes both.
+    let actual_peer_ifaces = backend
+        .list_interfaces(naming::PEER_PREFIX)
+        .await
+        .unwrap_or_default();
+
+    // Build set of expected peer-A interface names.
+    let expected_peer_a: HashSet<String> = state
+        .peerings
+        .iter()
+        .map(|p| naming::peer_name_a(&p.peering_id))
+        .collect();
+
+    for iface in &actual_peer_ifaces {
+        // Only process end-A interfaces to avoid double-deleting.
+        if !iface.starts_with("syfpa") {
+            continue;
+        }
+        if expected_peer_a.contains(iface) {
+            continue;
+        }
+
+        // Stale peering veth — discover its bridge masters so we can
+        // remove the nftables FORWARD rules before deleting the link.
+        let peer_b_name = format!("syfpb{}", &iface["syfpa".len()..]);
+
+        let master_a = backend.get_interface_master(iface).await.ok().flatten();
+        let master_b = backend
+            .get_interface_master(&peer_b_name)
+            .await
+            .ok()
+            .flatten();
+
+        if let (Some(ref br_a), Some(ref br_b)) = (&master_a, &master_b) {
+            if let Err(e) = backend.remove_peering_rules(br_a, br_b).await {
+                report.warnings.push(format!(
+                    "stale peering {iface}: failed to remove nftables rules: {e}"
+                ));
+            }
+        }
+
+        warn!(interface = %iface, "removing stale peering veth");
+        match backend.delete_tap(iface).await {
+            Ok(()) => {
+                report.peerings_removed += 1;
+            }
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("stale peering {iface}: failed to delete veth: {e}"));
+            }
+        }
+    }
 }
 
 /// Spawn a periodic reconciliation task that runs every `interval`.
@@ -977,5 +1039,77 @@ mod tests {
         let state = NetworkState::default();
         let report = reconcile_network(&mock, &state).await;
         assert_eq!(report.sg_chains_reapplied, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_peering_veth_removed() {
+        let backend = MockBackend::new();
+        let br_a = naming::bridge_name("vpc-a");
+        let br_b = naming::bridge_name("vpc-b");
+
+        // Simulate a stale peering veth pair in the kernel.
+        let stale_a = naming::peer_name_a("old-peer");
+        let stale_b = naming::peer_name_b("old-peer");
+        backend.add_interface(&stale_a);
+        backend.add_interface(&stale_b);
+        backend.set_master(&stale_a, &br_a);
+        backend.set_master(&stale_b, &br_b);
+
+        // Expected state has no peerings (the peering was deleted).
+        let state = make_state();
+
+        let report = reconcile_network(&backend, &state).await;
+
+        assert_eq!(
+            report.peerings_removed, 1,
+            "stale peering veth should be removed"
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("remove_peering_rules({br_a}, {br_b})")),
+            "should remove peering nftables rules; calls: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == &format!("delete_tap({stale_a})")),
+            "should delete stale veth; calls: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expected_peering_not_removed() {
+        let backend = MockBackend::new();
+        let br_a = naming::bridge_name("vpc-a");
+        let br_b = naming::bridge_name("vpc-b");
+        backend.add_interface(&br_a);
+        backend.add_interface(&br_b);
+
+        // Peering veth exists in kernel.
+        let peer_a = naming::peer_name_a("active-peer");
+        let peer_b = naming::peer_name_b("active-peer");
+        backend.add_interface(&peer_a);
+        backend.add_interface(&peer_b);
+
+        // Same peering is in expected state.
+        let mut state = make_state();
+        state.peerings.push(ExpectedPeering {
+            peering_id: "active-peer".into(),
+            bridge_a: br_a,
+            bridge_b: br_b,
+        });
+
+        let report = reconcile_network(&backend, &state).await;
+
+        assert_eq!(
+            report.peerings_removed, 0,
+            "expected peering should not be removed"
+        );
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("delete_tap(syfpa")),
+            "should not delete expected peering veth; calls: {calls:?}"
+        );
     }
 }
