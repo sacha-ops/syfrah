@@ -17,6 +17,7 @@ syfrah-compute = { path = "../../layers/compute" }
 syfrah-core = { path = "../../layers/core" }
 syfrah-fabric = { path = "../../layers/fabric" }
 syfrah-org = { path = "../../layers/org" }
+syfrah-storage = { path = "../../layers/storage" }
 syfrah-overlay = { path = "../../layers/overlay" }
 syfrah-state = { path = "../../layers/state" }
 syfrah-controlplane = { path = "../../layers/controlplane" }

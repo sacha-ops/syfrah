@@ -18,108 +18,110 @@ use openraft::{EntryPayload, OptionalSend};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::commands::{StateMachineCommand, StateMachineResponse, StorageConfig, VolumeType};
+use crate::commands::{
+    QuotaScope, StateMachineCommand, StateMachineResponse, StorageConfig, VolumeType,
+};
 use crate::types::SyfrahRaftConfig;
 
-/// Default number of log entries between snapshots.
-pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
-
 // ---------------------------------------------------------------------------
-// Volume in-memory store (temporary until redb tables land in #1182)
+// Storage state types (in-memory, replicated through Raft log + snapshots)
 // ---------------------------------------------------------------------------
 
-/// Desired state for a volume in the Raft state machine (ADR-006 §5).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum VolumeDesiredState {
-    /// Volume exists and is available for attachment.
-    Available,
-    /// Volume is attached to a specific VM on a specific hypervisor.
-    AttachedTo {
-        vm_id: String,
-        hypervisor_id: String,
-    },
-    /// Volume is marked for deletion.
-    Deleted,
+/// Storage quota limits for an org or project.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StorageQuota {
+    pub max_volumes: u32,
+    pub max_total_gb: u64,
+    pub max_snapshots: u32,
 }
 
-/// In-memory volume record. Mirrors the ADR-006 Volume struct but kept
-/// minimal — just enough fields to enforce the state machine invariants.
+/// Volume record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeRecord {
     pub id: String,
     pub name: String,
     pub size_gb: u32,
-    pub env_id: String,
     pub org_id: String,
     pub project_id: String,
+    pub env_id: String,
     pub volume_type: VolumeType,
-    pub desired_state: VolumeDesiredState,
+    pub state: VolumeState,
+    pub attached_vm_id: Option<String>,
+    pub attached_hypervisor_id: Option<String>,
     pub placement_generation: u64,
 }
 
-/// Thread-safe in-memory volume store.
-///
-/// Keyed by volume ID. A `std::sync::RwLock` is used (not tokio) because the
-/// apply path is synchronous (`apply_command` is `&self -> Response`).
-#[derive(Debug, Default)]
-pub struct VolumeStore {
-    volumes: std::sync::RwLock<HashMap<String, VolumeRecord>>,
+/// Volume lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VolumeState {
+    Available,
+    Attached,
+    Deleting,
 }
 
-impl VolumeStore {
-    pub fn new() -> Self {
-        Self {
-            volumes: std::sync::RwLock::new(HashMap::new()),
-        }
-    }
+/// Snapshot record tracked by the state machine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotRecord {
+    pub id: String,
+    pub source_volume_id: String,
+    pub sst_files: Vec<String>,
+    pub wal_position: u64,
+    /// org_id inherited from the source volume at creation time.
+    pub org_id: String,
+    /// project_id inherited from the source volume at creation time.
+    pub project_id: String,
+    /// Size in GB of the source volume at snapshot time.
+    /// Used by RestoreSnapshot so the restored volume gets the correct size
+    /// even if the source volume has been deleted or resized since.
+    #[serde(default)]
+    pub size_gb: u32,
+    /// env_id inherited from the source volume at creation time.
+    #[serde(default)]
+    pub env_id: String,
+    /// volume_type inherited from the source volume at creation time.
+    #[serde(default = "default_volume_type")]
+    pub volume_type: VolumeType,
+}
 
-    /// Insert a volume. Returns `Err` if the ID already exists.
-    fn insert(&self, record: VolumeRecord) -> Result<(), String> {
-        let mut map = self.volumes.write().unwrap();
-        if map.contains_key(&record.id) {
-            return Err(format!("volume '{}' already exists", record.id));
-        }
-        map.insert(record.id.clone(), record);
-        Ok(())
-    }
+fn default_volume_type() -> VolumeType {
+    VolumeType::Data
+}
 
-    /// Get a volume by ID.
-    fn get(&self, id: &str) -> Option<VolumeRecord> {
-        self.volumes.read().unwrap().get(id).cloned()
-    }
+/// SST file reference count for garbage collection.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SstRefCounts(pub HashMap<String, u64>);
 
-    /// Update a volume in-place. Returns `Err` if not found.
-    fn update(&self, record: VolumeRecord) -> Result<(), String> {
-        let mut map = self.volumes.write().unwrap();
-        if !map.contains_key(&record.id) {
-            return Err(format!("volume '{}' not found", record.id));
-        }
-        map.insert(record.id.clone(), record);
-        Ok(())
-    }
+/// Snapshot of all storage state for serialization into Raft snapshots.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StorageState {
+    pub quotas: HashMap<String, StorageQuota>,
+    pub volumes: HashMap<String, VolumeRecord>,
+    pub snapshots: HashMap<String, SnapshotRecord>,
+    pub sst_refcounts: SstRefCounts,
+    pub storage_configs: HashMap<String, StorageConfig>,
+}
 
-    /// Check whether a volume name already exists within an environment.
-    fn name_exists_in_env(&self, name: &str, env_id: &str) -> bool {
-        let map = self.volumes.read().unwrap();
-        map.values().any(|v| {
-            v.name == name && v.env_id == env_id && v.desired_state != VolumeDesiredState::Deleted
-        })
-    }
+/// Error returned when a storage quota is exceeded.
+#[derive(Debug, Clone)]
+pub struct QuotaExceededError {
+    pub scope: QuotaScope,
+    pub resource: String,
+    pub current: u64,
+    pub limit: u64,
+}
 
-    /// Export all volumes for snapshot serialization.
-    pub fn export_all(&self) -> Vec<VolumeRecord> {
-        self.volumes.read().unwrap().values().cloned().collect()
-    }
-
-    /// Import volumes (replaces all existing data).
-    pub fn import_all(&self, records: Vec<VolumeRecord>) {
-        let mut map = self.volumes.write().unwrap();
-        map.clear();
-        for r in records {
-            map.insert(r.id.clone(), r);
-        }
+impl std::fmt::Display for QuotaExceededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "quota exceeded for {}: {} limit is {} but current usage is {}",
+            self.scope, self.resource, self.limit, self.current
+        )
     }
 }
+
+/// Default number of log entries between snapshots.
+pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
 
 /// Event emitted by the state machine when a VM placement changes.
 ///
@@ -171,13 +173,9 @@ pub struct FullSnapshotData {
     /// Raw table data: table_name -> Vec<(key, json_bytes)>.
     /// Uses base64-encoded bytes for JSON compatibility.
     pub tables: HashMap<String, Vec<(String, Vec<u8>)>>,
-    /// In-memory volume records (not yet in redb).
+    /// In-memory storage state (volumes, snapshots, quotas, configs).
     #[serde(default)]
-    pub volumes: Vec<VolumeRecord>,
-    /// Per-region storage configuration (region -> StorageConfig).
-    /// Stored in-memory until a dedicated redb table is added.
-    #[serde(default)]
-    pub storage_configs: HashMap<String, StorageConfig>,
+    pub storage: StorageState,
 }
 
 /// Raft state machine that dispatches commands to the OrgStore.
@@ -191,8 +189,6 @@ pub struct RedbStateMachine {
     pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
     pub sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
     pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
-    /// In-memory volume store (temporary until redb table lands in #1182).
-    pub volume_store: VolumeStore,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -205,13 +201,9 @@ pub struct RedbStateMachine {
     pub entries_since_snapshot: AtomicU64,
     /// Configurable snapshot threshold (default: 10,000 log entries).
     pub snapshot_threshold: u64,
-    /// Per-region storage configuration (region name -> StorageConfig).
-    /// Stored in-memory and serialized into snapshots. Will migrate to redb
-    /// once a dedicated storage table is added.
-    ///
-    /// Uses `std::sync::RwLock` (not tokio) because `apply_command` is
-    /// synchronous and called from the Raft apply loop.
-    storage_configs: std::sync::RwLock<HashMap<String, StorageConfig>>,
+    /// In-memory storage state (volumes, snapshots, quotas, configs).
+    /// Protected by std::sync::RwLock since apply_command takes &self.
+    pub storage: std::sync::RwLock<StorageState>,
 }
 
 impl RedbStateMachine {
@@ -224,7 +216,6 @@ impl RedbStateMachine {
             placement_store: None,
             sg_rule_store: None,
             hypervisor_store: None,
-            volume_store: VolumeStore::new(),
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
@@ -232,7 +223,7 @@ impl RedbStateMachine {
             snapshot_count: AtomicU64::new(0),
             entries_since_snapshot: AtomicU64::new(0),
             snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
-            storage_configs: std::sync::RwLock::new(HashMap::new()),
+            storage: std::sync::RwLock::new(StorageState::default()),
         }
     }
 
@@ -422,13 +413,210 @@ impl RedbStateMachine {
         self
     }
 
+    /// Serialize a `QuotaScope` into a deterministic key for the quotas map.
+    fn quota_key(scope: &QuotaScope) -> String {
+        match scope {
+            QuotaScope::Org { org_id } => format!("org:{org_id}"),
+            QuotaScope::Project { org_id, project_id } => {
+                format!("project:{org_id}/{project_id}")
+            }
+        }
+    }
+
+    /// Look up the effective quota for a given org + project from an already-locked storage.
+    ///
+    /// Returns the project-level quota if set, otherwise the org-level quota.
+    /// Returns `None` if no quota is set (meaning unlimited).
+    fn effective_quota_from(
+        storage: &StorageState,
+        org_id: &str,
+        project_id: &str,
+    ) -> Option<StorageQuota> {
+        // Check project-level first.
+        let project_key = Self::quota_key(&QuotaScope::Project {
+            org_id: org_id.to_string(),
+            project_id: project_id.to_string(),
+        });
+        if let Some(q) = storage.quotas.get(&project_key) {
+            return Some(q.clone());
+        }
+        // Fall back to org-level.
+        let org_key = Self::quota_key(&QuotaScope::Org {
+            org_id: org_id.to_string(),
+        });
+        storage.quotas.get(&org_key).cloned()
+    }
+
+    /// Determine which scope is effective for quota from an already-locked storage.
+    fn effective_quota_scope_from(
+        storage: &StorageState,
+        org_id: &str,
+        project_id: &str,
+    ) -> QuotaScope {
+        let project_key = Self::quota_key(&QuotaScope::Project {
+            org_id: org_id.to_string(),
+            project_id: project_id.to_string(),
+        });
+        if storage.quotas.contains_key(&project_key) {
+            QuotaScope::Project {
+                org_id: org_id.to_string(),
+                project_id: project_id.to_string(),
+            }
+        } else {
+            QuotaScope::Org {
+                org_id: org_id.to_string(),
+            }
+        }
+    }
+
+    /// Check volume quotas for a CreateVolume operation.
+    ///
+    /// Returns `Ok(())` if quota is not exceeded, or an error with usage details.
+    ///
+    /// # TOCTOU safety
+    ///
+    /// There is no time-of-check-to-time-of-use race here because all
+    /// `apply_command` calls are serialized by Raft — only one command is
+    /// applied at a time on each node, so the quota read and the subsequent
+    /// volume insert are effectively atomic.
+    fn check_volume_quota(
+        &self,
+        org_id: &str,
+        project_id: &str,
+        new_size_gb: u32,
+    ) -> Result<(), QuotaExceededError> {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
+            Some(q) => q,
+            None => return Ok(()), // No quota = unlimited.
+        };
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
+
+        // TODO: For v1 we scan all volumes. Add index by org_id/project_id if this
+        // becomes a hot path.
+        let (count, total_gb) = Self::compute_volume_usage(&storage, &scope);
+
+        // Check volume count.
+        if count >= quota.max_volumes as u64 {
+            return Err(QuotaExceededError {
+                scope,
+                resource: "volume_count".to_string(),
+                current: count,
+                limit: quota.max_volumes as u64,
+            });
+        }
+        // Check total size.
+        if total_gb + new_size_gb as u64 > quota.max_total_gb {
+            return Err(QuotaExceededError {
+                scope,
+                resource: "total_gb".to_string(),
+                current: total_gb,
+                limit: quota.max_total_gb,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check total_gb quota for a ResizeVolume operation (delta only, no volume count check).
+    ///
+    /// # TOCTOU safety
+    ///
+    /// Same as `check_volume_quota` — Raft serializes all applies.
+    fn check_resize_quota(
+        &self,
+        org_id: &str,
+        project_id: &str,
+        delta_gb: u32,
+    ) -> Result<(), QuotaExceededError> {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
+            Some(q) => q,
+            None => return Ok(()), // No quota = unlimited.
+        };
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
+        let (_count, total_gb) = Self::compute_volume_usage(&storage, &scope);
+
+        if total_gb + delta_gb as u64 > quota.max_total_gb {
+            return Err(QuotaExceededError {
+                scope,
+                resource: "total_gb".to_string(),
+                current: total_gb,
+                limit: quota.max_total_gb,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check snapshot quota for a CreateSnapshot operation.
+    fn check_snapshot_quota(
+        &self,
+        org_id: &str,
+        project_id: &str,
+    ) -> Result<(), QuotaExceededError> {
+        let storage = self.storage.read().unwrap();
+        let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
+            Some(q) => q,
+            None => return Ok(()), // No quota = unlimited.
+        };
+        let scope = Self::effective_quota_scope_from(&storage, org_id, project_id);
+        let count = Self::compute_snapshot_count(&storage, &scope);
+
+        if count >= quota.max_snapshots as u64 {
+            return Err(QuotaExceededError {
+                scope,
+                resource: "snapshot_count".to_string(),
+                current: count,
+                limit: quota.max_snapshots as u64,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compute volume usage (count, total_gb) within the effective scope.
+    fn compute_volume_usage(storage: &StorageState, scope: &QuotaScope) -> (u64, u64) {
+        let mut count = 0u64;
+        let mut total_gb = 0u64;
+        for vol in storage.volumes.values() {
+            let in_scope = match scope {
+                QuotaScope::Org { org_id: oid } => vol.org_id == *oid,
+                QuotaScope::Project {
+                    org_id: oid,
+                    project_id: pid,
+                } => vol.org_id == *oid && vol.project_id == *pid,
+            };
+            if in_scope {
+                count += 1;
+                total_gb += vol.size_gb as u64;
+            }
+        }
+        (count, total_gb)
+    }
+
+    /// Compute snapshot count within the effective scope.
+    fn compute_snapshot_count(storage: &StorageState, scope: &QuotaScope) -> u64 {
+        let mut count = 0u64;
+        for snap in storage.snapshots.values() {
+            let in_scope = match scope {
+                QuotaScope::Org { org_id: oid } => snap.org_id == *oid,
+                QuotaScope::Project {
+                    org_id: oid,
+                    project_id: pid,
+                } => snap.org_id == *oid && snap.project_id == *pid,
+            };
+            if in_scope {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Retrieve the storage configuration for a given region.
     ///
-    /// This is a local read — it does not go through Raft consensus.
+    /// This is a local read -- it does not go through Raft consensus.
     /// Returns `None` if no config has been set for the region.
     pub fn get_storage_config(&self, region: &str) -> Option<StorageConfig> {
-        let configs = self.storage_configs.read().unwrap();
-        configs.get(region).cloned()
+        let storage = self.storage.read().unwrap();
+        storage.storage_configs.get(region).cloned()
     }
 
     /// Apply a single command to the state machine.
@@ -1424,6 +1612,25 @@ impl RedbStateMachine {
                 StateMachineResponse::Composite(results)
             }
 
+            // -- Storage (ADR-006 §16) --
+            StateMachineCommand::SetStorageQuota {
+                scope,
+                max_volumes,
+                max_total_gb,
+                max_snapshots,
+            } => {
+                let key = Self::quota_key(scope);
+                let quota = StorageQuota {
+                    max_volumes: *max_volumes,
+                    max_total_gb: *max_total_gb,
+                    max_snapshots: *max_snapshots,
+                };
+                let mut storage = self.storage.write().unwrap();
+                storage.quotas.insert(key, quota);
+                info!(%scope, max_volumes, max_total_gb, max_snapshots, "storage quota set");
+                StateMachineResponse::Ok
+            }
+
             // -- Storage: SetStorageConfig (ADR-006 §9) --
             StateMachineCommand::SetStorageConfig { region, config } => {
                 // Validate the config before storing.
@@ -1435,13 +1642,14 @@ impl RedbStateMachine {
                 if region.is_empty() {
                     return StateMachineResponse::Error("region must not be empty".to_string());
                 }
-                let mut configs = self.storage_configs.write().unwrap();
-                configs.insert(region.clone(), *config.clone());
+                let mut storage = self.storage.write().unwrap();
+                storage
+                    .storage_configs
+                    .insert(region.clone(), *config.clone());
                 info!(region = %region, "storage config set");
                 StateMachineResponse::Ok
             }
 
-            // -- Storage / Volume (ADR-006 §16) --
             StateMachineCommand::CreateVolume {
                 id,
                 name,
@@ -1451,26 +1659,61 @@ impl RedbStateMachine {
                 env_id,
                 volume_type,
             } => {
-                // Validate name uniqueness within environment.
-                if self.volume_store.name_exists_in_env(name, env_id) {
+                // Check quota before creating.
+                if let Err(e) = self.check_volume_quota(org_id, project_id, *size_gb) {
+                    return StateMachineResponse::Error(e.to_string());
+                }
+                let mut storage = self.storage.write().unwrap();
+                // Check name uniqueness within the environment.
+                let name_exists = storage.volumes.values().any(|v| {
+                    v.env_id == *env_id
+                        && v.name == *name
+                        && v.org_id == *org_id
+                        && v.project_id == *project_id
+                });
+                if name_exists {
                     return StateMachineResponse::Error(format!(
-                        "volume name '{name}' already exists in environment '{env_id}'"
+                        "volume '{name}' already exists in env '{env_id}'"
+                    ));
+                }
+                if storage.volumes.contains_key(id) {
+                    return StateMachineResponse::Error(format!(
+                        "volume with id '{id}' already exists"
                     ));
                 }
                 let record = VolumeRecord {
                     id: id.clone(),
                     name: name.clone(),
                     size_gb: *size_gb,
-                    env_id: env_id.clone(),
                     org_id: org_id.clone(),
                     project_id: project_id.clone(),
+                    env_id: env_id.clone(),
                     volume_type: volume_type.clone(),
-                    desired_state: VolumeDesiredState::Available,
+                    state: VolumeState::Available,
+                    attached_vm_id: None,
+                    attached_hypervisor_id: None,
                     placement_generation: 0,
                 };
-                match self.volume_store.insert(record) {
-                    Ok(()) => StateMachineResponse::Created(id.clone()),
-                    Err(e) => StateMachineResponse::Error(e),
+                storage.volumes.insert(id.clone(), record);
+                info!(
+                    id,
+                    name, size_gb, org_id, project_id, env_id, "volume created"
+                );
+                StateMachineResponse::Created(id.clone())
+            }
+
+            StateMachineCommand::DeleteVolume { volume_id } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Attached => StateMachineResponse::Error(
+                        format!("volume '{volume_id}' is attached, detach before deleting"),
+                    ),
+                    Some(_) => {
+                        storage.volumes.remove(volume_id);
+                        info!(volume_id, "volume deleted");
+                        StateMachineResponse::Ok
+                    }
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
                 }
             }
 
@@ -1479,98 +1722,39 @@ impl RedbStateMachine {
                 vm_id,
                 hypervisor_id,
             } => {
-                let vol = match self.volume_store.get(volume_id) {
-                    Some(v) => v,
-                    None => {
-                        return StateMachineResponse::Error(format!(
-                            "volume not found: {volume_id}"
-                        ))
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Available => {
+                        vol.state = VolumeState::Attached;
+                        vol.attached_vm_id = Some(vm_id.clone());
+                        vol.attached_hypervisor_id = Some(hypervisor_id.clone());
+                        vol.placement_generation += 1;
+                        info!(volume_id, vm_id, hypervisor_id, "volume attached");
+                        StateMachineResponse::Ok
                     }
-                };
-                match &vol.desired_state {
-                    VolumeDesiredState::Available => {}
-                    VolumeDesiredState::AttachedTo {
-                        vm_id: existing_vm, ..
-                    } => {
-                        return StateMachineResponse::Error(format!(
-                            "volume '{volume_id}' is already attached to VM '{existing_vm}'"
-                        ));
-                    }
-                    VolumeDesiredState::Deleted => {
-                        return StateMachineResponse::Error(format!(
-                            "volume '{volume_id}' is marked for deletion"
-                        ));
-                    }
-                }
-                let mut updated = vol;
-                updated.desired_state = VolumeDesiredState::AttachedTo {
-                    vm_id: vm_id.clone(),
-                    hypervisor_id: hypervisor_id.clone(),
-                };
-                updated.placement_generation += 1;
-                match self.volume_store.update(updated) {
-                    Ok(()) => StateMachineResponse::Ok,
-                    Err(e) => StateMachineResponse::Error(e),
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{volume_id}' is not available (state: {:?})",
+                        vol.state
+                    )),
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
                 }
             }
 
             StateMachineCommand::DetachVolume { volume_id } => {
-                let vol = match self.volume_store.get(volume_id) {
-                    Some(v) => v,
-                    None => {
-                        return StateMachineResponse::Error(format!(
-                            "volume not found: {volume_id}"
-                        ))
-                    }
-                };
-                match &vol.desired_state {
-                    VolumeDesiredState::AttachedTo { .. } => {
-                        // Transition: Attached -> Available
-                        let mut updated = vol;
-                        updated.desired_state = VolumeDesiredState::Available;
-                        updated.placement_generation += 1;
-                        match self.volume_store.update(updated) {
-                            Ok(()) => StateMachineResponse::Ok,
-                            Err(e) => StateMachineResponse::Error(e),
-                        }
-                    }
-                    VolumeDesiredState::Available => {
-                        // Already available — idempotent, treat as success.
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Attached => {
+                        vol.state = VolumeState::Available;
+                        vol.attached_vm_id = None;
+                        vol.attached_hypervisor_id = None;
+                        info!(volume_id, "volume detached");
                         StateMachineResponse::Ok
                     }
-                    VolumeDesiredState::Deleted => StateMachineResponse::Error(format!(
-                        "cannot detach volume '{volume_id}': volume is marked for deletion"
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{volume_id}' is not attached (state: {:?})",
+                        vol.state
                     )),
-                }
-            }
-
-            StateMachineCommand::DeleteVolume { volume_id } => {
-                let vol = match self.volume_store.get(volume_id) {
-                    Some(v) => v,
-                    None => {
-                        return StateMachineResponse::Error(format!(
-                            "volume not found: {volume_id}"
-                        ))
-                    }
-                };
-                match &vol.desired_state {
-                    VolumeDesiredState::Available => {
-                        let mut updated = vol;
-                        updated.desired_state = VolumeDesiredState::Deleted;
-                        match self.volume_store.update(updated) {
-                            Ok(()) => StateMachineResponse::Ok,
-                            Err(e) => StateMachineResponse::Error(e),
-                        }
-                    }
-                    VolumeDesiredState::AttachedTo {
-                        vm_id: attached_vm, ..
-                    } => StateMachineResponse::Error(format!(
-                        "cannot delete volume '{volume_id}': still attached to VM '{attached_vm}'"
-                    )),
-                    VolumeDesiredState::Deleted => {
-                        // Already deleted — idempotent.
-                        StateMachineResponse::Ok
-                    }
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
                 }
             }
 
@@ -1578,39 +1762,196 @@ impl RedbStateMachine {
                 volume_id,
                 new_size_gb,
             } => {
-                let vol = match self.volume_store.get(volume_id) {
-                    Some(v) => v,
-                    None => {
-                        return StateMachineResponse::Error(format!(
-                            "volume not found: {volume_id}"
-                        ))
+                // Read current volume to validate state and compute delta.
+                let (org_id, project_id, old_size_gb) = {
+                    let storage = self.storage.read().unwrap();
+                    match storage.volumes.get(volume_id) {
+                        Some(vol) if vol.state == VolumeState::Available => {
+                            if *new_size_gb <= vol.size_gb {
+                                return StateMachineResponse::Error(format!(
+                                    "cannot shrink volume '{}': current {}GB, requested {}GB",
+                                    volume_id, vol.size_gb, new_size_gb
+                                ));
+                            }
+                            (vol.org_id.clone(), vol.project_id.clone(), vol.size_gb)
+                        }
+                        Some(vol) => {
+                            return StateMachineResponse::Error(format!(
+                                "volume '{volume_id}' must be available to resize (state: {:?})",
+                                vol.state
+                            ))
+                        }
+                        None => {
+                            return StateMachineResponse::Error(format!(
+                                "volume not found: {volume_id}"
+                            ))
+                        }
                     }
                 };
-                if vol.desired_state != VolumeDesiredState::Available {
-                    return StateMachineResponse::Error(format!(
-                        "cannot resize volume '{volume_id}': volume is not Available"
-                    ));
+
+                // Check total_gb quota for the size delta.
+                let delta_gb = *new_size_gb - old_size_gb;
+                if let Err(e) = self.check_resize_quota(&org_id, &project_id, delta_gb) {
+                    return StateMachineResponse::Error(e.to_string());
                 }
-                if *new_size_gb < vol.size_gb {
-                    return StateMachineResponse::Error(format!(
-                        "cannot shrink volume '{volume_id}': current size {} GB, requested {} GB",
-                        vol.size_gb, new_size_gb
-                    ));
-                }
-                let mut updated = vol;
-                updated.size_gb = *new_size_gb;
-                match self.volume_store.update(updated) {
-                    Ok(()) => StateMachineResponse::Ok,
-                    Err(e) => StateMachineResponse::Error(e),
+
+                let mut storage = self.storage.write().unwrap();
+                if let Some(vol) = storage.volumes.get_mut(volume_id) {
+                    vol.size_gb = *new_size_gb;
+                    info!(volume_id, new_size_gb, "volume resized");
+                    StateMachineResponse::Ok
+                } else {
+                    StateMachineResponse::Error(format!("volume not found: {volume_id}"))
                 }
             }
 
-            // Snapshot / quota commands — not yet implemented.
-            StateMachineCommand::CreateSnapshot { .. }
-            | StateMachineCommand::DeleteSnapshot { .. }
-            | StateMachineCommand::RestoreSnapshot { .. }
-            | StateMachineCommand::SetStorageQuota { .. } => {
-                StateMachineResponse::Error("storage command not yet implemented".into())
+            StateMachineCommand::CreateSnapshot {
+                id,
+                source_volume_id,
+                sst_files,
+                wal_position,
+            } => {
+                // Look up source volume to capture org/project/size/env/type at snapshot time.
+                let (org_id, project_id, size_gb, env_id, volume_type) = {
+                    let storage = self.storage.read().unwrap();
+                    match storage.volumes.get(source_volume_id) {
+                        Some(vol) => (
+                            vol.org_id.clone(),
+                            vol.project_id.clone(),
+                            vol.size_gb,
+                            vol.env_id.clone(),
+                            vol.volume_type.clone(),
+                        ),
+                        None => {
+                            return StateMachineResponse::Error(format!(
+                                "source volume not found: {source_volume_id}"
+                            ))
+                        }
+                    }
+                };
+
+                // Check snapshot quota.
+                if let Err(e) = self.check_snapshot_quota(&org_id, &project_id) {
+                    return StateMachineResponse::Error(e.to_string());
+                }
+
+                let mut storage = self.storage.write().unwrap();
+                if storage.snapshots.contains_key(id) {
+                    return StateMachineResponse::Error(format!(
+                        "snapshot with id '{id}' already exists"
+                    ));
+                }
+                // Increment SST refcounts.
+                for sst in sst_files {
+                    *storage.sst_refcounts.0.entry(sst.clone()).or_insert(0) += 1;
+                }
+                let record = SnapshotRecord {
+                    id: id.clone(),
+                    source_volume_id: source_volume_id.clone(),
+                    sst_files: sst_files.clone(),
+                    wal_position: *wal_position,
+                    org_id,
+                    project_id,
+                    size_gb,
+                    env_id,
+                    volume_type,
+                };
+                storage.snapshots.insert(id.clone(), record);
+                info!(id, source_volume_id, size_gb, "snapshot created");
+                StateMachineResponse::Created(id.clone())
+            }
+
+            StateMachineCommand::DeleteSnapshot { snapshot_id } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.snapshots.remove(snapshot_id) {
+                    Some(snap) => {
+                        // Decrement SST refcounts; GC reclaims at 0.
+                        for sst in &snap.sst_files {
+                            if let Some(count) = storage.sst_refcounts.0.get_mut(sst) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    storage.sst_refcounts.0.remove(sst);
+                                }
+                            }
+                        }
+                        info!(snapshot_id, "snapshot deleted");
+                        StateMachineResponse::Ok
+                    }
+                    None => {
+                        StateMachineResponse::Error(format!("snapshot not found: {snapshot_id}"))
+                    }
+                }
+            }
+
+            StateMachineCommand::RestoreSnapshot {
+                snapshot_id,
+                new_volume_id,
+                new_volume_name,
+            } => {
+                let snap = {
+                    let storage = self.storage.read().unwrap();
+                    match storage.snapshots.get(snapshot_id) {
+                        Some(s) => s.clone(),
+                        None => {
+                            return StateMachineResponse::Error(format!(
+                                "snapshot not found: {snapshot_id}"
+                            ))
+                        }
+                    }
+                };
+
+                // Use the size_gb captured at snapshot creation time -- this is
+                // correct even if the source volume was subsequently resized or
+                // deleted.
+                let size_gb = snap.size_gb;
+                let env_id = snap.env_id.clone();
+                let volume_type = snap.volume_type.clone();
+
+                // Check quota for the new volume.
+                if let Err(e) = self.check_volume_quota(&snap.org_id, &snap.project_id, size_gb) {
+                    return StateMachineResponse::Error(e.to_string());
+                }
+
+                let mut storage = self.storage.write().unwrap();
+
+                // Check name uniqueness within the environment (same check as CreateVolume).
+                let name_exists = storage.volumes.values().any(|v| {
+                    v.env_id == env_id
+                        && v.name == *new_volume_name
+                        && v.org_id == snap.org_id
+                        && v.project_id == snap.project_id
+                });
+                if name_exists {
+                    return StateMachineResponse::Error(format!(
+                        "volume '{}' already exists in env '{}'",
+                        new_volume_name, env_id
+                    ));
+                }
+
+                if storage.volumes.contains_key(new_volume_id) {
+                    return StateMachineResponse::Error(format!(
+                        "volume with id '{new_volume_id}' already exists"
+                    ));
+                }
+                let record = VolumeRecord {
+                    id: new_volume_id.clone(),
+                    name: new_volume_name.clone(),
+                    size_gb,
+                    org_id: snap.org_id,
+                    project_id: snap.project_id,
+                    env_id,
+                    volume_type,
+                    state: VolumeState::Available,
+                    attached_vm_id: None,
+                    attached_hypervisor_id: None,
+                    placement_generation: 0,
+                };
+                storage.volumes.insert(new_volume_id.clone(), record);
+                info!(
+                    snapshot_id,
+                    new_volume_id, new_volume_name, size_gb, "snapshot restored"
+                );
+                StateMachineResponse::Created(new_volume_id.clone())
             }
         }
     }
@@ -1624,13 +1965,11 @@ impl RaftSnapshotBuilder<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         let tables = self.export_store_tables();
         let table_count: usize = tables.values().map(|v| v.len()).sum();
 
-        let volumes = self.volume_store.export_all();
-        let storage_configs = self.storage_configs.read().unwrap().clone();
+        let storage_snapshot = self.storage.read().unwrap().clone();
         let full_data = FullSnapshotData {
             sm_state: (*sm_state).clone(),
             tables,
-            volumes,
-            storage_configs,
+            storage: storage_snapshot,
         };
 
         let data = serde_json::to_vec(&full_data)
@@ -1758,14 +2097,9 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
             // Restore all store tables from the snapshot.
             let table_count: usize = full.tables.values().map(|v| v.len()).sum();
             self.import_store_tables(&full.tables);
-
-            // Restore in-memory volume records.
-            let volume_count = full.volumes.len();
-            self.volume_store.import_all(full.volumes);
-
             info!(
                 table_entries = table_count,
-                volume_count, "snapshot: restored store tables and volumes from full snapshot"
+                "snapshot: restored store tables from full snapshot"
             );
 
             // Emit PlacementEvent::Added for every placement in the restored
@@ -1795,12 +2129,10 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                 }
             }
 
-            // Restore storage configs from the snapshot.
-            if !full.storage_configs.is_empty() {
-                let mut configs = self.storage_configs.write().unwrap();
-                let count = full.storage_configs.len();
-                *configs = full.storage_configs;
-                info!(regions = count, "snapshot: restored storage configs");
+            // Restore in-memory storage state from snapshot.
+            {
+                let mut storage = self.storage.write().unwrap();
+                *storage = full.storage;
             }
 
             full.sm_state
@@ -2012,6 +2344,43 @@ mod tests {
         assert_eq!(membership.membership().voter_ids().count(), 0);
     }
 
+    // -----------------------------------------------------------------------
+    // Storage quota tests (#1184)
+    // -----------------------------------------------------------------------
+
+    use crate::commands::{QuotaScope, VolumeType};
+
+    /// Helper: create a volume via the state machine.
+    fn create_volume(
+        sm: &RedbStateMachine,
+        id: &str,
+        name: &str,
+        size_gb: u32,
+        org: &str,
+        project: &str,
+        env: &str,
+    ) -> StateMachineResponse {
+        sm.apply_command(&StateMachineCommand::CreateVolume {
+            id: id.into(),
+            name: name.into(),
+            size_gb,
+            org_id: org.into(),
+            project_id: project.into(),
+            env_id: env.into(),
+            volume_type: VolumeType::Data,
+        })
+    }
+
+    /// Helper: create a snapshot via the state machine (requires a volume).
+    fn create_snapshot(sm: &RedbStateMachine, id: &str, vol_id: &str) -> StateMachineResponse {
+        sm.apply_command(&StateMachineCommand::CreateSnapshot {
+            id: id.into(),
+            source_volume_id: vol_id.into(),
+            sst_files: vec!["sst-a".into()],
+            wal_position: 1,
+        })
+    }
+
     // -- StorageConfig tests (issue #1183) --
 
     fn make_valid_storage_config() -> crate::commands::StorageConfig {
@@ -2023,6 +2392,430 @@ mod tests {
             cache_disk_path: "/dev/nvme1n1".into(),
             cache_disk_size_gb: 200,
             cache_memory_size_gb: 8,
+        }
+    }
+
+    #[test]
+    fn no_quota_set_unlimited() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // With no quota, creating volumes should succeed indefinitely.
+        for i in 0..10 {
+            let resp = create_volume(
+                &sm,
+                &format!("vol-{i}"),
+                &format!("v{i}"),
+                100,
+                "acme",
+                "myapp",
+                "prod",
+            );
+            assert!(
+                matches!(resp, StateMachineResponse::Created(_)),
+                "expected Created, got {resp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn org_quota_volume_count_enforced() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 2 volumes.
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 2,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Create 2 volumes -- should succeed.
+        let resp = create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "p2", "staging");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // 3rd volume should fail with quota exceeded.
+        let resp = create_volume(&sm, "vol-3", "v3", 50, "acme", "p1", "prod");
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("quota exceeded"), "unexpected error: {msg}");
+                assert!(
+                    msg.contains("volume_count"),
+                    "should mention volume_count: {msg}"
+                );
+                assert!(msg.contains("2"), "should mention current usage: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn org_quota_total_gb_enforced() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 200GB total.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 100,
+            max_total_gb: 200,
+            max_snapshots: 100,
+        });
+
+        let resp = create_volume(&sm, "vol-1", "v1", 150, "acme", "p1", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // This would bring total to 250GB > 200GB limit.
+        let resp = create_volume(&sm, "vol-2", "v2", 100, "acme", "p1", "prod");
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("quota exceeded"), "unexpected error: {msg}");
+                assert!(msg.contains("total_gb"), "should mention total_gb: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_quota_enforced() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set project-level quota: max 1 volume.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Project {
+                org_id: "acme".into(),
+                project_id: "myapp".into(),
+            },
+            max_volumes: 1,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+
+        let resp = create_volume(&sm, "vol-1", "v1", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // 2nd volume in same project should fail.
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+
+        // But a volume in a different project should succeed (no quota for that project).
+        let resp = create_volume(&sm, "vol-3", "v3", 50, "acme", "other", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+    }
+
+    #[test]
+    fn project_inherits_org_quota() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota only (no project quota).
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 2,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+
+        // Create 2 volumes in a project -- should use org quota.
+        let resp = create_volume(&sm, "vol-1", "v1", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // 3rd should be rejected by org-level quota.
+        let resp = create_volume(&sm, "vol-3", "v3", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn project_quota_overrides_org_quota() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Org allows 10 volumes, but project only allows 1.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Project {
+                org_id: "acme".into(),
+                project_id: "limited".into(),
+            },
+            max_volumes: 1,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+
+        let resp = create_volume(&sm, "vol-1", "v1", 50, "acme", "limited", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Project-level limit of 1 should block this.
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "limited", "prod");
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn snapshot_quota_enforced() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 2 snapshots.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 100,
+            max_total_gb: 10000,
+            max_snapshots: 2,
+        });
+
+        // Create a volume to snapshot from.
+        create_volume(&sm, "vol-1", "v1", 50, "acme", "myapp", "prod");
+
+        let resp = create_snapshot(&sm, "snap-1", "vol-1");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+        let resp = create_snapshot(&sm, "snap-2", "vol-1");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // 3rd snapshot should fail.
+        let resp = create_snapshot(&sm, "snap-3", "vol-1");
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("quota exceeded"), "unexpected error: {msg}");
+                assert!(
+                    msg.contains("snapshot_count"),
+                    "should mention snapshot_count: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quota_exceeded_error_includes_usage_details() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 1,
+            max_total_gb: 10000,
+            max_snapshots: 100,
+        });
+
+        create_volume(&sm, "vol-1", "v1", 50, "acme", "myapp", "prod");
+
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "myapp", "prod");
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                // Should include both current count and limit.
+                assert!(msg.contains("limit is 1"), "should include limit: {msg}");
+                assert!(
+                    msg.contains("current usage is 1"),
+                    "should include current usage: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_volume_lifecycle() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create -> Attach -> Detach -> Resize -> Delete.
+        let resp = create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Cannot delete while attached.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+
+        // Detach.
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Resize (grow only).
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 200,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Cannot shrink.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 50,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+
+        // Delete.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[test]
+    fn snapshot_lifecycle_and_sst_refcounting() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "v1", 100, "acme", "myapp", "prod");
+
+        // Create snapshot with SST files.
+        let resp = sm.apply_command(&StateMachineCommand::CreateSnapshot {
+            id: "snap-1".into(),
+            source_volume_id: "vol-1".into(),
+            sst_files: vec!["sst-001".into(), "sst-002".into()],
+            wal_position: 42,
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Verify SST refcounts.
+        {
+            let storage = sm.storage.read().unwrap();
+            assert_eq!(storage.sst_refcounts.0.get("sst-001"), Some(&1));
+            assert_eq!(storage.sst_refcounts.0.get("sst-002"), Some(&1));
+        }
+
+        // Create another snapshot sharing sst-001.
+        sm.apply_command(&StateMachineCommand::CreateSnapshot {
+            id: "snap-2".into(),
+            source_volume_id: "vol-1".into(),
+            sst_files: vec!["sst-001".into(), "sst-003".into()],
+            wal_position: 50,
+        });
+        {
+            let storage = sm.storage.read().unwrap();
+            assert_eq!(storage.sst_refcounts.0.get("sst-001"), Some(&2));
+        }
+
+        // Delete snap-1: sst-001 refcount drops to 1, sst-002 drops to 0 (removed).
+        sm.apply_command(&StateMachineCommand::DeleteSnapshot {
+            snapshot_id: "snap-1".into(),
+        });
+        {
+            let storage = sm.storage.read().unwrap();
+            assert_eq!(storage.sst_refcounts.0.get("sst-001"), Some(&1));
+            assert_eq!(storage.sst_refcounts.0.get("sst-002"), None);
+        }
+    }
+
+    #[test]
+    fn restore_snapshot_creates_new_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Verify the new volume exists with correct size.
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-2").unwrap();
+        assert_eq!(vol.name, "pgdata-restored");
+        assert_eq!(vol.size_gb, 100);
+        assert_eq!(vol.org_id, "acme");
+    }
+
+    #[test]
+    fn set_storage_config() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(crate::commands::StorageConfig {
+                s3_endpoint: "https://s3.example.com".into(),
+                s3_bucket: "bucket".into(),
+                s3_access_key: "AK".into(),
+                s3_secret_key: "SK".into(),
+                cache_disk_path: "/dev/nvme1n1".into(),
+                cache_disk_size_gb: 200,
+                cache_memory_size_gb: 8,
+            }),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let cfg = storage.storage_configs.get("eu-west").unwrap();
+        assert_eq!(cfg.s3_bucket, "bucket");
+    }
+
+    #[test]
+    fn resize_volume_checks_total_gb_quota() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 200GB total.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 100,
+            max_total_gb: 200,
+            max_snapshots: 100,
+        });
+
+        // Create a 100GB volume.
+        let resp = create_volume(&sm, "vol-1", "v1", 100, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Resize to 150GB (delta=50, total=150) -- should succeed.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 150,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Resize to 300GB (delta=150, total=300 > 200 limit) -- should fail.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".into(),
+            new_size_gb: 300,
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("quota exceeded"), "unexpected error: {msg}");
+                assert!(msg.contains("total_gb"), "should mention total_gb: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
@@ -2095,6 +2888,63 @@ mod tests {
     }
 
     #[test]
+    fn restore_snapshot_uses_snapshot_size_after_source_deleted() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create volume, snapshot, then delete the volume.
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+        });
+
+        // Restore -- should use snapshot's stored size_gb (100), not 0.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-2").unwrap();
+        assert_eq!(
+            vol.size_gb, 100,
+            "restored volume should have snapshot's size, not 0"
+        );
+        assert_eq!(vol.env_id, "prod");
+    }
+
+    #[test]
+    fn restore_snapshot_enforces_name_uniqueness() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Create a volume with the name we want to restore into.
+        create_volume(&sm, "vol-x", "pgdata-restored", 50, "acme", "myapp", "prod");
+
+        // Restore should fail because "pgdata-restored" already exists in the env.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "should mention name conflict: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_set_storage_config_rejects_empty_bucket() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
@@ -2122,6 +2972,23 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_stores_size_gb_from_source_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "v1", 250, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        let storage = sm.storage.read().unwrap();
+        let snap = storage.snapshots.get("snap-1").unwrap();
+        assert_eq!(
+            snap.size_gb, 250,
+            "snapshot should capture source volume size"
+        );
+        assert_eq!(snap.env_id, "prod");
     }
 
     #[test]
@@ -2218,478 +3085,5 @@ mod tests {
         let us = sm.get_storage_config("us-east").unwrap();
         assert_eq!(eu.s3_bucket, "bucket-eu");
         assert_eq!(us.s3_bucket, "bucket-us");
-    }
-
-    // -----------------------------------------------------------------------
-    // Volume state machine tests (#1181)
-    // -----------------------------------------------------------------------
-
-    fn make_create_volume(id: &str, name: &str, size_gb: u32, env: &str) -> StateMachineCommand {
-        StateMachineCommand::CreateVolume {
-            id: id.to_string(),
-            name: name.to_string(),
-            size_gb,
-            org_id: "org-1".to_string(),
-            project_id: "proj-1".to_string(),
-            env_id: env.to_string(),
-            volume_type: crate::commands::VolumeType::Data,
-        }
-    }
-
-    #[test]
-    fn volume_create_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let resp = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        match resp {
-            StateMachineResponse::Created(id) => assert_eq!(id, "vol-1"),
-            other => panic!("expected Created, got {other:?}"),
-        }
-        // Verify the record exists.
-        let rec = sm.volume_store.get("vol-1").unwrap();
-        assert_eq!(rec.name, "data");
-        assert_eq!(rec.size_gb, 100);
-        assert_eq!(rec.desired_state, VolumeDesiredState::Available);
-        assert_eq!(rec.placement_generation, 0);
-    }
-
-    #[test]
-    fn volume_create_duplicate_name_same_env_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 50, "env-1"));
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("already exists"), "msg: {msg}");
-                assert!(msg.contains("env-1"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_create_same_name_different_env_ok() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 50, "env-2"));
-        assert!(matches!(resp, StateMachineResponse::Created(_)));
-    }
-
-    #[test]
-    fn volume_create_duplicate_id_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&make_create_volume("vol-1", "other-name", 50, "env-1"));
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("already exists"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_attach_available_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-        let rec = sm.volume_store.get("vol-1").unwrap();
-        assert_eq!(
-            rec.desired_state,
-            VolumeDesiredState::AttachedTo {
-                vm_id: "vm-1".to_string(),
-                hypervisor_id: "hv-1".to_string(),
-            }
-        );
-        assert_eq!(rec.placement_generation, 1);
-    }
-
-    #[test]
-    fn volume_attach_already_attached_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        // Try attaching again to a different VM.
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-2".to_string(),
-            hypervisor_id: "hv-2".to_string(),
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("already attached"), "msg: {msg}");
-                assert!(msg.contains("vm-1"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_attach_nonexistent_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-ghost".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("not found"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_attach_deleted_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("deletion"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_detach_attached_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-        let rec = sm.volume_store.get("vol-1").unwrap();
-        assert_eq!(rec.desired_state, VolumeDesiredState::Available);
-        // placement_generation should be 2 (1 from attach, 1 from detach).
-        assert_eq!(rec.placement_generation, 2);
-    }
-
-    #[test]
-    fn volume_detach_available_idempotent() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        // Detach when already Available — should be idempotent (no-op).
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-    }
-
-    #[test]
-    fn volume_detach_deleted_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("deletion"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_detach_nonexistent_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-ghost".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Error(_)));
-    }
-
-    #[test]
-    fn volume_delete_available_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-        let rec = sm.volume_store.get("vol-1").unwrap();
-        assert_eq!(rec.desired_state, VolumeDesiredState::Deleted);
-    }
-
-    #[test]
-    fn volume_delete_attached_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("still attached"), "msg: {msg}");
-                assert!(msg.contains("vm-1"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_delete_already_deleted_idempotent() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        // Deleting again should be idempotent.
-        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-    }
-
-    #[test]
-    fn volume_delete_nonexistent_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-ghost".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Error(_)));
-    }
-
-    #[test]
-    fn volume_resize_larger_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 200,
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-        let rec = sm.volume_store.get("vol-1").unwrap();
-        assert_eq!(rec.size_gb, 200);
-    }
-
-    #[test]
-    fn volume_resize_same_size_success() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        // Resizing to the same size should be a no-op success.
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 100,
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
-    }
-
-    #[test]
-    fn volume_resize_smaller_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 50,
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("shrink"), "msg: {msg}");
-                assert!(msg.contains("100"), "msg: {msg}");
-                assert!(msg.contains("50"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_resize_attached_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 200,
-        });
-        match resp {
-            StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("not Available"), "msg: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn volume_resize_deleted_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 200,
-        });
-        assert!(matches!(resp, StateMachineResponse::Error(_)));
-    }
-
-    #[test]
-    fn volume_resize_nonexistent_error() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-ghost".to_string(),
-            new_size_gb: 200,
-        });
-        assert!(matches!(resp, StateMachineResponse::Error(_)));
-    }
-
-    #[test]
-    fn volume_full_lifecycle() {
-        // Create -> Attach -> Detach -> Resize -> Delete
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-
-        // Create
-        let resp = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        assert!(matches!(resp, StateMachineResponse::Created(_)));
-
-        // Attach
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok));
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().placement_generation,
-            1
-        );
-
-        // Detach
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok));
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().placement_generation,
-            2
-        );
-
-        // Resize (grow)
-        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
-            volume_id: "vol-1".to_string(),
-            new_size_gb: 500,
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok));
-        assert_eq!(sm.volume_store.get("vol-1").unwrap().size_gb, 500);
-
-        // Delete
-        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert!(matches!(resp, StateMachineResponse::Ok));
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().desired_state,
-            VolumeDesiredState::Deleted,
-        );
-    }
-
-    #[test]
-    fn volume_deleted_name_can_be_reused() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        // Reuse the same name in the same env with a new ID.
-        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 200, "env-1"));
-        assert!(matches!(resp, StateMachineResponse::Created(_)));
-    }
-
-    #[test]
-    fn volume_placement_generation_increments_correctly() {
-        let (_dir, store) = make_org_store();
-        let sm = RedbStateMachine::new(store);
-        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
-
-        // Attach: 0 -> 1
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-1".to_string(),
-            hypervisor_id: "hv-1".to_string(),
-        });
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().placement_generation,
-            1
-        );
-
-        // Detach: 1 -> 2
-        let _ = sm.apply_command(&StateMachineCommand::DetachVolume {
-            volume_id: "vol-1".to_string(),
-        });
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().placement_generation,
-            2
-        );
-
-        // Attach again: 2 -> 3
-        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
-            volume_id: "vol-1".to_string(),
-            vm_id: "vm-2".to_string(),
-            hypervisor_id: "hv-2".to_string(),
-        });
-        assert_eq!(
-            sm.volume_store.get("vol-1").unwrap().placement_generation,
-            3
-        );
     }
 }

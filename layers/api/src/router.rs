@@ -21,6 +21,8 @@ pub enum LayerRequest {
     Org(Vec<u8>),
     /// Request destined for the Hypervisor layer.
     Hypervisor(Vec<u8>),
+    /// Request destined for the Storage layer.
+    Storage(Vec<u8>),
 }
 
 /// Top-level response envelope returned to the client.
@@ -34,6 +36,8 @@ pub enum LayerResponse {
     Org(Vec<u8>),
     /// Response originating from the Hypervisor layer.
     Hypervisor(Vec<u8>),
+    /// Response originating from the Storage layer.
+    Storage(Vec<u8>),
     /// The requested layer is not registered in the router.
     UnknownLayer(String),
 }
@@ -92,6 +96,13 @@ impl LayerRouter {
                     LayerResponse::Hypervisor(handler.handle(payload, caller_uid).await)
                 } else {
                     LayerResponse::UnknownLayer("hypervisor".into())
+                }
+            }
+            LayerRequest::Storage(payload) => {
+                if let Some(handler) = self.handlers.get("storage") {
+                    LayerResponse::Storage(handler.handle(payload, caller_uid).await)
+                } else {
+                    LayerResponse::UnknownLayer("storage".into())
                 }
             }
         }
