@@ -2916,6 +2916,7 @@ dependencies = [
  "openraft",
  "rand 0.8.5",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "sd-notify",

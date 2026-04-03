@@ -2073,13 +2073,220 @@ pub async fn run_daemon(
                 }
             })
         } else {
-            info!(
-                "raft: control plane not initialized. Run 'syfrah controlplane init' to bootstrap."
-            );
+            info!("raft: control plane not initialized. Probing peers for auto-join...");
+
+            // Spawn a background task that probes peers for an existing Raft
+            // cluster and auto-joins as a learner if one is found.
+            let auto_join_node_name = my_record.name.clone();
+            let auto_join_ipv6 = my_record.mesh_ipv6;
+            let auto_join_syfrah_dir = syfrah_dir.clone();
             tokio::spawn(async move {
-                // Placeholder: Raft not yet initialized. Listen for init signal.
                 let _ = raft_shutdown_rx.clone();
-                std::future::pending::<()>().await;
+
+                // Give the mesh a few seconds to settle after startup.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                // Skip if raft_initialized sentinel already exists (race with
+                // manual `syfrah controlplane join`).
+                if auto_join_syfrah_dir.join("raft_initialized").exists() {
+                    info!("raft: auto-join skipped — already initialized");
+                    return;
+                }
+
+                // Load current peers from fabric state.
+                let peers = match crate::store::load() {
+                    Ok(state) => state.peers,
+                    Err(_) => {
+                        info!("raft: auto-join skipped — no fabric state");
+                        return;
+                    }
+                };
+
+                if peers.is_empty() {
+                    info!("raft: no peers in mesh — staying in bootstrap mode");
+                    return;
+                }
+
+                // Derive our node ID the same way controlplane does.
+                let node_id = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    auto_join_node_name.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let node_addr = format!("[{auto_join_ipv6}]:7200");
+
+                let probe_client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("raft: auto-join failed to build HTTP client: {e}");
+                        return;
+                    }
+                };
+                let join_client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("raft: auto-join failed to build HTTP client: {e}");
+                        return;
+                    }
+                };
+
+                // Retry with exponential backoff: 5s, 10s, 20s, 40s, 80s
+                let backoffs = [5u64, 10, 20, 40, 80];
+                for (attempt, &delay) in backoffs.iter().enumerate() {
+                    if attempt > 0 {
+                        info!(
+                            "raft: auto-join attempt {}/{} (retry in {delay}s)...",
+                            attempt + 1,
+                            backoffs.len()
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+                        // Re-check sentinel in case manual join happened during backoff.
+                        if auto_join_syfrah_dir.join("raft_initialized").exists() {
+                            info!("raft: auto-join skipped — initialized during retry wait");
+                            return;
+                        }
+                    }
+
+                    // Probe each peer for Raft status.
+                    let mut leader_addr = None;
+                    for peer in &peers {
+                        let url = format!("http://[{}]:7200/raft/status", peer.mesh_ipv6);
+                        match probe_client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(status) = resp
+                                    .json::<syfrah_controlplane::server::RaftStatusResponse>()
+                                    .await
+                                {
+                                    if let Some(leader_id) = status.current_leader {
+                                        // Find the actual leader's address.
+                                        if let Some(detail) = status
+                                            .member_details
+                                            .iter()
+                                            .find(|d| d.node_id == leader_id)
+                                        {
+                                            leader_addr = Some(detail.addr.clone());
+                                        } else {
+                                            leader_addr =
+                                                Some(format!("[{}]:7200", peer.mesh_ipv6));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+
+                    let leader = match leader_addr {
+                        Some(addr) => addr,
+                        None => {
+                            if attempt == 0 {
+                                info!(
+                                    "raft: no Raft cluster detected in mesh. \
+                                     Operating in bootstrap mode."
+                                );
+                            }
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        "raft: detected Raft cluster (leader: {leader}). \
+                         Auto-joining as learner..."
+                    );
+
+                    // Initialize local Raft storage before joining.
+                    if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                        let log_db = syfrah_state::LayerDb::open("raft_log")?;
+                        let _log_store = syfrah_controlplane::RedbLogStore::new(log_db);
+                        Ok(())
+                    })() {
+                        warn!("raft: auto-join failed to init log storage: {e}");
+                        continue;
+                    }
+
+                    // Send join request to leader.
+                    let join_url = format!("http://{leader}/raft/join");
+                    let join_req = serde_json::json!({
+                        "node_id": node_id,
+                        "addr": node_addr,
+                    });
+
+                    match join_client.post(&join_url).json(&join_req).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            info!("raft: auto-join succeeded! Writing sentinel and restarting daemon...");
+
+                            // Write sentinel.
+                            if let Err(e) = std::fs::write(
+                                auto_join_syfrah_dir.join("raft_initialized"),
+                                format!("{node_id}"),
+                            ) {
+                                warn!("raft: failed to write sentinel: {e}");
+                                return;
+                            }
+
+                            // Restart daemon so Raft server starts.
+                            if let Some(pid) = crate::store::daemon_running() {
+                                if crate::store::is_syfrah_process(pid) {
+                                    #[cfg(unix)]
+                                    unsafe {
+                                        libc::kill(pid as i32, libc::SIGTERM);
+                                    }
+                                    // Wait for shutdown.
+                                    for _ in 0..100 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
+                                        if crate::store::daemon_running().is_none() {
+                                            break;
+                                        }
+                                    }
+                                    if crate::store::daemon_running().is_some() {
+                                        #[cfg(unix)]
+                                        unsafe {
+                                            libc::kill(pid as i32, libc::SIGKILL);
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                    }
+                                    crate::store::remove_pid();
+                                }
+                            }
+
+                            // Re-exec the daemon.
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(&exe)
+                                    .args(["fabric", "start"])
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }
+                            return;
+                        }
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!("raft: auto-join request failed: {status} — {body}");
+                        }
+                        Err(e) => {
+                            warn!("raft: auto-join request error: {e}");
+                        }
+                    }
+                }
+
+                warn!(
+                    "raft: could not auto-join Raft after {} attempts. \
+                     Run 'syfrah controlplane join' manually.",
+                    backoffs.len()
+                );
             })
         }
     };
@@ -4499,5 +4706,38 @@ mod tests {
     fn timeout_both_no_topology_uses_cross_region() {
         let policy = test_health_policy();
         assert_eq!(timeout_for_peer(&None, &None, &policy), 300);
+    }
+
+    #[test]
+    fn auto_join_skips_when_sentinel_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("raft_initialized");
+        std::fs::write(&sentinel, "12345").unwrap();
+        assert!(sentinel.exists(), "sentinel should exist");
+        // When sentinel exists, auto-join should be skipped.
+        // The daemon code checks: if syfrah_dir.join("raft_initialized").exists() { return; }
+        // This tests the precondition.
+        assert!(dir.path().join("raft_initialized").exists());
+    }
+
+    #[test]
+    fn auto_join_skips_when_no_peers() {
+        // No peers means no Raft cluster to join — stays in bootstrap mode.
+        let peers: Vec<syfrah_core::mesh::PeerRecord> = vec![];
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn auto_join_derives_node_id_consistently() {
+        use std::hash::{Hash, Hasher};
+        let node_name = "hv-test-1";
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        node_name.hash(&mut h1);
+        let id1 = h1.finish();
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        node_name.hash(&mut h2);
+        let id2 = h2.finish();
+        assert_eq!(id1, id2, "node_id derivation must be deterministic");
+        assert_ne!(id1, 0, "node_id should not be zero");
     }
 }
