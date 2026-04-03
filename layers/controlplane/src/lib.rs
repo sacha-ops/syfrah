@@ -36,7 +36,8 @@ pub use scheduler::{
 };
 pub use server::RaftServer;
 pub use state_machine::{
-    FullSnapshotData, PlacementEvent, RedbStateMachine, DEFAULT_SNAPSHOT_THRESHOLD,
+    FullSnapshotData, PlacementEvent, RedbStateMachine, SnapshotRecord, StorageQuota, StorageState,
+    VolumeRecord, VolumeState, DEFAULT_SNAPSHOT_THRESHOLD,
 };
 pub use types::{SyfrahNode, SyfrahRaftConfig};
 
