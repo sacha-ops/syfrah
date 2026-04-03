@@ -40,6 +40,7 @@ pub mod ownership;
 pub mod reconciler;
 pub mod runtime;
 pub mod shutdown;
+pub mod storage_cleanup;
 pub mod storage_reconciler;
 pub mod task;
 pub mod tracing_otel;
@@ -82,6 +83,9 @@ mod tests {
         let gen_tracker = generation::GenerationTracker::new();
         let _gen = gen_tracker.register("test-vm");
 
+        // storage reconciler types
+        let _sr = storage_reconciler::StorageReconciler::new("hv-test".into(), "passphrase".into());
+
         // task types are tested in task::tests
         // ownership types are tested in ownership::tests
     }
@@ -98,6 +102,7 @@ mod tests {
         let _health = health::NodeHealth::healthy(0, 0);
         let _recon = reconciler::Reconciler::new();
         let _rt = runtime::ForgeRuntime::new();
+        let _sr = storage_reconciler::StorageReconciler::new("hv-1".into(), "pass".into());
 
         // These all compiled without needing api — proves no circular deps.
     }

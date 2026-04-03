@@ -30,6 +30,7 @@ anyhow.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+syfrah-storage = { path = "../storage", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

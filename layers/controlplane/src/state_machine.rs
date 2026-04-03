@@ -63,7 +63,6 @@ pub struct VolumeRecord {
 pub enum VolumeState {
     Available,
     Attached,
-    Deleting,
     /// Tombstone state: volume is logically deleted, pending cleanup.
     /// Retained for audit purposes (30-day TTL).
     Deleted,
@@ -1743,7 +1742,11 @@ impl RedbStateMachine {
                 StateMachineResponse::Created(id.clone())
             }
 
-            StateMachineCommand::DeleteVolume { volume_id, cascade } => {
+            StateMachineCommand::DeleteVolume {
+                volume_id,
+                cascade,
+                deleted_at,
+            } => {
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => StateMachineResponse::Error(
@@ -1800,15 +1803,12 @@ impl RedbStateMachine {
                             }
                         }
 
-                        // Tombstone: mark as Deleted with timestamp instead of removing.
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
+                        // Tombstone: mark as Deleted with the caller-provided timestamp.
+                        // Using a field on the command (instead of SystemTime::now()) ensures
+                        // every Raft replica records the same deleted_at value.
                         if let Some(vol) = storage.volumes.get_mut(volume_id) {
                             vol.state = VolumeState::Deleted;
-                            vol.deleted_at = Some(now);
+                            vol.deleted_at = Some(*deleted_at);
                             vol.attached_vm_id = None;
                             vol.attached_hypervisor_id = None;
                         }
@@ -2762,6 +2762,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
 
@@ -2789,6 +2790,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
     }
@@ -3011,6 +3013,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: true,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
 
@@ -3213,6 +3216,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
 
@@ -3239,6 +3243,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("attached")));
     }
@@ -3252,12 +3257,14 @@ mod tests {
         sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
 
         // Second delete should fail.
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(
             matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("already deleted"))
@@ -3284,6 +3291,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(
             matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("deletion protection"))
@@ -3302,6 +3310,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("snapshot")));
 
@@ -3309,6 +3318,7 @@ mod tests {
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: true,
+            deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
 
@@ -3349,6 +3359,7 @@ mod tests {
         sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: true,
+            deleted_at: 1_700_000_000,
         });
 
         let storage = sm.storage.read().unwrap();
@@ -3376,6 +3387,7 @@ mod tests {
         sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: 1_700_000_000,
         });
 
         // Should be able to create another volume since tombstone doesn't count.
@@ -3388,22 +3400,20 @@ mod tests {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
 
+        let delete_time = 1_700_000_000_u64;
+
         create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
         sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: delete_time,
         });
 
         // Verify tombstone exists.
         assert!(sm.storage.read().unwrap().volumes.contains_key("vol-1"));
 
-        // Purge with a timestamp far in the future.
-        let far_future = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + TOMBSTONE_TTL_SECS
-            + 1;
+        // Purge with a timestamp past the TTL.
+        let far_future = delete_time + TOMBSTONE_TTL_SECS + 1;
 
         sm.apply_command(&StateMachineCommand::PurgeTombstones {
             now: far_future,
@@ -3419,20 +3429,20 @@ mod tests {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
 
+        // Use a fixed "now" so the test is deterministic and the tombstone
+        // is always "recent" relative to the purge timestamp.
+        let delete_time = 1_700_000_000_u64;
+        let purge_time = delete_time + 60; // 60 seconds later — well within 30-day TTL
+
         create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
         sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
             cascade: false,
+            deleted_at: delete_time,
         });
 
-        // Purge with current timestamp (tombstone is fresh).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
         sm.apply_command(&StateMachineCommand::PurgeTombstones {
-            now,
+            now: purge_time,
             max_age_secs: TOMBSTONE_TTL_SECS,
         });
 

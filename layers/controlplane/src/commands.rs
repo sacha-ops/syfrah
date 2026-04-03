@@ -361,6 +361,10 @@ pub enum StateMachineCommand {
         /// If true, delete all snapshots derived from this volume before deleting.
         #[serde(default)]
         cascade: bool,
+        /// Timestamp (seconds since epoch) when the delete was requested.
+        /// Must be set by the caller so every Raft replica uses the same value
+        /// (calling `SystemTime::now()` inside `apply_command` would diverge).
+        deleted_at: u64,
     },
     /// Attach a volume to a VM on a specific hypervisor. Enforces the
     /// single-writer invariant — the volume must be Available.
@@ -449,7 +453,9 @@ impl std::fmt::Display for StateMachineCommand {
                 write!(f, "UpdateHypervisorCapacity({name})")
             }
             Self::CreateVolume { id, name, .. } => write!(f, "CreateVolume({id}, {name})"),
-            Self::DeleteVolume { volume_id, cascade } => {
+            Self::DeleteVolume {
+                volume_id, cascade, ..
+            } => {
                 write!(f, "DeleteVolume({volume_id}, cascade={cascade})")
             }
             Self::AttachVolume {
@@ -735,6 +741,7 @@ mod tests {
             StateMachineCommand::DeleteVolume {
                 volume_id: "vol-01".into(),
                 cascade: false,
+                deleted_at: 1700000000,
             },
             StateMachineCommand::AttachVolume {
                 volume_id: "vol-01".into(),
