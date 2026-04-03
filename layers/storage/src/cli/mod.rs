@@ -1,8 +1,8 @@
 //! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
-//! Provides subcommands for volume lifecycle management and storage
-//! configuration. Each handler communicates with the daemon via the
-//! control socket.
+//! Provides subcommands for volume lifecycle management, storage
+//! configuration, and storage-layer utilities (e.g. ZeroFS version).
+//! Each handler communicates with the daemon via the control socket.
 
 pub mod configure;
 pub mod volume;
@@ -118,7 +118,11 @@ pub enum VolumeCommand {
 
 /// Top-level storage CLI command (`syfrah storage ...`).
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum StorageCommand {
+    /// Show ZeroFS binary version and path
+    #[command(after_help = "Examples:\n  syfrah storage version")]
+    Version,
     /// Configure storage backend (S3 endpoint, bucket, cache)
     #[command(after_help = "Examples:\n  \
             syfrah storage configure --region eu-west \\\n    \
@@ -170,6 +174,31 @@ pub enum StorageCommand {
 /// Execute a storage CLI command.
 pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
     match cmd {
+        StorageCommand::Version => {
+            let pinned = crate::binary::pinned_version();
+            println!("zerofs pinned version: {pinned}");
+
+            match crate::binary::resolve_binary(None) {
+                Ok(path) => {
+                    println!("zerofs binary: {}", path.display());
+                    match crate::binary::check_version(&path) {
+                        Ok(ver) => {
+                            println!("zerofs disk version: {ver}");
+                            if let Err(msg) = crate::binary::verify_version(&path) {
+                                eprintln!("warning: {msg}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("warning: could not determine zerofs version: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("zerofs binary: not found ({e})");
+                }
+            }
+            Ok(())
+        }
         StorageCommand::Configure {
             region,
             s3_endpoint,
@@ -420,6 +449,7 @@ mod tests {
                 assert!(encryption_passphrase.is_none());
                 assert!(encryption_passphrase_file.is_none());
             }
+            _ => panic!("unexpected variant"),
         }
     }
 
@@ -451,6 +481,7 @@ mod tests {
                 assert_eq!(cache_disk_size, Some(200));
                 assert_eq!(cache_memory_size, Some(8));
             }
+            _ => panic!("unexpected variant"),
         }
     }
 
@@ -480,6 +511,7 @@ mod tests {
                 assert_eq!(encryption_passphrase.as_deref(), Some("my-secret"));
                 assert!(encryption_passphrase_file.is_none());
             }
+            _ => panic!("unexpected variant"),
         }
     }
 
@@ -512,6 +544,7 @@ mod tests {
                     Some("/tmp/secret.key")
                 );
             }
+            _ => panic!("unexpected variant"),
         }
     }
 
@@ -542,6 +575,7 @@ mod tests {
                 assert!(encryption_passphrase.is_none());
                 assert!(encryption_passphrase_file.is_none());
             }
+            _ => panic!("unexpected variant"),
         }
     }
 }
