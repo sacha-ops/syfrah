@@ -383,6 +383,32 @@ Delete Volume A:
 GC runs: delete sst-003 from S3 (after grace period)
 ```
 
+### GC object matrix
+
+| Object type | Referenced by | Retention rule | GC authority |
+|-------------|--------------|----------------|-------------|
+| Manifest | Volume metadata in Raft, snapshot records | Keep until no volume or snapshot references this generation+version | Raft leader |
+| WAL segment | Active generation (for crash replay), snapshot wal_position | Keep all segments from the oldest snapshot wal_position to the current WAL head. Segments before the oldest reference point are deletable. | Raft leader |
+| SST file | Manifest sst_files list (any active manifest — volume or snapshot) | Refcount in Raft. Delete when refcount == 0 AND grace period elapsed. | Raft leader |
+| Orphaned generation objects | No active manifest references them | Delete after grace period (1 hour). Identified by generation < current active generation AND not in any manifest. | GC worker |
+
+### WAL retention invariant
+
+A WAL segment S must be retained if ANY of these are true:
+- S is needed for crash recovery of the current active volume (S >= last compaction checkpoint)
+- S is referenced by a snapshot's wal_position (S contains or follows that position)
+- S belongs to a generation that is still active
+
+A WAL segment is safe to delete only when ALL conditions are false.
+
+### Snapshot WAL dependency
+
+When a snapshot is created at wal_position P:
+- All WAL segments containing writes up to position P must be retained
+- These segments are added to the snapshot's dependency list in Raft
+- When the snapshot is deleted, the dependency is removed
+- GC recalculates the minimum retained WAL position across all snapshots
+
 ## 8. Attachment model (single-writer, hot-plug)
 
 ### Single-writer invariant
@@ -435,6 +461,31 @@ Control plane (Raft leader)           Forge (target hypervisor)
 7. Observed state converges to
    Available (via reconciliation)
 ```
+
+### Detach contract (precise)
+
+When `detach` returns success, the following are guaranteed:
+- All writes that the guest fsynced via the block device are persisted to S3 WAL
+- ZeroFS dirty cache has been flushed to S3
+- The NBD device is disconnected
+- The Cloud Hypervisor virtio-block device is removed
+
+The following are NOT guaranteed:
+- Dirty pages in the guest's page cache that were never fsynced are LOST
+- Filesystem metadata that the guest did not flush is LOST
+- If the guest had a mounted filesystem and did not unmount/sync before detach, the filesystem may be inconsistent (same as pulling a USB drive)
+
+### Operator/tenant responsibility
+
+Before detaching a volume from a running VM:
+1. Inside the guest: `sync && umount /mnt/data` (or `fsfreeze --freeze`)
+2. Then: `syfrah volume detach <volume>`
+
+Syfrah does NOT automatically sync the guest filesystem. Detach is a host-level operation — it flushes the ZeroFS/NBD layer, not the guest's VFS layer.
+
+### Force detach
+
+`syfrah volume detach --force` skips the flush. Use only when the VM is crashed or unresponsive. Data since last fsync will be lost.
 
 ### Root volumes vs. data volumes
 
@@ -638,7 +689,7 @@ During warmup, the VM is fully operational. Reads are slower (S3 latency instead
 
 When a VM is rescheduled, the old hypervisor's ZeroFS may still be writing to S3. The new hypervisor's ZeroFS must not read corrupted/interleaved data.
 
-### Hard fencing via S3 prefix rotation
+### Manifest-based fencing via S3 prefix rotation
 
 Each volume attachment uses a unique **S3 write prefix** derived from the placement generation:
 
@@ -653,7 +704,7 @@ When a volume is attached with generation N, ZeroFS writes to `gen-N/`. When the
 3. Old writer's prefix `gen-N/` is NEVER written to by the new writer
 4. Old writer's writes to `gen-N/` after the reschedule are IGNORED by the new writer (they read from their own manifest)
 
-### Why this is hard fencing
+### Why this is logical fencing, not hard fencing
 
 The old writer CAN still write to S3 (we can't revoke S3 credentials instantly). But:
 - The old writer writes to `gen-N/` prefix
@@ -663,9 +714,13 @@ The old writer CAN still write to S3 (we can't revoke S3 credentials instantly).
 
 This is **manifest-based fencing**: the commit point is the manifest, not the individual S3 objects. Only the active generation's manifest is authoritative.
 
+> **Important clarification:** This is NOT hard fencing in the traditional sense (physical prevention of writes). The old writer CAN still write to S3. Safety relies on the manifest being the sole authority for data visibility. Late writes by a stale writer are orphaned — never referenced by any active manifest.
+>
+> True hard fencing (short-lived S3 credentials via STS that expire on detach) is a Phase 5 hardening. Until then, the system relies on manifest-authoritative logical fencing.
+
 ### Alternative: short-lived S3 credentials (future)
 
-For even harder fencing, each attachment could use short-lived S3 credentials (STS tokens) that expire on detach. The old writer physically cannot write after credential expiry. This is Phase 5+ hardening.
+For true hard fencing, each attachment could use short-lived S3 credentials (STS tokens) that expire on detach. The old writer physically cannot write after credential expiry. This is Phase 5+ hardening.
 
 ### Fencing timeline
 
@@ -696,6 +751,71 @@ t=5     Node A recovers                        Forge reads     ZeroFS active
                                                orphaned
 ```
 
+## 12b. Manifest Commit Protocol
+
+The manifest is the commit point for all volume state. It defines which S3 objects constitute the current state of a volume. Without a valid manifest, data objects in S3 are meaningless.
+
+### Manifest structure
+
+```rust
+VolumeManifest {
+    volume_id: VolumeId,
+    generation: u64,           // placement generation — monotonically increasing
+    manifest_version: u64,     // incremented on every publish — monotonically increasing
+    sst_files: Vec<SstRef>,    // list of SST files comprising the volume data
+    wal_position: u64,         // WAL offset for crash recovery replay
+    created_at: u64,
+    published_by: HypervisorId, // which node published this manifest
+}
+```
+
+### Who can publish
+
+Only the hypervisor currently assigned in the Raft placement record (matching generation) can publish a manifest. A manifest published by a stale generation is invalid and ignored.
+
+### Publication path
+
+1. ZeroFS completes a compaction (or snapshot request)
+2. ZeroFS writes the new manifest object to S3: `s3://bucket/volumes/{id}/gen-{N}/manifest-{version}.json`
+3. ZeroFS atomically updates the manifest pointer in its local state
+4. The manifest pointer (volume_id, generation, manifest_version) is committed to Raft
+
+### Manifest pointer in Raft
+
+The Raft state machine stores the authoritative manifest pointer:
+
+```rust
+ManifestPointer {
+    volume_id: VolumeId,
+    generation: u64,
+    manifest_version: u64,
+    s3_key: String,
+}
+```
+
+Only the Raft leader can commit a manifest pointer update. This prevents split-brain manifest publication.
+
+### Concurrency rules
+
+| Operation A | Operation B | Allowed concurrently? | Resolution |
+|-------------|-------------|----------------------|------------|
+| Compaction | Write (WAL) | Yes | Compaction reads immutable SSTs, writes don't touch SSTs |
+| Compaction | Snapshot create | No | Snapshot pauses compaction, takes manifest at stable point |
+| Snapshot create | Write (WAL) | Yes | Snapshot captures WAL position, writes continue after |
+| Manifest publish | Manifest publish | No | Serialized through Raft — only one manifest pointer update at a time |
+| GC | Compaction | Safe | GC never deletes SSTs referenced by any manifest (refcount > 0) |
+| GC | Snapshot create | Safe | GC respects snapshot manifest references |
+
+### Validation
+
+A manifest is valid if and only if:
+1. Its generation matches the current Raft placement generation for this volume
+2. Its manifest_version is >= the last committed manifest_version in Raft
+3. All SST files listed in the manifest exist in S3
+4. The WAL position is reachable (WAL segments up to that position exist)
+
+A stale writer publishing manifest version M for generation N, when generation N+1 is active, produces a manifest that will never be committed to Raft (the leader rejects generation mismatches). The manifest object exists in S3 but is orphaned.
+
 ## 13. ZeroFS Dependency Boundary
 
 ### What Syfrah guarantees (control plane)
@@ -724,6 +844,19 @@ t=5     Node A recovers                        Forge reads     ZeroFS active
 - Long-running compaction stress
 - Cache overflow behavior
 - Multi-generation prefix isolation
+
+### GA condition
+
+**This ADR's acceptance as a production storage design is conditional on successful completion of the validation plan (section 27).** If ZeroFS fails to satisfy the assumed invariants under stress testing, the storage architecture must be reworked — potentially with a different storage engine or additional safety layers.
+
+No GA release of Syfrah storage will be made before:
+1. All correctness tests in the validation plan pass
+2. Power loss tests confirm WAL replay correctness
+3. Fencing tests confirm manifest isolation under concurrent writers
+4. GC tests confirm no premature deletion under snapshot/restore/delete churn
+5. Performance benchmarks validate expected latency ranges
+
+This is a non-negotiable gate. The storage layer handles customer data — it must be proven correct, not assumed correct.
 
 ## 14. ZeroFS integration (NBD, SlateDB, chunks, encryption)
 
@@ -1263,6 +1396,8 @@ All volume data is encrypted before leaving the hypervisor. The S3 provider neve
 | > 5min | Volume transitions to Degraded. New writes rejected. | Cache dirty data preserved locally. Recovery on S3 return. No data loss if hypervisor stays up. |
 | > 30min | Volume transitions to Error. Cache may overflow. | Best-effort preservation. Operator intervention required. |
 
+These thresholds are default operational policy values, configurable per-deployment. They are not inherent system properties — they depend on buffer sizes, retry budgets, and memory pressure. The actual behavior under S3 outage depends on the ZeroFS cache capacity and the guest's write rate.
+
 **Invariant: data that was fsynced and acknowledged BEFORE the outage is NEVER lost, regardless of outage duration.** It already reached S3 before the outage began.
 
 ### Cache disk full
@@ -1407,7 +1542,7 @@ Items explicitly deferred from v1, tracked for future phases:
 - Snapshot delete: Raft commit with SST refcount decrements → GC marks unreachable SSTs
 - `syfrah volume snapshot create/list/restore/delete` CLI
 - Volume migration on VM reschedule: flush → disconnect → reconnect on new HV with new generation prefix
-- Hard fencing with generation-based S3 prefix isolation
+- Logical fencing with write-prefix isolation (generation-based S3 prefix)
 
 ### Phase 5 — Production hardening (~4 issues)
 
