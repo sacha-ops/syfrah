@@ -700,9 +700,11 @@ s3://bucket/volumes/{volume_id}/gen-{generation}/
 When a volume is attached with generation N, ZeroFS writes to `gen-N/`. When the volume is rescheduled to generation N+1:
 
 1. New writer uses prefix `gen-{N+1}/`
-2. New writer reads from BOTH `gen-N/` and `gen-{N+1}/` (merge view)
+2. New writer reads from BOTH `gen-N/` and `gen-{N+1}/` (manifest-driven merge view — see below)
 3. Old writer's prefix `gen-N/` is NEVER written to by the new writer
 4. Old writer's writes to `gen-N/` after the reschedule are IGNORED by the new writer (they read from their own manifest)
+
+**Cross-generation reads are manifest-driven, not prefix-driven.** The new writer's merge view of `gen-N/` is strictly scoped to the objects listed in the last committed manifest for generation N. A hypervisor must never discover objects by raw S3 prefix listing and infer visibility from object presence alone. Only objects explicitly referenced in a Raft-committed manifest are visible. Late writes by a stale writer (objects that exist in `gen-N/` but are not in any committed manifest) are invisible to the new writer and will be garbage-collected.
 
 ### Why this is logical fencing, not hard fencing
 
@@ -776,9 +778,13 @@ Only the hypervisor currently assigned in the Raft placement record (matching ge
 ### Publication path
 
 1. ZeroFS completes a compaction (or snapshot request)
-2. ZeroFS writes the new manifest object to S3: `s3://bucket/volumes/{id}/gen-{N}/manifest-{version}.json`
-3. ZeroFS atomically updates the manifest pointer in its local state
-4. The manifest pointer (volume_id, generation, manifest_version) is committed to Raft
+2. ZeroFS writes the **candidate** manifest object to S3: `s3://bucket/volumes/{id}/gen-{N}/manifest-{version}.json`
+3. Forge requests Raft commit of the new authoritative manifest pointer (volume_id, generation, manifest_version, s3_key)
+4. **Only after Raft commit does the manifest become active for reconciliation and recovery**
+
+The local ZeroFS process may track which manifest it last published, but this local tracking has no authority. If the Raft commit fails (leader change, generation mismatch, network partition), the candidate manifest object in S3 is non-authoritative garbage — it will never be referenced by the committed pointer and will be cleaned up by GC.
+
+**Any manifest object not referenced by the committed Raft pointer is non-authoritative and must not be used for reads, recovery, or reconciliation.**
 
 ### Manifest pointer in Raft
 
@@ -795,6 +801,16 @@ ManifestPointer {
 
 Only the Raft leader can commit a manifest pointer update. This prevents split-brain manifest publication.
 
+### Authority chain
+
+ZeroFS may produce candidate manifests, but only Forge, through the control-plane-authorized Raft path, can make a manifest authoritative. The authority chain is:
+
+```
+ZeroFS (produces candidate) → Forge (requests commit) → Raft leader (validates + commits) → ManifestPointer (authoritative)
+```
+
+No component may treat a manifest as active based solely on its presence in S3. The Raft-committed pointer is the only source of truth.
+
 ### Concurrency rules
 
 | Operation A | Operation B | Allowed concurrently? | Resolution |
@@ -809,10 +825,12 @@ Only the Raft leader can commit a manifest pointer update. This prevents split-b
 ### Validation
 
 A manifest is valid if and only if:
-1. Its generation matches the current Raft placement generation for this volume
-2. Its manifest_version is >= the last committed manifest_version in Raft
+1. Its generation matches **exactly** the current Raft placement generation for this volume
+2. Its manifest_version is **exactly** `last_committed_manifest_version + 1` (strict sequential increment — no gaps, no skips)
 3. All SST files listed in the manifest exist in S3
 4. The WAL position is reachable (WAL segments up to that position exist)
+
+**Why strict sequential versioning (rule 2):** A `>=` comparison would allow version gaps, which are never expected in normal operation. A gap would indicate either a bug (skipped compaction cycle) or a stale writer racing against a new one. By requiring exactly `last + 1`, the Raft state machine rejects any manifest that doesn't follow the expected sequence. If a legitimate reason for gaps arises (e.g., failed compaction that incremented a local counter), the publishing logic must retry with the correct next version — not skip ahead.
 
 A stale writer publishing manifest version M for generation N, when generation N+1 is active, produces a manifest that will never be committed to Raft (the leader rejects generation mismatches). The manifest object exists in S3 but is orphaned.
 
@@ -1562,13 +1580,13 @@ Items explicitly deferred from v1, tracked for future phases:
 - **No storage cluster to operate.** The operator does not install, configure, or maintain Ceph, GlusterFS, or any distributed storage system. They rent an S3 bucket and Syfrah does the rest.
 - **Cost-effective.** S3 storage costs €0.005-0.01/GB/month. Ceph requires 2-3x raw disk for replication, plus dedicated nodes, plus operational overhead.
 - **Zero-copy migration.** Moving a VM to another hypervisor copies zero bytes of volume data. Downtime is 5-30 seconds instead of minutes-to-hours with local disk migration.
-- **Snapshots are free.** No data copy, no additional storage (until the volume diverges from the snapshot). Operators can offer snapshots as a standard feature without worrying about storage overhead.
+- **Snapshots are free (metadata-only).** No data copy, no additional storage (until the volume diverges from the snapshot). Operators can offer snapshots as a standard feature without worrying about storage overhead. Snapshots are crash-consistent — see §6 for semantics.
 
 ### Why this matters for tenants
 
-- **Persistent storage that survives machine failure.** Fsynced data is durable in S3 even if the hypervisor hardware fails. See §3 for the durability contract.
+- **Persistent storage that survives machine failure (for fsync-aware workloads).** Fsynced data is durable in S3 even if the hypervisor hardware fails. Non-fsynced writes may be lost — see §3 for the full durability contract and §20 for workload fit guidance.
 - **Standard block device interface.** `/dev/vda`, `/dev/vdb` — format with ext4, XFS, or any filesystem. No proprietary API.
-- **Fast snapshots.** Create a snapshot in seconds, restore in seconds. Useful for backups before deployments, database point-in-time recovery, cloning environments.
+- **Fast snapshots (within the durability semantics defined in §3).** Create a snapshot in seconds, restore in seconds. Crash-consistent only — app-consistent snapshots require guest-side fsfreeze (see §6). Useful for backups before deployments, database point-in-time recovery, cloning environments.
 - **Predictable performance for cache-friendly workloads.** With proper cache sizing, >95% of I/O is served from local NVMe at sub-millisecond latency. S3 latency is invisible for typical workloads. See §20 for workload fit guidance.
 
 ## 31. Rejected alternatives
