@@ -2807,6 +2807,7 @@ dependencies = [
  "syfrah-org",
  "syfrah-overlay",
  "syfrah-state",
+ "syfrah-storage",
  "tar",
  "tempfile",
  "tokio",
@@ -3028,10 +3029,15 @@ dependencies = [
 name = "syfrah-storage"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "clap",
+ "console",
+ "dirs",
  "serde",
  "serde_json",
  "syfrah-api",
+ "terminal_size",
  "tokio",
 ]
 

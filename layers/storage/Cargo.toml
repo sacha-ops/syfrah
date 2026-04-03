@@ -11,8 +11,14 @@ categories.workspace = true
 [dependencies]
 syfrah-api = { path = "../api" }
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+dirs = "6"
 serde.workspace = true
 serde_json.workspace = true
+terminal_size = "0.4"
+anyhow.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
