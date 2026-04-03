@@ -2748,7 +2748,14 @@ pub async fn run_daemon(
                                 "raft: joined and started in-process. No daemon restart needed. \
                                  PID unchanged."
                             );
-                            return;
+
+                            // Do NOT return — the auto-join task is the `raft_task`
+                            // in the main `tokio::select!` loop. If it completes,
+                            // the daemon interprets it as an unexpected exit and
+                            // shuts down. Instead, park this task forever (it will
+                            // be cancelled when the daemon shuts down normally).
+                            std::future::pending::<()>().await;
+                            unreachable!();
                         }
                         Ok(resp) => {
                             let status = resp.status();
