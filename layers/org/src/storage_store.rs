@@ -193,8 +193,12 @@ impl StorageStore {
             self.remove_from_hypervisor_index(hv_id, id)?;
         }
         self.db.delete(VOLUMES_TABLE, id)?;
-        // Clean up manifest pointer if present.
-        let _ = self.db.delete(MANIFEST_POINTERS_TABLE, id);
+        // Clean up manifest pointer if present — ignore "not found" but propagate real errors.
+        match self.db.delete(MANIFEST_POINTERS_TABLE, id) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("not found") => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 
@@ -242,10 +246,11 @@ impl StorageStore {
             .get_volume(volume_id)?
             .ok_or_else(|| OrgError::NotFound(format!("volume '{volume_id}'")))?;
         if vol.state != VolumeState::Available {
-            return Err(OrgError::InvalidState(format!(
-                "volume '{}' is {:?}, expected Available",
-                volume_id, vol.state
-            )));
+            return Err(OrgError::InvalidVolumeState {
+                volume_id: volume_id.to_string(),
+                current: format!("{:?}", vol.state),
+                expected: "Available".to_string(),
+            });
         }
         vol.state = VolumeState::Attached;
         vol.attached_vm_id = Some(vm_id.to_string());
@@ -263,10 +268,11 @@ impl StorageStore {
             .get_volume(volume_id)?
             .ok_or_else(|| OrgError::NotFound(format!("volume '{volume_id}'")))?;
         if vol.state != VolumeState::Attached {
-            return Err(OrgError::InvalidState(format!(
-                "volume '{}' is {:?}, expected Attached",
-                volume_id, vol.state
-            )));
+            return Err(OrgError::InvalidVolumeState {
+                volume_id: volume_id.to_string(),
+                current: format!("{:?}", vol.state),
+                expected: "Attached".to_string(),
+            });
         }
         if let Some(ref hv_id) = vol.attached_hypervisor_id {
             self.remove_from_hypervisor_index(hv_id, volume_id)?;
@@ -285,14 +291,15 @@ impl StorageStore {
             .get_volume(volume_id)?
             .ok_or_else(|| OrgError::NotFound(format!("volume '{volume_id}'")))?;
         if vol.state != VolumeState::Available {
-            return Err(OrgError::InvalidState(format!(
-                "volume '{}' is {:?}, expected Available for resize",
-                volume_id, vol.state
-            )));
+            return Err(OrgError::InvalidVolumeState {
+                volume_id: volume_id.to_string(),
+                current: format!("{:?}", vol.state),
+                expected: "Available".to_string(),
+            });
         }
         if new_size_gb <= vol.size_gb {
-            return Err(OrgError::InvalidState(format!(
-                "new size {}GB must be greater than current {}GB",
+            return Err(OrgError::InvalidArgument(format!(
+                "new size {}GB must be greater than current {}GB (shrink is not supported)",
                 new_size_gb, vol.size_gb
             )));
         }
@@ -396,7 +403,8 @@ impl StorageStore {
         Ok(val.unwrap_or(0))
     }
 
-    /// Atomically increment SST refcount by 1. Returns the new count.
+    /// Increment SST refcount by 1. Returns the new count.
+    /// Thread-safety guaranteed by single-writer access.
     pub fn increment_sst_refcount(&self, sst_key: &str) -> Result<u64> {
         let current = self.get_sst_refcount(sst_key)?;
         let new_val = current + 1;
@@ -404,8 +412,9 @@ impl StorageStore {
         Ok(new_val)
     }
 
-    /// Atomically decrement SST refcount by 1. Returns the new count.
+    /// Decrement SST refcount by 1. Returns the new count.
     /// Removes the entry if the count reaches 0.
+    /// Thread-safety guaranteed by single-writer access.
     pub fn decrement_sst_refcount(&self, sst_key: &str) -> Result<u64> {
         let current = self.get_sst_refcount(sst_key)?;
         if current == 0 {

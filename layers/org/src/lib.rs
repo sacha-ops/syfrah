@@ -29,8 +29,8 @@ pub use nic::NicStore;
 pub use placement::PlacementStore;
 pub use sg_rules::SgRuleStore;
 pub use storage_store::{
-    ManifestPointer, Snapshot, StorageConfig as StorageStoreConfig, StorageQuota, StorageStore,
-    Volume, VolumeState, VolumeType as StorageVolumeType,
+    ManifestPointer, Snapshot, StorageConfig, StorageQuota, StorageStore, Volume, VolumeState,
+    VolumeType,
 };
 pub use store::OrgStore;
 pub use types::{
