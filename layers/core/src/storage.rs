@@ -1,18 +1,101 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::ids::{EnvId, HypervisorId, OrgId, ProjectId, SnapshotId, VmId, VolumeId};
 
 // ---------------------------------------------------------------------------
-// ID newtypes — thin wrappers around Uuid.
-// When #1178 lands with its own ID types, these may be consolidated.
+// Volume
 // ---------------------------------------------------------------------------
 
-/// Unique identifier for a virtual machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VmId(pub Uuid);
+/// Whether a volume is a root volume (tied to a VM) or a data volume
+/// (independent lifecycle).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeType {
+    /// Root volume: created automatically with a VM, deleted with the VM.
+    Root,
+    /// Data volume: created independently, lifecycle is not tied to any VM.
+    Data,
+}
 
-/// Unique identifier for a hypervisor node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HypervisorId(pub Uuid);
+/// A persistent block volume backed by S3 via ZeroFS.
+///
+/// See ADR-006 §4 for the full resource model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Volume {
+    /// Globally unique identifier. Format: `vol-{ulid}`.
+    pub id: VolumeId,
+    /// Human-readable name. Unique within an environment.
+    pub name: String,
+    /// Size in gigabytes.
+    pub size_gb: u32,
+    /// Current desired state in the volume lifecycle.
+    pub desired_state: VolumeDesiredState,
+    /// The VM this volume is attached to, if any.
+    pub attached_to: Option<VmId>,
+    /// The hypervisor where the NBD device is currently active.
+    pub hypervisor_id: Option<HypervisorId>,
+    /// S3 key prefix for this volume's data.
+    pub s3_prefix: String,
+    /// Encryption key identifier.
+    pub encryption_key_id: String,
+    /// Snapshots taken from this volume.
+    pub snapshot_ids: Vec<SnapshotId>,
+    /// Organization this volume belongs to.
+    pub org_id: OrgId,
+    /// Project this volume belongs to.
+    pub project_id: ProjectId,
+    /// Environment this volume belongs to.
+    pub env_id: EnvId,
+    /// Placement generation — incremented on attach/detach/reschedule.
+    pub placement_generation: u64,
+    /// Root or data volume.
+    pub volume_type: VolumeType,
+    /// Unix timestamp (seconds) when the volume was created.
+    pub created_at: u64,
+    /// Unix timestamp (seconds) when the volume was last updated.
+    pub updated_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotState {
+    /// ZeroFS is flushing pending writes and recording the SST file list.
+    Creating,
+    /// Snapshot is available for restore.
+    Available,
+    /// SST file references are being removed.
+    Deleting,
+    /// Terminal state.
+    Deleted,
+}
+
+/// A crash-consistent point-in-time snapshot of a volume.
+///
+/// See ADR-006 §6 for the full snapshot model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// Globally unique identifier. Format: `snap-{ulid}`.
+    pub id: SnapshotId,
+    /// The volume this snapshot was taken from.
+    pub source_volume_id: VolumeId,
+    /// Current state.
+    pub state: SnapshotState,
+    /// Size in gigabytes (matches source volume at snapshot time).
+    pub size_gb: u32,
+    /// S3 prefix where snapshot metadata is stored.
+    pub s3_prefix: String,
+    /// Organization (inherited from source volume).
+    pub org_id: OrgId,
+    /// Project (inherited from source volume).
+    pub project_id: ProjectId,
+    /// Environment (inherited from source volume).
+    pub env_id: EnvId,
+    /// Unix timestamp (seconds) when the snapshot was created.
+    pub created_at: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Desired state — stored in Raft (control plane truth)
@@ -162,14 +245,51 @@ pub fn derive_reported_state(
 mod tests {
     use super::*;
 
-    // Helpers ---------------------------------------------------------------
+    // -- Helpers (Soren's volume/snapshot helpers) ---------------------------
+
+    fn sample_volume() -> Volume {
+        Volume {
+            id: VolumeId("vol-01JA0000000000000000000000".into()),
+            name: "my-volume".into(),
+            size_gb: 100,
+            desired_state: VolumeDesiredState::Available,
+            attached_to: None,
+            hypervisor_id: None,
+            s3_prefix: "volumes/vol-01JA0000000000000000000000/gen-1/".into(),
+            encryption_key_id: "key-default".into(),
+            snapshot_ids: vec![SnapshotId("snap-01JA0000000000000000000001".into())],
+            org_id: OrgId("org-acme".into()),
+            project_id: ProjectId("proj-web".into()),
+            env_id: EnvId("env-prod".into()),
+            placement_generation: 1,
+            volume_type: VolumeType::Root,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    fn sample_snapshot() -> Snapshot {
+        Snapshot {
+            id: SnapshotId("snap-01JA0000000000000000000001".into()),
+            source_volume_id: VolumeId("vol-01JA0000000000000000000000".into()),
+            state: SnapshotState::Available,
+            size_gb: 100,
+            s3_prefix: "snapshots/snap-01JA0000000000000000000001/".into(),
+            org_id: OrgId("org-acme".into()),
+            project_id: ProjectId("proj-web".into()),
+            env_id: EnvId("env-prod".into()),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    // -- Helpers (Ren's state-test helpers) ----------------------------------
 
     fn vm_id() -> VmId {
-        VmId(Uuid::from_u128(1))
+        VmId("vm-01JA0000000000000000000099".into())
     }
 
     fn hypervisor_id() -> HypervisorId {
-        HypervisorId(Uuid::from_u128(2))
+        HypervisorId("hv-01JA0000000000000000000042".into())
     }
 
     /// An observed state that has been seen at least once but is fully idle.
@@ -193,6 +313,64 @@ mod tests {
             last_observed: 2_000,
         }
     }
+
+    // -- Soren's tests: Volume/Snapshot serde roundtrips ---------------------
+
+    #[test]
+    fn volume_serde_roundtrip() {
+        let vol = sample_volume();
+        let json = serde_json::to_string(&vol).unwrap();
+        let parsed: Volume = serde_json::from_str(&json).unwrap();
+        assert_eq!(vol, parsed);
+    }
+
+    #[test]
+    fn snapshot_serde_roundtrip() {
+        let snap = sample_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, parsed);
+    }
+
+    #[test]
+    fn volume_type_serde_roundtrip() {
+        for vt in [VolumeType::Root, VolumeType::Data] {
+            let json = serde_json::to_string(&vt).unwrap();
+            let parsed: VolumeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(vt, parsed);
+        }
+    }
+
+    #[test]
+    fn snapshot_state_serde_roundtrip() {
+        for state in [
+            SnapshotState::Creating,
+            SnapshotState::Available,
+            SnapshotState::Deleting,
+            SnapshotState::Deleted,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let parsed: SnapshotState = serde_json::from_str(&json).unwrap();
+            assert_eq!(state, parsed);
+        }
+    }
+
+    #[test]
+    fn volume_with_attachment() {
+        let mut vol = sample_volume();
+        vol.desired_state = VolumeDesiredState::AttachedTo {
+            vm_id: vm_id(),
+            hypervisor_id: hypervisor_id(),
+        };
+        vol.attached_to = Some(VmId("vm-01JA0000000000000000000099".into()));
+        vol.hypervisor_id = Some(HypervisorId("hv-01JA0000000000000000000042".into()));
+
+        let json = serde_json::to_string(&vol).unwrap();
+        let parsed: Volume = serde_json::from_str(&json).unwrap();
+        assert_eq!(vol, parsed);
+    }
+
+    // -- Ren's tests: derive_reported_state ---------------------------------
 
     // 1. Creating -----------------------------------------------------------
 
@@ -333,15 +511,9 @@ mod tests {
     }
 
     // 6. Resizing -----------------------------------------------------------
-    // NOTE: Resizing requires knowledge of the "new size" field which is not yet
-    // in VolumeDesiredState (ADR-006 mentions "Available with new size"). Until
-    // that field is added, resizing is not distinguishable from Available. We
-    // add a placeholder test documenting this gap.
 
     #[test]
     fn resizing_not_yet_distinguishable() {
-        // When a resize_target_bytes field is added to VolumeDesiredState::Available,
-        // this test should be updated to assert VolumeReportedState::Resizing.
         let desired = VolumeDesiredState::Available;
         let observed = idle_observed();
         // Currently maps to Available (no resize field yet).
@@ -392,15 +564,9 @@ mod tests {
     }
 
     // 9. Error --------------------------------------------------------------
-    // Error requires a retry counter or reconciliation-failure flag which is
-    // outside the scope of desired/observed state alone. The derive function
-    // does not currently return Error — that will be handled by the reconciler
-    // layer. We document that here.
 
     #[test]
     fn error_state_requires_reconciler_context() {
-        // Verify that VolumeReportedState::Error variant exists and can be
-        // constructed (it will be set by the reconciler, not by derive_reported_state).
         let err = VolumeReportedState::Error;
         assert_eq!(err, VolumeReportedState::Error);
     }
@@ -478,8 +644,6 @@ mod tests {
 
     #[test]
     fn deleting_when_nbd_still_connected() {
-        // Edge: desired Deleted but NBD is still up (shouldn't normally happen
-        // per transition rules, but the derive function must handle it).
         let desired = VolumeDesiredState::Deleted;
         let observed = VolumeObservedState {
             nbd_connected: true,
