@@ -675,4 +675,21 @@ impl NetworkBackend for LinuxBackend {
         }
         Ok(entries)
     }
+
+    async fn get_interface_master(&self, iface: &str) -> Result<Option<String>> {
+        // `ip -o link show <iface>` includes "master <bridge>" when enslaved.
+        let output = Self::run("ip", &["-o", "link", "show", iface]).await?;
+        for part in output.split_whitespace() {
+            if part == "master" {
+                // Next token is the master device name.
+                let idx = output.find("master ").unwrap() + 7;
+                let rest = &output[idx..];
+                let master = rest.split_whitespace().next().unwrap_or("");
+                if !master.is_empty() {
+                    return Ok(Some(master.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
