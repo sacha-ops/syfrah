@@ -280,6 +280,14 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             .await
             .map_err(|e| ComputeError::NetworkSetup(format!("bridge creation failed: {e}")))?;
 
+        // Apply per-bridge accept rules (intra-VPC + internet egress) now
+        // that the bridge exists. With policy drop on the forward chain,
+        // traffic would be blocked without these.
+        self.backend
+            .apply_bridge_accept_rules(&bridge_name)
+            .await
+            .map_err(|e| ComputeError::NetworkSetup(format!("bridge accept rules failed: {e}")))?;
+
         self.backend
             .attach_to_bridge(&vxlan_name, &bridge_name)
             .await

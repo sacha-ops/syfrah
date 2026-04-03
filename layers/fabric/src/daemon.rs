@@ -1201,6 +1201,13 @@ pub async fn run_daemon(
                                 .map_err(|e| e.to_string())
                         });
 
+                        // Enable IP forwarding so the kernel routes packets
+                        // between VPC bridges and to the internet. Without
+                        // this, cross-subnet and NAT traffic silently fails.
+                        if let Err(e) = syfrah_overlay::ensure_ip_forwarding() {
+                            warn!("compute: failed to enable ip_forward: {e}");
+                        }
+
                         // Enable bridge netfilter hooks so nftables sees
                         // bridged VM traffic (same-bridge VM-to-VM).  Must
                         // run before any bridge or nftables setup.

@@ -460,13 +460,14 @@ impl LayerHandler for RaftOrgHandler {
                                 let peering_id = format!("{}-{}", va.id.0, vb.id.0);
                                 let backend_guard = self.network_backend.read().await;
                                 if let Some(ref backend) = *backend_guard {
-                                    // Only wire data plane on hypervisors that have at
-                                    // least one of the peered VPC bridges locally. If
-                                    // neither bridge exists, no local VMs are in either
-                                    // VPC and there is nothing to connect.
+                                    // Only wire data plane when BOTH bridges exist
+                                    // locally. If only one exists, the veth would be
+                                    // created but one end cannot attach — resulting in
+                                    // a dangling interface. The reconcile loop will
+                                    // wire the peering once the second bridge appears.
                                     let has_a = backend.link_exists(&bridge_a).await;
                                     let has_b = backend.link_exists(&bridge_b).await;
-                                    if has_a || has_b {
+                                    if has_a && has_b {
                                         if let Err(e) = syfrah_overlay::veth_peer::create_veth_peer(
                                             backend.as_ref(),
                                             &peering_id,
@@ -488,7 +489,8 @@ impl LayerHandler for RaftOrgHandler {
                                     } else {
                                         tracing::debug!(
                                             "skipping peering data plane for {from}<->{to}: \
-                                             no local bridges on this hypervisor"
+                                             need both bridges (has_a={has_a}, has_b={has_b}); \
+                                             reconcile loop will wire when ready"
                                         );
                                     }
                                 }

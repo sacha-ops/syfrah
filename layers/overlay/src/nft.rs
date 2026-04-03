@@ -37,7 +37,7 @@ pub fn generate_table_setup() -> String {
     writeln!(buf, "add table inet {TABLE_NAME}").unwrap();
     writeln!(
         buf,
-        "add chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy accept; }}"
+        "add chain inet {TABLE_NAME} {CHAIN_NAME} {{ type filter hook forward priority 0; policy drop; }}"
     )
     .unwrap();
     writeln!(
@@ -76,6 +76,19 @@ pub fn generate_infra_protection() -> String {
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} tcp dport {PEERING_PORT} drop"
+    )
+    .unwrap();
+
+    // Conntrack: allow established/related return traffic (must come after
+    // infra port blocks so infra ports are always dropped first).
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} ct state established,related accept"
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} ct state invalid drop"
     )
     .unwrap();
 
@@ -178,6 +191,32 @@ pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+// ── VPC bridge base rules ───────────────────────────────────────────
+
+/// Generate nftables rules to allow intra-VPC traffic (same bridge in/out)
+/// and internet egress from a VPC bridge.
+///
+/// With `policy drop` on the forward chain, traffic between bridges is
+/// blocked by default (VPC isolation). These rules explicitly allow:
+/// 1. Same-bridge traffic (intra-VPC communication between subnets)
+/// 2. Outbound internet egress (bridge → non-bridge interface)
+pub fn generate_bridge_accept_rules(bridge: &str) -> String {
+    let mut buf = String::new();
+    // Same bridge: intra-VPC traffic allowed
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iifname \"{bridge}\" oifname \"{bridge}\" accept"
+    )
+    .unwrap();
+    // Internet egress: bridge → any non-bridge interface
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iifname \"{bridge}\" oifname != \"syfb-*\" accept"
+    )
+    .unwrap();
+    buf
 }
 
 // ── Subnet isolation ────────────────────────────────────────────────
@@ -353,6 +392,42 @@ mod tests {
         let setup = generate_table_setup();
         assert!(setup.contains("add table inet syfrah"));
         assert!(setup.contains("add chain inet syfrah forward"));
+    }
+
+    #[test]
+    fn forward_chain_policy_drop() {
+        let setup = generate_table_setup();
+        assert!(
+            setup.contains("policy drop"),
+            "forward chain must use policy drop for VPC isolation"
+        );
+    }
+
+    #[test]
+    fn infra_protection_has_conntrack() {
+        let rules = generate_infra_protection();
+        assert!(rules.contains("ct state established,related accept"));
+        assert!(rules.contains("ct state invalid drop"));
+    }
+
+    #[test]
+    fn bridge_accept_rules_intra_vpc() {
+        let br = crate::naming::bridge_name("100");
+        let rules = generate_bridge_accept_rules(&br);
+        assert!(
+            rules.contains(&format!("iifname \"{br}\" oifname \"{br}\" accept")),
+            "same-bridge traffic must be accepted"
+        );
+    }
+
+    #[test]
+    fn bridge_accept_rules_internet_egress() {
+        let br = crate::naming::bridge_name("100");
+        let rules = generate_bridge_accept_rules(&br);
+        assert!(
+            rules.contains(&format!("iifname \"{br}\" oifname != \"syfb-*\" accept")),
+            "bridge to internet must be accepted"
+        );
     }
 
     #[test]

@@ -231,6 +231,11 @@ impl NetworkBackend for MockBackend {
         Ok(())
     }
 
+    async fn apply_bridge_accept_rules(&self, bridge: &str) -> Result<()> {
+        self.record(format!("apply_bridge_accept_rules({bridge})"));
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         self.record(format!("apply_vm_rules({tap}, {mac}, {ip})"));
         Ok(())

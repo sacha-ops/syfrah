@@ -180,6 +180,13 @@ pub async fn reconcile_network(
     // 2. Check expected TAPs exist — warn if missing
     check_taps(backend, expected_state, &mut report).await;
 
+    // 3a-pre. Re-enable IP forwarding (sysctl values don't survive reboot)
+    if let Err(e) = crate::sysctl::ensure_ip_forwarding() {
+        report
+            .warnings
+            .push(format!("ip_forward re-enable failed: {e}"));
+    }
+
     // 3a. Re-enable br_netfilter (sysctl values don't survive reboot)
     if let Err(e) = backend.enable_br_netfilter().await {
         report
@@ -273,6 +280,13 @@ async fn check_bridges(
                         .push(format!("failed to re-create bridge {}: {e}", bridge.name));
                 }
             }
+        }
+        // Re-apply per-bridge accept rules (intra-VPC + internet egress).
+        // These nftables rules don't survive reboots.
+        if let Err(e) = backend.apply_bridge_accept_rules(&bridge.name).await {
+            report
+                .warnings
+                .push(format!("bridge {} accept rules failed: {e}", bridge.name));
         }
     }
 }
@@ -557,6 +571,19 @@ async fn reconcile_peerings(
     report: &mut ReconcileReport,
 ) {
     for peering in &state.peerings {
+        // Both bridges must exist before we can wire the veth pair.
+        // If only one exists, skip — the next reconcile tick will retry
+        // once the second bridge appears (after a VM is created in that VPC).
+        let has_a = backend.link_exists(&peering.bridge_a).await;
+        let has_b = backend.link_exists(&peering.bridge_b).await;
+        if !has_a || !has_b {
+            report.warnings.push(format!(
+                "peering {}: skipping — bridges not ready ({}={}, {}={})",
+                peering.peering_id, peering.bridge_a, has_a, peering.bridge_b, has_b,
+            ));
+            continue;
+        }
+
         // Check if the veth peer interface already exists.
         let peer_a = naming::peer_name_a(&peering.peering_id);
         let existing = match backend
