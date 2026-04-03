@@ -9,6 +9,7 @@ pub mod ipam;
 pub mod nic;
 pub mod placement;
 pub mod sg_rules;
+pub mod storage_store;
 pub mod store;
 pub mod ttl;
 pub mod types;
@@ -27,6 +28,10 @@ pub use ipam::{AllocationState, IpAllocation, IpamStore, SubnetBitmap};
 pub use nic::NicStore;
 pub use placement::PlacementStore;
 pub use sg_rules::SgRuleStore;
+pub use storage_store::{
+    ManifestPointer, Snapshot, StorageConfig, StorageQuota, StorageStore, Volume, VolumeState,
+    VolumeType,
+};
 pub use store::OrgStore;
 pub use types::{
     AllocatableCapacity, CpuArchitecture, Direction, DiskType, Environment, EnvironmentId, GpuSpec,
