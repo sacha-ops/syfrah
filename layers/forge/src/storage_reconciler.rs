@@ -1,5 +1,6 @@
 //! Storage reconciler — detects desired volumes in Raft state and
-//! initializes/stops ZeroFS processes via VolumeMgr.
+//! initializes/stops ZeroFS processes via VolumeMgr, then attaches NBD
+//! devices to Cloud Hypervisor VMs via the CH add-disk API.
 //!
 //! ## How it works
 //!
@@ -11,6 +12,8 @@
 //!    - Running but not desired  -> stop_volume  (fenced / detached / deleted)
 //!    - Generation mismatch      -> stop_volume  (stale placement, fencing)
 //! 4. Reaps crashed ZeroFS processes
+//! 5. For volumes with desired=AttachedTo and ZeroFS running but not yet
+//!    attached to CH: calls PUT /vm.add-disk with rate limiting defaults
 //!
 //! The reconciler does NOT modify Raft state. It only reads desired state
 //! and converges local ZeroFS processes to match.
@@ -37,6 +40,80 @@ pub struct DesiredVolume {
     pub size_gb: u32,
     pub placement_generation: u64,
     pub hypervisor_id: String,
+    /// The VM this volume should be attached to, if any.
+    /// When `Some`, the reconciler will call CH add-disk after ZeroFS starts.
+    pub vm_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Disk rate limiting configuration (ADR-006 §15)
+// ---------------------------------------------------------------------------
+
+/// I/O rate limiting configuration for virtio-block devices attached via CH.
+///
+/// These defaults match ADR-006 §15 and can be overridden per-volume in the
+/// desired state (future work).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskRateLimitConfig {
+    /// Maximum sustained bandwidth in bytes/sec (default: 200 MB/s).
+    pub bw_size: u64,
+    /// Refill period for the bandwidth bucket in milliseconds.
+    pub bw_refill_ms: u64,
+    /// Maximum sustained IOPS (default: 10,000).
+    pub ops_size: u64,
+    /// Refill period for the IOPS bucket in milliseconds.
+    pub ops_refill_ms: u64,
+}
+
+impl Default for DiskRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            bw_size: 200 * 1024 * 1024, // 200 MB/s
+            bw_refill_ms: 1000,
+            ops_size: 10_000,
+            ops_refill_ms: 1000,
+        }
+    }
+}
+
+impl DiskRateLimitConfig {
+    /// Build the `rate_limiter_config` JSON fragment for CH `add-disk`.
+    pub fn to_ch_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bandwidth": {
+                "size": self.bw_size,
+                "one_time_burst": 0,
+                "refill_time": self.bw_refill_ms
+            },
+            "ops": {
+                "size": self.ops_size,
+                "one_time_burst": 0,
+                "refill_time": self.ops_refill_ms
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait for attaching disks to VMs via Cloud Hypervisor (mockable in tests)
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the Cloud Hypervisor add-disk API.
+///
+/// In production, this is implemented by resolving the VM's API socket and
+/// calling `ChClient::add_disk`. In tests, a mock records calls.
+#[async_trait::async_trait]
+pub trait VmDiskAttacher: Send + Sync {
+    /// Attach an NBD device to the specified VM as a virtio-block disk.
+    ///
+    /// `vm_id` identifies the VM. `nbd_path` is the block device path
+    /// (e.g. `/dev/nbd0`). `rate_limit` configures I/O throttling.
+    async fn attach_disk(
+        &self,
+        vm_id: &str,
+        nbd_path: &std::path::Path,
+        rate_limit: &DiskRateLimitConfig,
+    ) -> Result<(), String>;
 }
 
 /// Storage configuration for the region (from Raft).
@@ -83,6 +160,8 @@ pub enum StorageReconcileAction {
     StopVolume { volume_id: String, reason: String },
     /// Reap a crashed ZeroFS process.
     ReapCrashed { volume_id: String },
+    /// Attach an NBD device to a VM via Cloud Hypervisor.
+    AttachDisk { volume_id: String, vm_id: String },
 }
 
 /// Report from a single reconciliation pass.
@@ -92,6 +171,7 @@ pub struct StorageReconcileReport {
     pub started: usize,
     pub stopped: usize,
     pub reaped: usize,
+    pub attached: usize,
     pub errors: Vec<String>,
     pub duration_ms: u64,
 }
@@ -101,7 +181,8 @@ pub struct StorageReconcileReport {
 // ---------------------------------------------------------------------------
 
 /// The storage reconciler — runs a periodic loop converging local ZeroFS
-/// processes to match the desired Raft state.
+/// processes to match the desired Raft state, and attaching NBD devices
+/// to Cloud Hypervisor VMs when desired=AttachedTo.
 pub struct StorageReconciler {
     /// This hypervisor's ID (used to filter volumes from Raft).
     local_hypervisor_id: String,
@@ -113,6 +194,11 @@ pub struct StorageReconciler {
     last_report: std::sync::Mutex<Option<StorageReconcileReport>>,
     /// Local encryption passphrase (never replicated via Raft).
     encryption_passphrase: String,
+    /// Rate limiting defaults for attached disks (ADR-006 §15).
+    disk_rate_limit: DiskRateLimitConfig,
+    /// Set of volume IDs already attached to CH in previous passes.
+    /// Cleared when a volume is stopped or no longer desired.
+    attached_volumes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl StorageReconciler {
@@ -124,12 +210,20 @@ impl StorageReconciler {
             pass_count: std::sync::atomic::AtomicU64::new(0),
             last_report: std::sync::Mutex::new(None),
             encryption_passphrase,
+            disk_rate_limit: DiskRateLimitConfig::default(),
+            attached_volumes: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     /// Create with a custom interval.
     pub fn with_interval(mut self, interval_secs: u64) -> Self {
         self.interval_secs = interval_secs;
+        self
+    }
+
+    /// Override disk rate limiting configuration.
+    pub fn with_disk_rate_limit(mut self, config: DiskRateLimitConfig) -> Self {
+        self.disk_rate_limit = config;
         self
     }
 
@@ -146,11 +240,25 @@ impl StorageReconciler {
     /// Run a single reconciliation pass.
     ///
     /// Reads desired state from `reader`, diffs against `volume_mgr`'s
-    /// running processes, and applies start/stop actions.
+    /// running processes, and applies start/stop/attach actions.
+    ///
+    /// When `attacher` is `Some`, volumes with `vm_id` set and ZeroFS
+    /// running will be attached to Cloud Hypervisor via `add-disk`.
     pub async fn reconcile_once(
         &self,
         reader: &dyn VolumeStateReader,
         volume_mgr: &mut VolumeMgr,
+    ) -> StorageReconcileReport {
+        self.reconcile_once_with_attacher(reader, volume_mgr, None)
+            .await
+    }
+
+    /// Run a single reconciliation pass with an optional disk attacher.
+    pub async fn reconcile_once_with_attacher(
+        &self,
+        reader: &dyn VolumeStateReader,
+        volume_mgr: &mut VolumeMgr,
+        attacher: Option<&dyn VmDiskAttacher>,
     ) -> StorageReconcileReport {
         let pass = self
             .pass_count
@@ -279,10 +387,64 @@ impl StorageReconciler {
                 match volume_mgr.stop_volume(id).await {
                     Ok(()) => {
                         report.stopped += 1;
+                        // Remove from attached set — volume is no longer running.
+                        self.attached_volumes.lock().unwrap().remove(id);
                     }
                     Err(e) => {
                         error!(volume_id = %id, error = %e, "storage reconciler: failed to stop volume");
                         report.errors.push(format!("stop {id}: {e}"));
+                    }
+                }
+            }
+        }
+
+        // 7. Attach volumes to Cloud Hypervisor VMs.
+        //    For volumes with desired=AttachedTo (vm_id set) and ZeroFS running
+        //    but not yet attached to CH, call add-disk with rate limiting.
+        if let Some(attacher) = attacher {
+            for (id, vol) in &desired_map {
+                if let Some(ref vm_id) = vol.vm_id {
+                    // Only attach if ZeroFS is running and not already attached
+                    // in a previous pass.
+                    let already_attached =
+                        self.attached_volumes.lock().unwrap().contains(id.as_str());
+                    if volume_mgr.is_running(id) && !already_attached {
+                        if let Some(nbd_path) = volume_mgr.get_nbd_device(id) {
+                            info!(
+                                volume_id = %id,
+                                vm_id = %vm_id,
+                                nbd_device = %nbd_path.display(),
+                                "storage reconciler: attaching volume to VM"
+                            );
+                            match attacher
+                                .attach_disk(vm_id, &nbd_path, &self.disk_rate_limit)
+                                .await
+                            {
+                                Ok(()) => {
+                                    info!(
+                                        volume_id = %id,
+                                        vm_id = %vm_id,
+                                        "storage reconciler: volume attached to VM"
+                                    );
+                                    report.attached += 1;
+                                    self.attached_volumes.lock().unwrap().insert(id.clone());
+                                }
+                                Err(e) => {
+                                    error!(
+                                        volume_id = %id,
+                                        vm_id = %vm_id,
+                                        error = %e,
+                                        "storage reconciler: failed to attach volume to VM"
+                                    );
+                                    report.errors.push(format!("attach {id} to {vm_id}: {e}"));
+                                }
+                            }
+                        } else {
+                            warn!(
+                                volume_id = %id,
+                                "storage reconciler: volume running but no NBD device found"
+                            );
+                        }
                     }
                 }
             }
@@ -294,6 +456,7 @@ impl StorageReconciler {
             pass = pass,
             started = report.started,
             stopped = report.stopped,
+            attached = report.attached,
             reaped = report.reaped,
             errors = report.errors.len(),
             "storage reconciliation pass complete"
@@ -496,6 +659,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            vm_id: None,
         }]);
         let mut mgr = VolumeMgr::new();
 
@@ -567,6 +731,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 2,
             hypervisor_id: "hv-1".into(),
+            vm_id: None,
         }]);
 
         let report = reconciler.reconcile_once(&reader, &mut mgr).await;
@@ -604,6 +769,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 3,
             hypervisor_id: "hv-1".into(),
+            vm_id: None,
         }]);
 
         let report = reconciler.reconcile_once(&reader, &mut mgr).await;
@@ -616,5 +782,279 @@ mod tests {
 
         // Cleanup.
         mgr.stop_volume("vol-ok").await.ok();
+    }
+
+    // -- Attach flow tests ---------------------------------------------------
+
+    /// Mock disk attacher that records calls.
+    struct MockDiskAttacher {
+        calls: Mutex<Vec<(String, String)>>,
+        fail_for: Mutex<Vec<String>>,
+    }
+
+    impl MockDiskAttacher {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_for: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn fail_for_volume(self, vol_id: &str) -> Self {
+            self.fail_for.lock().unwrap().push(vol_id.to_string());
+            self
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VmDiskAttacher for MockDiskAttacher {
+        async fn attach_disk(
+            &self,
+            vm_id: &str,
+            nbd_path: &std::path::Path,
+            _rate_limit: &DiskRateLimitConfig,
+        ) -> Result<(), String> {
+            let vol_hint = nbd_path.display().to_string();
+            if self
+                .fail_for
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| vol_hint.contains(v))
+            {
+                return Err("mock attach failure".to_string());
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((vm_id.to_string(), vol_hint));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_volume_to_vm_after_zerofs_starts() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+        let attacher = MockDiskAttacher::new();
+
+        // Inject a fake running ZeroFS process.
+        mgr.inject_fake_process("vol-attach", 1);
+        assert!(mgr.is_running("vol-attach"));
+
+        // Desired: volume should be attached to vm-42.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-attach".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-42".into()),
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+
+        assert_eq!(
+            report.attached, 1,
+            "expected 1 attach, got {}",
+            report.attached
+        );
+        assert!(report.errors.is_empty());
+
+        let calls = attacher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "vm-42");
+
+        // Cleanup.
+        mgr.stop_volume("vol-attach").await.ok();
+    }
+
+    #[tokio::test]
+    async fn attach_idempotent_does_not_reattach() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+        let attacher = MockDiskAttacher::new();
+
+        mgr.inject_fake_process("vol-idem", 1);
+
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-idem".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-99".into()),
+        }]);
+
+        // First pass: should attach.
+        let r1 = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+        assert_eq!(r1.attached, 1);
+
+        // Second pass: already attached — should NOT call attacher again.
+        let r2 = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+        assert_eq!(r2.attached, 0);
+
+        // Only one call total.
+        assert_eq!(attacher.calls().len(), 1);
+
+        mgr.stop_volume("vol-idem").await.ok();
+    }
+
+    #[tokio::test]
+    async fn attach_not_called_without_vm_id() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+        let attacher = MockDiskAttacher::new();
+
+        mgr.inject_fake_process("vol-no-vm", 1);
+
+        // No vm_id — volume is just a ZeroFS process, no CH attach.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-no-vm".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: None,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+
+        assert_eq!(report.attached, 0);
+        assert!(attacher.calls().is_empty());
+
+        mgr.stop_volume("vol-no-vm").await.ok();
+    }
+
+    #[tokio::test]
+    async fn attach_failure_records_error() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+        // This attacher fails for any path containing "nbd" (all of them).
+        let attacher = MockDiskAttacher::new().fail_for_volume("nbd");
+
+        mgr.inject_fake_process("vol-fail", 1);
+
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-fail".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-fail".into()),
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+
+        assert_eq!(report.attached, 0);
+        assert!(!report.errors.is_empty());
+        assert!(report.errors[0].contains("attach"));
+
+        mgr.stop_volume("vol-fail").await.ok();
+    }
+
+    #[tokio::test]
+    async fn attach_without_attacher_is_noop() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        mgr.inject_fake_process("vol-noop", 1);
+
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-noop".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-noop".into()),
+        }]);
+
+        // reconcile_once (no attacher) should not crash.
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+        assert_eq!(report.attached, 0);
+        assert!(report.errors.is_empty());
+
+        mgr.stop_volume("vol-noop").await.ok();
+    }
+
+    // -- Rate limit config tests ---------------------------------------------
+
+    #[test]
+    fn disk_rate_limit_default_values() {
+        let config = DiskRateLimitConfig::default();
+        assert_eq!(config.bw_size, 200 * 1024 * 1024); // 200 MB/s
+        assert_eq!(config.ops_size, 10_000);
+        assert_eq!(config.bw_refill_ms, 1000);
+        assert_eq!(config.ops_refill_ms, 1000);
+    }
+
+    #[test]
+    fn disk_rate_limit_to_ch_json() {
+        let config = DiskRateLimitConfig::default();
+        let json = config.to_ch_json();
+        assert_eq!(json["bandwidth"]["size"], 200 * 1024 * 1024);
+        assert_eq!(json["ops"]["size"], 10_000);
+        assert_eq!(json["bandwidth"]["refill_time"], 1000);
+        assert_eq!(json["ops"]["refill_time"], 1000);
+    }
+
+    #[test]
+    fn disk_rate_limit_serde_roundtrip() {
+        let config = DiskRateLimitConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: DiskRateLimitConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bw_size, config.bw_size);
+        assert_eq!(parsed.ops_size, config.ops_size);
+    }
+
+    #[test]
+    fn reconcile_action_attach_serializes() {
+        let action = StorageReconcileAction::AttachDisk {
+            volume_id: "vol-01".into(),
+            vm_id: "vm-42".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("vol-01"));
+        assert!(json.contains("vm-42"));
+        assert!(json.contains("AttachDisk"));
+    }
+
+    #[test]
+    fn reconcile_report_default_includes_attached() {
+        let report = StorageReconcileReport::default();
+        assert_eq!(report.attached, 0);
+    }
+
+    #[test]
+    fn reconciler_with_disk_rate_limit() {
+        let config = DiskRateLimitConfig {
+            bw_size: 100 * 1024 * 1024,
+            bw_refill_ms: 500,
+            ops_size: 5_000,
+            ops_refill_ms: 500,
+        };
+        let r =
+            StorageReconciler::new("hv-1".into(), "test-pass".into()).with_disk_rate_limit(config);
+        assert_eq!(r.disk_rate_limit.bw_size, 100 * 1024 * 1024);
+        assert_eq!(r.disk_rate_limit.ops_size, 5_000);
     }
 }
