@@ -143,56 +143,45 @@ pub async fn run_get(name: &str, project: Option<&str>, json: bool) -> anyhow::R
 
             let is_tty = console::Term::stdout().is_term();
 
-            let print_heading = |title: &str| {
-                if is_tty {
-                    println!(
-                        "{}",
-                        console::Style::new().bold().underlined().apply_to(title)
-                    );
-                } else {
-                    println!("{title}");
-                    println!("{}", "=".repeat(title.len()));
-                }
-            };
-
-            let print_kv = |key: &str, val: &str| {
-                if is_tty {
-                    println!("  {}: {val}", console::Style::new().bold().apply_to(key));
-                } else {
-                    println!("  {key}: {val}");
-                }
-            };
-
-            print_heading(&format!("Volume: {}", v["name"].as_str().unwrap_or(name)));
-            print_kv("Name", v["name"].as_str().unwrap_or("?"));
-            print_kv(
+            super::fmt::print_heading(
+                &format!("Volume: {}", v["name"].as_str().unwrap_or(name)),
+                is_tty,
+            );
+            super::fmt::print_kv("Name", v["name"].as_str().unwrap_or("?"), is_tty);
+            super::fmt::print_kv(
                 "Size",
                 &v["size_gb"]
                     .as_u64()
                     .map(|s| format!("{s} GB"))
                     .unwrap_or_else(|| "?".into()),
+                is_tty,
             );
-            print_kv("State", v["state"].as_str().unwrap_or("?"));
-            print_kv("Attached To", v["attached_to"].as_str().unwrap_or("(none)"));
+            super::fmt::print_kv("State", v["state"].as_str().unwrap_or("?"), is_tty);
+            super::fmt::print_kv(
+                "Attached To",
+                v["attached_to"].as_str().unwrap_or("(none)"),
+                is_tty,
+            );
             if let Some(org) = v["org"].as_str() {
-                print_kv("Organization", org);
+                super::fmt::print_kv("Organization", org, is_tty);
             }
             if let Some(project) = v["project"].as_str() {
-                print_kv("Project", project);
+                super::fmt::print_kv("Project", project, is_tty);
             }
             if let Some(env) = v["env"].as_str() {
-                print_kv("Environment", env);
+                super::fmt::print_kv("Environment", env, is_tty);
             }
-            print_kv(
+            super::fmt::print_kv(
                 "Deletion Protection",
                 if v["deletion_protection"].as_bool().unwrap_or(false) {
                     "enabled"
                 } else {
                     "disabled"
                 },
+                is_tty,
             );
             if let Some(ts) = v["created_at"].as_u64() {
-                print_kv("Created", &format_timestamp(ts));
+                super::fmt::print_kv("Created", &format_timestamp(ts), is_tty);
             }
 
             Ok(())
@@ -345,13 +334,17 @@ fn term_width() -> usize {
 }
 
 /// Truncate a string to `max` characters, appending "..." if it exceeds the limit.
+///
+/// Uses `char_indices` to avoid panicking on multi-byte UTF-8 strings.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else if max <= 3 {
-        s[..max].to_string()
+        s.chars().take(max).collect()
     } else {
-        format!("{}...", &s[..max - 3])
+        let truncated: String = s.chars().take(max - 3).collect();
+        format!("{truncated}...")
     }
 }
 
