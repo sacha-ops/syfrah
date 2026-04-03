@@ -1,8 +1,10 @@
-//! CLI commands for `syfrah volume ...`.
+//! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
-//! Provides subcommands for volume lifecycle management. Each handler
-//! communicates with the daemon via the control socket.
+//! Provides subcommands for volume lifecycle management and storage
+//! configuration. Each handler communicates with the daemon via the
+//! control socket.
 
+pub mod configure;
 pub mod volume;
 
 use clap::Subcommand;
@@ -114,6 +116,172 @@ pub enum VolumeCommand {
     },
 }
 
+/// Top-level storage CLI command (`syfrah storage ...`).
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    /// Configure storage backend (S3 endpoint, bucket, cache)
+    #[command(after_help = "Examples:\n  \
+            syfrah storage configure --region eu-west \\\n    \
+              --s3-endpoint https://s3.par.io.cloud.ovh.net \\\n    \
+              --s3-bucket syfrah-storage --s3-access-key AKID --s3-secret-key SECRET \\\n    \
+              --cache-disk /dev/nvme1n1 --cache-disk-size 200 --cache-memory-size 8\n  \
+            syfrah storage configure --region eu-west \\\n    \
+              --s3-endpoint https://s3.par.io.cloud.ovh.net \\\n    \
+              --s3-bucket syfrah-storage --s3-access-key AKID --s3-secret-key SECRET \\\n    \
+              --encryption-passphrase 'my-secret-key'\n  \
+            syfrah storage configure --cache-disk /dev/nvme1n1 \\\n    \
+              --cache-disk-size 200 --cache-memory-size 8")]
+    Configure {
+        /// Target region for this storage configuration
+        #[arg(long)]
+        region: Option<String>,
+        /// S3-compatible endpoint URL (must start with https:// or http://)
+        #[arg(long)]
+        s3_endpoint: Option<String>,
+        /// S3 bucket name
+        #[arg(long)]
+        s3_bucket: Option<String>,
+        /// S3 access key
+        #[arg(long)]
+        s3_access_key: Option<String>,
+        /// S3 secret key
+        #[arg(long)]
+        s3_secret_key: Option<String>,
+        /// Path to local disk used for warm cache
+        #[arg(long)]
+        cache_disk: Option<String>,
+        /// Maximum cache disk size in gigabytes
+        #[arg(long)]
+        cache_disk_size: Option<u32>,
+        /// Maximum memory cache size in gigabytes
+        #[arg(long)]
+        cache_memory_size: Option<u32>,
+        /// Encryption passphrase (stored locally at /etc/syfrah/storage-key, never replicated)
+        #[arg(long)]
+        encryption_passphrase: Option<String>,
+    },
+}
+
+/// Execute a storage CLI command.
+pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
+    match cmd {
+        StorageCommand::Configure {
+            region,
+            s3_endpoint,
+            s3_bucket,
+            s3_access_key,
+            s3_secret_key,
+            cache_disk,
+            cache_disk_size,
+            cache_memory_size,
+            encryption_passphrase,
+        } => {
+            // Per-HV cache override: if only --cache-* flags provided, update cache only
+            let has_s3 = s3_endpoint.is_some()
+                || s3_bucket.is_some()
+                || s3_access_key.is_some()
+                || s3_secret_key.is_some()
+                || region.is_some();
+            let has_cache =
+                cache_disk.is_some() || cache_disk_size.is_some() || cache_memory_size.is_some();
+
+            if !has_s3 && has_cache {
+                // Cache-only override
+                let disk = cache_disk.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--cache-disk is required for cache-only configuration.\n\n\
+                         Usage: syfrah storage configure --cache-disk /dev/nvme1n1 \
+                         --cache-disk-size <GB> --cache-memory-size <GB>"
+                    )
+                })?;
+                let disk_size = cache_disk_size.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--cache-disk-size is required for cache-only configuration.\n\n\
+                         Usage: syfrah storage configure --cache-disk /dev/nvme1n1 \
+                         --cache-disk-size <GB> --cache-memory-size <GB>"
+                    )
+                })?;
+                let mem_size = cache_memory_size.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--cache-memory-size is required for cache-only configuration.\n\n\
+                         Usage: syfrah storage configure --cache-disk /dev/nvme1n1 \
+                         --cache-disk-size <GB> --cache-memory-size <GB>"
+                    )
+                })?;
+                return configure::run_configure_cache(&disk, disk_size, mem_size).await;
+            }
+
+            if !has_s3 && !has_cache {
+                anyhow::bail!(
+                    "no configuration flags provided.\n\n\
+                     Full configuration:\n  \
+                     syfrah storage configure --region <region> \\\n    \
+                       --s3-endpoint <url> --s3-bucket <bucket> \\\n    \
+                       --s3-access-key <key> --s3-secret-key <key>\n\n\
+                     Cache-only override:\n  \
+                     syfrah storage configure --cache-disk <path> \\\n    \
+                       --cache-disk-size <GB> --cache-memory-size <GB>"
+                );
+            }
+
+            // Full S3 configuration — require all S3 fields
+            let region = region.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--region is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --region <region> \
+                     --s3-endpoint <url> --s3-bucket <bucket> \
+                     --s3-access-key <key> --s3-secret-key <key>"
+                )
+            })?;
+            let endpoint = s3_endpoint.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--s3-endpoint is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --region {region} \
+                     --s3-endpoint <url> --s3-bucket <bucket> \
+                     --s3-access-key <key> --s3-secret-key <key>"
+                )
+            })?;
+            let bucket = s3_bucket.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--s3-bucket is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --region {region} \
+                     --s3-endpoint {endpoint} --s3-bucket <bucket> \
+                     --s3-access-key <key> --s3-secret-key <key>"
+                )
+            })?;
+            let access_key = s3_access_key.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--s3-access-key is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --region {region} \
+                     --s3-endpoint {endpoint} --s3-bucket {bucket} \
+                     --s3-access-key <key> --s3-secret-key <key>"
+                )
+            })?;
+            let secret_key = s3_secret_key.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--s3-secret-key is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --region {region} \
+                     --s3-endpoint {endpoint} --s3-bucket {bucket} \
+                     --s3-access-key {access_key} --s3-secret-key <key>"
+                )
+            })?;
+
+            configure::run_configure(&configure::ConfigureParams {
+                region: &region,
+                s3_endpoint: &endpoint,
+                s3_bucket: &bucket,
+                s3_access_key: &access_key,
+                s3_secret_key: &secret_key,
+                cache_disk: cache_disk.as_deref(),
+                cache_disk_size,
+                cache_memory_size,
+                encryption_passphrase: encryption_passphrase.as_deref(),
+            })
+            .await
+        }
+    }
+}
+
 /// Execute a volume CLI command.
 pub async fn run(cmd: VolumeCommand) -> anyhow::Result<()> {
     match cmd {
@@ -159,6 +327,160 @@ pub async fn run(cmd: VolumeCommand) -> anyhow::Result<()> {
                 no_deletion_protection,
             )
             .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::StorageCommand;
+
+    /// Helper to parse storage commands from an arg list.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: StorageCommand,
+    }
+
+    fn parse(args: &[&str]) -> StorageCommand {
+        let full_args = std::iter::once("test").chain(args.iter().copied());
+        TestCli::parse_from(full_args).cmd
+    }
+
+    #[test]
+    fn configure_full_parse() {
+        let cmd = parse(&[
+            "configure",
+            "--region",
+            "eu-west",
+            "--s3-endpoint",
+            "https://s3.par.io.cloud.ovh.net",
+            "--s3-bucket",
+            "syfrah-storage",
+            "--s3-access-key",
+            "AKID",
+            "--s3-secret-key",
+            "SECRET",
+            "--cache-disk",
+            "/dev/nvme1n1",
+            "--cache-disk-size",
+            "200",
+            "--cache-memory-size",
+            "8",
+        ]);
+        match cmd {
+            StorageCommand::Configure {
+                region,
+                s3_endpoint,
+                s3_bucket,
+                s3_access_key,
+                s3_secret_key,
+                cache_disk,
+                cache_disk_size,
+                cache_memory_size,
+                encryption_passphrase,
+            } => {
+                assert_eq!(region.as_deref(), Some("eu-west"));
+                assert_eq!(
+                    s3_endpoint.as_deref(),
+                    Some("https://s3.par.io.cloud.ovh.net")
+                );
+                assert_eq!(s3_bucket.as_deref(), Some("syfrah-storage"));
+                assert_eq!(s3_access_key.as_deref(), Some("AKID"));
+                assert_eq!(s3_secret_key.as_deref(), Some("SECRET"));
+                assert_eq!(cache_disk.as_deref(), Some("/dev/nvme1n1"));
+                assert_eq!(cache_disk_size, Some(200));
+                assert_eq!(cache_memory_size, Some(8));
+                assert!(encryption_passphrase.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn configure_cache_only_parse() {
+        let cmd = parse(&[
+            "configure",
+            "--cache-disk",
+            "/dev/nvme1n1",
+            "--cache-disk-size",
+            "200",
+            "--cache-memory-size",
+            "8",
+        ]);
+        match cmd {
+            StorageCommand::Configure {
+                region,
+                s3_endpoint,
+                s3_bucket,
+                cache_disk,
+                cache_disk_size,
+                cache_memory_size,
+                ..
+            } => {
+                assert!(region.is_none());
+                assert!(s3_endpoint.is_none());
+                assert!(s3_bucket.is_none());
+                assert_eq!(cache_disk.as_deref(), Some("/dev/nvme1n1"));
+                assert_eq!(cache_disk_size, Some(200));
+                assert_eq!(cache_memory_size, Some(8));
+            }
+        }
+    }
+
+    #[test]
+    fn configure_with_encryption_passphrase() {
+        let cmd = parse(&[
+            "configure",
+            "--region",
+            "eu-west",
+            "--s3-endpoint",
+            "https://s3.example.com",
+            "--s3-bucket",
+            "bucket",
+            "--s3-access-key",
+            "AKID",
+            "--s3-secret-key",
+            "SECRET",
+            "--encryption-passphrase",
+            "my-secret",
+        ]);
+        match cmd {
+            StorageCommand::Configure {
+                encryption_passphrase,
+                ..
+            } => {
+                assert_eq!(encryption_passphrase.as_deref(), Some("my-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn configure_no_flags() {
+        let cmd = parse(&["configure"]);
+        match cmd {
+            StorageCommand::Configure {
+                region,
+                s3_endpoint,
+                s3_bucket,
+                s3_access_key,
+                s3_secret_key,
+                cache_disk,
+                cache_disk_size,
+                cache_memory_size,
+                encryption_passphrase,
+            } => {
+                assert!(region.is_none());
+                assert!(s3_endpoint.is_none());
+                assert!(s3_bucket.is_none());
+                assert!(s3_access_key.is_none());
+                assert!(s3_secret_key.is_none());
+                assert!(cache_disk.is_none());
+                assert!(cache_disk_size.is_none());
+                assert!(cache_memory_size.is_none());
+                assert!(encryption_passphrase.is_none());
+            }
         }
     }
 }
