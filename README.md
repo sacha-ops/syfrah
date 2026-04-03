@@ -4,32 +4,31 @@
 [![E2E Tests](https://github.com/sacha-ops/syfrah/actions/workflows/e2e.yml/badge.svg)](https://github.com/sacha-ops/syfrah/actions/workflows/e2e.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-An open-source WireGuard mesh networking tool for dedicated servers.
+An open-source cloud platform that turns bare-metal servers into a programmable cloud.
 
 ## What is Syfrah?
 
-Syfrah connects dedicated servers from any provider (OVH, Hetzner, Scaleway, or others) into an encrypted WireGuard mesh network. Each pair of nodes establishes a point-to-point WireGuard tunnel, forming a full-mesh topology where every node can reach every other node over private, encrypted IPv6.
+Syfrah transforms dedicated servers from any provider (OVH, Hetzner, Scaleway, or others) into a unified cloud platform. It builds an encrypted WireGuard mesh between servers, then layers compute (Cloud Hypervisor VMs, container fallback), overlay networking (VXLAN, VPCs, security groups), a distributed control plane (Raft consensus + SWIM gossip), and multi-tenant organization management on top.
 
-The mesh is fully decentralized with no central coordinator. An operator adds nodes one at a time through a manual peering process: the new node sends a join request, the operator approves it (or uses a pre-shared PIN), and the node receives the mesh credentials and peer list. All inter-node traffic is encrypted with WireGuard (Curve25519 + ChaCha20-Poly1305).
-
-The long-term vision is to grow Syfrah into a full control plane that orchestrates compute, storage, and networking on top of the mesh. Today, it is a networking tool: it builds the encrypted fabric that everything else will run on.
+Nodes join the mesh through a manual peering process (PIN or interactive approval). Once connected, a node automatically detects and joins the Raft control plane cluster. The operator only needs to bootstrap the control plane on one node; all subsequent nodes auto-join on fabric join. All inter-node traffic is encrypted with WireGuard (Curve25519 + ChaCha20-Poly1305).
 
 ## Status
 
 | Layer | Crate | Status |
 |---|---|---|
 | **Core** | `syfrah-core` | Stable — types, crypto, IPv6 addressing |
-| **State** (library) | `syfrah-state` | Stable — embedded persistence (redb), cross-cutting library used by all layers |
-| **API** (library) | `syfrah-api` | Stable — error types, structured responses, cross-cutting library |
-| **Fabric** | `syfrah-fabric` | Stable — WireGuard mesh, peering, daemon, CLI |
-| Forge | — | Design phase |
-| Compute | — | Design phase |
-| Storage | — | Design phase |
-| Overlay | — | Design phase |
-| Control Plane | — | Design phase |
-| IAM | — | Design phase |
-| Org | — | Design phase |
-| Products | — | Design phase |
+| **State** | `syfrah-state` | Stable — embedded persistence (redb) |
+| **API** | `syfrah-api` | Stable — error types, structured responses |
+| **Fabric** | `syfrah-fabric` | Stable — WireGuard mesh, peering, daemon |
+| **Compute** | `syfrah-compute` | Stable — Cloud Hypervisor VMs, container fallback (crun + gVisor), image management |
+| **Org** | `syfrah-org` | Stable — Org/Project/Environment, VPC, Subnet, Security Groups, Route Tables, NAT Gateway, IPAM |
+| **Overlay** | `syfrah-overlay` | Stable — VXLAN, bridges, TAP/veth, nftables, FDB, ARP proxy |
+| **Forge** | `syfrah-forge` | Stable — per-hypervisor REST API, reconciliation, capacity management, drain, Prometheus metrics |
+| **Control Plane** | `syfrah-controlplane` | Stable — Raft consensus (openraft), SWIM gossip (foca), distributed scheduler, leader election |
+| **Hypervisor** | (in `syfrah-org`) | Stable — Region/Zone/Hypervisor topology, auto-discovery, labels, taints, drain |
+| Storage | — | Planned — ZeroFS + S3 block devices |
+| IAM | — | Planned — role-based access control, API keys |
+| Products | — | Planned — managed databases, load balancers |
 
 ## Install
 
@@ -87,43 +86,54 @@ This creates an encrypted WireGuard mesh between the two servers. Each additiona
 ## How it works
 
 ```
-                  ┌──────────────────────────────┐
-                  │           CLI binary          │
-                  │         (bin/syfrah)          │
-                  └──────────────┬───────────────┘
-                                 │
-                  ┌──────────────┴───────────────┐
-                  │       syfrah-fabric           │
-                  │                               │
-                  │  peering.rs   TCP join/accept  │
-                  │  daemon.rs    background loop  │
-                  │  wg.rs        WireGuard iface  │
-                  │  control.rs   Unix socket IPC  │
-                  │  store.rs     state persist    │
-                  │  events.rs    event log        │
-                  └──────┬───────────┬────────────┘
-                         │           │
-              ┌──────────┴──┐  ┌─────┴──────────┐
-              │ syfrah-core │  │  syfrah-state   │
-              │             │  │                 │
-              │ identity    │  │ redb wrapper    │
-              │ addressing  │  │ ACID persistence│
-              │ mesh types  │  │                 │
-              │ crypto      │  │                 │
-              └─────────────┘  └─────────────────┘
+                      ┌──────────────────────────────┐
+                      │           CLI binary          │
+                      │         (bin/syfrah)          │
+                      └──────────────┬───────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+ ┌────────┴─────────┐  ┌────────────┴────────────┐  ┌─────────┴────────┐
+ │  syfrah-forge    │  │   syfrah-controlplane   │  │   syfrah-org     │
+ │                  │  │                          │  │                  │
+ │  REST API        │  │  Raft consensus          │  │  Org/Project/Env │
+ │  reconciliation  │  │  SWIM gossip             │  │  VPC/Subnet/SG   │
+ │  capacity mgmt   │  │  distributed scheduler   │  │  IPAM, Hypervisor│
+ └────────┬─────────┘  └────────────┬─────────────┘  └─────────┬───────┘
+          │                         │                           │
+ ┌────────┴─────────┐  ┌───────────┴────────────┐  ┌──────────┴───────┐
+ │  syfrah-compute  │  │    syfrah-overlay      │  │  syfrah-fabric   │
+ │                  │  │                         │  │                  │
+ │  Cloud Hypervisor│  │  VXLAN, bridges, TAP    │  │  WireGuard mesh  │
+ │  crun + gVisor   │  │  nftables, FDB, ARP    │  │  peering, daemon │
+ └────────┬─────────┘  └───────────┬─────────────┘  └──────┬──────────┘
+          │                        │                        │
+          └────────────┬───────────┴────────────────────────┘
+                       │
+            ┌──────────┴──┐  ┌─────────────────┐
+            │ syfrah-core │  │  syfrah-state   │
+            │             │  │                 │
+            │ identity    │  │ redb wrapper    │
+            │ addressing  │  │ ACID persistence│
+            │ crypto      │  │                 │
+            └─────────────┘  └─────────────────┘
 ```
 
-**Core** provides pure types with no I/O: node identities, WireGuard keypairs, mesh secrets, and deterministic IPv6 address derivation (ULA /48 prefix per mesh derived from the mesh secret, /128 address per node derived from SHA-256 of the WireGuard public key).
+**Core** provides pure types with no I/O: node identities, WireGuard keypairs, mesh secrets, and deterministic IPv6 address derivation.
 
-**State** wraps redb for crash-safe embedded persistence. Mesh state is stored in `~/.syfrah/fabric.redb`. A backward-compatible JSON export is maintained at `~/.syfrah/state.json` (debounced, best-effort).
+**State** wraps redb for crash-safe embedded persistence. All layers store data in `~/.syfrah/`.
 
-**Fabric** is the main layer. It manages:
-- A WireGuard interface (`syfrah0`) with a full-mesh topology
-- A TCP peering protocol for manual node enrollment (PIN or interactive approval)
-- Encrypted peer announcements (AES-256-GCM, key derived from mesh secret)
-- A daemon loop with health checks (60s interval, 5-minute unreachable threshold)
-- A reconciliation loop (30s interval) that keeps WireGuard config in sync with stored state
-- Metrics: peers discovered, reconciliations, unreachable count, uptime
+**Fabric** manages the WireGuard mesh: encrypted tunnels, TCP peering protocol, health checks, reconciliation, and auto-join for the Raft control plane.
+
+**Compute** runs workloads via Cloud Hypervisor VMs with container fallback (crun + gVisor). Handles image management, VM lifecycle, and resource tracking.
+
+**Overlay** provides virtual networking: VXLAN tunnels, Linux bridges, TAP/veth devices, nftables rules, FDB entries, and ARP proxy for cross-hypervisor VM communication.
+
+**Control Plane** implements distributed consensus (Raft via openraft), failure detection (SWIM gossip via foca), a distributed scheduler for VM placement, and leader election.
+
+**Org** manages the multi-tenant hierarchy: Organizations, Projects, Environments, VPCs, Subnets, Security Groups, Route Tables, NAT Gateways, and IPAM. Also includes the Hypervisor model (Region/Zone/Hypervisor topology).
+
+**Forge** exposes a per-hypervisor REST API for local resource management, capacity tracking, reconciliation, drain operations, and Prometheus metrics.
 
 The CLI binary in `bin/syfrah` composes these crates and contains no logic of its own.
 
@@ -131,9 +141,14 @@ The CLI binary in `bin/syfrah` composes these crates and contains no logic of it
 
 ### Implemented layers
 
-- [layers/fabric/README.md](layers/fabric/README.md) — Fabric: WireGuard mesh, peering protocol, security model, failure modes, scalability
 - [layers/core/](layers/core/) — Core: types, crypto, addressing
 - [layers/state/](layers/state/) — State: embedded persistence
+- [layers/fabric/README.md](layers/fabric/README.md) — Fabric: WireGuard mesh, peering, security model
+- [layers/compute/](layers/compute/) — Compute: Cloud Hypervisor VMs, containers
+- [layers/overlay/](layers/overlay/) — Overlay: VXLAN, VPCs, security groups
+- [layers/controlplane/](layers/controlplane/) — Control Plane: Raft, gossip, scheduler
+- [layers/org/](layers/org/) — Org: multi-tenant model, IPAM, hypervisor topology
+- [layers/forge/](layers/forge/) — Forge: per-node REST API, capacity, metrics
 
 ### Architecture and handbook
 
@@ -146,15 +161,10 @@ The CLI binary in `bin/syfrah` composes these crates and contains no logic of it
 
 ## Roadmap
 
-The layers below are architecturally designed with concept documentation but have no implementation yet. Each has a README in its `layers/` directory describing the planned design.
+The following layers are planned but not yet implemented:
 
-- **Forge** — per-node REST API for managing local resources
-- **Compute** — KVM-based microVMs via Cloud Hypervisor
-- **Storage** — S3-backed block devices (ZeroFS)
-- **Overlay** — VXLAN, VPCs, security groups, private DNS
-- **Control Plane** — Raft consensus + SWIM gossip, embedded on every node
-- **IAM** — role-based access control and API keys
-- **Org** — multi-tenant organization/project/environment model
+- **Storage** — S3-backed block devices (ZeroFS), persistent volumes
+- **IAM** — role-based access control, API keys, service accounts
 - **Products** — managed databases, load balancers, composed from forge primitives
 
 See [handbook/ARCHITECTURE.md](handbook/ARCHITECTURE.md) for the full design.

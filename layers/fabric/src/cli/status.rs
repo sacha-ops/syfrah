@@ -20,7 +20,7 @@ pub async fn run(opts: StatusOpts) -> Result<()> {
     let state = store::load().map_err(|_| no_mesh_error())?;
 
     if opts.json {
-        return run_json(&state, &opts);
+        return run_json(&state, &opts).await;
     }
 
     // ── Uptime (computed early for the Mesh box) ────────────────────
@@ -95,6 +95,49 @@ pub async fn run(opts: StatusOpts) -> Result<()> {
         ui::info_line("Gateway", "disabled");
     }
     println!();
+
+    // ── Control Plane status ────────────────────────────────────────
+    {
+        let cp_url = format!("http://[{}]:7200/raft/status", state.mesh_ipv6);
+        let cp_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .ok();
+
+        let cp_status = if let Some(client) = cp_client {
+            client.get(&cp_url).send().await.ok()
+        } else {
+            None
+        };
+
+        match cp_status {
+            Some(resp) if resp.status().is_success() => {
+                if let Ok(raft_status) = resp
+                    .json::<syfrah_controlplane::server::RaftStatusResponse>()
+                    .await
+                {
+                    let role = if raft_status.current_leader == Some(raft_status.id) {
+                        "leader"
+                    } else if raft_status
+                        .member_details
+                        .iter()
+                        .any(|m| m.node_id == raft_status.id && m.role == "learner")
+                    {
+                        "learner"
+                    } else {
+                        "voter"
+                    };
+                    ui::health_ok(&format!(
+                        "Control Plane: joined ({role}, term {})",
+                        raft_status.current_term
+                    ));
+                }
+            }
+            _ => {
+                ui::info_line("Control Plane", "not available (bootstrap mode)");
+            }
+        }
+    }
 
     // TODO(#644): Add compute summary (runtime type, VM count, running VMs)
     // to fabric status output. This requires cross-layer integration:
@@ -268,7 +311,7 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-fn run_json(state: &store::NodeState, opts: &StatusOpts) -> Result<()> {
+async fn run_json(state: &store::NodeState, opts: &StatusOpts) -> Result<()> {
     let daemon_pid = store::daemon_running();
     let iface_up = wg::interface_summary()
         .map(|s| s.public_key.is_some())
@@ -304,6 +347,56 @@ fn run_json(state: &store::NodeState, opts: &StatusOpts) -> Result<()> {
 
     let gw = config::load_gateway_config();
 
+    // Probe control plane status for JSON output.
+    let control_plane = {
+        let cp_url = format!("http://[{}]:7200/raft/status", state.mesh_ipv6);
+        let cp_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .ok();
+
+        if let Some(client) = cp_client {
+            if let Ok(resp) = client.get(&cp_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(raft_status) = resp
+                        .json::<syfrah_controlplane::server::RaftStatusResponse>()
+                        .await
+                    {
+                        let role = if raft_status.current_leader == Some(raft_status.id) {
+                            "leader"
+                        } else if raft_status
+                            .member_details
+                            .iter()
+                            .any(|m| m.node_id == raft_status.id && m.role == "learner")
+                        {
+                            "learner"
+                        } else {
+                            "voter"
+                        };
+                        Some(JsonControlPlane {
+                            joined: true,
+                            role: Some(role.to_string()),
+                            term: Some(raft_status.current_term),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    .unwrap_or(JsonControlPlane {
+        joined: false,
+        role: None,
+        term: None,
+    });
+
     let output = StatusJson {
         mesh_name: &state.mesh_name,
         node_name: &state.node_name,
@@ -321,6 +414,7 @@ fn run_json(state: &store::NodeState, opts: &StatusOpts) -> Result<()> {
         secret: secret_display,
         traffic_rx: rx,
         traffic_tx: tx,
+        control_plane,
         gateway: JsonGateway {
             enabled: gw.enabled,
             port: if gw.enabled {
@@ -368,9 +462,19 @@ struct StatusJson<'a> {
     secret: String,
     traffic_rx: u64,
     traffic_tx: u64,
+    control_plane: JsonControlPlane,
     gateway: JsonGateway,
     metrics: JsonMetrics,
     config: JsonConfig,
+}
+
+#[derive(Serialize)]
+struct JsonControlPlane {
+    joined: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    term: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -450,6 +554,11 @@ mod tests {
             secret: "abc***".to_string(),
             traffic_rx: 1024,
             traffic_tx: 2048,
+            control_plane: JsonControlPlane {
+                joined: true,
+                role: Some("voter".to_string()),
+                term: Some(3),
+            },
             gateway: JsonGateway {
                 enabled: true,
                 port: Some(8080),
@@ -483,6 +592,9 @@ mod tests {
         assert_eq!(val["interface_up"], true);
         assert_eq!(val["peers_total"], 3);
         assert_eq!(val["peers_active"], 2);
+        assert_eq!(val["control_plane"]["joined"], true);
+        assert_eq!(val["control_plane"]["role"], "voter");
+        assert_eq!(val["control_plane"]["term"], 3);
         assert_eq!(val["peers_unreachable"], 1);
         assert_eq!(val["traffic_rx"], 1024);
         assert_eq!(val["traffic_tx"], 2048);
@@ -511,6 +623,11 @@ mod tests {
             secret: "***".to_string(),
             traffic_rx: 0,
             traffic_tx: 0,
+            control_plane: JsonControlPlane {
+                joined: false,
+                role: None,
+                term: None,
+            },
             gateway: JsonGateway {
                 enabled: false,
                 port: None,
@@ -541,5 +658,9 @@ mod tests {
         assert_eq!(val["gateway"]["enabled"], false);
         // port should be omitted (skip_serializing_if)
         assert!(val["gateway"].get("port").is_none());
+        assert_eq!(val["control_plane"]["joined"], false);
+        // role and term should be omitted (skip_serializing_if)
+        assert!(val["control_plane"].get("role").is_none());
+        assert!(val["control_plane"].get("term").is_none());
     }
 }
