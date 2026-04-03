@@ -1,11 +1,20 @@
-//! CLI commands for `syfrah volume ...`.
+//! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
-//! Provides subcommands for volume lifecycle management. Each handler
-//! communicates with the daemon via the control socket.
+//! Provides subcommands for volume lifecycle management and storage-layer
+//! utilities (e.g. ZeroFS version). Each handler communicates with the
+//! daemon via the control socket.
 
 pub mod volume;
 
 use clap::Subcommand;
+
+/// Top-level `syfrah storage` command.
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    /// Show ZeroFS binary version and path
+    #[command(after_help = "Examples:\n  syfrah storage version")]
+    Version,
+}
 
 /// Top-level volume CLI command.
 #[derive(Debug, Subcommand)]
@@ -159,6 +168,39 @@ pub async fn run(cmd: VolumeCommand) -> anyhow::Result<()> {
                 no_deletion_protection,
             )
             .await
+        }
+    }
+}
+
+/// Execute a `syfrah storage` subcommand.
+pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
+    match cmd {
+        StorageCommand::Version => {
+            let pinned = crate::binary::pinned_version();
+            println!("zerofs pinned version: {pinned}");
+
+            match crate::binary::resolve_binary(None) {
+                Ok(path) => {
+                    println!("zerofs binary: {}", path.display());
+                    match crate::binary::check_version(&path) {
+                        Ok(ver) => {
+                            println!("zerofs disk version: {ver}");
+                            if ver != pinned {
+                                eprintln!(
+                                    "warning: zerofs version mismatch — pinned {pinned}, found {ver}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("warning: could not determine zerofs version: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("zerofs binary: not found ({e})");
+                }
+            }
+            Ok(())
         }
     }
 }
