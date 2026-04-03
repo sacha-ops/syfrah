@@ -4,7 +4,7 @@
 //! provides:
 //!
 //! - [`CacheConfig`] — SSD path, SSD size limit, memory limit
-//! - [`VolumeCacheDir`] — per-volume cache directory at `{ssd_path}/vol-{id}/`
+//! - [`VolumeCacheDir`] — per-volume cache directory at `{ssd_path}/{id}/`
 //! - [`CacheDiskInfo`] — disk space information for the cache device
 //! - Validation of cache disk (exists, has sufficient space)
 //! - Path-traversal protection when constructing volume cache directories
@@ -59,7 +59,7 @@ pub struct CacheDiskInfo {
 // VolumeCacheDir
 // ---------------------------------------------------------------------------
 
-/// Manages a per-volume cache directory at `{ssd_path}/vol-{volume_id}/`.
+/// Manages a per-volume cache directory at `{ssd_path}/{volume_id}/`.
 ///
 /// SECURITY: The volume ID is validated against path-traversal attacks before
 /// any filesystem operations.
@@ -206,7 +206,7 @@ pub fn validate_cache_disk(path: &Path) -> Result<CacheDiskInfo, CacheError> {
     disk_space(path)
 }
 
-/// Create a per-volume cache directory at `{ssd_path}/vol-{volume_id}/`.
+/// Create a per-volume cache directory at `{ssd_path}/{volume_id}/`.
 ///
 /// Validates:
 /// 1. `volume_id` does not contain path-traversal characters
@@ -232,8 +232,7 @@ pub fn create_volume_cache(
         });
     }
 
-    let dir_name = format!("vol-{volume_id}");
-    let cache_dir = config.ssd_path.join(&dir_name);
+    let cache_dir = config.ssd_path.join(volume_id);
 
     fs::create_dir_all(&cache_dir).map_err(|e| CacheError::CreateDir {
         path: cache_dir.display().to_string(),
@@ -277,8 +276,7 @@ pub fn create_volume_cache(
 pub fn cleanup_volume_cache(config: &CacheConfig, volume_id: &str) -> Result<(), CacheError> {
     validate_volume_id(volume_id)?;
 
-    let dir_name = format!("vol-{volume_id}");
-    let cache_dir = config.ssd_path.join(&dir_name);
+    let cache_dir = config.ssd_path.join(volume_id);
 
     if !cache_dir.exists() {
         return Ok(());
@@ -300,7 +298,7 @@ pub fn cleanup_volume_cache(config: &CacheConfig, volume_id: &str) -> Result<(),
 ///
 /// Returns arguments suitable for passing to the `zerofs` binary:
 /// ```text
-/// --cache-dir {ssd_path}/vol-{volume_id}/
+/// --cache-dir {ssd_path}/{volume_id}/
 /// --cache-size {ssd_size_gb}
 /// --memory-size {memory_size_gb}
 /// ```
@@ -311,8 +309,7 @@ pub fn cleanup_volume_cache(config: &CacheConfig, volume_id: &str) -> Result<(),
 pub fn zerofs_cache_args(config: &CacheConfig, volume_id: &str) -> Result<Vec<String>, CacheError> {
     validate_volume_id(volume_id)?;
 
-    let dir_name = format!("vol-{volume_id}");
-    let cache_dir = config.ssd_path.join(&dir_name);
+    let cache_dir = config.ssd_path.join(volume_id);
 
     Ok(vec![
         "--cache-dir".to_string(),
@@ -541,9 +538,7 @@ mod tests {
         let vol_cache = create_volume_cache(&config, "vol-01JA0000000000000000000000").unwrap();
         assert!(vol_cache.path().exists());
         assert!(vol_cache.path().is_dir());
-        assert!(vol_cache
-            .path()
-            .ends_with("vol-vol-01JA0000000000000000000000"));
+        assert!(vol_cache.path().ends_with("vol-01JA0000000000000000000000"));
 
         // Cleanup
         cleanup_volume_cache(&config, "vol-01JA0000000000000000000000").unwrap();
@@ -610,7 +605,7 @@ mod tests {
         let args = zerofs_cache_args(&config, "vol-01JA0000000000000000000000").unwrap();
         assert_eq!(args.len(), 6);
         assert_eq!(args[0], "--cache-dir");
-        assert_eq!(args[1], "/mnt/cache/vol-vol-01JA0000000000000000000000");
+        assert_eq!(args[1], "/mnt/cache/vol-01JA0000000000000000000000");
         assert_eq!(args[2], "--cache-size");
         assert_eq!(args[3], "200");
         assert_eq!(args[4], "--memory-size");
