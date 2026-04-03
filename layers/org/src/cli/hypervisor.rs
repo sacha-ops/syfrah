@@ -147,6 +147,10 @@ pub async fn run_register(region: String, zone: String) -> anyhow::Result<()> {
             println!("Hypervisor '{}' registered ({}).", hv.name, hv.id);
             Ok(())
         }
+        HypervisorResponse::Ok => {
+            println!("Hypervisor registered.");
+            Ok(())
+        }
         HypervisorResponse::Error(msg) => anyhow::bail!("{msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
