@@ -1135,54 +1135,74 @@ async fn create_instance_handler(
         let _ = task_store.start_task(&task_id);
     }
 
-    // Resolve subnet if specified.
+    // Resolve subnet if specified, with retry for Raft replication lag.
     let subnet_info = if let Some(ref subnet_name) = req.subnet {
         if let Some(ref org_store) = state.org_store {
-            match org_store.find_subnets_by_name(subnet_name) {
-                Ok(matches) if !matches.is_empty() => {
-                    let (_vpc_name, subnet) = &matches[0];
-                    Some(syfrah_compute::types::SubnetInfo {
-                        name: subnet.name.clone(),
-                        cidr: subnet.cidr.clone(),
-                        gateway: subnet.gateway.clone(),
-                        vpc_id: subnet.vpc_id.0.clone(),
-                        env_id: subnet.env_id.0.clone(),
-                    })
-                }
-                Ok(_) => {
-                    // Release capacity reservation on error.
-                    if let Some(ref capacity) = state.capacity {
-                        capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+            let mut resolved = None;
+            let mut last_err = None;
+            for attempt in 0..5u32 {
+                match org_store.find_subnets_by_name(subnet_name) {
+                    Ok(matches) if !matches.is_empty() => {
+                        let (_vpc_name, subnet) = &matches[0];
+                        resolved = Some(syfrah_compute::types::SubnetInfo {
+                            name: subnet.name.clone(),
+                            cidr: subnet.cidr.clone(),
+                            gateway: subnet.gateway.clone(),
+                            vpc_id: subnet.vpc_id.0.clone(),
+                            env_id: subnet.env_id.0.clone(),
+                        });
+                        break;
                     }
-                    if let Some(ref task_store) = state.task_store {
-                        let _ = task_store.fail_task(&task_id, "subnet not found");
+                    Ok(_) => {
+                        if attempt < 4 {
+                            warn!(
+                                subnet = %subnet_name,
+                                attempt = attempt + 1,
+                                "subnet not found — Raft may not have replicated yet. Retrying..."
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
                     }
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "code": "FORGE_SUBNET_NOT_FOUND",
-                            "message": format!("subnet '{}' not found", subnet_name),
-                            "task_id": task_id,
-                        })),
-                    );
-                }
-                Err(e) => {
-                    if let Some(ref capacity) = state.capacity {
-                        capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
                     }
-                    if let Some(ref task_store) = state.task_store {
-                        let _ = task_store.fail_task(&task_id, &e.to_string());
-                    }
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "code": "FORGE_SUBNET_RESOLVE_FAILED",
-                            "message": e.to_string(),
-                            "task_id": task_id,
-                        })),
-                    );
                 }
             }
+            if let Some(err) = last_err {
+                if let Some(ref capacity) = state.capacity {
+                    capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+                }
+                if let Some(ref task_store) = state.task_store {
+                    let _ = task_store.fail_task(&task_id, &err.to_string());
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "code": "FORGE_SUBNET_RESOLVE_FAILED",
+                        "message": err.to_string(),
+                        "task_id": task_id,
+                    })),
+                );
+            }
+            if resolved.is_none() {
+                // Release capacity reservation on error.
+                if let Some(ref capacity) = state.capacity {
+                    capacity.release(&req.name, req.vcpus, req.memory_mb as u64);
+                }
+                if let Some(ref task_store) = state.task_store {
+                    let _ = task_store.fail_task(&task_id, "subnet not found");
+                }
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "code": "FORGE_SUBNET_NOT_FOUND",
+                        "message": format!("subnet '{}' not found after 5 retries", subnet_name),
+                        "task_id": task_id,
+                    })),
+                );
+            }
+            resolved
         } else {
             warn!("forge: subnet requested but org store not available");
             None

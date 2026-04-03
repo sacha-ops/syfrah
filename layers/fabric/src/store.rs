@@ -696,6 +696,11 @@ fn pid_file() -> PathBuf {
     state_dir().join("daemon.pid")
 }
 
+/// Public accessor for the PID file path.
+pub fn pid_path() -> PathBuf {
+    pid_file()
+}
+
 /// Write the current process PID to the PID file with exclusive flock.
 ///
 /// Uses flock(LOCK_EX | LOCK_NB) to prevent two daemons from running
