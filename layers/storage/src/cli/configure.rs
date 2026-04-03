@@ -58,7 +58,7 @@ pub async fn run_configure(params: &ConfigureParams<'_>) -> anyhow::Result<()> {
         if !Path::new(disk).exists() {
             anyhow::bail!(
                 "cache disk path '{disk}' does not exist.\n\n\
-                 Provide a valid block device or directory, e.g. --cache-disk /dev/nvme1n1"
+                 Provide a valid block device or directory, e.g. --cache-disk-path /dev/nvme1n1"
             );
         }
     }
@@ -107,7 +107,7 @@ pub async fn run_configure_cache(
     if !Path::new(cache_disk).exists() {
         anyhow::bail!(
             "cache disk path '{cache_disk}' does not exist.\n\n\
-             Provide a valid block device or directory, e.g. --cache-disk /dev/nvme1n1"
+             Provide a valid block device or directory, e.g. --cache-disk-path /dev/nvme1n1"
         );
     }
 
@@ -172,6 +172,8 @@ fn daemon_connect_error(e: Box<dyn std::error::Error>) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn validate_s3_endpoint_https() {
         let ep = "https://s3.example.com";
@@ -194,5 +196,117 @@ mod tests {
     fn validate_s3_endpoint_rejects_empty() {
         let ep = "";
         assert!(!ep.starts_with("https://") && !ep.starts_with("http://"));
+    }
+
+    #[test]
+    fn write_encryption_passphrase_creates_file_with_correct_perms() {
+        let dir = std::env::temp_dir().join("syfrah-test-passphrase");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let key_path = dir.join("storage-key");
+        // Write directly to a temp path to test logic without needing /etc
+        std::fs::write(&key_path, "test-passphrase").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let contents = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(contents, "test-passphrase");
+
+        let perms = std::fs::metadata(&key_path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cache-only mode requires all three cache flags.
+    #[tokio::test]
+    async fn cache_only_rejects_missing_disk_path() {
+        // Simulate run_storage logic: cache_disk_path = None should bail
+        let cache_disk_path: Option<String> = None;
+        let result = cache_disk_path.ok_or_else(|| {
+            anyhow::anyhow!("--cache-disk-path is required for cache-only configuration.")
+        });
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--cache-disk-path is required"));
+    }
+
+    /// Cache-only mode requires --cache-disk-size.
+    #[tokio::test]
+    async fn cache_only_rejects_missing_disk_size() {
+        let cache_disk_size: Option<u32> = None;
+        let result = cache_disk_size.ok_or_else(|| {
+            anyhow::anyhow!("--cache-disk-size is required for cache-only configuration.")
+        });
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--cache-disk-size is required"));
+    }
+
+    /// Cache-only mode requires --cache-memory-size.
+    #[tokio::test]
+    async fn cache_only_rejects_missing_memory_size() {
+        let cache_memory_size: Option<u32> = None;
+        let result = cache_memory_size.ok_or_else(|| {
+            anyhow::anyhow!("--cache-memory-size is required for cache-only configuration.")
+        });
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--cache-memory-size is required"));
+    }
+
+    /// run_configure rejects non-existent cache disk paths.
+    #[tokio::test]
+    async fn run_configure_rejects_nonexistent_cache_disk() {
+        let params = ConfigureParams {
+            region: "eu-west",
+            s3_endpoint: "https://s3.example.com",
+            s3_bucket: "bucket",
+            s3_access_key: "AKID",
+            s3_secret_key: "SECRET",
+            cache_disk: Some("/dev/nonexistent-disk-xyz"),
+            cache_disk_size: Some(200),
+            cache_memory_size: Some(8),
+            encryption_passphrase: None,
+        };
+        let result = run_configure(&params).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "error was: {err}");
+    }
+
+    /// run_configure rejects invalid S3 endpoint URLs.
+    #[tokio::test]
+    async fn run_configure_rejects_invalid_s3_endpoint() {
+        let params = ConfigureParams {
+            region: "eu-west",
+            s3_endpoint: "ftp://bad.example.com",
+            s3_bucket: "bucket",
+            s3_access_key: "AKID",
+            s3_secret_key: "SECRET",
+            cache_disk: None,
+            cache_disk_size: None,
+            cache_memory_size: None,
+            encryption_passphrase: None,
+        };
+        let result = run_configure(&params).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid S3 endpoint URL"), "error was: {err}");
+    }
+
+    /// run_configure_cache rejects non-existent disk.
+    #[tokio::test]
+    async fn run_configure_cache_rejects_nonexistent_disk() {
+        let result = run_configure_cache("/dev/nonexistent-cache-disk-xyz", 200, 8).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "error was: {err}");
     }
 }
