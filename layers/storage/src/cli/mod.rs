@@ -117,6 +117,35 @@ pub enum VolumeCommand {
         #[arg(long, conflicts_with = "deletion_protection")]
         no_deletion_protection: bool,
     },
+    /// Attach a volume to a VM
+    #[command(after_help = "Examples:\n  \
+            syfrah volume attach pgdata --vm web-1\n  \
+            syfrah volume attach pgdata --vm web-1 --project backend")]
+    Attach {
+        /// Volume name
+        name: String,
+        /// VM to attach the volume to
+        #[arg(long)]
+        vm: String,
+        /// Project the volume belongs to (auto-detected if name is unique)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Detach a volume from its VM
+    #[command(after_help = "Examples:\n  \
+            syfrah volume detach pgdata\n  \
+            syfrah volume detach pgdata --force\n  \
+            syfrah volume detach pgdata --project backend")]
+    Detach {
+        /// Volume name
+        name: String,
+        /// Project the volume belongs to (auto-detected if name is unique)
+        #[arg(long)]
+        project: Option<String>,
+        /// Force detach even if the VM is still running
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Top-level storage CLI command (`syfrah storage ...`).
@@ -403,6 +432,14 @@ pub async fn run(cmd: VolumeCommand) -> anyhow::Result<()> {
             )
             .await
         }
+        VolumeCommand::Attach { name, vm, project } => {
+            volume::run_attach(&name, &vm, project.as_deref()).await
+        }
+        VolumeCommand::Detach {
+            name,
+            project,
+            force,
+        } => volume::run_detach(&name, project.as_deref(), force).await,
     }
 }
 

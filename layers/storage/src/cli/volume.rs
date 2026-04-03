@@ -313,6 +313,56 @@ pub async fn run_update(
     }
 }
 
+/// Attach a volume to a VM.
+pub async fn run_attach(name: &str, vm: &str, project: Option<&str>) -> anyhow::Result<()> {
+    let req = StorageRequest::AttachVolume {
+        name: name.to_string(),
+        vm: vm.to_string(),
+        project: project.map(|s| s.to_string()),
+    };
+    let resp = send_storage_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_connect_error)?;
+
+    match resp {
+        StorageResponse::Volume(v) => {
+            let attached_vm = v["attached_to"].as_str().unwrap_or(vm);
+            println!("Volume '{name}' attached to VM '{attached_vm}'.");
+            Ok(())
+        }
+        StorageResponse::Error(msg) => {
+            // Surface clear messages for invalid-state errors from the daemon.
+            anyhow::bail!("{msg}")
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Detach a volume from its VM.
+pub async fn run_detach(name: &str, project: Option<&str>, force: bool) -> anyhow::Result<()> {
+    let req = StorageRequest::DetachVolume {
+        name: name.to_string(),
+        project: project.map(|s| s.to_string()),
+        force,
+    };
+    let resp = send_storage_request(&control_socket_path(), &req)
+        .await
+        .map_err(daemon_connect_error)?;
+
+    match resp {
+        StorageResponse::Volume(_) | StorageResponse::Ok => {
+            let extra = if force { " (forced)" } else { "" };
+            println!("Volume '{name}' detached{extra}.");
+            Ok(())
+        }
+        StorageResponse::Error(msg) => {
+            // Surface clear messages for invalid-state errors from the daemon.
+            anyhow::bail!("{msg}")
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -594,6 +644,78 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_parse() {
+        let cmd = parse(&["attach", "pgdata", "--vm", "web-1"]);
+        match cmd {
+            VolumeCommand::Attach { name, vm, project } => {
+                assert_eq!(name, "pgdata");
+                assert_eq!(vm, "web-1");
+                assert!(project.is_none());
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_with_project() {
+        let cmd = parse(&["attach", "pgdata", "--vm", "web-1", "--project", "backend"]);
+        match cmd {
+            VolumeCommand::Attach { name, vm, project } => {
+                assert_eq!(name, "pgdata");
+                assert_eq!(vm, "web-1");
+                assert_eq!(project.as_deref(), Some("backend"));
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_detach_parse() {
+        let cmd = parse(&["detach", "pgdata"]);
+        match cmd {
+            VolumeCommand::Detach {
+                name,
+                project,
+                force,
+            } => {
+                assert_eq!(name, "pgdata");
+                assert!(project.is_none());
+                assert!(!force);
+            }
+            other => panic!("expected Detach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_detach_with_force() {
+        let cmd = parse(&["detach", "pgdata", "--force"]);
+        match cmd {
+            VolumeCommand::Detach { name, force, .. } => {
+                assert_eq!(name, "pgdata");
+                assert!(force);
+            }
+            other => panic!("expected Detach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_detach_with_project() {
+        let cmd = parse(&["detach", "pgdata", "--project", "backend", "--force"]);
+        match cmd {
+            VolumeCommand::Detach {
+                name,
+                project,
+                force,
+            } => {
+                assert_eq!(name, "pgdata");
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert!(force);
+            }
+            other => panic!("expected Detach, got {other:?}"),
         }
     }
 }
