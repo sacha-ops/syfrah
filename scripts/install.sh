@@ -390,10 +390,42 @@ fi
 
 # --- Create data directories ------------------------------------------------
 
-mkdir -p /opt/syfrah/images
-mkdir -p /opt/syfrah/instances
-# Note: /run/syfrah/vms (VM runtime state) lives on tmpfs and is recreated on
-# boot by the syfrah daemon (VmManager::new). No need to create it here.
+mkdir -p /opt/syfrah/images /opt/syfrah/kernels /opt/syfrah/instances /run/syfrah/vms /usr/local/lib/syfrah
+
+# --- Install prerequisites --------------------------------------------------
+
+# WireGuard (required for fabric mesh)
+if ! command -v wg > /dev/null 2>&1; then
+  start_spinner "Installing wireguard-tools..."
+  if apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq wireguard-tools > /dev/null 2>&1; then
+    stop_spinner "Installed wireguard-tools"
+  elif yum install -y wireguard-tools > /dev/null 2>&1; then
+    stop_spinner "Installed wireguard-tools"
+  else
+    stop_spinner "Could not install wireguard-tools — install manually" fail
+  fi
+fi
+
+# Load WireGuard kernel module
+modprobe wireguard 2>/dev/null || true
+
+# nftables (required for security groups, NAT, anti-spoofing)
+if ! command -v nft > /dev/null 2>&1; then
+  start_spinner "Installing nftables..."
+  if apt-get install -y -qq nftables > /dev/null 2>&1; then
+    stop_spinner "Installed nftables"
+  elif yum install -y nftables > /dev/null 2>&1; then
+    stop_spinner "Installed nftables"
+  else
+    stop_spinner "Could not install nftables — install manually" fail
+  fi
+fi
+
+# Container runtime check (informational)
+if ! command -v crun > /dev/null 2>&1 && ! command -v cloud-hypervisor > /dev/null 2>&1; then
+  printf "  %b %s\n" "\342\232\240" "No compute runtime found. Install crun for containers:"
+  printf "    apt-get install -y crun\n"
+fi
 
 # --- Verify -----------------------------------------------------------------
 
