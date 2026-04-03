@@ -21,6 +21,7 @@ anyhow.workspace = true
 libc = "0.2"
 thiserror.workspace = true
 tokio.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

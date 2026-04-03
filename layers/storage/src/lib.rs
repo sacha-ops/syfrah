@@ -2,6 +2,8 @@ pub mod api;
 pub mod binary;
 pub mod cache;
 pub mod cli;
+pub mod nbd;
+pub mod volume_mgr;
 
 pub use api::{
     send_storage_request, StorageHealthReport, StorageLayerHandler, StorageRequest,
@@ -12,3 +14,4 @@ pub use cache::{
     CacheDiskInfo, CacheError, VolumeCacheDir,
 };
 pub use cli::{StorageCommand, VolumeCommand};
+pub use volume_mgr::{CacheConfig, S3Config, VolumeMgr, VolumeMgrError};
