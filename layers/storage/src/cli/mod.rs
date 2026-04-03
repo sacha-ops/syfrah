@@ -185,10 +185,8 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
                     match crate::binary::check_version(&path) {
                         Ok(ver) => {
                             println!("zerofs disk version: {ver}");
-                            if ver != pinned {
-                                eprintln!(
-                                    "warning: zerofs version mismatch — pinned {pinned}, found {ver}"
-                                );
+                            if let Err(msg) = crate::binary::verify_version(&path) {
+                                eprintln!("warning: {msg}");
                             }
                         }
                         Err(e) => {

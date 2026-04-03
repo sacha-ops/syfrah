@@ -30,8 +30,8 @@ pub enum ZerofsError {
 ///
 /// Resolution order:
 /// 1. `explicit` path (if provided, must exist and be executable)
-/// 2. `zerofs` on `$PATH` (via `which`)
-/// 3. `/usr/local/lib/syfrah/zerofs` (standard install location)
+/// 2. `/usr/local/lib/syfrah/zerofs` (standard install location)
+/// 3. `zerofs` on `$PATH` (via `which`)
 ///
 /// Returns the first match or an error if none found.
 pub fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf, ZerofsError> {
@@ -48,7 +48,13 @@ pub fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf, ZerofsError> {
         // File exists but is not executable — fall through.
     }
 
-    // 2. Search $PATH via `which`
+    // 2. Standard installation path
+    let installed = PathBuf::from("/usr/local/lib/syfrah/zerofs");
+    if is_executable(&installed) {
+        return Ok(installed);
+    }
+
+    // 3. Search $PATH via `which`
     if let Ok(output) = std::process::Command::new("which").arg("zerofs").output() {
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout);
@@ -57,12 +63,6 @@ pub fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf, ZerofsError> {
                 return Ok(path);
             }
         }
-    }
-
-    // 3. Standard installation path
-    let installed = PathBuf::from("/usr/local/lib/syfrah/zerofs");
-    if is_executable(&installed) {
-        return Ok(installed);
     }
 
     Err(ZerofsError::NotFound {
@@ -263,5 +263,51 @@ mod tests {
     #[test]
     fn is_executable_on_nonexistent_path() {
         assert!(!is_executable(Path::new("/does/not/exist")));
+    }
+
+    #[test]
+    fn verify_version_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = make_fake_binary(
+            tmp.path(),
+            "zerofs-match",
+            &format!("zerofs {PINNED_VERSION}"),
+        );
+        let result = verify_version(&bin);
+        assert!(
+            result.is_ok(),
+            "verify_version should succeed when versions match: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_version_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = make_fake_binary(tmp.path(), "zerofs-mismatch", "zerofs v99.99.99");
+        let result = verify_version(&bin);
+        match result {
+            Err(msg) => {
+                assert!(
+                    msg.contains("mismatch"),
+                    "error should mention mismatch: {msg}"
+                );
+            }
+            Ok(()) => panic!("verify_version should return Err on mismatch"),
+        }
+    }
+
+    #[test]
+    fn resolve_binary_none_not_found() {
+        // With no explicit path and no zerofs installed, resolve_binary(None) should error.
+        // We rely on the test environment not having zerofs at /usr/local/lib/syfrah/zerofs
+        // or on $PATH.
+        let result = resolve_binary(None);
+        // This test is environment-dependent; if zerofs happens to be installed, skip.
+        if let Err(err) = result {
+            assert!(
+                matches!(err, ZerofsError::NotFound { .. }),
+                "expected NotFound, got: {err}"
+            );
+        }
     }
 }
