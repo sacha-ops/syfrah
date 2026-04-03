@@ -171,6 +171,9 @@ pub struct FullSnapshotData {
     /// Raw table data: table_name -> Vec<(key, json_bytes)>.
     /// Uses base64-encoded bytes for JSON compatibility.
     pub tables: HashMap<String, Vec<(String, Vec<u8>)>>,
+    /// In-memory volume records (not yet in redb).
+    #[serde(default)]
+    pub volumes: Vec<VolumeRecord>,
 }
 
 /// Raft state machine that dispatches commands to the OrgStore.
@@ -1584,9 +1587,11 @@ impl RaftSnapshotBuilder<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         let tables = self.export_store_tables();
         let table_count: usize = tables.values().map(|v| v.len()).sum();
 
+        let volumes = self.volume_store.export_all();
         let full_data = FullSnapshotData {
             sm_state: (*sm_state).clone(),
             tables,
+            volumes,
         };
 
         let data = serde_json::to_vec(&full_data)
@@ -1714,9 +1719,14 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
             // Restore all store tables from the snapshot.
             let table_count: usize = full.tables.values().map(|v| v.len()).sum();
             self.import_store_tables(&full.tables);
+
+            // Restore in-memory volume records.
+            let volume_count = full.volumes.len();
+            self.volume_store.import_all(full.volumes);
+
             info!(
                 table_entries = table_count,
-                "snapshot: restored store tables from full snapshot"
+                volume_count, "snapshot: restored store tables and volumes from full snapshot"
             );
 
             // Emit PlacementEvent::Added for every placement in the restored
