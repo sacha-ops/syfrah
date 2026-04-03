@@ -18,7 +18,7 @@ use openraft::{EntryPayload, OptionalSend};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::commands::{StateMachineCommand, StateMachineResponse};
+use crate::commands::{StateMachineCommand, StateMachineResponse, StorageConfig};
 use crate::types::SyfrahRaftConfig;
 
 /// Default number of log entries between snapshots.
@@ -74,6 +74,10 @@ pub struct FullSnapshotData {
     /// Raw table data: table_name -> Vec<(key, json_bytes)>.
     /// Uses base64-encoded bytes for JSON compatibility.
     pub tables: HashMap<String, Vec<(String, Vec<u8>)>>,
+    /// Per-region storage configuration (region -> StorageConfig).
+    /// Stored in-memory until a dedicated redb table is added.
+    #[serde(default)]
+    pub storage_configs: HashMap<String, StorageConfig>,
 }
 
 /// Raft state machine that dispatches commands to the OrgStore.
@@ -99,6 +103,13 @@ pub struct RedbStateMachine {
     pub entries_since_snapshot: AtomicU64,
     /// Configurable snapshot threshold (default: 10,000 log entries).
     pub snapshot_threshold: u64,
+    /// Per-region storage configuration (region name -> StorageConfig).
+    /// Stored in-memory and serialized into snapshots. Will migrate to redb
+    /// once a dedicated storage table is added.
+    ///
+    /// Uses `std::sync::RwLock` (not tokio) because `apply_command` is
+    /// synchronous and called from the Raft apply loop.
+    storage_configs: std::sync::RwLock<HashMap<String, StorageConfig>>,
 }
 
 impl RedbStateMachine {
@@ -118,6 +129,7 @@ impl RedbStateMachine {
             snapshot_count: AtomicU64::new(0),
             entries_since_snapshot: AtomicU64::new(0),
             snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+            storage_configs: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -305,6 +317,15 @@ impl RedbStateMachine {
     pub fn with_placement_tx(mut self, tx: tokio::sync::broadcast::Sender<PlacementEvent>) -> Self {
         self.placement_tx = tx;
         self
+    }
+
+    /// Retrieve the storage configuration for a given region.
+    ///
+    /// This is a local read — it does not go through Raft consensus.
+    /// Returns `None` if no config has been set for the region.
+    pub fn get_storage_config(&self, region: &str) -> Option<StorageConfig> {
+        let configs = self.storage_configs.read().unwrap();
+        configs.get(region).cloned()
     }
 
     /// Apply a single command to the state machine.
@@ -1300,7 +1321,24 @@ impl RedbStateMachine {
                 StateMachineResponse::Composite(results)
             }
 
-            // Storage commands (ADR-006 §16) — apply handler is #1181.
+            // -- Storage: SetStorageConfig (ADR-006 §9) --
+            StateMachineCommand::SetStorageConfig { region, config } => {
+                // Validate the config before storing.
+                if let Err(msg) = config.validate() {
+                    return StateMachineResponse::Error(format!(
+                        "invalid storage config for region {region}: {msg}"
+                    ));
+                }
+                if region.is_empty() {
+                    return StateMachineResponse::Error("region must not be empty".to_string());
+                }
+                let mut configs = self.storage_configs.write().unwrap();
+                configs.insert(region.clone(), *config.clone());
+                info!(region = %region, "storage config set");
+                StateMachineResponse::Ok
+            }
+
+            // Storage commands (ADR-006 §16) — remaining handlers are #1181.
             StateMachineCommand::CreateVolume { .. }
             | StateMachineCommand::DeleteVolume { .. }
             | StateMachineCommand::AttachVolume { .. }
@@ -1309,7 +1347,6 @@ impl RedbStateMachine {
             | StateMachineCommand::CreateSnapshot { .. }
             | StateMachineCommand::DeleteSnapshot { .. }
             | StateMachineCommand::RestoreSnapshot { .. }
-            | StateMachineCommand::SetStorageConfig { .. }
             | StateMachineCommand::SetStorageQuota { .. } => {
                 // TODO(#1181): implement storage apply handler
                 StateMachineResponse::Error("storage commands not yet implemented".into())
@@ -1326,9 +1363,11 @@ impl RaftSnapshotBuilder<SyfrahRaftConfig> for Arc<RedbStateMachine> {
         let tables = self.export_store_tables();
         let table_count: usize = tables.values().map(|v| v.len()).sum();
 
+        let storage_configs = self.storage_configs.read().unwrap().clone();
         let full_data = FullSnapshotData {
             sm_state: (*sm_state).clone(),
             tables,
+            storage_configs,
         };
 
         let data = serde_json::to_vec(&full_data)
@@ -1486,6 +1525,14 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                         );
                     }
                 }
+            }
+
+            // Restore storage configs from the snapshot.
+            if !full.storage_configs.is_empty() {
+                let mut configs = self.storage_configs.write().unwrap();
+                let count = full.storage_configs.len();
+                *configs = full.storage_configs;
+                info!(regions = count, "snapshot: restored storage configs");
             }
 
             full.sm_state
@@ -1695,5 +1742,213 @@ mod tests {
         assert!(last.is_none());
         // Default membership should be empty.
         assert_eq!(membership.membership().voter_ids().count(), 0);
+    }
+
+    // -- StorageConfig tests (issue #1183) --
+
+    fn make_valid_storage_config() -> crate::commands::StorageConfig {
+        crate::commands::StorageConfig {
+            s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
+            s3_bucket: "syfrah-storage-eu".into(),
+            s3_access_key: "AKIAEXAMPLE".into(),
+            s3_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            cache_disk_path: "/dev/nvme1n1".into(),
+            cache_disk_size_gb: 200,
+            cache_memory_size_gb: 8,
+        }
+    }
+
+    #[test]
+    fn apply_set_storage_config() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let config = make_valid_storage_config();
+        let cmd = StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config.clone()),
+        };
+        let resp = sm.apply_command(&cmd);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        // Verify retrieval.
+        let got = sm.get_storage_config("eu-west").unwrap();
+        assert_eq!(got.s3_endpoint, config.s3_endpoint);
+        assert_eq!(got.s3_bucket, config.s3_bucket);
+        assert_eq!(got.s3_access_key, config.s3_access_key);
+        assert_eq!(got.s3_secret_key, config.s3_secret_key);
+        assert_eq!(got.cache_disk_path, config.cache_disk_path);
+        assert_eq!(got.cache_disk_size_gb, config.cache_disk_size_gb);
+        assert_eq!(got.cache_memory_size_gb, config.cache_memory_size_gb);
+    }
+
+    #[test]
+    fn apply_set_storage_config_overwrites() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let config1 = make_valid_storage_config();
+        let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config1),
+        });
+        // Update with a different bucket.
+        let mut config2 = make_valid_storage_config();
+        config2.s3_bucket = "new-bucket".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config2),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        let got = sm.get_storage_config("eu-west").unwrap();
+        assert_eq!(got.s3_bucket, "new-bucket");
+    }
+
+    #[test]
+    fn get_storage_config_returns_none_for_unknown_region() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        assert!(sm.get_storage_config("nonexistent").is_none());
+    }
+
+    #[test]
+    fn apply_set_storage_config_rejects_invalid_endpoint() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let mut config = make_valid_storage_config();
+        config.s3_endpoint = "ftp://wrong.example.com".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("s3_endpoint must start with https:// or http://"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_set_storage_config_rejects_empty_bucket() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let mut config = make_valid_storage_config();
+        config.s3_bucket = "".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn apply_set_storage_config_rejects_empty_region() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let config = make_valid_storage_config();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "".into(),
+            config: Box::new(config),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("region must not be empty"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_set_storage_config_rejects_empty_credentials() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Empty access key.
+        let mut config = make_valid_storage_config();
+        config.s3_access_key = "".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        // Empty secret key.
+        let mut config = make_valid_storage_config();
+        config.s3_secret_key = "".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn apply_set_storage_config_accepts_http_endpoint() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let mut config = make_valid_storage_config();
+        config.s3_endpoint = "http://minio.local:9000".into();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "local".into(),
+            config: Box::new(config),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[test]
+    fn storage_config_debug_does_not_leak_secrets() {
+        let config = make_valid_storage_config();
+        let debug_output = format!("{config:?}");
+        // SECURITY: The secret key must never appear in Debug output.
+        assert!(
+            !debug_output.contains(&config.s3_secret_key),
+            "s3_secret_key leaked in Debug output"
+        );
+        assert!(
+            !debug_output.contains("AKIAEXAMPLE"),
+            "s3_access_key leaked in Debug output"
+        );
+        // Verify it shows REDACTED instead.
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn storage_config_has_no_encryption_passphrase() {
+        // SECURITY: Verify that StorageConfig does not have an
+        // encryption_passphrase field. This is a compile-time guarantee
+        // enforced by the struct definition, but we also verify that
+        // the serialized form does not contain the word.
+        let config = make_valid_storage_config();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("encryption_passphrase"),
+            "StorageConfig must NOT contain encryption_passphrase (ADR-006 §9)"
+        );
+        assert!(
+            !json.contains("passphrase"),
+            "StorageConfig must NOT contain any passphrase field"
+        );
+    }
+
+    #[test]
+    fn storage_config_multiple_regions() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let mut config_eu = make_valid_storage_config();
+        config_eu.s3_bucket = "bucket-eu".into();
+        let mut config_us = make_valid_storage_config();
+        config_us.s3_bucket = "bucket-us".into();
+        config_us.s3_endpoint = "https://s3.us-east.example.com".into();
+        let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(config_eu),
+        });
+        let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "us-east".into(),
+            config: Box::new(config_us),
+        });
+        let eu = sm.get_storage_config("eu-west").unwrap();
+        let us = sm.get_storage_config("us-east").unwrap();
+        assert_eq!(eu.s3_bucket, "bucket-eu");
+        assert_eq!(us.s3_bucket, "bucket-us");
     }
 }
