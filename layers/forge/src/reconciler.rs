@@ -75,6 +75,8 @@ pub enum ResourceType {
     NatGateway = 5,
     Route = 6,
     Vm = 7,
+    /// Volume resources — cleaned up after VM teardown.
+    Volume = 8,
 }
 
 /// A reconciliation event — what changed and what action was taken.

@@ -354,9 +354,13 @@ pub enum StateMachineCommand {
         env_id: String,
         volume_type: VolumeType,
     },
-    /// Mark a volume for deletion. Volume must be Available (not attached).
+    /// Mark a volume for deletion (tombstone). Volume must be Available (not attached).
+    /// With `cascade: true`, all snapshots referencing this volume are deleted first.
     DeleteVolume {
         volume_id: String,
+        /// If true, delete all snapshots derived from this volume before deleting.
+        #[serde(default)]
+        cascade: bool,
     },
     /// Attach a volume to a VM on a specific hypervisor. Enforces the
     /// single-writer invariant — the volume must be Available.
@@ -409,6 +413,15 @@ pub enum StateMachineCommand {
         max_snapshots: u32,
     },
 
+    /// Purge volume tombstones older than `max_age_secs`.
+    /// Called periodically by a background task to clean up old Deleted records.
+    PurgeTombstones {
+        /// Current timestamp (seconds since epoch).
+        now: u64,
+        /// Maximum age in seconds before a tombstone is purged.
+        max_age_secs: u64,
+    },
+
     // -- Composite Transaction --
     /// Atomic batch of commands applied in a single Raft log entry.
     /// All sub-commands succeed or all fail. Used for placement transactions
@@ -436,7 +449,9 @@ impl std::fmt::Display for StateMachineCommand {
                 write!(f, "UpdateHypervisorCapacity({name})")
             }
             Self::CreateVolume { id, name, .. } => write!(f, "CreateVolume({id}, {name})"),
-            Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
+            Self::DeleteVolume { volume_id, cascade } => {
+                write!(f, "DeleteVolume({volume_id}, cascade={cascade})")
+            }
             Self::AttachVolume {
                 volume_id, vm_id, ..
             } => write!(f, "AttachVolume({volume_id}→{vm_id})"),
@@ -454,6 +469,9 @@ impl std::fmt::Display for StateMachineCommand {
             } => write!(f, "RestoreSnapshot({snapshot_id}→{new_volume_id})"),
             Self::SetStorageConfig { region, .. } => write!(f, "SetStorageConfig({region})"),
             Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope})"),
+            Self::PurgeTombstones { max_age_secs, .. } => {
+                write!(f, "PurgeTombstones(ttl={max_age_secs}s)")
+            }
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -716,6 +734,7 @@ mod tests {
             },
             StateMachineCommand::DeleteVolume {
                 volume_id: "vol-01".into(),
+                cascade: false,
             },
             StateMachineCommand::AttachVolume {
                 volume_id: "vol-01".into(),

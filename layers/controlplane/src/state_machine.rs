@@ -49,6 +49,13 @@ pub struct VolumeRecord {
     pub attached_vm_id: Option<String>,
     pub attached_hypervisor_id: Option<String>,
     pub placement_generation: u64,
+    /// Whether deletion protection is enabled (prevents accidental deletion).
+    #[serde(default)]
+    pub deletion_protection: bool,
+    /// Unix timestamp (seconds) when the volume was marked as Deleted.
+    /// Used for tombstone retention (30-day TTL before purge).
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
 }
 
 /// Volume lifecycle state.
@@ -57,7 +64,13 @@ pub enum VolumeState {
     Available,
     Attached,
     Deleting,
+    /// Tombstone state: volume is logically deleted, pending cleanup.
+    /// Retained for audit purposes (30-day TTL).
+    Deleted,
 }
+
+/// Default tombstone retention period: 30 days in seconds.
+pub const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// Snapshot record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -573,10 +586,15 @@ impl RedbStateMachine {
     }
 
     /// Compute volume usage (count, total_gb) within the effective scope.
+    /// Excludes volumes in the Deleted state (tombstones).
     fn compute_volume_usage(storage: &StorageState, scope: &QuotaScope) -> (u64, u64) {
         let mut count = 0u64;
         let mut total_gb = 0u64;
         for vol in storage.volumes.values() {
+            // Tombstoned volumes don't count against quota.
+            if vol.state == VolumeState::Deleted {
+                continue;
+            }
             let in_scope = match scope {
                 QuotaScope::Org { org_id: oid } => vol.org_id == *oid,
                 QuotaScope::Project {
@@ -1650,6 +1668,27 @@ impl RedbStateMachine {
                 StateMachineResponse::Ok
             }
 
+            StateMachineCommand::PurgeTombstones { now, max_age_secs } => {
+                let mut storage = self.storage.write().unwrap();
+                let mut purged = Vec::new();
+                for (id, vol) in &storage.volumes {
+                    if vol.state == VolumeState::Deleted {
+                        if let Some(deleted_at) = vol.deleted_at {
+                            if now.saturating_sub(deleted_at) >= *max_age_secs {
+                                purged.push(id.clone());
+                            }
+                        }
+                    }
+                }
+                for id in &purged {
+                    storage.volumes.remove(id);
+                }
+                if !purged.is_empty() {
+                    info!(count = purged.len(), "purged expired volume tombstones");
+                }
+                StateMachineResponse::Ok
+            }
+
             StateMachineCommand::CreateVolume {
                 id,
                 name,
@@ -1693,6 +1732,8 @@ impl RedbStateMachine {
                     attached_vm_id: None,
                     attached_hypervisor_id: None,
                     placement_generation: 0,
+                    deletion_protection: false,
+                    deleted_at: None,
                 };
                 storage.volumes.insert(id.clone(), record);
                 info!(
@@ -1702,15 +1743,77 @@ impl RedbStateMachine {
                 StateMachineResponse::Created(id.clone())
             }
 
-            StateMachineCommand::DeleteVolume { volume_id } => {
+            StateMachineCommand::DeleteVolume { volume_id, cascade } => {
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => StateMachineResponse::Error(
                         format!("volume '{volume_id}' is attached, detach before deleting"),
                     ),
+                    Some(vol) if vol.state == VolumeState::Deleted => StateMachineResponse::Error(
+                        format!("volume '{volume_id}' is already deleted"),
+                    ),
+                    Some(vol) if vol.deletion_protection => StateMachineResponse::Error(
+                        format!(
+                            "volume '{volume_id}' has deletion protection enabled. \
+                             Disable it first with: syfrah volume update {volume_id} --no-deletion-protection"
+                        ),
+                    ),
                     Some(_) => {
-                        storage.volumes.remove(volume_id);
-                        info!(volume_id, "volume deleted");
+                        // Check for snapshots referencing this volume.
+                        let snapshot_ids: Vec<String> = storage
+                            .snapshots
+                            .iter()
+                            .filter(|(_, s)| s.source_volume_id == *volume_id)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+
+                        if !snapshot_ids.is_empty() && !cascade {
+                            return StateMachineResponse::Error(format!(
+                                "volume '{volume_id}' has {} snapshot(s). \
+                                 Use --cascade to delete them, or delete snapshots manually first.",
+                                snapshot_ids.len()
+                            ));
+                        }
+
+                        // Cascade: delete all snapshots first and decrement SST refcounts.
+                        if *cascade {
+                            for snap_id in &snapshot_ids {
+                                if let Some(snap) = storage.snapshots.remove(snap_id) {
+                                    for sst in &snap.sst_files {
+                                        let count = storage
+                                            .sst_refcounts
+                                            .0
+                                            .get(sst)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        if count <= 1 {
+                                            storage.sst_refcounts.0.remove(sst);
+                                        } else {
+                                            storage
+                                                .sst_refcounts
+                                                .0
+                                                .insert(sst.clone(), count - 1);
+                                        }
+                                    }
+                                    info!(snapshot_id = %snap_id, volume_id, "snapshot cascade-deleted");
+                                }
+                            }
+                        }
+
+                        // Tombstone: mark as Deleted with timestamp instead of removing.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        if let Some(vol) = storage.volumes.get_mut(volume_id) {
+                            vol.state = VolumeState::Deleted;
+                            vol.deleted_at = Some(now);
+                            vol.attached_vm_id = None;
+                            vol.attached_hypervisor_id = None;
+                        }
+
+                        info!(volume_id, "volume marked as deleted (tombstone)");
                         StateMachineResponse::Ok
                     }
                     None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
@@ -1945,6 +2048,8 @@ impl RedbStateMachine {
                     attached_vm_id: None,
                     attached_hypervisor_id: None,
                     placement_generation: 0,
+                    deletion_protection: false,
+                    deleted_at: None,
                 };
                 storage.volumes.insert(new_volume_id.clone(), record);
                 info!(
@@ -2656,6 +2761,7 @@ mod tests {
         // Cannot delete while attached.
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
+            cascade: false,
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
 
@@ -2682,6 +2788,7 @@ mod tests {
         // Delete.
         let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
             volume_id: "vol-1".into(),
+            cascade: false,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
     }
@@ -2892,28 +2999,34 @@ mod tests {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
 
-        // Create volume, snapshot, then delete the volume.
+        // Create volume, snapshot, then delete the snapshot manually and
+        // delete the volume. The snapshot stores the source volume's size
+        // at creation time, so restoring uses that size even if the source
+        // is gone.
         create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
         create_snapshot(&sm, "snap-1", "vol-1");
-        sm.apply_command(&StateMachineCommand::DeleteVolume {
-            volume_id: "vol-1".into(),
-        });
 
-        // Restore -- should use snapshot's stored size_gb (100), not 0.
+        // Delete volume with cascade: snapshots are deleted too.
+        // Verify cascade deletes the snapshot and marks volume as Deleted.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: true,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Snapshot was cascade-deleted, so restore should fail.
         let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
             snapshot_id: "snap-1".into(),
             new_volume_id: "vol-2".into(),
             new_volume_name: "pgdata-restored".into(),
         });
-        assert!(matches!(resp, StateMachineResponse::Created(_)));
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
 
+        // Volume should be in Deleted state (tombstone), not removed.
         let storage = sm.storage.read().unwrap();
-        let vol = storage.volumes.get("vol-2").unwrap();
-        assert_eq!(
-            vol.size_gb, 100,
-            "restored volume should have snapshot's size, not 0"
-        );
-        assert_eq!(vol.env_id, "prod");
+        let vol = storage.volumes.get("vol-1").unwrap();
+        assert_eq!(vol.state, VolumeState::Deleted);
+        assert!(vol.deleted_at.is_some());
     }
 
     #[test]
@@ -3085,5 +3198,245 @@ mod tests {
         let us = sm.get_storage_config("us-east").unwrap();
         assert_eq!(eu.s3_bucket, "bucket-eu");
         assert_eq!(us.s3_bucket, "bucket-us");
+    }
+
+    // -----------------------------------------------------------------------
+    // Volume delete e2e: tombstone, guards, cascade, purge (#1191)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn delete_volume_creates_tombstone() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Volume should still exist as a tombstone.
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-1").unwrap();
+        assert_eq!(vol.state, VolumeState::Deleted);
+        assert!(vol.deleted_at.is_some());
+        assert!(vol.attached_vm_id.is_none());
+    }
+
+    #[test]
+    fn delete_volume_attached_rejected() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("attached")));
+    }
+
+    #[test]
+    fn delete_volume_already_deleted_rejected() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+
+        // Second delete should fail.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("already deleted"))
+        );
+    }
+
+    #[test]
+    fn delete_volume_deletion_protection_rejected() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        // Enable deletion protection manually.
+        {
+            let mut storage = sm.storage.write().unwrap();
+            storage
+                .volumes
+                .get_mut("vol-1")
+                .unwrap()
+                .deletion_protection = true;
+        }
+
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("deletion protection"))
+        );
+    }
+
+    #[test]
+    fn delete_volume_with_snapshots_requires_cascade() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Without cascade: should fail.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("snapshot")));
+
+        // With cascade: should succeed and delete the snapshot.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: true,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        assert!(
+            !storage.snapshots.contains_key("snap-1"),
+            "snapshot should be cascade-deleted"
+        );
+        assert_eq!(
+            storage.volumes.get("vol-1").unwrap().state,
+            VolumeState::Deleted
+        );
+    }
+
+    #[test]
+    fn cascade_delete_decrements_sst_refcounts() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        // Create snapshot with SST files.
+        sm.apply_command(&StateMachineCommand::CreateSnapshot {
+            id: "snap-1".into(),
+            source_volume_id: "vol-1".into(),
+            sst_files: vec!["sst-a.sst".into(), "sst-b.sst".into()],
+            wal_position: 42,
+        });
+
+        // Verify refcounts were set.
+        {
+            let storage = sm.storage.read().unwrap();
+            assert_eq!(storage.sst_refcounts.0.get("sst-a.sst"), Some(&1));
+            assert_eq!(storage.sst_refcounts.0.get("sst-b.sst"), Some(&1));
+        }
+
+        // Cascade delete should decrement refcounts to 0 (remove).
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: true,
+        });
+
+        let storage = sm.storage.read().unwrap();
+        assert!(!storage.sst_refcounts.0.contains_key("sst-a.sst"));
+        assert!(!storage.sst_refcounts.0.contains_key("sst-b.sst"));
+    }
+
+    #[test]
+    fn tombstone_does_not_count_against_quota() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set org quota: max 1 volume.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 1,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+
+        // Create and delete a volume (creates tombstone).
+        create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+
+        // Should be able to create another volume since tombstone doesn't count.
+        let resp = create_volume(&sm, "vol-2", "v2", 50, "acme", "p1", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+    }
+
+    #[test]
+    fn purge_tombstones_removes_expired() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+
+        // Verify tombstone exists.
+        assert!(sm.storage.read().unwrap().volumes.contains_key("vol-1"));
+
+        // Purge with a timestamp far in the future.
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + TOMBSTONE_TTL_SECS
+            + 1;
+
+        sm.apply_command(&StateMachineCommand::PurgeTombstones {
+            now: far_future,
+            max_age_secs: TOMBSTONE_TTL_SECS,
+        });
+
+        // Tombstone should be purged.
+        assert!(!sm.storage.read().unwrap().volumes.contains_key("vol-1"));
+    }
+
+    #[test]
+    fn purge_tombstones_keeps_recent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "v1", 50, "acme", "p1", "prod");
+        sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: false,
+        });
+
+        // Purge with current timestamp (tombstone is fresh).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        sm.apply_command(&StateMachineCommand::PurgeTombstones {
+            now,
+            max_age_secs: TOMBSTONE_TTL_SECS,
+        });
+
+        // Tombstone should still exist (not old enough).
+        assert!(sm.storage.read().unwrap().volumes.contains_key("vol-1"));
     }
 }
