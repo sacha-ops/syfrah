@@ -72,6 +72,10 @@ pub enum StorageRequest {
         cache_disk_size_gb: u32,
         cache_memory_size_gb: u32,
     },
+    /// Run storage health check (S3 probe + cache info).
+    Health,
+    /// Get storage status (connectivity + cache utilization).
+    Status,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,8 +88,65 @@ pub enum StorageResponse {
     Ok,
     /// Storage configuration applied successfully.
     StorageConfigured { region: String },
+    /// Storage health check results.
+    Health(StorageHealthReport),
+    /// Storage status results.
+    Status(StorageStatusReport),
     /// Error message.
     Error(String),
+}
+
+/// Results of a storage health probe.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageHealthReport {
+    /// S3 endpoint URL (never contains credentials).
+    pub s3_endpoint: String,
+    /// S3 bucket name.
+    pub s3_bucket: String,
+    /// Whether the S3 endpoint is reachable.
+    pub s3_reachable: bool,
+    /// Whether the bucket is accessible (PUT/GET/DELETE succeeded).
+    pub bucket_accessible: bool,
+    /// PUT latency in milliseconds, if the probe succeeded.
+    pub put_latency_ms: Option<u64>,
+    /// GET latency in milliseconds, if the probe succeeded.
+    pub get_latency_ms: Option<u64>,
+    /// DELETE latency in milliseconds, if the probe succeeded.
+    pub delete_latency_ms: Option<u64>,
+    /// Error message from the S3 probe, if any.
+    pub s3_error: Option<String>,
+    /// Cache disk path.
+    pub cache_disk_path: String,
+    /// Cache disk total space in bytes.
+    pub cache_disk_total_bytes: u64,
+    /// Cache disk available space in bytes.
+    pub cache_disk_available_bytes: u64,
+    /// Cache memory allocation limit in bytes.
+    pub cache_memory_limit_bytes: u64,
+}
+
+/// Results of a storage status query.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageStatusReport {
+    /// S3 connectivity: true if the last health check passed.
+    pub s3_connected: bool,
+    /// S3 endpoint URL (never contains credentials).
+    pub s3_endpoint: String,
+    /// Per-volume cache utilization (placeholder until ZeroFS metrics in #1187).
+    pub volume_cache_stats: Vec<VolumeCacheStat>,
+    /// Total dirty bytes across all volumes (placeholder).
+    pub total_dirty_bytes: u64,
+}
+
+/// Per-volume cache utilization (placeholder structure).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeCacheStat {
+    /// Volume name.
+    pub name: String,
+    /// Cached bytes for this volume.
+    pub cached_bytes: u64,
+    /// Dirty bytes pending writeback for this volume.
+    pub dirty_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +206,34 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
         StorageRequest::ConfigureCache { .. } => {
             // TODO: persist cache overrides locally
             StorageResponse::Ok
+        }
+        StorageRequest::Health => {
+            // Stub: return a placeholder health report.
+            // Real implementation reads StorageConfig from Raft and probes S3.
+            StorageResponse::Health(StorageHealthReport {
+                s3_endpoint: "(not configured)".into(),
+                s3_bucket: "(not configured)".into(),
+                s3_reachable: false,
+                bucket_accessible: false,
+                put_latency_ms: None,
+                get_latency_ms: None,
+                delete_latency_ms: None,
+                s3_error: Some("storage config not yet loaded from Raft".into()),
+                cache_disk_path: "/var/lib/syfrah/cache".into(),
+                cache_disk_total_bytes: 0,
+                cache_disk_available_bytes: 0,
+                cache_memory_limit_bytes: 0,
+            })
+        }
+        StorageRequest::Status => {
+            // Stub: return placeholder status.
+            // Real per-volume stats come in #1187 (ZeroFS metrics).
+            StorageResponse::Status(StorageStatusReport {
+                s3_connected: false,
+                s3_endpoint: "(not configured)".into(),
+                volume_cache_stats: vec![],
+                total_dirty_bytes: 0,
+            })
         }
     }
 }

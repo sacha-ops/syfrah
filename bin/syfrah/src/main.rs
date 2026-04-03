@@ -89,7 +89,7 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_org::HypervisorCommand,
     },
-    /// Manage storage configuration, ZeroFS version, and diagnostics
+    /// Manage storage configuration, ZeroFS version, health, and status
     Storage {
         #[command(subcommand)]
         command: syfrah_storage::StorageCommand,

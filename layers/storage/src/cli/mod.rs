@@ -1,10 +1,13 @@
 //! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
 //! Provides subcommands for volume lifecycle management, storage
-//! configuration, and storage-layer utilities (e.g. ZeroFS version).
-//! Each handler communicates with the daemon via the control socket.
+//! configuration, health/status inspection, and storage-layer utilities
+//! (e.g. ZeroFS version). Each handler communicates with the daemon via
+//! the control socket.
 
 pub mod configure;
+pub mod fmt;
+pub mod health;
 pub mod volume;
 
 use clap::Subcommand;
@@ -169,6 +172,24 @@ pub enum StorageCommand {
         #[arg(long, conflicts_with = "encryption_passphrase")]
         encryption_passphrase_file: Option<String>,
     },
+    /// Run a health check against the S3 backend and cache subsystem
+    #[command(after_help = "Examples:\n  \
+            syfrah storage health\n  \
+            syfrah storage health --json")]
+    Health {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show storage status: connectivity, cache utilization, dirty bytes
+    #[command(after_help = "Examples:\n  \
+            syfrah storage status\n  \
+            syfrah storage status --json")]
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Execute a storage CLI command.
@@ -331,6 +352,8 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             })
             .await
         }
+        StorageCommand::Health { json } => health::run_health(json).await,
+        StorageCommand::Status { json } => health::run_status(json).await,
     }
 }
 
