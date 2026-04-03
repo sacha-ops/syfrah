@@ -315,7 +315,7 @@ pub async fn run_update(
 
 /// Attach a volume to a VM.
 pub async fn run_attach(name: &str, vm: &str, project: Option<&str>) -> anyhow::Result<()> {
-    let req = StorageRequest::AttachVolume {
+    let req = StorageRequest::VolumeAttach {
         name: name.to_string(),
         vm: vm.to_string(),
         project: project.map(|s| s.to_string()),
@@ -340,7 +340,7 @@ pub async fn run_attach(name: &str, vm: &str, project: Option<&str>) -> anyhow::
 
 /// Detach a volume from its VM.
 pub async fn run_detach(name: &str, project: Option<&str>, force: bool) -> anyhow::Result<()> {
-    let req = StorageRequest::DetachVolume {
+    let req = StorageRequest::VolumeDetach {
         name: name.to_string(),
         project: project.map(|s| s.to_string()),
         force,

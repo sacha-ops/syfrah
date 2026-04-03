@@ -369,8 +369,8 @@ enum RaftCommand {
         env_id: EnvironmentId,
     },
     DeleteVolume { volume_id: VolumeId },
-    AttachVolume { volume_id: VolumeId, vm_id: VmId },
-    DetachVolume { volume_id: VolumeId },
+    VolumeAttach { volume_id: VolumeId, vm_id: VmId },
+    VolumeDetach { volume_id: VolumeId },
 
     // ── Cluster Membership ──────────────────────────────────
     AddRaftMember { node_id: NodeId, fabric_ipv6: String, voter: bool },

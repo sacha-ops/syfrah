@@ -369,13 +369,13 @@ pub enum StateMachineCommand {
     /// Attach a volume to a VM on a specific hypervisor. Enforces the
     /// single-writer invariant — the volume must be Available.
     /// Increments `placement_generation` for fencing.
-    AttachVolume {
+    VolumeAttach {
         volume_id: String,
         vm_id: String,
         hypervisor_id: String,
     },
     /// Detach a volume from its current VM. Volume must be Attached.
-    DetachVolume {
+    VolumeDetach {
         volume_id: String,
     },
     /// Resize a volume (grow only, no shrink in v1). Volume must be Available.
@@ -458,10 +458,10 @@ impl std::fmt::Display for StateMachineCommand {
             } => {
                 write!(f, "DeleteVolume({volume_id}, cascade={cascade})")
             }
-            Self::AttachVolume {
+            Self::VolumeAttach {
                 volume_id, vm_id, ..
-            } => write!(f, "AttachVolume({volume_id}→{vm_id})"),
-            Self::DetachVolume { volume_id } => write!(f, "DetachVolume({volume_id})"),
+            } => write!(f, "VolumeAttach({volume_id}→{vm_id})"),
+            Self::VolumeDetach { volume_id } => write!(f, "VolumeDetach({volume_id})"),
             Self::ResizeVolume {
                 volume_id,
                 new_size_gb,
@@ -743,12 +743,12 @@ mod tests {
                 cascade: false,
                 deleted_at: 1700000000,
             },
-            StateMachineCommand::AttachVolume {
+            StateMachineCommand::VolumeAttach {
                 volume_id: "vol-01".into(),
                 vm_id: "vm1".into(),
                 hypervisor_id: "hv1".into(),
             },
-            StateMachineCommand::DetachVolume {
+            StateMachineCommand::VolumeDetach {
                 volume_id: "vol-01".into(),
             },
             StateMachineCommand::ResizeVolume {

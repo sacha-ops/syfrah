@@ -56,13 +56,13 @@ pub enum StorageRequest {
         deletion_protection: Option<bool>,
     },
     /// Attach a volume to a VM.
-    AttachVolume {
+    VolumeAttach {
         name: String,
         vm: String,
         project: Option<String>,
     },
     /// Detach a volume from its VM.
-    DetachVolume {
+    VolumeDetach {
         name: String,
         project: Option<String>,
         force: bool,
@@ -211,16 +211,16 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
         StorageRequest::VolumeUpdate { name, .. } => StorageResponse::Error(format!(
             "volume '{name}' not found. List available volumes with: syfrah volume list"
         )),
-        StorageRequest::AttachVolume { name, vm, .. } => {
-            // TODO: forward to Raft AttachVolume
+        StorageRequest::VolumeAttach { name, vm, .. } => {
+            // TODO: forward to Raft VolumeAttach
             StorageResponse::Volume(serde_json::json!({
                 "name": name,
                 "state": "attached",
                 "attached_to": vm,
             }))
         }
-        StorageRequest::DetachVolume { name, .. } => {
-            // TODO: forward to Raft DetachVolume
+        StorageRequest::VolumeDetach { name, .. } => {
+            // TODO: forward to Raft VolumeDetach
             StorageResponse::Volume(serde_json::json!({
                 "name": name,
                 "state": "available",
@@ -322,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn handler_returns_attached_volume() {
         let handler = StorageLayerHandler;
-        let req = StorageRequest::AttachVolume {
+        let req = StorageRequest::VolumeAttach {
             name: "pgdata".into(),
             vm: "web-1".into(),
             project: None,
@@ -343,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn handler_returns_detached_volume() {
         let handler = StorageLayerHandler;
-        let req = StorageRequest::DetachVolume {
+        let req = StorageRequest::VolumeDetach {
             name: "pgdata".into(),
             project: None,
             force: false,
