@@ -279,7 +279,8 @@ impl RaftComputeHandler {
                                     if let Ok(matches) =
                                         store.find_subnets_by_name(&subnet_info.name)
                                     {
-                                        if let Some((sid, _)) = matches.into_iter().next() {
+                                        if let Some((vpc_name, _)) = matches.into_iter().next() {
+                                            let sid = format!("{vpc_name}/{}", subnet_info.name);
                                             // Find the NIC that was just created locally.
                                             if let Ok(Some(nic)) = store.find_nic_by_vm(&name) {
                                                 let cmd = StateMachineCommand::CreateNic {
@@ -321,7 +322,11 @@ impl RaftComputeHandler {
                             store
                                 .find_subnets_by_name(&subnet_info.name)
                                 .ok()
-                                .and_then(|matches| matches.into_iter().next().map(|(id, _)| id))
+                                .and_then(|matches| {
+                                    matches.into_iter().next().map(|(vpc_name, _)| {
+                                        format!("{vpc_name}/{}", subnet_info.name)
+                                    })
+                                })
                         } else {
                             None
                         };
@@ -397,7 +402,10 @@ impl RaftComputeHandler {
                                         if let Ok(matches) =
                                             store.find_subnets_by_name(&subnet_info.name)
                                         {
-                                            if let Some((sid, _)) = matches.into_iter().next() {
+                                            if let Some((vpc_name, _)) = matches.into_iter().next()
+                                            {
+                                                let sid =
+                                                    format!("{vpc_name}/{}", subnet_info.name);
                                                 let cmd = StateMachineCommand::CreateNic {
                                                     vm_id: name.clone(),
                                                     subnet_id: sid,
