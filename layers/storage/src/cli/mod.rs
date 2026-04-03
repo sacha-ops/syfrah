@@ -1,8 +1,10 @@
-//! CLI commands for `syfrah volume ...`.
+//! CLI commands for `syfrah volume ...` and `syfrah storage ...`.
 //!
-//! Provides subcommands for volume lifecycle management. Each handler
-//! communicates with the daemon via the control socket.
+//! Provides subcommands for volume lifecycle management and storage
+//! health/status inspection. Each handler communicates with the daemon
+//! via the control socket.
 
+pub mod health;
 pub mod volume;
 
 use clap::Subcommand;
@@ -112,6 +114,37 @@ pub enum VolumeCommand {
         #[arg(long, conflicts_with = "deletion_protection")]
         no_deletion_protection: bool,
     },
+}
+
+/// Top-level storage CLI command (`syfrah storage ...`).
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    /// Run a health check against the S3 backend and cache subsystem
+    #[command(after_help = "Examples:\n  \
+            syfrah storage health\n  \
+            syfrah storage health --json")]
+    Health {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show storage status: connectivity, cache utilization, dirty bytes
+    #[command(after_help = "Examples:\n  \
+            syfrah storage status\n  \
+            syfrah storage status --json")]
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Execute a storage CLI command.
+pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
+    match cmd {
+        StorageCommand::Health { json } => health::run_health(json).await,
+        StorageCommand::Status { json } => health::run_status(json).await,
+    }
 }
 
 /// Execute a volume CLI command.
