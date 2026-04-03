@@ -4,6 +4,7 @@
 //! health/status inspection. Each handler communicates with the daemon
 //! via the control socket.
 
+pub mod fmt;
 pub mod health;
 pub mod volume;
 

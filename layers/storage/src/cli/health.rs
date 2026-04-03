@@ -67,96 +67,78 @@ pub async fn run_status(json: bool) -> anyhow::Result<()> {
 fn print_health_report(r: &StorageHealthReport) {
     let is_tty = console::Term::stdout().is_term();
 
-    let print_heading = |title: &str| {
-        if is_tty {
-            println!(
-                "{}",
-                console::Style::new().bold().underlined().apply_to(title)
-            );
-        } else {
-            println!("{title}");
-            println!("{}", "=".repeat(title.len()));
-        }
-    };
-
-    let print_kv = |key: &str, val: &str| {
-        if is_tty {
-            println!("  {}: {val}", console::Style::new().bold().apply_to(key));
-        } else {
-            println!("  {key}: {val}");
-        }
-    };
-
     // -- S3 section --
-    print_heading("S3 Backend");
-    print_kv("Endpoint", &r.s3_endpoint);
-    print_kv("Bucket", &r.s3_bucket);
-    print_kv("Reachable", if r.s3_reachable { "yes" } else { "no" });
-    print_kv(
+    super::fmt::print_heading("S3 Backend", is_tty);
+    super::fmt::print_kv("Endpoint", &r.s3_endpoint, is_tty);
+    super::fmt::print_kv("Bucket", &r.s3_bucket, is_tty);
+    super::fmt::print_kv(
+        "Reachable",
+        if r.s3_reachable { "yes" } else { "no" },
+        is_tty,
+    );
+    super::fmt::print_kv(
         "Bucket Accessible",
         if r.bucket_accessible { "yes" } else { "no" },
+        is_tty,
     );
 
     if let Some(ms) = r.put_latency_ms {
-        print_kv("PUT Latency", &format!("{ms} ms"));
+        super::fmt::print_kv("PUT Latency", &format!("{ms} ms"), is_tty);
     }
     if let Some(ms) = r.get_latency_ms {
-        print_kv("GET Latency", &format!("{ms} ms"));
+        super::fmt::print_kv("GET Latency", &format!("{ms} ms"), is_tty);
     }
     if let Some(ms) = r.delete_latency_ms {
-        print_kv("DELETE Latency", &format!("{ms} ms"));
+        super::fmt::print_kv("DELETE Latency", &format!("{ms} ms"), is_tty);
     }
     if let Some(ref err) = r.s3_error {
-        print_kv("Error", err);
+        super::fmt::print_kv("Error", err, is_tty);
     }
 
     println!();
 
     // -- Cache section --
-    print_heading("Cache");
-    print_kv("Disk Path", &r.cache_disk_path);
-    print_kv("Disk Total", &format_bytes(r.cache_disk_total_bytes));
-    print_kv(
+    super::fmt::print_heading("Cache", is_tty);
+    super::fmt::print_kv("Disk Path", &r.cache_disk_path, is_tty);
+    super::fmt::print_kv(
+        "Disk Total",
+        &format_bytes(r.cache_disk_total_bytes),
+        is_tty,
+    );
+    super::fmt::print_kv(
         "Disk Available",
         &format_bytes(r.cache_disk_available_bytes),
+        is_tty,
     );
-    print_kv("Memory Limit", &format_bytes(r.cache_memory_limit_bytes));
+    super::fmt::print_kv(
+        "Memory Limit",
+        &format_bytes(r.cache_memory_limit_bytes),
+        is_tty,
+    );
 }
 
 fn print_status_report(r: &StorageStatusReport) {
     let is_tty = console::Term::stdout().is_term();
 
-    let print_heading = |title: &str| {
-        if is_tty {
-            println!(
-                "{}",
-                console::Style::new().bold().underlined().apply_to(title)
-            );
-        } else {
-            println!("{title}");
-            println!("{}", "=".repeat(title.len()));
-        }
-    };
-
-    let print_kv = |key: &str, val: &str| {
-        if is_tty {
-            println!("  {}: {val}", console::Style::new().bold().apply_to(key));
-        } else {
-            println!("  {key}: {val}");
-        }
-    };
-
-    print_heading("Storage Status");
-    print_kv("S3 Endpoint", &r.s3_endpoint);
-    print_kv("S3 Connected", if r.s3_connected { "yes" } else { "no" });
-    print_kv("Total Dirty Bytes", &format_bytes(r.total_dirty_bytes));
+    super::fmt::print_heading("Storage Status", is_tty);
+    super::fmt::print_kv("S3 Endpoint", &r.s3_endpoint, is_tty);
+    super::fmt::print_kv(
+        "S3 Connected",
+        if r.s3_connected { "yes" } else { "no" },
+        is_tty,
+    );
+    super::fmt::print_kv(
+        "Total Dirty Bytes",
+        &format_bytes(r.total_dirty_bytes),
+        is_tty,
+    );
 
     println!();
 
     if r.volume_cache_stats.is_empty() {
         println!("  (no volumes with cache data)");
     } else {
-        print_heading("Per-Volume Cache");
+        super::fmt::print_heading("Per-Volume Cache", is_tty);
         let tw = terminal_size::terminal_size()
             .map(|(w, _)| w.0 as usize)
             .unwrap_or(120);
@@ -207,13 +189,17 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Truncate a string to `max` characters, appending "..." if it exceeds the limit.
+///
+/// Uses `char_indices` to avoid panicking on multi-byte UTF-8 strings.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else if max <= 3 {
-        s[..max].to_string()
+        s.chars().take(max).collect()
     } else {
-        format!("{}...", &s[..max - 3])
+        let truncated: String = s.chars().take(max - 3).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -253,6 +239,15 @@ mod tests {
     #[test]
     fn truncate_long() {
         assert_eq!(truncate("abcdefghij", 7), "abcd...");
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8() {
+        // Multi-byte chars must not panic
+        assert_eq!(truncate("aaaaaaaaaa", 7), "aaaa...");
+        // Japanese chars (3 bytes each) — should not panic at byte boundary
+        let jp = "\u{3042}\u{3044}\u{3046}\u{3048}\u{304A}"; // 5 chars
+        assert_eq!(truncate(jp, 4), "\u{3042}...");
     }
 
     #[test]
