@@ -1,6 +1,10 @@
 # External API
 
-This document covers exposing the syfrah control plane API to external clients (laptop CLI, Terraform provider, SDKs) via a dedicated gateway node. It includes gateway setup, API key management, authentication, rate limiting, a full endpoint reference, and troubleshooting.
+This document covers the **Gateway API** and **Admin API** — the two external-facing API levels served on port 8443. Both share the same TLS endpoint; the caller's IAM role determines which endpoints are accessible. Tenant developers see only their own resources (Gateway API), while platform admins get full cluster visibility (Admin API).
+
+The third API level, **Forge API**, is internal and machine-to-machine only (port 7100 over WireGuard). It is not covered here. See [api-architecture.md](api-architecture.md#three-api-levels) for the full overview of all three levels.
+
+This document includes gateway setup, API key management, authentication, rate limiting, a full endpoint reference, and troubleshooting.
 
 For internal architecture details, see [api-architecture.md](api-architecture.md).
 For the Terraform provider, multi-language SDKs, and SDK generation pipeline, see [api-architecture.md](api-architecture.md#sdk-generation).
@@ -9,7 +13,7 @@ For the Terraform provider, multi-language SDKs, and SDK generation pipeline, se
 
 ## Gateway Node Setup
 
-A gateway node is a syfrah node explicitly designated by the operator to terminate TLS and serve the external REST/gRPC API. Gateway nodes are **not** dynamically elected; the operator promotes them via configuration.
+A gateway node is a syfrah node explicitly designated by the operator to terminate TLS and serve both the tenant-facing Gateway API and the Admin API on a single endpoint. The caller's IAM role (attached to the API key) determines which endpoints are accessible — a `developer` key sees tenant resources only, while an `admin` or `owner` key unlocks cluster-wide operations. Gateway nodes are **not** dynamically elected; the operator promotes them via configuration.
 
 ### Configuration
 
