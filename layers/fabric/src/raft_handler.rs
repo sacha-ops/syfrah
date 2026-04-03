@@ -333,7 +333,14 @@ impl LayerHandler for RaftOrgHandler {
             None => {
                 // No Raft — direct write (backward compatible).
                 debug!("raft not available, falling back to direct write");
-                return self.inner.handle(request, caller_uid).await;
+                let result = self.inner.handle(request, caller_uid).await;
+
+                // Post-write side effect: wire or tear down VPC peering data plane.
+                // This mirrors the post-Raft side effect below but for the fallback path.
+                wire_peering_data_plane(&req, &result, &self.org_store, &self.network_backend)
+                    .await;
+
+                return result;
             }
         };
 
@@ -445,95 +452,8 @@ impl LayerHandler for RaftOrgHandler {
                 let result = submit_raft_command(client, &req, cmd, &self.org_store).await;
 
                 // Post-Raft side effect: wire or tear down VPC peering data plane.
-                match &req {
-                    OrgRequest::VpcPeer { from, to } => {
-                        // Only wire the data plane when Raft succeeded.
-                        let resp: OrgResponse = serde_json::from_slice(&result)
-                            .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
-                        if !matches!(resp, OrgResponse::Error(_)) {
-                            // Resolve VPC names to bridge names.
-                            let vpc_a = self.org_store.get_vpc(from);
-                            let vpc_b = self.org_store.get_vpc(to);
-                            if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
-                                let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
-                                let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
-                                let peering_id = format!("{}-{}", va.id.0, vb.id.0);
-                                let backend_guard = self.network_backend.read().await;
-                                if let Some(ref backend) = *backend_guard {
-                                    // Only wire data plane when BOTH bridges exist
-                                    // locally. If only one exists, the veth would be
-                                    // created but one end cannot attach — resulting in
-                                    // a dangling interface. The reconcile loop will
-                                    // wire the peering once the second bridge appears.
-                                    let has_a = backend.link_exists(&bridge_a).await;
-                                    let has_b = backend.link_exists(&bridge_b).await;
-                                    if has_a && has_b {
-                                        if let Err(e) = syfrah_overlay::veth_peer::create_veth_peer(
-                                            backend.as_ref(),
-                                            &peering_id,
-                                            &bridge_a,
-                                            &bridge_b,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                "peering data plane wiring failed for \
-                                                 {from}<->{to}: {e}"
-                                            );
-                                        } else {
-                                            tracing::info!(
-                                                "peering data plane wired: \
-                                                 {from}<->{to} ({bridge_a}<->{bridge_b})"
-                                            );
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            "skipping peering data plane for {from}<->{to}: \
-                                             need both bridges (has_a={has_a}, has_b={has_b}); \
-                                             reconcile loop will wire when ready"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    OrgRequest::VpcUnpeer { from, to } => {
-                        // Tear down the data plane when Raft succeeded.
-                        let resp: OrgResponse = serde_json::from_slice(&result)
-                            .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
-                        if !matches!(resp, OrgResponse::Error(_)) {
-                            let vpc_a = self.org_store.get_vpc(from);
-                            let vpc_b = self.org_store.get_vpc(to);
-                            if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
-                                let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
-                                let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
-                                let peering_id = format!("{}-{}", va.id.0, vb.id.0);
-                                let backend_guard = self.network_backend.read().await;
-                                if let Some(ref backend) = *backend_guard {
-                                    if let Err(e) = syfrah_overlay::veth_peer::delete_veth_peer(
-                                        backend.as_ref(),
-                                        &peering_id,
-                                        &bridge_a,
-                                        &bridge_b,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            "peering data plane teardown failed for \
-                                             {from}<->{to}: {e}"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            "peering data plane torn down: \
-                                             {from}<->{to} ({bridge_a}<->{bridge_b})"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                wire_peering_data_plane(&req, &result, &self.org_store, &self.network_backend)
+                    .await;
 
                 result
             }
@@ -543,6 +463,107 @@ impl LayerHandler for RaftOrgHandler {
                 self.inner.handle(request, caller_uid).await
             }
         }
+    }
+}
+
+/// Wire or tear down VPC peering data plane after a successful peer/unpeer operation.
+///
+/// Called from BOTH the Raft path and the direct-write fallback path so that the
+/// data plane is always wired regardless of which code path handles the mutation.
+async fn wire_peering_data_plane(
+    req: &OrgRequest,
+    result: &[u8],
+    org_store: &OrgStore,
+    network_backend: &RwLock<Option<Arc<dyn syfrah_overlay::NetworkBackend>>>,
+) {
+    match req {
+        OrgRequest::VpcPeer { from, to } => {
+            // Only wire the data plane when the store write succeeded.
+            let resp: OrgResponse = serde_json::from_slice(result)
+                .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
+            if !matches!(resp, OrgResponse::Error(_)) {
+                // Resolve VPC names to bridge names.
+                let vpc_a = org_store.get_vpc(from);
+                let vpc_b = org_store.get_vpc(to);
+                if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
+                    let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
+                    let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
+                    let peering_id = format!("{}-{}", va.id.0, vb.id.0);
+                    let backend_guard = network_backend.read().await;
+                    if let Some(ref backend) = *backend_guard {
+                        // Only wire data plane when BOTH bridges exist locally.
+                        // If only one exists, the veth would be created but one end
+                        // cannot attach — resulting in a dangling interface. The
+                        // reconcile loop will wire the peering once the second bridge
+                        // appears.
+                        let has_a = backend.link_exists(&bridge_a).await;
+                        let has_b = backend.link_exists(&bridge_b).await;
+                        if has_a && has_b {
+                            if let Err(e) = syfrah_overlay::veth_peer::create_veth_peer(
+                                backend.as_ref(),
+                                &peering_id,
+                                &bridge_a,
+                                &bridge_b,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "peering data plane wiring failed for \
+                                     {from}<->{to}: {e}"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "peering data plane wired: \
+                                     {from}<->{to} ({bridge_a}<->{bridge_b})"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                "skipping peering data plane for {from}<->{to}: \
+                                 need both bridges (has_a={has_a}, has_b={has_b}); \
+                                 reconcile loop will wire when ready"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        OrgRequest::VpcUnpeer { from, to } => {
+            // Tear down the data plane when the store write succeeded.
+            let resp: OrgResponse = serde_json::from_slice(result)
+                .unwrap_or(OrgResponse::Error("deserialization failed".to_string()));
+            if !matches!(resp, OrgResponse::Error(_)) {
+                let vpc_a = org_store.get_vpc(from);
+                let vpc_b = org_store.get_vpc(to);
+                if let (Ok(Some(va)), Ok(Some(vb))) = (vpc_a, vpc_b) {
+                    let bridge_a = syfrah_overlay::naming::bridge_name(&va.id.0);
+                    let bridge_b = syfrah_overlay::naming::bridge_name(&vb.id.0);
+                    let peering_id = format!("{}-{}", va.id.0, vb.id.0);
+                    let backend_guard = network_backend.read().await;
+                    if let Some(ref backend) = *backend_guard {
+                        if let Err(e) = syfrah_overlay::veth_peer::delete_veth_peer(
+                            backend.as_ref(),
+                            &peering_id,
+                            &bridge_a,
+                            &bridge_b,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "peering data plane teardown failed for \
+                                 {from}<->{to}: {e}"
+                            );
+                        } else {
+                            tracing::info!(
+                                "peering data plane torn down: \
+                                 {from}<->{to} ({bridge_a}<->{bridge_b})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
