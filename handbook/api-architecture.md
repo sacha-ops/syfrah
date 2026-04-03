@@ -19,28 +19,113 @@ These decisions were reached through two rounds of architectural review by five 
 
 ## Architecture Overview
 
+Syfrah exposes three distinct API surfaces, each serving a different audience with different trust models.
+
+### Three API Levels
+
+#### 1. Gateway API — Tenant-Facing
+
+**Audience:** Developers, CI/CD pipelines, Terraform providers, `syfrah-cli` from laptops.
+
+**Purpose:** Deploy and manage resources within a tenant (org/project/environment). Create VMs, VPCs, subnets, security groups. The caller never sees or interacts with individual hypervisors.
+
+**Transport:** gRPC + REST/JSON on port 8443, TLS 1.3, API key authentication.
+
+**Scope:** Scoped to the caller's organization and project. A developer in org "acme" cannot see resources in org "beta-corp".
+
+**IAM Roles:** `developer` (full CRUD on own resources), `viewer` (read-only).
+
+**Example operations:**
+- `POST /v1/instances` — create a VM (scheduler picks the hypervisor)
+- `GET /v1/instances` — list my VMs across all zones
+- `POST /v1/vpcs` — create a VPC
+- `POST /v1/security-groups` — create a security group
+- `GET /v1/subnets` — list subnets in my environment
+
+**What tenants DON'T see:**
+- Individual hypervisors (they see zones, not machines)
+- Raft cluster state
+- Other tenants' resources
+- Forge internal APIs
+
+#### 2. Admin API — Platform Operations
+
+**Audience:** SRE teams, infrastructure admins, Ansible playbooks, capacity planning dashboards.
+
+**Purpose:** Manage the cloud infrastructure itself. Drain hypervisors, view capacity, monitor the control plane, manage Raft membership.
+
+**Transport:** Same gateway endpoint (port 8443), TLS 1.3, API key with admin role.
+
+**Scope:** Full cluster visibility. Can see all orgs, all hypervisors, all VMs.
+
+**IAM Roles:** `admin` (cluster operations), `owner` (admin + IAM management).
+
+**Example operations:**
+- `GET /v1/hypervisors` — list all hypervisors with capacity
+- `POST /v1/hypervisors/:id/drain` — drain a hypervisor for maintenance
+- `GET /v1/controlplane/status` — Raft leader, term, members
+- `GET /v1/controlplane/members` — list Raft voters and learners
+- `POST /v1/controlplane/promote/:id` — promote a learner to voter
+- `GET /v1/metrics` — Prometheus metrics for the cluster
+- `GET /v1/hypervisors/:id/capacity` — detailed capacity breakdown
+
+**Key difference from Gateway:** Same endpoint, same TLS, but the IAM role unlocks admin-only endpoints. A `developer` API key calling `/v1/hypervisors` gets 403 Forbidden.
+
+#### 3. Forge API — Machine-to-Machine (Internal)
+
+**Audience:** Hypervisor daemons communicating with each other.
+
+**Purpose:** Raft consensus, scheduler remote placement, FDB synchronization, overlay reconciliation. Never called by humans or external tools.
+
+**Transport:** HTTP/JSON on port 7100, over the WireGuard fabric (`syfrah0` interface). Not exposed on public interfaces.
+
+**Authentication:** WireGuard mesh membership is the trust boundary. Only nodes in the mesh can reach port 7100.
+
+**Example operations (internal):**
+- `POST /v1/instances` (with `?direct=true`) — direct VM creation on this hypervisor (called by scheduler)
+- `GET /v1/hypervisor/health` — this hypervisor's health
+- `GET /v1/hypervisor/capacity` — this hypervisor's capacity
+- `POST /raft/append_entries` — Raft log replication
+- `POST /raft/vote` — Raft leader election
+- `POST /raft/join` — Raft cluster membership
+
+**Key difference:** Forge is per-hypervisor, internal, and never exposed to the internet. The Gateway is the single public entry point for all external access.
+
+### How They Relate
+
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  External Clients                                                │
-│  Laptop CLI (syfrah-cli), Terraform provider, Go/Python/JS SDKs │
-│                                                                  │
-│  Auth: API key (syf_key_...) over TLS 1.3                       │
-│  Protocol: gRPC (primary) + REST/JSON gateway (from same .proto) │
-├──────────────────────────────────────────────────────────────────┤
-│  API Gateway (dedicated gateway node(s) with public IP)          │
-│  Terminates TLS, validates key + CIDR + rate limit               │
-│  Authorizes via IAM role table                                   │
-│  Forwards mutations to Raft leader over internal fabric          │
-│  Leader commits state transition; execution may run on followers  │
-├──────────────────────────────────────────────────────────────────┤
-│  Internal Fabric (WireGuard mesh)                                │
-│  Node → Node: HTTP/JSON over syfrah0 interface                   │
-│  Server CLI → Daemon: Unix domain socket + JSON                  │
-│  Gossip / Raft: purpose-built protocols over WireGuard           │
-└──────────────────────────────────────────────────────────────────┘
+                    ┌─────────────────────────────┐
+                    │  External (Internet / VPN)   │
+                    │                              │
+                    │  syfrah-cli, Terraform, SDK  │
+                    │  Dashboard, CI/CD            │
+                    └──────────┬──────────────────┘
+                               │ TLS + API key
+                               ▼
+                    ┌──────────────────────────────┐
+                    │  Gateway (port 8443)          │
+                    │                               │
+                    │  developer role → tenant API  │
+                    │  admin role → admin API        │
+                    │                               │
+                    │  Forwards mutations to        │
+                    │  Raft leader via fabric       │
+                    └──────────┬───────────────────┘
+                               │ WireGuard fabric
+                               ▼
+                    ┌──────────────────────────────┐
+                    │  Forge (port 7100, per-HV)   │
+                    │                               │
+                    │  Raft RPCs (7200)             │
+                    │  VM creation (direct)          │
+                    │  Reconciliation               │
+                    │  FDB sync                     │
+                    │                               │
+                    │  Machine-to-machine only      │
+                    └──────────────────────────────┘
 ```
 
-Three trust boundaries. Three transports. Never mixed.
+One physical gateway endpoint. Two levels of human access (tenant vs admin) differentiated by IAM. One internal bus (Forge) that humans never touch.
 
 **Gateway node designation:** In v1, gateway nodes are explicitly designated by the operator via configuration (`--role gateway`). They are not dynamically elected. API key state (hashed keys, CIDR allowlists, rate limit counters) is replicated to all gateway nodes through the Raft-backed IAM state. If a gateway node fails, the operator promotes another node or relies on DNS failover across multiple designated gateways. A future version may automate gateway election based on health and topology.
 

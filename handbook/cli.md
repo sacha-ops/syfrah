@@ -3,6 +3,22 @@ tags: [cli, tooling, operations]
 ---
 # CLI
 
+## Two CLI Binaries
+
+### `syfrah` — Server CLI (local)
+Runs on hypervisors. Communicates via Unix domain socket to the local daemon.
+No network, no auth (filesystem permissions are the auth).
+Used by: admins with SSH access to hypervisors.
+
+### `syfrah-cli` — Remote CLI (planned)
+Runs on laptops/workstations. Communicates via gRPC/TLS to the Gateway.
+Requires an API key (`syf_key_...`).
+Used by: developers, platform ops, CI/CD pipelines.
+
+Both CLIs offer the same operations. `syfrah-cli` is scoped by the API key's role and organization.
+
+---
+
 ## Overview
 
 `syfrah` is the single binary that operators use to manage the platform. The CLI is organized by **namespace**, where each namespace maps to an architectural layer and a directory in the codebase.
