@@ -65,8 +65,15 @@ pub enum NbdError {
 pub struct NbdDevice {
     /// The device number (the `N` in `/dev/nbdN`).
     pub number: usize,
+}
+
+impl NbdDevice {
     /// The full device path, e.g. `/dev/nbd0`.
-    pub path: PathBuf,
+    ///
+    /// Derived from `number` so there is only one source of truth.
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/nbd{}", self.number))
+    }
 }
 
 impl fmt::Display for NbdDevice {
@@ -228,10 +235,7 @@ impl<S: NbdSystem> NbdAllocator<S> {
                 continue;
             }
             state.in_use.insert(n);
-            return Ok(NbdDevice {
-                number: n,
-                path: PathBuf::from(format!("/dev/nbd{n}")),
-            });
+            return Ok(NbdDevice { number: n });
         }
 
         Err(NbdError::AllDevicesBusy { max })
@@ -343,7 +347,7 @@ mod tests {
 
         let dev = alloc.allocate().unwrap();
         assert_eq!(dev.number, 0);
-        assert_eq!(dev.path, PathBuf::from("/dev/nbd0"));
+        assert_eq!(dev.path(), PathBuf::from("/dev/nbd0"));
     }
 
     #[test]
@@ -425,10 +429,7 @@ mod tests {
         let sys = FakeSystem::new(4, &[0, 1, 2, 3]);
         let alloc = NbdAllocator::with_system(sys);
 
-        let fake_dev = NbdDevice {
-            number: 5,
-            path: PathBuf::from("/dev/nbd5"),
-        };
+        let fake_dev = NbdDevice { number: 5 };
         let err = alloc.release(&fake_dev).unwrap_err();
         assert!(
             matches!(err, NbdError::NotAllocated { n: 5 }),
@@ -518,10 +519,7 @@ mod tests {
 
     #[test]
     fn nbd_device_display() {
-        let dev = NbdDevice {
-            number: 7,
-            path: PathBuf::from("/dev/nbd7"),
-        };
+        let dev = NbdDevice { number: 7 };
         assert_eq!(format!("{dev}"), "/dev/nbd7");
     }
 
