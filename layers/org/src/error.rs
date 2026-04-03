@@ -240,6 +240,9 @@ pub enum OrgError {
     #[error("cannot detach the last security group from NIC '{nic}' — a NIC must always have at least one SG")]
     LastSgDetach { nic: String },
 
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+
     #[error("store error: {0}")]
     StoreError(String),
 }
