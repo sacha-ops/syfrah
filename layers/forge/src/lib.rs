@@ -40,6 +40,7 @@ pub mod ownership;
 pub mod reconciler;
 pub mod runtime;
 pub mod shutdown;
+pub mod storage_cleanup;
 pub mod storage_reconciler;
 pub mod task;
 pub mod tracing_otel;
