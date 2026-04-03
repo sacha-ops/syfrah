@@ -143,15 +143,13 @@ impl VolumeMgr {
         let nbd_device = self.allocate_nbd_device();
         let prefix = format!("volumes/{volume_id}/gen-{generation}/");
 
-        let child = Command::new(&binary_path)
+        let mut child = Command::new(&binary_path)
             .arg("--s3-endpoint")
             .arg(&s3.endpoint)
             .arg("--s3-bucket")
             .arg(&s3.bucket)
             .arg("--s3-access-key")
             .arg(&s3.access_key)
-            .arg("--s3-secret-key")
-            .arg(&s3.secret_key)
             .arg("--prefix")
             .arg(&prefix)
             .arg("--cache-dir")
@@ -162,14 +160,21 @@ impl VolumeMgr {
             .arg(cache.memory_size_bytes.to_string())
             .arg("--nbd-device")
             .arg(&nbd_device)
-            .arg("--encryption-key")
-            .arg(encryption_passphrase)
+            // Pass secrets via environment variables instead of CLI args
+            // to avoid exposure in /proc/pid/cmdline.
+            .env("ZEROFS_S3_SECRET_KEY", &s3.secret_key)
+            .env("ZEROFS_ENCRYPTION_KEY", encryption_passphrase)
             .kill_on_drop(false)
             .spawn()
             .map_err(|e| VolumeMgrError::Spawn(e.to_string()))?;
 
-        // Wait for NBD device to appear.
-        self.wait_for_nbd(&nbd_device).await?;
+        // Wait for NBD device to appear. If it times out, kill the orphaned
+        // child process before returning the error.
+        if let Err(e) = self.wait_for_nbd(&nbd_device).await {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(e);
+        }
 
         self.processes.insert(
             volume_id.to_string(),
@@ -277,6 +282,31 @@ impl VolumeMgr {
             time::sleep(NBD_POLL_INTERVAL).await;
         }
         Err(VolumeMgrError::NbdTimeout(NBD_WAIT_TIMEOUT))
+    }
+}
+
+impl Drop for VolumeMgr {
+    fn drop(&mut self) {
+        for (id, proc) in &self.processes {
+            if let Some(pid) = proc.child.id() {
+                eprintln!(
+                    "VolumeMgr::drop: sending SIGTERM to orphaned ZeroFS process \
+                     (volume={id}, pid={pid})"
+                );
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            } else {
+                eprintln!("VolumeMgr::drop: volume {id} has no PID (already exited?)");
+            }
+        }
+        if !self.processes.is_empty() {
+            eprintln!(
+                "VolumeMgr::drop: {} volume process(es) were still active at drop time",
+                self.processes.len()
+            );
+        }
     }
 }
 
