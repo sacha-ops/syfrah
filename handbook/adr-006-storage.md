@@ -1113,7 +1113,7 @@ syfrah storage configure \
     --s3-bucket <bucket> \
     --s3-access-key <key> \
     --s3-secret-key <key> \
-    --cache-disk <path> \
+    --cache-disk-path <path> \
     --cache-disk-size <gb> \
     --cache-memory-size <gb>
 
@@ -1131,7 +1131,7 @@ syfrah storage configure \
     --s3-bucket syfrah-storage-eu-west \
     --s3-access-key XXXX \
     --s3-secret-key XXXX \
-    --cache-disk /dev/nvme1n1 \
+    --cache-disk-path /dev/nvme1n1 \
     --cache-disk-size 200 \
     --cache-memory-size 8
 
@@ -1303,7 +1303,7 @@ syfrah storage configure \
     --s3-bucket syfrah-storage-eu-west \
     --s3-access-key AK_XXXXXXXXXXXX \
     --s3-secret-key SK_XXXXXXXXXXXX \
-    --cache-disk /dev/nvme1n1 \
+    --cache-disk-path /dev/nvme1n1 \
     --cache-disk-size 200 \
     --cache-memory-size 8
 
@@ -1325,7 +1325,7 @@ Cache sizing can be overridden per hypervisor (some servers have more SSD than o
 ```bash
 syfrah storage configure \
     --region eu-west \
-    --cache-disk /dev/nvme1n1 \
+    --cache-disk-path /dev/nvme1n1 \
     --cache-disk-size 500 \
     --cache-memory-size 16
 ```

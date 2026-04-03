@@ -55,6 +55,23 @@ pub enum StorageRequest {
         project: Option<String>,
         deletion_protection: Option<bool>,
     },
+    /// Configure storage backend (S3 + cache settings).
+    Configure {
+        region: String,
+        s3_endpoint: String,
+        s3_bucket: String,
+        s3_access_key: String,
+        s3_secret_key: String,
+        cache_disk_path: Option<String>,
+        cache_disk_size_gb: Option<u32>,
+        cache_memory_size_gb: Option<u32>,
+    },
+    /// Update per-hypervisor cache overrides only.
+    ConfigureCache {
+        cache_disk_path: String,
+        cache_disk_size_gb: u32,
+        cache_memory_size_gb: u32,
+    },
     /// Run storage health check (S3 probe + cache info).
     Health,
     /// Get storage status (connectivity + cache utilization).
@@ -69,6 +86,8 @@ pub enum StorageResponse {
     VolumeList(Vec<serde_json::Value>),
     /// Success with no data.
     Ok,
+    /// Storage configuration applied successfully.
+    StorageConfigured { region: String },
     /// Storage health check results.
     Health(StorageHealthReport),
     /// Storage status results.
@@ -180,6 +199,14 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
         StorageRequest::VolumeUpdate { name, .. } => StorageResponse::Error(format!(
             "volume '{name}' not found. List available volumes with: syfrah volume list"
         )),
+        StorageRequest::Configure { region, .. } => {
+            // TODO: forward to Raft SetStorageConfig
+            StorageResponse::StorageConfigured { region }
+        }
+        StorageRequest::ConfigureCache { .. } => {
+            // TODO: persist cache overrides locally
+            StorageResponse::Ok
+        }
         StorageRequest::Health => {
             // Stub: return a placeholder health report.
             // Real implementation reads StorageConfig from Raft and probes S3.

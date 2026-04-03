@@ -216,7 +216,7 @@ syfrah node configure-storage \
   --s3-bucket syfrah-storage-eu-west \
   --s3-access-key XXXX \
   --s3-secret-key XXXX \
-  --cache-disk /dev/nvme1n1 \
+  --cache-disk-path /dev/nvme1n1 \
   --cache-disk-size 200 \
   --cache-memory-size 8
 ```
