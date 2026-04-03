@@ -1548,12 +1548,20 @@ pub async fn run_daemon(
                 syfrah_state::LayerDb::open("raft_log").expect("failed to open raft_log database");
             let log_store = std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
 
+            // Create the PlacementEvent broadcast channel BEFORE the state
+            // machine so we can subscribe before any events are emitted.
+            // This eliminates the window between SM creation and subscription
+            // where events could be lost.
+            let (placement_tx, placement_event_rx) =
+                tokio::sync::broadcast::channel::<syfrah_controlplane::PlacementEvent>(256);
+
             let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
                 shared_org_store.clone().unwrap_or_else(|| {
                     let db = syfrah_state::LayerDb::open("org").unwrap();
                     std::sync::Arc::new(syfrah_org::OrgStore::new(db))
                 }),
-            );
+            )
+            .with_placement_tx(placement_tx);
 
             // Wire shared IPAM store into the state machine for distributed IP allocation.
             if let Some(ref ipam) = shared_ipam_store {
@@ -1582,10 +1590,6 @@ pub async fn run_daemon(
             }
 
             let sm = std::sync::Arc::new(sm_builder);
-
-            // Subscribe to placement events for incremental FDB updates.
-            // Must subscribe before starting Raft so we don't miss events.
-            let placement_event_rx = sm.subscribe_placement_events();
 
             let network = syfrah_controlplane::SyfrahNetworkFactory::new();
 
@@ -2047,8 +2051,53 @@ pub async fn run_daemon(
                                 warn!(
                                     skipped = n,
                                     "FDB incremental update lagged — missed {n} events, \
-                                     next reconcile pass will catch up"
+                                     running full FDB rebuild to catch up"
                                 );
+                                // Rebuild FDB from the placement store so that
+                                // any missed events are recovered immediately.
+                                if let Some(ref ps) = fdb_placement_store {
+                                    match ps.list_all() {
+                                        Ok(placements) => {
+                                            let overlay_placements: Vec<
+                                                syfrah_overlay::VmPlacement,
+                                            > = placements
+                                                .iter()
+                                                .map(|p| syfrah_overlay::VmPlacement {
+                                                    vpc_id: p.vpc_id.clone(),
+                                                    vm_id: p.vm_id.clone(),
+                                                    vm_mac: p.vm_mac.clone(),
+                                                    vm_ip: p.vm_ip.clone(),
+                                                    subnet_id: p.subnet_id.clone(),
+                                                    hypervisor_id: p.hypervisor_id.clone(),
+                                                    action: syfrah_overlay::PlacementAction::Add,
+                                                    placement_generation: p.placement_generation,
+                                                })
+                                                .collect();
+                                            match syfrah_overlay::rebuild_fdb(
+                                                backend.as_ref(),
+                                                &overlay_placements,
+                                                &local_node,
+                                            )
+                                            .await
+                                            {
+                                                Ok(summary) => {
+                                                    info!(
+                                                        rebuilt = summary.rebuilt,
+                                                        skipped_local = summary.skipped_local,
+                                                        errors = summary.errors,
+                                                        "FDB rebuild after lag complete"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!("FDB rebuild after lag failed: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("FDB rebuild after lag: failed to list placements: {e}");
+                                        }
+                                    }
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 info!("FDB incremental update channel closed, stopping");
@@ -2279,12 +2328,20 @@ pub async fn run_daemon(
                                     syfrah_controlplane::RedbLogStore::new(log_db),
                                 );
 
+                                // Create broadcast channel before SM so we subscribe
+                                // before any events can be emitted.
+                                let (aj_placement_tx, placement_event_rx) =
+                                    tokio::sync::broadcast::channel::<
+                                        syfrah_controlplane::PlacementEvent,
+                                    >(256);
+
                                 let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
                                     aj_org_store.clone().unwrap_or_else(|| {
                                         let db = syfrah_state::LayerDb::open("org").unwrap();
                                         std::sync::Arc::new(syfrah_org::OrgStore::new(db))
                                     }),
-                                );
+                                )
+                                .with_placement_tx(aj_placement_tx);
 
                                 if let Some(ref ipam) = aj_ipam_store {
                                     sm_builder = sm_builder.with_ipam_store(Arc::clone(ipam));
@@ -2313,7 +2370,6 @@ pub async fn run_daemon(
                                 }
 
                                 let sm = std::sync::Arc::new(sm_builder);
-                                let placement_event_rx = sm.subscribe_placement_events();
                                 let network = syfrah_controlplane::SyfrahNetworkFactory::new();
 
                                 let config = std::sync::Arc::new(openraft::Config {
@@ -2740,8 +2796,48 @@ pub async fn run_daemon(
                                             ) => {
                                                 warn!(
                                                     skipped = n,
-                                                    "FDB incremental update lagged (in-process) — missed {n} events"
+                                                    "FDB incremental update lagged (in-process) — missed {n} events, \
+                                                     running full FDB rebuild to catch up"
                                                 );
+                                                if let Some(ref ps) = fdb_placement_store {
+                                                    match ps.list_all() {
+                                                        Ok(placements) => {
+                                                            let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
+                                                                .iter()
+                                                                .map(|p| syfrah_overlay::VmPlacement {
+                                                                    vpc_id: p.vpc_id.clone(),
+                                                                    vm_id: p.vm_id.clone(),
+                                                                    vm_mac: p.vm_mac.clone(),
+                                                                    vm_ip: p.vm_ip.clone(),
+                                                                    subnet_id: p.subnet_id.clone(),
+                                                                    hypervisor_id: p.hypervisor_id.clone(),
+                                                                    action: syfrah_overlay::PlacementAction::Add,
+                                                                    placement_generation: p.placement_generation,
+                                                                })
+                                                                .collect();
+                                                            match syfrah_overlay::rebuild_fdb(
+                                                                backend.as_ref(),
+                                                                &overlay_placements,
+                                                                &local_node,
+                                                            ).await {
+                                                                Ok(summary) => {
+                                                                    info!(
+                                                                        rebuilt = summary.rebuilt,
+                                                                        skipped_local = summary.skipped_local,
+                                                                        errors = summary.errors,
+                                                                        "FDB rebuild after lag complete (in-process)"
+                                                                    );
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("FDB rebuild after lag failed (in-process): {e}");
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("FDB rebuild after lag: failed to list placements (in-process): {e}");
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(
                                                 tokio::sync::broadcast::error::RecvError::Closed,
@@ -3541,6 +3637,8 @@ pub async fn run_daemon(
     // data plane (veth + nftables) is wired on ALL nodes, not only the
     // Raft leader that handled the original VpcPeer command.
     let overlay_reconcile_org_store = shared_org_store.clone();
+    let overlay_reconcile_placement_store = shared_placement_store.clone();
+    let overlay_reconcile_local_node = my_record.mesh_ipv6.to_string();
     let shutdown_overlay_reconcile = shutdown.clone();
     let overlay_reconcile = async move {
         let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
@@ -3705,6 +3803,56 @@ pub async fn run_daemon(
                         &gw.name,
                         syfrah_org::types::ResourceState::Failed,
                     );
+                }
+            }
+
+            // -- FDB periodic reconcile (safety net) ---------------------------------
+            //
+            // The incremental PlacementEvent channel handles FDB updates in
+            // real-time, but if events are ever missed (lag, snapshot install
+            // race, channel overflow), this periodic rebuild ensures FDB
+            // converges within 30 seconds. The rebuild is idempotent — adding
+            // an existing FDB entry is a no-op.
+            if let Some(ref ps) = overlay_reconcile_placement_store {
+                match ps.list_all() {
+                    Ok(placements) => {
+                        let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
+                            .iter()
+                            .map(|p| syfrah_overlay::VmPlacement {
+                                vpc_id: p.vpc_id.clone(),
+                                vm_id: p.vm_id.clone(),
+                                vm_mac: p.vm_mac.clone(),
+                                vm_ip: p.vm_ip.clone(),
+                                subnet_id: p.subnet_id.clone(),
+                                hypervisor_id: p.hypervisor_id.clone(),
+                                action: syfrah_overlay::PlacementAction::Add,
+                                placement_generation: p.placement_generation,
+                            })
+                            .collect();
+                        match syfrah_overlay::rebuild_fdb(
+                            backend.as_ref(),
+                            &overlay_placements,
+                            &overlay_reconcile_local_node,
+                        )
+                        .await
+                        {
+                            Ok(summary) => {
+                                if summary.rebuilt > 0 || summary.errors > 0 {
+                                    info!(
+                                        rebuilt = summary.rebuilt,
+                                        errors = summary.errors,
+                                        "overlay reconcile: FDB periodic rebuild"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("overlay reconcile: FDB periodic rebuild failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("overlay reconcile: failed to list placements for FDB rebuild: {e}");
+                    }
                 }
             }
         }
