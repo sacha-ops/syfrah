@@ -3034,6 +3034,7 @@ dependencies = [
  "clap",
  "console",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "syfrah-api",
