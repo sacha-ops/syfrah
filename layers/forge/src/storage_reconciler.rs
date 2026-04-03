@@ -15,7 +15,7 @@
 //! The reconciler does NOT modify Raft state. It only reads desired state
 //! and converges local ZeroFS processes to match.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -181,10 +181,10 @@ impl StorageReconciler {
             }
         };
 
-        // 3. Build desired set.
+        // 3. Build desired set and running map (with generations).
         let desired_map: HashMap<String, &DesiredVolume> =
             desired.iter().map(|v| (v.id.clone(), v)).collect();
-        let running: HashSet<String> = volume_mgr.list_active().into_iter().collect();
+        let running: HashMap<String, u64> = volume_mgr.list_active().into_iter().collect();
 
         let s3 = S3Config {
             endpoint: config.s3_endpoint.clone(),
@@ -198,9 +198,39 @@ impl StorageReconciler {
             memory_size_bytes: config.cache_memory_size_bytes,
         };
 
-        // 4. Start volumes that are desired but not running.
+        // 4. Generation fencing: stop volumes running with a stale generation.
+        //    After stopping, the volume will be picked up as "desired but not
+        //    running" in step 5 and restarted with the correct generation.
         for (id, vol) in &desired_map {
-            if !running.contains(id) {
+            if let Some(&running_gen) = running.get(id.as_str()) {
+                if running_gen != vol.placement_generation {
+                    warn!(
+                        volume_id = %id,
+                        running_generation = running_gen,
+                        desired_generation = vol.placement_generation,
+                        "storage reconciler: generation mismatch, stopping stale volume"
+                    );
+                    match volume_mgr.stop_volume(id).await {
+                        Ok(()) => {
+                            report.stopped += 1;
+                        }
+                        Err(e) => {
+                            error!(
+                                volume_id = %id,
+                                error = %e,
+                                "storage reconciler: failed to stop stale-generation volume"
+                            );
+                            report.errors.push(format!("stop-stale {id}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Start volumes that are desired but not running (including those
+        //    just stopped due to generation mismatch above).
+        for (id, vol) in &desired_map {
+            if !volume_mgr.is_running(id) {
                 info!(
                     volume_id = %id,
                     generation = vol.placement_generation,
@@ -236,9 +266,13 @@ impl StorageReconciler {
             }
         }
 
-        // 5. Stop volumes that are running but not desired (fenced/detached/deleted).
-        for id in &running {
+        // 6. Stop volumes that are running but not desired (fenced/detached/deleted).
+        for id in running.keys() {
             if !desired_map.contains_key(id) {
+                // Skip if already stopped during generation fencing above.
+                if !volume_mgr.is_running(id) {
+                    continue;
+                }
                 let reason =
                     "volume no longer desired on this hypervisor (detached/deleted/fenced)";
                 info!(volume_id = %id, reason, "storage reconciler: stopping volume");
@@ -514,5 +548,73 @@ mod tests {
         assert_eq!(report.stopped, 0);
         assert_eq!(report.reaped, 0);
         assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_generation_mismatch_stops_stale_volume() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        // Inject a fake process running with generation 1.
+        mgr.inject_fake_process("vol-gen", 1);
+        assert!(mgr.is_running("vol-gen"));
+
+        // Desired state says generation should be 2.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-gen".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 2,
+            hypervisor_id: "hv-1".into(),
+        }]);
+
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+
+        // The stale volume should have been stopped.
+        assert!(
+            report.stopped >= 1,
+            "expected at least 1 stop for stale generation, got {}",
+            report.stopped
+        );
+
+        // start_volume will fail (no zerofs binary) but the attempt should
+        // be recorded as an error — proving the reconciler tried to restart
+        // with the new generation.
+        assert!(
+            !report.errors.is_empty(),
+            "expected a start error (no zerofs binary) after stopping stale volume"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_matching_generation_no_restart() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        // Inject a fake process running with generation 3.
+        mgr.inject_fake_process("vol-ok", 3);
+        assert!(mgr.is_running("vol-ok"));
+
+        // Desired state also says generation 3.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-ok".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 3,
+            hypervisor_id: "hv-1".into(),
+        }]);
+
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+
+        // Nothing should be stopped or started — generations match.
+        assert_eq!(report.stopped, 0);
+        assert_eq!(report.started, 0);
+        assert!(report.errors.is_empty());
+        assert!(mgr.is_running("vol-ok"));
+
+        // Cleanup.
+        mgr.stop_volume("vol-ok").await.ok();
     }
 }

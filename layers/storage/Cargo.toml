@@ -8,6 +8,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+test-helpers = []
+
 [dependencies]
 syfrah-api = { path = "../api" }
 async-trait = "0.1"
