@@ -4,6 +4,56 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Storage types (inline until syfrah-core #1178 lands proper typed IDs)
+// ---------------------------------------------------------------------------
+
+/// Volume type: root volumes are tied to a VM lifecycle, data volumes are independent.
+// TODO: Replace with syfrah_core::VolumeType once #1178 lands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VolumeType {
+    /// Root volume — auto-created with a VM, deleted when the VM is deleted.
+    Root,
+    /// Data volume — created independently, lifecycle is not tied to any VM.
+    Data,
+}
+
+/// Per-region S3 storage configuration replicated through Raft.
+///
+/// # Security notes
+/// - `s3_access_key` and `s3_secret_key` ARE stored in Raft so that all nodes
+///   in the region know how to reach the S3 bucket.
+/// - The `encryption_passphrase` is NOT stored in Raft. It is kept locally on
+///   each hypervisor (file with 0600 permissions) and never replicated via
+///   consensus. See ADR-006 §9.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// S3-compatible endpoint URL (e.g. "https://s3.par.io.cloud.ovh.net").
+    pub s3_endpoint: String,
+    /// S3 bucket name. All volumes in this region share this bucket.
+    pub s3_bucket: String,
+    /// S3 access key (replicated via Raft for cross-node access).
+    pub s3_access_key: String,
+    /// S3 secret key (replicated via Raft for cross-node access).
+    pub s3_secret_key: String,
+    /// Path to the local SSD used for the warm cache.
+    pub cache_disk_path: String,
+    /// Maximum SSD cache size in gigabytes.
+    pub cache_disk_size_gb: u32,
+    /// Maximum memory cache size in gigabytes.
+    pub cache_memory_size_gb: u32,
+}
+
+/// Scope for storage quotas — either per-org or per-project.
+// TODO: Replace with typed OrgId/ProjectId from syfrah-core once #1178 lands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QuotaScope {
+    /// Quota applies to an entire organisation.
+    Org { org_id: String },
+    /// Quota applies to a specific project within an organisation.
+    Project { org_id: String, project_id: String },
+}
+
 /// A command that is replicated through Raft and applied to the state machine.
 ///
 /// Each variant maps to an existing store method in the org/hypervisor/ipam layers.
@@ -237,6 +287,74 @@ pub enum StateMachineCommand {
         nic_id: String,
     },
 
+    // -- Storage (ADR-006 §16) --
+    // TODO: Replace String IDs with typed VolumeId/SnapshotId/VmId/HypervisorId
+    // from syfrah-core once #1178 lands.
+    /// Create a new volume. Raft validates quota and name uniqueness within env.
+    CreateVolume {
+        id: String,
+        name: String,
+        size_gb: u32,
+        org_id: String,
+        project_id: String,
+        env_id: String,
+        volume_type: VolumeType,
+    },
+    /// Mark a volume for deletion. Volume must be Available (not attached).
+    DeleteVolume {
+        volume_id: String,
+    },
+    /// Attach a volume to a VM on a specific hypervisor. Enforces the
+    /// single-writer invariant — the volume must be Available.
+    /// Increments `placement_generation` for fencing.
+    AttachVolume {
+        volume_id: String,
+        vm_id: String,
+        hypervisor_id: String,
+    },
+    /// Detach a volume from its current VM. Volume must be Attached.
+    DetachVolume {
+        volume_id: String,
+    },
+    /// Resize a volume (grow only, no shrink in v1). Volume must be Available.
+    ResizeVolume {
+        volume_id: String,
+        new_size_gb: u32,
+    },
+    /// Record a crash-consistent snapshot. Increments SST refcounts.
+    CreateSnapshot {
+        id: String,
+        source_volume_id: String,
+        sst_files: Vec<String>,
+        wal_position: u64,
+    },
+    /// Delete a snapshot. Decrements SST refcounts; GC reclaims unreachable SSTs.
+    DeleteSnapshot {
+        snapshot_id: String,
+    },
+    /// Restore a snapshot into a new volume with a fresh generation.
+    RestoreSnapshot {
+        snapshot_id: String,
+        new_volume_id: String,
+        new_volume_name: String,
+    },
+    /// Set per-region S3 storage configuration (replicated to all nodes).
+    /// NOTE: The encryption_passphrase is NOT included — it is stored locally
+    /// on each hypervisor with 0600 permissions, never replicated via Raft.
+    /// The S3 credentials (access_key, secret_key) ARE stored in Raft so that
+    /// every node in the region can reach the bucket.
+    SetStorageConfig {
+        region: String,
+        config: StorageConfig,
+    },
+    /// Set storage quotas for an org or project.
+    SetStorageQuota {
+        scope: QuotaScope,
+        max_volumes: u32,
+        max_total_gb: u64,
+        max_snapshots: u32,
+    },
+
     // -- Composite Transaction --
     /// Atomic batch of commands applied in a single Raft log entry.
     /// All sub-commands succeed or all fail. Used for placement transactions
@@ -263,6 +381,25 @@ impl std::fmt::Display for StateMachineCommand {
             Self::UpdateHypervisorCapacity { name, .. } => {
                 write!(f, "UpdateHypervisorCapacity({name})")
             }
+            Self::CreateVolume { id, name, .. } => write!(f, "CreateVolume({id}, {name})"),
+            Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
+            Self::AttachVolume {
+                volume_id, vm_id, ..
+            } => write!(f, "AttachVolume({volume_id}→{vm_id})"),
+            Self::DetachVolume { volume_id } => write!(f, "DetachVolume({volume_id})"),
+            Self::ResizeVolume {
+                volume_id,
+                new_size_gb,
+            } => write!(f, "ResizeVolume({volume_id}, {new_size_gb}GB)"),
+            Self::CreateSnapshot { id, .. } => write!(f, "CreateSnapshot({id})"),
+            Self::DeleteSnapshot { snapshot_id } => write!(f, "DeleteSnapshot({snapshot_id})"),
+            Self::RestoreSnapshot {
+                snapshot_id,
+                new_volume_id,
+                ..
+            } => write!(f, "RestoreSnapshot({snapshot_id}→{new_volume_id})"),
+            Self::SetStorageConfig { region, .. } => write!(f, "SetStorageConfig({region})"),
+            Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope:?})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -510,6 +647,65 @@ mod tests {
             },
             StateMachineCommand::DeleteNic {
                 nic_id: "nic1".into(),
+            },
+            // -- Storage --
+            StateMachineCommand::CreateVolume {
+                id: "vol-01".into(),
+                name: "pgdata".into(),
+                size_gb: 100,
+                org_id: "acme".into(),
+                project_id: "myapp".into(),
+                env_id: "prod".into(),
+                volume_type: VolumeType::Data,
+            },
+            StateMachineCommand::DeleteVolume {
+                volume_id: "vol-01".into(),
+            },
+            StateMachineCommand::AttachVolume {
+                volume_id: "vol-01".into(),
+                vm_id: "vm1".into(),
+                hypervisor_id: "hv1".into(),
+            },
+            StateMachineCommand::DetachVolume {
+                volume_id: "vol-01".into(),
+            },
+            StateMachineCommand::ResizeVolume {
+                volume_id: "vol-01".into(),
+                new_size_gb: 200,
+            },
+            StateMachineCommand::CreateSnapshot {
+                id: "snap-01".into(),
+                source_volume_id: "vol-01".into(),
+                sst_files: vec!["sst-001".into(), "sst-002".into()],
+                wal_position: 42,
+            },
+            StateMachineCommand::DeleteSnapshot {
+                snapshot_id: "snap-01".into(),
+            },
+            StateMachineCommand::RestoreSnapshot {
+                snapshot_id: "snap-01".into(),
+                new_volume_id: "vol-02".into(),
+                new_volume_name: "pgdata-restored".into(),
+            },
+            StateMachineCommand::SetStorageConfig {
+                region: "eu-west".into(),
+                config: StorageConfig {
+                    s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
+                    s3_bucket: "syfrah-storage-eu-west".into(),
+                    s3_access_key: "AKID".into(),
+                    s3_secret_key: "secret".into(),
+                    cache_disk_path: "/dev/nvme1n1".into(),
+                    cache_disk_size_gb: 200,
+                    cache_memory_size_gb: 8,
+                },
+            },
+            StateMachineCommand::SetStorageQuota {
+                scope: QuotaScope::Org {
+                    org_id: "acme".into(),
+                },
+                max_volumes: 50,
+                max_total_gb: 10000,
+                max_snapshots: 200,
             },
         ];
 

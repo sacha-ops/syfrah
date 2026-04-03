@@ -1299,6 +1299,21 @@ impl RedbStateMachine {
                 }
                 StateMachineResponse::Composite(results)
             }
+
+            // Storage commands (ADR-006 §16) — apply handler is #1181.
+            StateMachineCommand::CreateVolume { .. }
+            | StateMachineCommand::DeleteVolume { .. }
+            | StateMachineCommand::AttachVolume { .. }
+            | StateMachineCommand::DetachVolume { .. }
+            | StateMachineCommand::ResizeVolume { .. }
+            | StateMachineCommand::CreateSnapshot { .. }
+            | StateMachineCommand::DeleteSnapshot { .. }
+            | StateMachineCommand::RestoreSnapshot { .. }
+            | StateMachineCommand::SetStorageConfig { .. }
+            | StateMachineCommand::SetStorageQuota { .. } => {
+                // TODO(#1181): implement storage apply handler
+                StateMachineResponse::Error("storage commands not yet implemented".into())
+            }
         }
     }
 }
