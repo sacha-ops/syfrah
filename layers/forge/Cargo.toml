@@ -15,6 +15,7 @@ syfrah-controlplane = { path = "../controlplane" }
 syfrah-org = { path = "../org" }
 syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
+syfrah-storage = { path = "../storage" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 axum = "0.8"
@@ -29,6 +30,7 @@ anyhow.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+syfrah-storage = { path = "../storage", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

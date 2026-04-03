@@ -231,9 +231,12 @@ impl VolumeMgr {
         self.processes.contains_key(volume_id)
     }
 
-    /// List IDs of all actively tracked volumes.
-    pub fn list_active(&self) -> Vec<String> {
-        self.processes.keys().cloned().collect()
+    /// List all actively tracked volumes as `(volume_id, generation)` pairs.
+    pub fn list_active(&self) -> Vec<(String, u64)> {
+        self.processes
+            .iter()
+            .map(|(id, proc)| (id.clone(), proc.generation))
+            .collect()
     }
 
     /// Reap any child processes that have exited (crashed or terminated
@@ -317,6 +320,34 @@ impl Default for VolumeMgr {
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers (cfg(test) or cfg(feature = "test-helpers"))
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl VolumeMgr {
+    /// Inject a fake running process for testing.
+    ///
+    /// Spawns a long-running `sleep` process so that `is_running` and
+    /// `list_active` behave as if a real ZeroFS process were tracked.
+    pub fn inject_fake_process(&mut self, volume_id: &str, generation: u64) {
+        let child = Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn sleep for test helper");
+        let nbd_device = self.allocate_nbd_device();
+        self.processes.insert(
+            volume_id.to_string(),
+            VolumeProcess {
+                child,
+                nbd_device,
+                generation,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -329,6 +360,31 @@ mod tests {
         let mgr = VolumeMgr::new();
         assert!(mgr.list_active().is_empty());
         assert!(!mgr.is_running("vol-1"));
+    }
+
+    #[tokio::test]
+    async fn list_active_returns_generation() {
+        let mut mgr = VolumeMgr::new();
+        let child = Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        mgr.processes.insert(
+            "vol-gen".to_string(),
+            VolumeProcess {
+                child,
+                nbd_device: PathBuf::from("/dev/nbd50"),
+                generation: 42,
+            },
+        );
+
+        let active = mgr.list_active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "vol-gen");
+        assert_eq!(active[0].1, 42);
+
+        mgr.stop_volume("vol-gen").await.ok();
     }
 
     #[test]
@@ -467,6 +523,7 @@ mod tests {
     #[test]
     fn default_impl_matches_new() {
         let mgr = VolumeMgr::default();
-        assert!(mgr.list_active().is_empty());
+        let active: Vec<(String, u64)> = mgr.list_active();
+        assert!(active.is_empty());
     }
 }
