@@ -157,35 +157,65 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // Re-exec the daemon in the background via the syfrah binary.
+    // Wait for PID file to be fully removed.
+    let pid_path = syfrah_fabric::store::pid_path();
+    for _ in 0..20 {
+        if !pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Wait for control socket to be released.
+    let sock_path = syfrah_fabric::store::control_socket_path();
+    for _ in 0..20 {
+        if !sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Re-exec the daemon in the background via the syfrah binary with retry.
     // This mirrors the double-fork pattern used by `syfrah fabric start`.
     let exe = std::env::current_exe().context("Failed to find syfrah binary")?;
-    let child = std::process::Command::new(&exe)
-        .args(["fabric", "start"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let mut started = false;
+    for attempt in 0..3u32 {
+        let child = std::process::Command::new(&exe)
+            .args(["fabric", "start"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
 
-    match child {
-        Ok(_) => {
-            // Wait briefly for the daemon to start and write its PID file.
-            for _ in 0..50 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match child {
+            Ok(_) => {
+                // Wait briefly for the daemon to start and write its PID file.
+                for _ in 0..50 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if syfrah_fabric::store::daemon_running().is_some() {
+                        break;
+                    }
+                }
                 if syfrah_fabric::store::daemon_running().is_some() {
+                    println!("  Daemon restarted with Raft enabled.");
+                    started = true;
                     break;
+                } else {
+                    println!(
+                        "  Daemon spawned but not yet ready (attempt {}/3).",
+                        attempt + 1
+                    );
                 }
             }
-            if syfrah_fabric::store::daemon_running().is_some() {
-                println!("  Daemon restarted with Raft enabled.");
-            } else {
-                println!("  Daemon spawned but not yet ready. Check: syfrah fabric status");
+            Err(e) => {
+                eprintln!("  Warning: restart attempt {}/3 failed: {e}", attempt + 1);
             }
         }
-        Err(e) => {
-            eprintln!("  Warning: failed to restart daemon: {e}");
-            println!("  Restart manually: syfrah fabric stop && syfrah fabric start");
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+    }
+    if !started {
+        eprintln!("  Auto-restart failed after 3 attempts. Run 'syfrah fabric start' manually.");
     }
 
     Ok(())

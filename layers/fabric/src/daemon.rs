@@ -2260,14 +2260,52 @@ pub async fn run_daemon(
                                 }
                             }
 
-                            // Re-exec the daemon.
+                            // Wait for PID file to be fully removed.
+                            let pid_path = crate::store::pid_path();
+                            for _ in 0..20 {
+                                if !pid_path.exists() {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                            // Wait for control socket to be released.
+                            let sock_path = crate::store::control_socket_path();
+                            for _ in 0..20 {
+                                if !sock_path.exists() {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+
+                            // Re-exec the daemon with retry.
+                            let mut started = false;
                             if let Ok(exe) = std::env::current_exe() {
-                                let _ = std::process::Command::new(&exe)
-                                    .args(["fabric", "start"])
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .spawn();
+                                for attempt in 0..3u32 {
+                                    match std::process::Command::new(&exe)
+                                        .args(["fabric", "start"])
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn()
+                                    {
+                                        Ok(_) => {
+                                            started = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "raft: auto-join restart attempt {}/{} failed: {e}",
+                                                attempt + 1,
+                                                3
+                                            );
+                                            tokio::time::sleep(std::time::Duration::from_secs(2))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            if !started {
+                                warn!("raft: auto-restart failed after 3 attempts. Run 'syfrah fabric start' manually.");
                             }
                             return;
                         }
