@@ -2814,6 +2814,76 @@ pub async fn run_daemon(
         }
     };
 
+    // Overlay network reconciliation loop: populate expected peering state
+    // from the org store and call reconcile_network so that VPC peering
+    // data plane (veth + nftables) is wired on ALL nodes, not only the
+    // Raft leader that handled the original VpcPeer command.
+    let overlay_reconcile_org_store = shared_org_store.clone();
+    let shutdown_overlay_reconcile = shutdown.clone();
+    let overlay_reconcile = async move {
+        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+            Arc::new(syfrah_overlay::LinuxBackend::new());
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = shutdown_overlay_reconcile.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+
+            let org_store = match overlay_reconcile_org_store {
+                Some(ref s) => s,
+                None => continue,
+            };
+
+            // Build expected peerings from the org store.
+            let peerings = match org_store.list_peerings() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "overlay reconcile: failed to list peerings");
+                    continue;
+                }
+            };
+
+            let mut expected_peerings = Vec::new();
+            for peering in &peerings {
+                if peering.status != syfrah_org::PeeringStatus::Active {
+                    continue;
+                }
+                // Resolve VPC names to VPC records to get the IDs for bridge naming.
+                let vpc_a = match org_store.get_vpc(&peering.vpc_a) {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                };
+                let vpc_b = match org_store.get_vpc(&peering.vpc_b) {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                };
+                let bridge_a = syfrah_overlay::naming::bridge_name(&vpc_a.id.0);
+                let bridge_b = syfrah_overlay::naming::bridge_name(&vpc_b.id.0);
+                let peering_id = format!("{}-{}", vpc_a.id.0, vpc_b.id.0);
+
+                expected_peerings.push(syfrah_overlay::ExpectedPeering {
+                    peering_id,
+                    bridge_a,
+                    bridge_b,
+                });
+            }
+
+            let state = syfrah_overlay::NetworkState {
+                peerings: expected_peerings,
+                ..Default::default()
+            };
+
+            let report = syfrah_overlay::reconcile_network(backend.as_ref(), &state).await;
+            if report.peerings_wired > 0 {
+                info!(
+                    peerings_wired = report.peerings_wired,
+                    "overlay reconcile: VPC peering data plane wired"
+                );
+            }
+        }
+    };
+
     // Periodic self-announce (anti-entropy): re-announce our own record to
     // ALL known peers so that any announcements lost during initial join
     // propagation are eventually recovered. Without this, a failed announce
@@ -2990,6 +3060,7 @@ pub async fn run_daemon(
         _ = persist => {}
         _ = health_check => {}
         _ = reconcile => {}
+        _ = overlay_reconcile => {}
         _ = self_announce => {}
         _ = sighup_reload => {}
         _ = api_task => {}
