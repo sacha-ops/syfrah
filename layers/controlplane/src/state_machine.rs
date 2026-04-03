@@ -298,6 +298,15 @@ impl RedbStateMachine {
         self
     }
 
+    /// Replace the internal placement-event broadcast sender with an
+    /// externally created one.  This lets the caller subscribe *before*
+    /// the state machine (and therefore before openraft) is created,
+    /// eliminating the window where events can be missed.
+    pub fn with_placement_tx(mut self, tx: tokio::sync::broadcast::Sender<PlacementEvent>) -> Self {
+        self.placement_tx = tx;
+        self
+    }
+
     /// Apply a single command to the state machine.
     ///
     /// Every mutation goes through here on ALL Raft nodes, producing identical redb state.
@@ -1436,6 +1445,34 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                 table_entries = table_count,
                 "snapshot: restored store tables from full snapshot"
             );
+
+            // Emit PlacementEvent::Added for every placement in the restored
+            // store so that FDB incremental listeners learn about them
+            // immediately — without this, placements from snapshots would be
+            // invisible until the next daemon restart (cold rebuild).
+            if let Some(ref ps) = self.placement_store {
+                if let Ok(placements) = ps.list_all() {
+                    let mut emitted = 0usize;
+                    for p in &placements {
+                        let _ = self.placement_tx.send(PlacementEvent::Added {
+                            vpc_id: p.vpc_id.clone(),
+                            vm_id: p.vm_id.clone(),
+                            vm_mac: p.vm_mac.clone(),
+                            vm_ip: p.vm_ip.clone(),
+                            subnet_id: p.subnet_id.clone(),
+                            hypervisor_id: p.hypervisor_id.clone(),
+                        });
+                        emitted += 1;
+                    }
+                    if emitted > 0 {
+                        info!(
+                            emitted,
+                            "snapshot: emitted PlacementEvents for restored placements"
+                        );
+                    }
+                }
+            }
+
             full.sm_state
         } else {
             // Legacy format: SmState only (no store data).
