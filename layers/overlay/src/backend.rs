@@ -90,6 +90,15 @@ pub trait NetworkBackend: Send + Sync {
     /// physdev dispatch chains. Idempotent — safe to call multiple times.
     async fn apply_sg_base_chain(&self) -> Result<()>;
 
+    /// Apply intra-VPC and internet egress rules for a bridge.
+    ///
+    /// With `policy drop` on the forward chain, these rules explicitly allow:
+    /// 1. Same-bridge traffic (intra-VPC communication)
+    /// 2. Outbound internet egress from the bridge
+    ///
+    /// Must be called when a bridge is created or during reconciliation.
+    async fn apply_bridge_accept_rules(&self, bridge: &str) -> Result<()>;
+
     /// Apply anti-spoofing + default ingress/egress rules for a VM.
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()>;
 

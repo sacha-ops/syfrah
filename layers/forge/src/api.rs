@@ -1588,6 +1588,12 @@ async fn create_bridge_handler(
         .as_ref()
         .map(|gt| gt.register(&resource_id));
 
+    // Apply per-bridge accept rules (intra-VPC + internet egress) so
+    // that traffic is not dropped by the forward chain's policy drop.
+    if let Err(e) = backend.apply_bridge_accept_rules(&bridge_name).await {
+        warn!(vpc_id = %req.vpc_id, error = %e, "failed to apply bridge accept rules");
+    }
+
     info!(vpc_id = %req.vpc_id, bridge = %bridge_name, "bridge ensured");
     (
         StatusCode::OK,

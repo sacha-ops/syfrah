@@ -151,6 +151,9 @@ pub async fn recover_network(
             warn!(bridge = %bridge, error = %e, "failed to recover bridge");
             continue;
         }
+        if let Err(e) = backend.apply_bridge_accept_rules(&bridge).await {
+            warn!(bridge = %bridge, error = %e, "failed to apply bridge accept rules");
+        }
 
         // Add gateway IPs for subnets in this VPC.
         for subnet in subnets.iter().filter(|s| s.vpc_id == vpc.id) {

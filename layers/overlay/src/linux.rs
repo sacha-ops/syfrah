@@ -364,6 +364,13 @@ impl NetworkBackend for LinuxBackend {
         Ok(())
     }
 
+    async fn apply_bridge_accept_rules(&self, bridge: &str) -> Result<()> {
+        let ruleset = crate::nft::generate_bridge_accept_rules(bridge);
+        crate::nft::apply_ruleset(&ruleset)
+            .map_err(|e| OverlayError::CommandFailed(e.to_string()))?;
+        Ok(())
+    }
+
     async fn apply_vm_rules(&self, tap: &str, mac: &str, ip: &str) -> Result<()> {
         // Ensure table and chain exist (ignore errors if already present)
         Self::run("nft", &["add", "table", "inet", "syfrah"])
@@ -377,7 +384,7 @@ impl NetworkBackend for LinuxBackend {
                 "inet",
                 "syfrah",
                 "forward",
-                "{ type filter hook forward priority 0; policy accept; }",
+                "{ type filter hook forward priority 0; policy drop; }",
             ],
         )
         .await
@@ -567,7 +574,7 @@ impl NetworkBackend for LinuxBackend {
                 "inet",
                 "syfrah",
                 "forward",
-                "{ type filter hook forward priority 0; policy accept; }",
+                "{ type filter hook forward priority 0; policy drop; }",
             ],
         )
         .await
