@@ -14,4 +14,4 @@ pub use cache::{
     CacheDiskInfo, CacheError, VolumeCacheDir,
 };
 pub use cli::{StorageCommand, VolumeCommand};
-pub use volume_mgr::{CacheConfig, S3Config, VolumeMgr, VolumeMgrError};
+pub use volume_mgr::{S3Config, VolumeMgr, VolumeMgrError};
