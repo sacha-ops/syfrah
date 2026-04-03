@@ -18,11 +18,108 @@ use openraft::{EntryPayload, OptionalSend};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::commands::{StateMachineCommand, StateMachineResponse};
+use crate::commands::{StateMachineCommand, StateMachineResponse, VolumeType};
 use crate::types::SyfrahRaftConfig;
 
 /// Default number of log entries between snapshots.
 pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
+
+// ---------------------------------------------------------------------------
+// Volume in-memory store (temporary until redb tables land in #1182)
+// ---------------------------------------------------------------------------
+
+/// Desired state for a volume in the Raft state machine (ADR-006 §5).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VolumeDesiredState {
+    /// Volume exists and is available for attachment.
+    Available,
+    /// Volume is attached to a specific VM on a specific hypervisor.
+    AttachedTo {
+        vm_id: String,
+        hypervisor_id: String,
+    },
+    /// Volume is marked for deletion.
+    Deleted,
+}
+
+/// In-memory volume record. Mirrors the ADR-006 Volume struct but kept
+/// minimal — just enough fields to enforce the state machine invariants.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VolumeRecord {
+    pub id: String,
+    pub name: String,
+    pub size_gb: u32,
+    pub env_id: String,
+    pub org_id: String,
+    pub project_id: String,
+    pub volume_type: VolumeType,
+    pub desired_state: VolumeDesiredState,
+    pub placement_generation: u64,
+}
+
+/// Thread-safe in-memory volume store.
+///
+/// Keyed by volume ID. A `std::sync::RwLock` is used (not tokio) because the
+/// apply path is synchronous (`apply_command` is `&self -> Response`).
+#[derive(Debug, Default)]
+pub struct VolumeStore {
+    volumes: std::sync::RwLock<HashMap<String, VolumeRecord>>,
+}
+
+impl VolumeStore {
+    pub fn new() -> Self {
+        Self {
+            volumes: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Insert a volume. Returns `Err` if the ID already exists.
+    fn insert(&self, record: VolumeRecord) -> Result<(), String> {
+        let mut map = self.volumes.write().unwrap();
+        if map.contains_key(&record.id) {
+            return Err(format!("volume '{}' already exists", record.id));
+        }
+        map.insert(record.id.clone(), record);
+        Ok(())
+    }
+
+    /// Get a volume by ID.
+    fn get(&self, id: &str) -> Option<VolumeRecord> {
+        self.volumes.read().unwrap().get(id).cloned()
+    }
+
+    /// Update a volume in-place. Returns `Err` if not found.
+    fn update(&self, record: VolumeRecord) -> Result<(), String> {
+        let mut map = self.volumes.write().unwrap();
+        if !map.contains_key(&record.id) {
+            return Err(format!("volume '{}' not found", record.id));
+        }
+        map.insert(record.id.clone(), record);
+        Ok(())
+    }
+
+    /// Check whether a volume name already exists within an environment.
+    fn name_exists_in_env(&self, name: &str, env_id: &str) -> bool {
+        let map = self.volumes.read().unwrap();
+        map.values().any(|v| {
+            v.name == name && v.env_id == env_id && v.desired_state != VolumeDesiredState::Deleted
+        })
+    }
+
+    /// Export all volumes for snapshot serialization.
+    pub fn export_all(&self) -> Vec<VolumeRecord> {
+        self.volumes.read().unwrap().values().cloned().collect()
+    }
+
+    /// Import volumes (replaces all existing data).
+    pub fn import_all(&self, records: Vec<VolumeRecord>) {
+        let mut map = self.volumes.write().unwrap();
+        map.clear();
+        for r in records {
+            map.insert(r.id.clone(), r);
+        }
+    }
+}
 
 /// Event emitted by the state machine when a VM placement changes.
 ///
@@ -87,6 +184,8 @@ pub struct RedbStateMachine {
     pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
     pub sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
     pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
+    /// In-memory volume store (temporary until redb table lands in #1182).
+    pub volume_store: VolumeStore,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -111,6 +210,7 @@ impl RedbStateMachine {
             placement_store: None,
             sg_rule_store: None,
             hypervisor_store: None,
+            volume_store: VolumeStore::new(),
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
@@ -1300,19 +1400,177 @@ impl RedbStateMachine {
                 StateMachineResponse::Composite(results)
             }
 
-            // Storage commands (ADR-006 §16) — apply handler is #1181.
-            StateMachineCommand::CreateVolume { .. }
-            | StateMachineCommand::DeleteVolume { .. }
-            | StateMachineCommand::AttachVolume { .. }
-            | StateMachineCommand::DetachVolume { .. }
-            | StateMachineCommand::ResizeVolume { .. }
-            | StateMachineCommand::CreateSnapshot { .. }
+            // -- Storage / Volume (ADR-006 §16) --
+            StateMachineCommand::CreateVolume {
+                id,
+                name,
+                size_gb,
+                org_id,
+                project_id,
+                env_id,
+                volume_type,
+            } => {
+                // Validate name uniqueness within environment.
+                if self.volume_store.name_exists_in_env(name, env_id) {
+                    return StateMachineResponse::Error(format!(
+                        "volume name '{name}' already exists in environment '{env_id}'"
+                    ));
+                }
+                let record = VolumeRecord {
+                    id: id.clone(),
+                    name: name.clone(),
+                    size_gb: *size_gb,
+                    env_id: env_id.clone(),
+                    org_id: org_id.clone(),
+                    project_id: project_id.clone(),
+                    volume_type: volume_type.clone(),
+                    desired_state: VolumeDesiredState::Available,
+                    placement_generation: 0,
+                };
+                match self.volume_store.insert(record) {
+                    Ok(()) => StateMachineResponse::Created(id.clone()),
+                    Err(e) => StateMachineResponse::Error(e),
+                }
+            }
+
+            StateMachineCommand::AttachVolume {
+                volume_id,
+                vm_id,
+                hypervisor_id,
+            } => {
+                let vol = match self.volume_store.get(volume_id) {
+                    Some(v) => v,
+                    None => {
+                        return StateMachineResponse::Error(format!(
+                            "volume not found: {volume_id}"
+                        ))
+                    }
+                };
+                match &vol.desired_state {
+                    VolumeDesiredState::Available => {}
+                    VolumeDesiredState::AttachedTo {
+                        vm_id: existing_vm, ..
+                    } => {
+                        return StateMachineResponse::Error(format!(
+                            "volume '{volume_id}' is already attached to VM '{existing_vm}'"
+                        ));
+                    }
+                    VolumeDesiredState::Deleted => {
+                        return StateMachineResponse::Error(format!(
+                            "volume '{volume_id}' is marked for deletion"
+                        ));
+                    }
+                }
+                let mut updated = vol;
+                updated.desired_state = VolumeDesiredState::AttachedTo {
+                    vm_id: vm_id.clone(),
+                    hypervisor_id: hypervisor_id.clone(),
+                };
+                updated.placement_generation += 1;
+                match self.volume_store.update(updated) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e),
+                }
+            }
+
+            StateMachineCommand::DetachVolume { volume_id } => {
+                let vol = match self.volume_store.get(volume_id) {
+                    Some(v) => v,
+                    None => {
+                        return StateMachineResponse::Error(format!(
+                            "volume not found: {volume_id}"
+                        ))
+                    }
+                };
+                match &vol.desired_state {
+                    VolumeDesiredState::AttachedTo { .. } => {
+                        // Transition: Attached -> Available
+                        let mut updated = vol;
+                        updated.desired_state = VolumeDesiredState::Available;
+                        updated.placement_generation += 1;
+                        match self.volume_store.update(updated) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e),
+                        }
+                    }
+                    VolumeDesiredState::Available => {
+                        // Already available — idempotent, treat as success.
+                        StateMachineResponse::Ok
+                    }
+                    VolumeDesiredState::Deleted => StateMachineResponse::Error(format!(
+                        "cannot detach volume '{volume_id}': volume is marked for deletion"
+                    )),
+                }
+            }
+
+            StateMachineCommand::DeleteVolume { volume_id } => {
+                let vol = match self.volume_store.get(volume_id) {
+                    Some(v) => v,
+                    None => {
+                        return StateMachineResponse::Error(format!(
+                            "volume not found: {volume_id}"
+                        ))
+                    }
+                };
+                match &vol.desired_state {
+                    VolumeDesiredState::Available => {
+                        let mut updated = vol;
+                        updated.desired_state = VolumeDesiredState::Deleted;
+                        match self.volume_store.update(updated) {
+                            Ok(()) => StateMachineResponse::Ok,
+                            Err(e) => StateMachineResponse::Error(e),
+                        }
+                    }
+                    VolumeDesiredState::AttachedTo {
+                        vm_id: attached_vm, ..
+                    } => StateMachineResponse::Error(format!(
+                        "cannot delete volume '{volume_id}': still attached to VM '{attached_vm}'"
+                    )),
+                    VolumeDesiredState::Deleted => {
+                        // Already deleted — idempotent.
+                        StateMachineResponse::Ok
+                    }
+                }
+            }
+
+            StateMachineCommand::ResizeVolume {
+                volume_id,
+                new_size_gb,
+            } => {
+                let vol = match self.volume_store.get(volume_id) {
+                    Some(v) => v,
+                    None => {
+                        return StateMachineResponse::Error(format!(
+                            "volume not found: {volume_id}"
+                        ))
+                    }
+                };
+                if vol.desired_state != VolumeDesiredState::Available {
+                    return StateMachineResponse::Error(format!(
+                        "cannot resize volume '{volume_id}': volume is not Available"
+                    ));
+                }
+                if *new_size_gb < vol.size_gb {
+                    return StateMachineResponse::Error(format!(
+                        "cannot shrink volume '{volume_id}': current size {} GB, requested {} GB",
+                        vol.size_gb, new_size_gb
+                    ));
+                }
+                let mut updated = vol;
+                updated.size_gb = *new_size_gb;
+                match self.volume_store.update(updated) {
+                    Ok(()) => StateMachineResponse::Ok,
+                    Err(e) => StateMachineResponse::Error(e),
+                }
+            }
+
+            // Snapshot / config / quota commands — not in scope for #1181.
+            StateMachineCommand::CreateSnapshot { .. }
             | StateMachineCommand::DeleteSnapshot { .. }
             | StateMachineCommand::RestoreSnapshot { .. }
             | StateMachineCommand::SetStorageConfig { .. }
             | StateMachineCommand::SetStorageQuota { .. } => {
-                // TODO(#1181): implement storage apply handler
-                StateMachineResponse::Error("storage commands not yet implemented".into())
+                StateMachineResponse::Error("storage command not yet implemented".into())
             }
         }
     }
@@ -1695,5 +1953,478 @@ mod tests {
         assert!(last.is_none());
         // Default membership should be empty.
         assert_eq!(membership.membership().voter_ids().count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Volume state machine tests (#1181)
+    // -----------------------------------------------------------------------
+
+    fn make_create_volume(id: &str, name: &str, size_gb: u32, env: &str) -> StateMachineCommand {
+        StateMachineCommand::CreateVolume {
+            id: id.to_string(),
+            name: name.to_string(),
+            size_gb,
+            org_id: "org-1".to_string(),
+            project_id: "proj-1".to_string(),
+            env_id: env.to_string(),
+            volume_type: crate::commands::VolumeType::Data,
+        }
+    }
+
+    #[test]
+    fn volume_create_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        match resp {
+            StateMachineResponse::Created(id) => assert_eq!(id, "vol-1"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Verify the record exists.
+        let rec = sm.volume_store.get("vol-1").unwrap();
+        assert_eq!(rec.name, "data");
+        assert_eq!(rec.size_gb, 100);
+        assert_eq!(rec.desired_state, VolumeDesiredState::Available);
+        assert_eq!(rec.placement_generation, 0);
+    }
+
+    #[test]
+    fn volume_create_duplicate_name_same_env_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 50, "env-1"));
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("already exists"), "msg: {msg}");
+                assert!(msg.contains("env-1"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_create_same_name_different_env_ok() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 50, "env-2"));
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+    }
+
+    #[test]
+    fn volume_create_duplicate_id_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&make_create_volume("vol-1", "other-name", 50, "env-1"));
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("already exists"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_available_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+        let rec = sm.volume_store.get("vol-1").unwrap();
+        assert_eq!(
+            rec.desired_state,
+            VolumeDesiredState::AttachedTo {
+                vm_id: "vm-1".to_string(),
+                hypervisor_id: "hv-1".to_string(),
+            }
+        );
+        assert_eq!(rec.placement_generation, 1);
+    }
+
+    #[test]
+    fn volume_attach_already_attached_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        // Try attaching again to a different VM.
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-2".to_string(),
+            hypervisor_id: "hv-2".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("already attached"), "msg: {msg}");
+                assert!(msg.contains("vm-1"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_nonexistent_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-ghost".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("not found"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_deleted_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("deletion"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_detach_attached_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+        let rec = sm.volume_store.get("vol-1").unwrap();
+        assert_eq!(rec.desired_state, VolumeDesiredState::Available);
+        // placement_generation should be 2 (1 from attach, 1 from detach).
+        assert_eq!(rec.placement_generation, 2);
+    }
+
+    #[test]
+    fn volume_detach_available_idempotent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        // Detach when already Available — should be idempotent (no-op).
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+    }
+
+    #[test]
+    fn volume_detach_deleted_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("deletion"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_detach_nonexistent_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-ghost".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn volume_delete_available_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+        let rec = sm.volume_store.get("vol-1").unwrap();
+        assert_eq!(rec.desired_state, VolumeDesiredState::Deleted);
+    }
+
+    #[test]
+    fn volume_delete_attached_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("still attached"), "msg: {msg}");
+                assert!(msg.contains("vm-1"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_delete_already_deleted_idempotent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        // Deleting again should be idempotent.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+    }
+
+    #[test]
+    fn volume_delete_nonexistent_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-ghost".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn volume_resize_larger_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 200,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+        let rec = sm.volume_store.get("vol-1").unwrap();
+        assert_eq!(rec.size_gb, 200);
+    }
+
+    #[test]
+    fn volume_resize_same_size_success() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        // Resizing to the same size should be a no-op success.
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 100,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got {resp:?}");
+    }
+
+    #[test]
+    fn volume_resize_smaller_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 50,
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("shrink"), "msg: {msg}");
+                assert!(msg.contains("100"), "msg: {msg}");
+                assert!(msg.contains("50"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_resize_attached_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 200,
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("not Available"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_resize_deleted_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 200,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn volume_resize_nonexistent_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-ghost".to_string(),
+            new_size_gb: 200,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn volume_full_lifecycle() {
+        // Create -> Attach -> Detach -> Resize -> Delete
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create
+        let resp = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Attach
+        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().placement_generation,
+            1
+        );
+
+        // Detach
+        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().placement_generation,
+            2
+        );
+
+        // Resize (grow)
+        let resp = sm.apply_command(&StateMachineCommand::ResizeVolume {
+            volume_id: "vol-1".to_string(),
+            new_size_gb: 500,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        assert_eq!(sm.volume_store.get("vol-1").unwrap().size_gb, 500);
+
+        // Delete
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().desired_state,
+            VolumeDesiredState::Deleted,
+        );
+    }
+
+    #[test]
+    fn volume_deleted_name_can_be_reused() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        // Reuse the same name in the same env with a new ID.
+        let resp = sm.apply_command(&make_create_volume("vol-2", "data", 200, "env-1"));
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+    }
+
+    #[test]
+    fn volume_placement_generation_increments_correctly() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let _ = sm.apply_command(&make_create_volume("vol-1", "data", 100, "env-1"));
+
+        // Attach: 0 -> 1
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            hypervisor_id: "hv-1".to_string(),
+        });
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().placement_generation,
+            1
+        );
+
+        // Detach: 1 -> 2
+        let _ = sm.apply_command(&StateMachineCommand::DetachVolume {
+            volume_id: "vol-1".to_string(),
+        });
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().placement_generation,
+            2
+        );
+
+        // Attach again: 2 -> 3
+        let _ = sm.apply_command(&StateMachineCommand::AttachVolume {
+            volume_id: "vol-1".to_string(),
+            vm_id: "vm-2".to_string(),
+            hypervisor_id: "hv-2".to_string(),
+        });
+        assert_eq!(
+            sm.volume_store.get("vol-1").unwrap().placement_generation,
+            3
+        );
     }
 }
