@@ -2077,11 +2077,28 @@ pub async fn run_daemon(
 
             // Spawn a background task that probes peers for an existing Raft
             // cluster and auto-joins as a learner if one is found.
+            // Clone shared state so we can initialize Raft in-process after join.
             let auto_join_node_name = my_record.name.clone();
             let auto_join_ipv6 = my_record.mesh_ipv6;
             let auto_join_syfrah_dir = syfrah_dir.clone();
+            let aj_org_store = shared_org_store.clone();
+            let aj_ipam_store = shared_ipam_store.clone();
+            let aj_placement_store = shared_placement_store.clone();
+            let aj_sg_rule_store = shared_sg_rule_store.clone();
+            let aj_hypervisor_store = shared_hypervisor_store.clone();
+            let aj_raft_client_holder = Arc::clone(&raft_client_holder);
+            let aj_forge_raft_client = Arc::clone(&forge_raft_client);
+            let aj_forge_gossip_cluster = Arc::clone(&forge_gossip_cluster);
+            let aj_raft_org_handler = raft_org_handler.clone();
+            let aj_raft_hv_handler_ref = raft_hv_handler_ref.clone();
+            let aj_raft_compute_handler_ref = raft_compute_handler_ref.clone();
+            let aj_capacity_for_raft = Arc::clone(&capacity_for_raft);
+            let aj_shared_vm_manager = shared_vm_manager.clone();
+            let aj_raft_bind_addr = raft_bind_addr;
+            let aj_raft_shutdown_rx = raft_shutdown_rx.clone();
+            let aj_my_record = my_record.clone();
             tokio::spawn(async move {
-                let _ = raft_shutdown_rx.clone();
+                let _ = aj_raft_shutdown_rx.clone();
 
                 // Give the mesh a few seconds to settle after startup.
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2222,7 +2239,7 @@ pub async fn run_daemon(
 
                     match join_client.post(&join_url).json(&join_req).send().await {
                         Ok(resp) if resp.status().is_success() => {
-                            info!("raft: auto-join succeeded! Writing sentinel and restarting daemon...");
+                            info!("raft: auto-join succeeded! Writing sentinel and starting Raft in-process...");
 
                             // Write sentinel.
                             if let Err(e) = std::fs::write(
@@ -2233,80 +2250,504 @@ pub async fn run_daemon(
                                 return;
                             }
 
-                            // Restart daemon so Raft server starts.
-                            if let Some(pid) = crate::store::daemon_running() {
-                                if crate::store::is_syfrah_process(pid) {
-                                    #[cfg(unix)]
-                                    unsafe {
-                                        libc::kill(pid as i32, libc::SIGTERM);
-                                    }
-                                    // Wait for shutdown.
-                                    for _ in 0..100 {
-                                        tokio::time::sleep(std::time::Duration::from_millis(100))
-                                            .await;
-                                        if crate::store::daemon_running().is_none() {
-                                            break;
-                                        }
-                                    }
-                                    if crate::store::daemon_running().is_some() {
-                                        #[cfg(unix)]
-                                        unsafe {
-                                            libc::kill(pid as i32, libc::SIGKILL);
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                                            .await;
-                                    }
-                                    crate::store::remove_pid();
+                            // --- Start Raft in-process (no daemon restart) ---
+                            //
+                            // Initialize the Raft node dynamically within the
+                            // running daemon. This avoids the race condition
+                            // where the dying process can't reliably start its
+                            // successor.
+
+                            let log_db = match syfrah_state::LayerDb::open("raft_log") {
+                                Ok(db) => db,
+                                Err(e) => {
+                                    warn!("raft: in-process init failed to open raft_log: {e}");
+                                    return;
                                 }
+                            };
+                            let log_store =
+                                std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
+
+                            let mut sm_builder = syfrah_controlplane::RedbStateMachine::new(
+                                aj_org_store.clone().unwrap_or_else(|| {
+                                    let db = syfrah_state::LayerDb::open("org").unwrap();
+                                    std::sync::Arc::new(syfrah_org::OrgStore::new(db))
+                                }),
+                            );
+
+                            if let Some(ref ipam) = aj_ipam_store {
+                                sm_builder = sm_builder.with_ipam_store(Arc::clone(ipam));
+                                info!("raft: IPAM store wired into state machine (in-process)");
+                            }
+                            if let Some(ref placement) = aj_placement_store {
+                                sm_builder = sm_builder.with_placement_store(Arc::clone(placement));
+                                info!(
+                                    "raft: placement store wired into state machine (in-process)"
+                                );
+                            }
+                            if let Some(ref sg_rules) = aj_sg_rule_store {
+                                sm_builder = sm_builder.with_sg_rule_store(Arc::clone(sg_rules));
+                                info!("raft: SG rule store wired into state machine (in-process)");
+                            }
+                            if let Some(ref hv_store) = aj_hypervisor_store {
+                                sm_builder = sm_builder.with_hypervisor_store(Arc::clone(hv_store));
+                                info!(
+                                    "raft: hypervisor store wired into state machine (in-process)"
+                                );
                             }
 
-                            // Wait for PID file to be fully removed.
-                            let pid_path = crate::store::pid_path();
-                            for _ in 0..20 {
-                                if !pid_path.exists() {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            }
-                            // Wait for control socket to be released.
-                            let sock_path = crate::store::control_socket_path();
-                            for _ in 0..20 {
-                                if !sock_path.exists() {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let sm = std::sync::Arc::new(sm_builder);
+                            let placement_event_rx = sm.subscribe_placement_events();
+                            let network = syfrah_controlplane::SyfrahNetworkFactory::new();
+
+                            let config = std::sync::Arc::new(openraft::Config {
+                                cluster_name: "syfrah-raft".to_string(),
+                                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                                    syfrah_controlplane::state_machine::DEFAULT_SNAPSHOT_THRESHOLD,
+                                ),
+                                max_in_snapshot_log_to_keep: 100,
+                                ..Default::default()
+                            });
+
+                            let raft =
+                                match openraft::Raft::new(node_id, config, network, log_store, sm)
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        warn!(
+                                            "raft: in-process init failed to create Raft node: {e}"
+                                        );
+                                        return;
+                                    }
+                                };
+
+                            let raft_client = syfrah_controlplane::RaftClient::new(raft.clone());
+
+                            // Inject Raft client into placement hook.
+                            {
+                                let mut holder = aj_raft_client_holder.lock().unwrap();
+                                *holder = Some(raft_client.clone());
+                                info!(
+                                    "raft: injected Raft client into placement hook (in-process)"
+                                );
                             }
 
-                            // Re-exec the daemon with retry.
-                            let mut started = false;
-                            if let Ok(exe) = std::env::current_exe() {
-                                for attempt in 0..3u32 {
-                                    match std::process::Command::new(&exe)
-                                        .args(["fabric", "start"])
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn()
+                            // Inject Raft client into Forge HTTP API.
+                            {
+                                let holder = Arc::clone(&aj_forge_raft_client);
+                                let client = raft_client.clone();
+                                tokio::spawn(async move {
+                                    let mut guard = holder.write().await;
+                                    *guard = Some(client);
+                                    info!("raft: injected Raft client into Forge API (in-process)");
+                                });
+                            }
+
+                            // Inject Raft client into org handler.
+                            if let Some(ref handler) = aj_raft_org_handler {
+                                let handler = Arc::clone(handler);
+                                let client = raft_client.clone();
+                                tokio::spawn(async move {
+                                    handler.set_raft_client(client).await;
+                                    info!(
+                                        "raft: injected Raft client into org handler (in-process)"
+                                    );
+                                });
+                            }
+
+                            // Inject Raft client into hypervisor handler.
+                            if let Some(ref handler) = aj_raft_hv_handler_ref {
+                                let handler = Arc::clone(handler);
+                                let client = raft_client.clone();
+                                tokio::spawn(async move {
+                                    handler.set_raft_client(client).await;
+                                    info!("raft: injected Raft client into hypervisor handler (in-process)");
+                                });
+                            }
+
+                            // Inject Raft client + scheduler into compute handler.
+                            if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                let handler = Arc::clone(handler);
+                                let client = raft_client.clone();
+                                let local_node = aj_my_record.name.clone();
+                                let local_addr = aj_my_record.mesh_ipv6.to_string();
+                                tokio::spawn(async move {
+                                    handler.set_raft_client(client).await;
+                                    let scheduler =
+                                        syfrah_controlplane::Scheduler::new(local_node, local_addr);
+                                    handler.set_scheduler(scheduler).await;
+                                    info!("raft: injected Raft client + scheduler into compute handler (in-process)");
+                                });
+                            }
+
+                            // Start gossip agent.
+                            {
+                                let gossip_cluster =
+                                    if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                        handler.gossip_cluster().clone()
+                                    } else {
+                                        syfrah_controlplane::GossipCluster::new()
+                                    };
+
+                                {
+                                    let holder = Arc::clone(&aj_forge_gossip_cluster);
+                                    let gc = gossip_cluster.clone();
+                                    tokio::spawn(async move {
+                                        let mut guard = holder.write().await;
+                                        *guard = Some(gc);
+                                        info!("gossip: injected gossip cluster into Forge API (in-process)");
+                                    });
+                                }
+
+                                let region = aj_my_record
+                                    .region
+                                    .as_deref()
+                                    .unwrap_or("default")
+                                    .to_string();
+                                let zone = aj_my_record
+                                    .zone
+                                    .as_deref()
+                                    .unwrap_or("default")
+                                    .to_string();
+                                let gossip_bind_addr = std::net::SocketAddrV6::new(
+                                    aj_my_record.mesh_ipv6,
+                                    syfrah_controlplane::gossip::GOSSIP_PORT,
+                                    0,
+                                    0,
+                                );
+
+                                let gossip_seeds: Vec<std::net::SocketAddrV6> = {
+                                    match crate::store::load() {
+                                        Ok(state) => state
+                                            .peers
+                                            .iter()
+                                            .map(|p| {
+                                                std::net::SocketAddrV6::new(
+                                                    p.mesh_ipv6,
+                                                    syfrah_controlplane::gossip::GOSSIP_PORT,
+                                                    0,
+                                                    0,
+                                                )
+                                            })
+                                            .collect(),
+                                        Err(_) => vec![],
+                                    }
+                                };
+
+                                let gossip_config = syfrah_controlplane::GossipConfig {
+                                    bind_addr: gossip_bind_addr,
+                                    seeds: gossip_seeds,
+                                    local_node_name: aj_my_record.name.clone(),
+                                    local_hypervisor_id: aj_my_record.mesh_ipv6.to_string(),
+                                    local_region: region,
+                                    local_zone: zone,
+                                };
+
+                                let capacity_fn: Arc<
+                                    dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync,
+                                > = Arc::new(|| {
+                                    let alloc_vcpus = std::thread::available_parallelism()
+                                        .map(|n| n.get() as u32)
+                                        .unwrap_or(1);
+                                    let alloc_memory = std::fs::read_to_string("/proc/meminfo")
+                                        .ok()
+                                        .and_then(|content| {
+                                            content.lines().find_map(|line| {
+                                                if line.starts_with("MemTotal:") {
+                                                    let parts: Vec<&str> =
+                                                        line.split_whitespace().collect();
+                                                    parts
+                                                        .get(1)?
+                                                        .parse::<u64>()
+                                                        .ok()
+                                                        .map(|kb| kb / 1024)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        })
+                                        .unwrap_or(1024);
+                                    (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
+                                });
+
+                                let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
+                                        gossip_config,
+                                        gossip_cluster,
+                                        capacity_fn,
+                                        gossip_shutdown_rx,
+                                    )
+                                    .await
                                     {
-                                        Ok(_) => {
-                                            started = true;
-                                            break;
+                                        warn!("gossip agent failed to start (in-process): {e}");
+                                    }
+                                });
+                                info!("gossip: SWIM gossip agent starting (in-process)");
+                            }
+
+                            // Periodic hypervisor capacity update via Raft.
+                            {
+                                let cap_client = raft_client.clone();
+                                let cap_node_name = aj_my_record.name.clone();
+                                let mut cap_shutdown = aj_raft_shutdown_rx.clone();
+                                let cap_tracker = Arc::clone(&aj_capacity_for_raft);
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::select! {
+                                            _ = cap_shutdown.wait_for(|v| *v) => break,
+                                            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {},
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "raft: auto-join restart attempt {}/{} failed: {e}",
-                                                attempt + 1,
-                                                3
+                                        let alloc_vcpus = cap_tracker.allocatable_vcpus();
+                                        let alloc_memory = cap_tracker.allocatable_memory_mb();
+                                        let used_v = cap_tracker.used_vcpus();
+                                        let used_m = cap_tracker.used_memory_mb();
+                                        let cmd = syfrah_controlplane::StateMachineCommand::UpdateHypervisorCapacity {
+                                            name: cap_node_name.clone(),
+                                            allocatable_vcpus: alloc_vcpus,
+                                            allocatable_memory_mb: alloc_memory,
+                                            used_vcpus: used_v,
+                                            used_memory_mb: used_m,
+                                        };
+                                        if let Err(e) = cap_client.write(cmd).await {
+                                            tracing::debug!(
+                                                "capacity update via raft failed (may not be leader): {e}"
                                             );
-                                            tokio::time::sleep(std::time::Duration::from_secs(2))
-                                                .await;
                                         }
+                                    }
+                                    tracing::debug!("capacity update loop stopped (in-process)");
+                                });
+                                info!("raft: periodic capacity update started (in-process)");
+                            }
+
+                            let raft_state = syfrah_controlplane::server::RaftServerState {
+                                raft,
+                                max_voters: syfrah_controlplane::server::DEFAULT_MAX_VOTERS,
+                            };
+
+                            // FDB cold rebuild from Raft placements.
+                            if let Some(ref placement) = aj_placement_store {
+                                let local_node = aj_my_record.mesh_ipv6.to_string();
+                                match placement.list_all() {
+                                    Ok(placements) => {
+                                        let overlay_placements: Vec<syfrah_overlay::VmPlacement> =
+                                            placements
+                                                .iter()
+                                                .map(|p| syfrah_overlay::VmPlacement {
+                                                    vpc_id: p.vpc_id.clone(),
+                                                    vm_id: p.vm_id.clone(),
+                                                    vm_mac: p.vm_mac.clone(),
+                                                    vm_ip: p.vm_ip.clone(),
+                                                    subnet_id: p.subnet_id.clone(),
+                                                    hypervisor_id: p.hypervisor_id.clone(),
+                                                    action: syfrah_overlay::PlacementAction::Add,
+                                                    placement_generation: p.placement_generation,
+                                                })
+                                                .collect();
+                                        let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                                            Arc::new(syfrah_overlay::LinuxBackend::new());
+                                        match syfrah_overlay::rebuild_fdb(
+                                            backend.as_ref(),
+                                            &overlay_placements,
+                                            &local_node,
+                                        )
+                                        .await
+                                        {
+                                            Ok(summary) => {
+                                                info!(
+                                                    rebuilt = summary.rebuilt,
+                                                    skipped_local = summary.skipped_local,
+                                                    errors = summary.errors,
+                                                    "FDB cold rebuild complete (in-process)"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("FDB cold rebuild failed (in-process): {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("FDB cold rebuild: failed to list placements (in-process): {e}");
                                     }
                                 }
                             }
-                            if !started {
-                                warn!("raft: auto-restart failed after 3 attempts. Run 'syfrah fabric start' manually.");
+
+                            // Post-Raft VM reconnect.
+                            if let Some(ref vm_manager) = aj_shared_vm_manager {
+                                match vm_manager.reconnect().await {
+                                    Ok(summary) => {
+                                        if summary.recovered_count > 0 || !summary.failed.is_empty()
+                                        {
+                                            info!(
+                                                recovered = summary.recovered_count,
+                                                failed = summary.failed.len(),
+                                                orphans = summary.orphans_cleaned.len(),
+                                                "compute: post-Raft VM reconnect complete (in-process)"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "compute: post-Raft reconnect failed (in-process): {e}"
+                                        );
+                                    }
+                                }
                             }
+
+                            // FDB incremental update task.
+                            {
+                                let local_node = aj_my_record.mesh_ipv6.to_string();
+                                let mut rx = placement_event_rx;
+                                let fdb_placement_store = aj_placement_store.clone();
+                                tokio::spawn(async move {
+                                    let backend: Arc<dyn syfrah_overlay::NetworkBackend> =
+                                        Arc::new(syfrah_overlay::LinuxBackend::new());
+                                    loop {
+                                        match rx.recv().await {
+                                            Ok(event) => {
+                                                let placement = match &event {
+                                                    syfrah_controlplane::PlacementEvent::Added {
+                                                        vpc_id,
+                                                        vm_id,
+                                                        vm_mac,
+                                                        vm_ip,
+                                                        subnet_id,
+                                                        hypervisor_id,
+                                                    } => syfrah_overlay::VmPlacement {
+                                                        vpc_id: vpc_id.clone(),
+                                                        vm_id: vm_id.clone(),
+                                                        vm_mac: vm_mac.clone(),
+                                                        vm_ip: vm_ip.clone(),
+                                                        subnet_id: subnet_id.clone(),
+                                                        hypervisor_id: hypervisor_id.clone(),
+                                                        action: syfrah_overlay::PlacementAction::Add,
+                                                        placement_generation: 0,
+                                                    },
+                                                    syfrah_controlplane::PlacementEvent::Removed {
+                                                        vpc_id,
+                                                        vm_id,
+                                                        vm_mac,
+                                                        vm_ip,
+                                                        hypervisor_id,
+                                                    } => syfrah_overlay::VmPlacement {
+                                                        vpc_id: vpc_id.clone(),
+                                                        vm_id: vm_id.clone(),
+                                                        vm_mac: vm_mac.clone(),
+                                                        vm_ip: vm_ip.clone(),
+                                                        subnet_id: String::new(),
+                                                        hypervisor_id: hypervisor_id.clone(),
+                                                        action: syfrah_overlay::PlacementAction::Remove,
+                                                        placement_generation: 0,
+                                                    },
+                                                };
+
+                                                if placement.hypervisor_id != local_node {
+                                                    if let Err(e) = syfrah_overlay::sync_placement(
+                                                        backend.as_ref(),
+                                                        &placement,
+                                                        &local_node,
+                                                    )
+                                                    .await
+                                                    {
+                                                        warn!(
+                                                            vm_id = %placement.vm_id,
+                                                            "FDB incremental update failed (in-process): {e}"
+                                                        );
+                                                    }
+                                                } else if let Some(ref ps) = fdb_placement_store {
+                                                    // Local VM placed — backfill remote peers.
+                                                    match ps.list_by_vpc(&placement.vpc_id) {
+                                                        Ok(peers) => {
+                                                            let mut backfilled = 0u32;
+                                                            for peer in &peers {
+                                                                if peer.hypervisor_id == local_node
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                let remote = syfrah_overlay::VmPlacement {
+                                                                    vpc_id: peer.vpc_id.clone(),
+                                                                    vm_id: peer.vm_id.clone(),
+                                                                    vm_mac: peer.vm_mac.clone(),
+                                                                    vm_ip: peer.vm_ip.clone(),
+                                                                    subnet_id: peer.subnet_id.clone(),
+                                                                    hypervisor_id: peer.hypervisor_id.clone(),
+                                                                    action: syfrah_overlay::PlacementAction::Add,
+                                                                    placement_generation: peer.placement_generation,
+                                                                };
+                                                                if let Err(e) =
+                                                                    syfrah_overlay::sync_placement(
+                                                                        backend.as_ref(),
+                                                                        &remote,
+                                                                        &local_node,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    warn!(
+                                                                        vpc_id = %placement.vpc_id,
+                                                                        "FDB backfill failed (in-process): {e}"
+                                                                    );
+                                                                } else {
+                                                                    backfilled += 1;
+                                                                }
+                                                            }
+                                                            if backfilled > 0 {
+                                                                info!(
+                                                                    vpc_id = %placement.vpc_id,
+                                                                    vm_id = %placement.vm_id,
+                                                                    backfilled,
+                                                                    "FDB backfill: added entries for remote VPC peers (in-process)"
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                vpc_id = %placement.vpc_id,
+                                                                "FDB backfill: failed to list VPC placements (in-process): {e}"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Lagged(n),
+                                            ) => {
+                                                warn!(
+                                                    skipped = n,
+                                                    "FDB incremental update lagged (in-process) — missed {n} events"
+                                                );
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Closed,
+                                            ) => {
+                                                info!("FDB incremental update channel closed (in-process)");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+
+                            // Start the Raft HTTP server on port 7200.
+                            info!(
+                                "raft: control plane server starting on {} (node_id={node_id}, in-process)",
+                                aj_raft_bind_addr
+                            );
+                            tokio::spawn(async move {
+                                if let Err(e) = syfrah_controlplane::RaftServer::serve(
+                                    aj_raft_bind_addr,
+                                    raft_state,
+                                    aj_raft_shutdown_rx,
+                                )
+                                .await
+                                {
+                                    warn!("Raft HTTP server error (in-process): {e}");
+                                }
+                            });
+
+                            info!(
+                                "raft: joined and started in-process. No daemon restart needed. \
+                                 PID unchanged."
+                            );
                             return;
                         }
                         Ok(resp) => {
