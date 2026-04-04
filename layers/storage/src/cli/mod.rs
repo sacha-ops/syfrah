@@ -459,8 +459,8 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             })?;
 
             configure::run_configure(&configure::ConfigureParams {
+                region: region.as_deref().unwrap_or(""),
                 zone: &zone,
-                region: region.as_deref(),
                 s3_endpoint: &endpoint,
                 s3_bucket: &bucket,
                 s3_access_key: &access_key,

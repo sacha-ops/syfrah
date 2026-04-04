@@ -906,6 +906,11 @@ pub struct RaftVolumeStateReader {
 
 impl RaftVolumeStateReader {
     /// Create a new reader with a late-binding reference to the state machine.
+    ///
+    /// `zone` is the availability zone of this hypervisor, used to look up
+    /// the per-zone `StorageConfig`. Callers that only know the region can
+    /// pass the region string — backward compat is preserved in the state
+    /// machine key.
     pub fn new(
         sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
         zone: String,

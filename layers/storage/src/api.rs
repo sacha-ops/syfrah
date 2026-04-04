@@ -79,8 +79,10 @@ pub enum StorageRequest {
     },
     /// Configure storage backend (S3 + cache settings) for a specific zone.
     Configure {
+        region: String,
+        /// Availability zone. When empty, `region` is used as fallback.
+        #[serde(default)]
         zone: String,
-        region: Option<String>,
         s3_endpoint: String,
         s3_bucket: String,
         s3_access_key: String,
@@ -454,8 +456,8 @@ impl StorageLayerHandler {
             }
 
             StorageRequest::Configure {
-                zone,
                 region,
+                zone,
                 s3_endpoint,
                 s3_bucket,
                 s3_access_key,
@@ -474,15 +476,9 @@ impl StorageLayerHandler {
                     cache_disk_size_gb: cache_disk_size_gb.unwrap_or(100),
                     cache_memory_size_gb: cache_memory_size_gb.unwrap_or(4),
                 };
-                // Use zone as the Raft config key. Region is optional metadata
-                // stored alongside the zone identifier.
-                let raft_key = if let Some(ref r) = region {
-                    format!("{zone}/{r}")
-                } else {
-                    zone.clone()
-                };
                 let cmd = StateMachineCommand::SetStorageConfig {
-                    region: raft_key,
+                    region: region.clone(),
+                    zone: zone.clone(),
                     config: Box::new(config),
                 };
                 match self.submit_raft(cmd).await {
@@ -1031,8 +1027,8 @@ mod tests {
     async fn stub_handler_configure_returns_raft_error() {
         let handler = StorageLayerHandler::new_stub();
         let req = StorageRequest::Configure {
-            zone: "fsn1".into(),
-            region: Some("eu-central".into()),
+            region: "par1".into(),
+            zone: "par1-a".into(),
             s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
             s3_bucket: "syfrah-volumes".into(),
             s3_access_key: "key".into(),

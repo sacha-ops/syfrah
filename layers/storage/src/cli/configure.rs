@@ -21,8 +21,9 @@ fn control_socket_path() -> PathBuf {
 
 /// Parameters for `syfrah storage configure` (full S3 configuration).
 pub struct ConfigureParams<'a> {
+    pub region: &'a str,
+    /// Availability zone. Empty string means "use region as fallback".
     pub zone: &'a str,
-    pub region: Option<&'a str>,
     pub s3_endpoint: &'a str,
     pub s3_bucket: &'a str,
     pub s3_access_key: &'a str,
@@ -36,8 +37,8 @@ pub struct ConfigureParams<'a> {
 /// Run the full `syfrah storage configure` flow with all S3 + cache flags.
 pub async fn run_configure(params: &ConfigureParams<'_>) -> anyhow::Result<()> {
     let ConfigureParams {
-        zone,
         region,
+        zone,
         s3_endpoint,
         s3_bucket,
         s3_access_key,
@@ -72,8 +73,8 @@ pub async fn run_configure(params: &ConfigureParams<'_>) -> anyhow::Result<()> {
 
     // --- Send Configure request to daemon ---
     let req = StorageRequest::Configure {
+        region: region.to_string(),
         zone: zone.to_string(),
-        region: region.map(|s| s.to_string()),
         s3_endpoint: s3_endpoint.to_string(),
         s3_bucket: s3_bucket.to_string(),
         s3_access_key: s3_access_key.to_string(),
@@ -268,8 +269,8 @@ mod tests {
     #[tokio::test]
     async fn run_configure_rejects_nonexistent_cache_disk() {
         let params = ConfigureParams {
-            zone: "fsn1",
-            region: Some("eu-central"),
+            region: "eu-west",
+            zone: "eu-west-a",
             s3_endpoint: "https://s3.example.com",
             s3_bucket: "bucket",
             s3_access_key: "AKID",
@@ -289,8 +290,8 @@ mod tests {
     #[tokio::test]
     async fn run_configure_rejects_invalid_s3_endpoint() {
         let params = ConfigureParams {
-            zone: "fsn1",
-            region: None,
+            region: "eu-west",
+            zone: "eu-west-a",
             s3_endpoint: "ftp://bad.example.com",
             s3_bucket: "bucket",
             s3_access_key: "AKID",
