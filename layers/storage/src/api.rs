@@ -162,6 +162,12 @@ pub struct StorageStatusReport {
     pub volume_cache_stats: Vec<VolumeCacheStat>,
     /// Total dirty bytes across all volumes (placeholder).
     pub total_dirty_bytes: u64,
+    /// Aggregated cache metrics for this node.
+    #[serde(default)]
+    pub cache_metrics: Option<crate::cache::CacheMetrics>,
+    /// Active cache alerts (empty when healthy).
+    #[serde(default)]
+    pub cache_alerts: Vec<String>,
 }
 
 /// Per-volume cache utilization (placeholder structure).
@@ -308,6 +314,8 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 s3_endpoint: "(not configured)".into(),
                 volume_cache_stats: vec![],
                 total_dirty_bytes: 0,
+                cache_metrics: Some(crate::cache::CacheMetrics::default()),
+                cache_alerts: vec![],
             })
         }
     }
@@ -488,6 +496,24 @@ mod tests {
             matches!(resp, StorageResponse::Ok),
             "expected Ok, got {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn handler_returns_status_with_cache_metrics() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::Status;
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Status(s) => {
+                assert!(s.cache_metrics.is_some());
+                let cm = s.cache_metrics.unwrap();
+                assert_eq!(cm.cache_hit_rate, 100.0);
+                assert!(s.cache_alerts.is_empty());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[tokio::test]
