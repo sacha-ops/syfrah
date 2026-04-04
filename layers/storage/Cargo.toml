@@ -13,6 +13,9 @@ test-helpers = []
 
 [dependencies]
 syfrah-api = { path = "../api" }
+syfrah-controlplane = { path = "../controlplane" }
+syfrah-org = { path = "../org" }
+syfrah-state = { path = "../state" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 console = "0.15"
