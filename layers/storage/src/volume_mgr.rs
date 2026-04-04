@@ -22,8 +22,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::time;
+use tracing::info;
 
 use crate::binary;
+use crate::cache::{CachePrewarmConfig, CachePrewarmProgress, CachePrewarmer, PrewarmHandle};
 
 // ---------------------------------------------------------------------------
 // Volume health (ADR-006 §25 — S3 outage degradation)
@@ -311,6 +313,8 @@ struct VolumeProcess {
     generation: u64,
     /// S3 health tracker for this volume.
     health_tracker: VolumeHealthTracker,
+    /// Handle for an in-flight cache pre-warming task (if any).
+    prewarm_handle: Option<PrewarmHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +375,8 @@ pub struct VolumeMgr {
     volumes_base: PathBuf,
     /// S3 health transition thresholds (ADR-006 §25).
     s3_health_config: S3HealthConfig,
+    /// Cache pre-warming configuration for post-migration warmup.
+    prewarm_config: CachePrewarmConfig,
 }
 
 impl VolumeMgr {
@@ -381,6 +387,7 @@ impl VolumeMgr {
             binary_override: None,
             volumes_base: PathBuf::from(VOLUMES_BASE),
             s3_health_config: S3HealthConfig::default(),
+            prewarm_config: CachePrewarmConfig::default(),
         }
     }
 
@@ -393,6 +400,12 @@ impl VolumeMgr {
     /// Override S3 health transition thresholds.
     pub fn with_s3_health_config(mut self, config: S3HealthConfig) -> Self {
         self.s3_health_config = config;
+        self
+    }
+
+    /// Override cache pre-warming configuration.
+    pub fn with_prewarm_config(mut self, config: CachePrewarmConfig) -> Self {
+        self.prewarm_config = config;
         self
     }
 
@@ -506,8 +519,14 @@ impl VolumeMgr {
                 mount_point: mount_point.clone(),
                 generation,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
+
+        // Trigger cache pre-warming for migrated volumes (generation > 1).
+        if generation > 1 && self.prewarm_config.enabled {
+            self.start_prewarm(volume_id);
+        }
 
         Ok(mount_point)
     }
@@ -688,6 +707,73 @@ impl VolumeMgr {
             .iter()
             .map(|(id, proc)| (id.clone(), proc.generation))
             .collect()
+    }
+
+    // -------------------------------------------------------------------
+    // Cache pre-warming (post-migration)
+    // -------------------------------------------------------------------
+
+    /// Start cache pre-warming for a volume.
+    ///
+    /// Called automatically by `start_volume` when `generation > 1` (indicating
+    /// the volume migrated to this hypervisor). Can also be called manually.
+    ///
+    /// If pre-warming is already in progress for this volume, the existing task
+    /// is left running.
+    pub fn start_prewarm(&mut self, volume_id: &str) {
+        let proc = match self.processes.get_mut(volume_id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Don't restart if already warming.
+        if let Some(ref handle) = proc.prewarm_handle {
+            if !handle.progress().done {
+                return;
+            }
+        }
+
+        info!(
+            volume = %volume_id,
+            generation = proc.generation,
+            "starting cache pre-warm for migrated volume"
+        );
+
+        let handle = CachePrewarmer::start(volume_id, &proc.mount_point, &self.prewarm_config);
+        proc.prewarm_handle = Some(handle);
+    }
+
+    /// Cancel cache pre-warming for a volume.
+    pub fn cancel_prewarm(&mut self, volume_id: &str) {
+        if let Some(proc) = self.processes.get_mut(volume_id) {
+            if let Some(ref handle) = proc.prewarm_handle {
+                handle.cancel();
+            }
+            proc.prewarm_handle = None;
+        }
+    }
+
+    /// Get the pre-warm progress for a specific volume.
+    ///
+    /// Returns `None` if the volume is not running or has no active pre-warm.
+    pub fn prewarm_progress(&self, volume_id: &str) -> Option<CachePrewarmProgress> {
+        self.processes
+            .get(volume_id)
+            .and_then(|p| p.prewarm_handle.as_ref())
+            .map(|h| h.progress())
+    }
+
+    /// Get pre-warm progress for all volumes with active or recent warming.
+    pub fn all_prewarm_progress(&self) -> Vec<CachePrewarmProgress> {
+        self.processes
+            .values()
+            .filter_map(|p| p.prewarm_handle.as_ref().map(|h| h.progress()))
+            .collect()
+    }
+
+    /// Get the current pre-warm configuration.
+    pub fn prewarm_config(&self) -> &CachePrewarmConfig {
+        &self.prewarm_config
     }
 
     // -------------------------------------------------------------------
@@ -949,6 +1035,7 @@ impl VolumeMgr {
                 mount_point,
                 generation,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
     }
@@ -984,6 +1071,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-gen"),
                 generation: 42,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1017,6 +1105,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-dup"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1068,6 +1157,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-stop"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1088,6 +1178,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-dead"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1114,6 +1205,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-alive"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1149,6 +1241,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-flush"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1172,6 +1265,7 @@ mod tests {
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-force"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
@@ -1210,6 +1304,7 @@ mod tests {
                 mount_point: PathBuf::from("/var/lib/syfrah/volumes/vol-9p"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
