@@ -373,6 +373,21 @@ impl RedbStateMachine {
             }
         }
 
+        // Export storage store tables.
+        if let Some(ref storage) = self.storage_store {
+            for table_name in syfrah_org::StorageStore::table_names() {
+                match storage.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export storage table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
         tables
     }
 
@@ -426,6 +441,17 @@ impl RedbStateMachine {
                 if let Some(entries) = tables.get(*table_name) {
                     if let Err(e) = hv_store.db().import_table_raw(table_name, entries) {
                         warn!("snapshot: failed to import hypervisor table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Import storage store tables.
+        if let Some(ref storage) = self.storage_store {
+            for table_name in syfrah_org::StorageStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = storage.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import storage table {table_name}: {e}");
                     }
                 }
             }
@@ -486,10 +512,16 @@ impl RedbStateMachine {
     // queries (e.g. `syfrah volume list`) see the latest state.
 
     /// Convert an in-memory VolumeRecord to a storage_store::Volume and upsert.
+    ///
+    /// Maintains the `VOLUMES_BY_HYPERVISOR` secondary index by comparing the
+    /// old hypervisor assignment (from redb) with the new one. Also sets
+    /// proper `created_at` / `updated_at` timestamps.
     fn sync_volume_to_store(&self, vol: &VolumeRecord) {
         let Some(ref store) = self.storage_store else {
             return;
         };
+        let now = syfrah_org::StorageStore::now();
+        let existing = store.get_volume(&vol.id).ok().flatten();
         let store_vol = syfrah_org::storage_store::Volume {
             id: vol.id.clone(),
             name: vol.name.clone(),
@@ -509,11 +541,34 @@ impl RedbStateMachine {
             attached_vm_id: vol.attached_vm_id.clone(),
             attached_hypervisor_id: vol.attached_hypervisor_id.clone(),
             placement_generation: vol.placement_generation,
-            created_at: 0,
-            updated_at: 0,
+            created_at: existing.as_ref().map_or(now, |e| e.created_at),
+            updated_at: now,
         };
+
+        // Maintain VOLUMES_BY_HYPERVISOR index: compare old ↔ new hypervisor.
+        let old_hv = existing
+            .as_ref()
+            .and_then(|e| e.attached_hypervisor_id.as_deref());
+        let new_hv = vol.attached_hypervisor_id.as_deref();
+        if old_hv != new_hv {
+            // Remove from old hypervisor index.
+            if let Some(hv_id) = old_hv {
+                if let Err(e) = store.remove_from_hypervisor_index(hv_id, &vol.id) {
+                    warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
+                        "failed to remove volume from old hypervisor index");
+                }
+            }
+            // Add to new hypervisor index.
+            if let Some(hv_id) = new_hv {
+                if let Err(e) = store.add_to_hypervisor_index(hv_id, &vol.id) {
+                    warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
+                        "failed to add volume to new hypervisor index");
+                }
+            }
+        }
+
         // Use create for new volumes, update for existing ones.
-        if store.get_volume(&vol.id).ok().flatten().is_some() {
+        if existing.is_some() {
             if let Err(e) = store.update_volume(&store_vol) {
                 warn!(volume_id = %vol.id, error = %e, "failed to sync volume update to redb");
             }
