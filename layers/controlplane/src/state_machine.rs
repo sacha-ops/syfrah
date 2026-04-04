@@ -49,6 +49,10 @@ pub struct VolumeRecord {
     pub attached_vm_id: Option<String>,
     pub attached_hypervisor_id: Option<String>,
     pub placement_generation: u64,
+    /// The zone where this volume's data lives (determines which S3 bucket to use).
+    /// Matches the hypervisor's zone at creation time.
+    #[serde(default)]
+    pub zone: Option<String>,
     /// Whether deletion protection is enabled (prevents accidental deletion).
     #[serde(default)]
     pub deletion_protection: bool,
@@ -1979,6 +1983,7 @@ impl RedbStateMachine {
                 env_id,
                 volume_type,
                 hypervisor_id,
+                zone,
             } => {
                 // Check quota before creating.
                 if let Err(e) = self.check_volume_quota(org_id, project_id, *size_gb) {
@@ -2020,6 +2025,7 @@ impl RedbStateMachine {
                     attached_vm_id: None,
                     attached_hypervisor_id,
                     placement_generation,
+                    zone: zone.clone(),
                     deletion_protection: false,
                     deleted_at: None,
                 };
@@ -2592,6 +2598,7 @@ impl RedbStateMachine {
                     attached_vm_id: None,
                     attached_hypervisor_id: None,
                     placement_generation: 0,
+                    zone: None,
                     deletion_protection: false,
                     deleted_at: None,
                 };
@@ -3077,6 +3084,7 @@ mod tests {
             env_id: env.into(),
             volume_type: VolumeType::Data,
             hypervisor_id: None,
+            zone: None,
         })
     }
 
@@ -4562,6 +4570,7 @@ mod tests {
             env_id: "prod".into(),
             volume_type: VolumeType::Root,
             hypervisor_id: None,
+            zone: None,
         });
         assert!(matches!(resp, StateMachineResponse::Created(_)));
 
@@ -4648,6 +4657,7 @@ mod tests {
             env_id: "prod".into(),
             volume_type: VolumeType::Root,
             hypervisor_id: None,
+            zone: None,
         });
         assert!(matches!(resp, StateMachineResponse::Created(_)));
 

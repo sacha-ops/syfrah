@@ -89,8 +89,8 @@ pub async fn run_configure(params: &ConfigureParams<'_>) -> anyhow::Result<()> {
         .map_err(daemon_connect_error)?;
 
     match resp {
-        StorageResponse::StorageConfigured { region } => {
-            println!("Storage configured for region '{region}'.");
+        StorageResponse::StorageConfigured { zone } => {
+            println!("Storage configured for zone '{zone}'.");
             if encryption_passphrase.is_some() {
                 println!("Encryption passphrase saved to {STORAGE_KEY_PATH}.");
             }
