@@ -77,9 +77,12 @@ pub enum StorageRequest {
         project: Option<String>,
         force: bool,
     },
-    /// Configure storage backend (S3 + cache settings).
+    /// Configure storage backend (S3 + cache settings) for a specific zone.
     Configure {
         region: String,
+        /// Availability zone. When empty, `region` is used as fallback.
+        #[serde(default)]
+        zone: String,
         s3_endpoint: String,
         s3_bucket: String,
         s3_access_key: String,
@@ -123,7 +126,7 @@ pub enum StorageResponse {
     /// Success with no data.
     Ok,
     /// Storage configuration applied successfully.
-    StorageConfigured { region: String },
+    StorageConfigured { zone: String },
     /// Storage health check results.
     Health(StorageHealthReport),
     /// Storage status results.
@@ -161,6 +164,17 @@ pub struct StorageHealthReport {
     pub cache_memory_limit_bytes: u64,
 }
 
+/// Per-zone storage configuration summary (no credentials).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ZoneConfigSummary {
+    /// Zone identifier (e.g. "fsn1").
+    pub zone: String,
+    /// S3 endpoint URL.
+    pub s3_endpoint: String,
+    /// S3 bucket name.
+    pub s3_bucket: String,
+}
+
 /// Results of a storage status query.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StorageStatusReport {
@@ -168,6 +182,9 @@ pub struct StorageStatusReport {
     pub s3_connected: bool,
     /// S3 endpoint URL (never contains credentials).
     pub s3_endpoint: String,
+    /// Per-zone storage configurations.
+    #[serde(default)]
+    pub zone_configs: Vec<ZoneConfigSummary>,
     /// Per-volume cache utilization (placeholder until ZeroFS metrics in #1187).
     pub volume_cache_stats: Vec<VolumeCacheStat>,
     /// Total dirty bytes across all volumes (placeholder).
@@ -307,6 +324,7 @@ impl StorageLayerHandler {
                     env_id,
                     volume_type: syfrah_controlplane::commands::VolumeType::Data,
                     hypervisor_id,
+                    zone: None, // TODO(#1282): pass zone from request context
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {
@@ -439,6 +457,7 @@ impl StorageLayerHandler {
 
             StorageRequest::Configure {
                 region,
+                zone,
                 s3_endpoint,
                 s3_bucket,
                 s3_access_key,
@@ -459,10 +478,11 @@ impl StorageLayerHandler {
                 };
                 let cmd = StateMachineCommand::SetStorageConfig {
                     region: region.clone(),
+                    zone: zone.clone(),
                     config: Box::new(config),
                 };
                 match self.submit_raft(cmd).await {
-                    Ok(_) => StorageResponse::StorageConfigured { region },
+                    Ok(_) => StorageResponse::StorageConfigured { zone },
                     Err(e) => StorageResponse::Error(e),
                 }
             }
@@ -678,6 +698,8 @@ impl StorageLayerHandler {
             }
 
             StorageRequest::Status => {
+                // Collect per-zone configs from store.
+                let zone_configs = self.list_zone_configs();
                 // Status still uses placeholders for per-volume stats (#1187).
                 StorageResponse::Status(StorageStatusReport {
                     s3_connected: false,
@@ -685,6 +707,7 @@ impl StorageLayerHandler {
                         .get_storage_config()
                         .map(|c| c.s3_endpoint)
                         .unwrap_or_else(|| "(not configured)".into()),
+                    zone_configs,
                     volume_cache_stats: vec![],
                     total_dirty_bytes: 0,
                     s3_put_latency_ms: None,
@@ -806,6 +829,26 @@ impl StorageLayerHandler {
         Err(format!(
             "snapshot '{name}' not found. List available snapshots with: syfrah volume snapshot list"
         ))
+    }
+
+    /// List all per-zone storage configurations from the store.
+    fn list_zone_configs(&self) -> Vec<ZoneConfigSummary> {
+        let store = match self.store.as_ref() {
+            Some(s) => s,
+            None => return vec![],
+        };
+        let configs = match store.list_storage_configs() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        configs
+            .into_iter()
+            .map(|(zone_key, cfg)| ZoneConfigSummary {
+                zone: zone_key,
+                s3_endpoint: cfg.s3_endpoint,
+                s3_bucket: cfg.s3_bucket,
+            })
+            .collect()
     }
 
     /// Read StorageConfig from the local store for this node's region.
@@ -985,6 +1028,7 @@ mod tests {
         let handler = StorageLayerHandler::new_stub();
         let req = StorageRequest::Configure {
             region: "par1".into(),
+            zone: "par1-a".into(),
             s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
             s3_bucket: "syfrah-volumes".into(),
             s3_access_key: "key".into(),

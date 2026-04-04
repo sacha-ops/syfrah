@@ -362,6 +362,11 @@ pub enum StateMachineCommand {
         /// VolumeAttach command.
         #[serde(default)]
         hypervisor_id: Option<String>,
+        /// The zone where this volume's data will live. Determines which
+        /// zone-local S3 bucket is used for storage. Typically matches the
+        /// hypervisor's zone at creation time.
+        #[serde(default)]
+        zone: Option<String>,
     },
     /// Mark a volume for deletion (tombstone). Volume must be Available (not attached).
     /// With `cascade: true`, all snapshots referencing this volume are deleted first.
@@ -419,13 +424,17 @@ pub enum StateMachineCommand {
     MarkRestoreComplete {
         snapshot_id: String,
     },
-    /// Set per-region S3 storage configuration (replicated to all nodes).
+    /// Set per-zone S3 storage configuration (replicated to all nodes).
     /// NOTE: The encryption_passphrase is NOT included — it is stored locally
     /// on each hypervisor with 0600 permissions, never replicated via Raft.
     /// The S3 credentials (access_key, secret_key) ARE stored in Raft so that
-    /// every node in the region can reach the bucket.
+    /// every node in the zone can reach the bucket.
     SetStorageConfig {
         region: String,
+        /// Availability zone. When empty (backward compat with old commands),
+        /// the `region` value is used as the zone key.
+        #[serde(default)]
+        zone: String,
         config: Box<StorageConfig>,
     },
     /// Set storage quotas for an org or project.
@@ -588,7 +597,10 @@ impl std::fmt::Display for StateMachineCommand {
             Self::MarkRestoreComplete { snapshot_id } => {
                 write!(f, "MarkRestoreComplete({snapshot_id})")
             }
-            Self::SetStorageConfig { region, .. } => write!(f, "SetStorageConfig({region})"),
+            Self::SetStorageConfig { region, zone, .. } => {
+                let key = if zone.is_empty() { region } else { zone };
+                write!(f, "SetStorageConfig({key})")
+            }
             Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope})"),
             Self::PurgeTombstones { max_age_secs, .. } => {
                 write!(f, "PurgeTombstones(ttl={max_age_secs}s)")
@@ -888,6 +900,7 @@ mod tests {
                 env_id: "prod".into(),
                 volume_type: VolumeType::Data,
                 hypervisor_id: None,
+                zone: None,
             },
             StateMachineCommand::DeleteVolume {
                 volume_id: "vol-01".into(),
@@ -922,6 +935,7 @@ mod tests {
             },
             StateMachineCommand::SetStorageConfig {
                 region: "eu-west".into(),
+                zone: "eu-west-a".into(),
                 config: Box::new(StorageConfig {
                     s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
                     s3_bucket: "syfrah-storage-eu-west".into(),

@@ -53,6 +53,8 @@ pub struct DesiredVolume {
     pub size_gb: u32,
     pub placement_generation: u64,
     pub hypervisor_id: String,
+    /// The zone where this volume's data lives (determines which S3 bucket to use).
+    pub zone: String,
     /// The VM this volume should be attached to, if any.
     /// When `Some`, the reconciler will call CH add-disk after ZeroFS starts.
     pub vm_id: Option<String>,
@@ -145,9 +147,9 @@ pub struct DesiredDetach {
     pub force: bool,
 }
 
-/// Storage configuration for the region (from Raft).
+/// Storage configuration for a zone (from Raft).
 #[derive(Debug, Clone)]
-pub struct RegionStorageConfig {
+pub struct ZoneStorageConfig {
     pub s3_endpoint: String,
     pub s3_bucket: String,
     pub s3_access_key: String,
@@ -186,18 +188,8 @@ pub trait VolumeStateReader: Send + Sync {
     /// fenced are NOT returned here — only tombstoned (Deleted) volumes.
     async fn deleted_volumes(&self, local_hypervisor_id: &str) -> Vec<String>;
 
-    /// Get the storage config for the region, if configured.
-    async fn storage_config(&self) -> Option<RegionStorageConfig>;
-
-    /// List volumes pending cross-zone migration on this hypervisor.
-    ///
-    /// Returns volumes in the `Migrating` state that have been assigned to
-    /// this hypervisor as the migration target. The reconciler uses this to
-    /// trigger the S3-to-S3 copy process.
-    async fn pending_migrations(
-        &self,
-        local_hypervisor_id: &str,
-    ) -> Vec<crate::storage_migration::PendingMigration>;
+    /// Get the storage config for the local hypervisor's zone, if configured.
+    async fn storage_config(&self) -> Option<ZoneStorageConfig>;
 }
 
 // ---------------------------------------------------------------------------
@@ -889,15 +881,8 @@ impl VolumeStateReader for EmptyStateReader {
         Vec::new()
     }
 
-    async fn storage_config(&self) -> Option<RegionStorageConfig> {
+    async fn storage_config(&self) -> Option<ZoneStorageConfig> {
         None
-    }
-
-    async fn pending_migrations(
-        &self,
-        _local_hypervisor_id: &str,
-    ) -> Vec<crate::storage_migration::PendingMigration> {
-        Vec::new()
     }
 }
 
@@ -913,19 +898,24 @@ impl VolumeStateReader for EmptyStateReader {
 /// like `EmptyStateReader` (returns no volumes, no config). Once the control
 /// plane injects the SM reference, the reader returns real data.
 ///
-/// The `region` field determines which `StorageConfig` entry to look up.
+/// The `zone` field determines which `StorageConfig` entry to look up.
 pub struct RaftVolumeStateReader {
     sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
-    region: String,
+    zone: String,
 }
 
 impl RaftVolumeStateReader {
     /// Create a new reader with a late-binding reference to the state machine.
+    ///
+    /// `zone` is the availability zone of this hypervisor, used to look up
+    /// the per-zone `StorageConfig`. Callers that only know the region can
+    /// pass the region string — backward compat is preserved in the state
+    /// machine key.
     pub fn new(
         sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
-        region: String,
+        zone: String,
     ) -> Self {
-        Self { sm, region }
+        Self { sm, zone }
     }
 }
 
@@ -957,6 +947,7 @@ impl VolumeStateReader for RaftVolumeStateReader {
                 size_gb: vol.size_gb,
                 placement_generation: vol.placement_generation,
                 hypervisor_id: local_hypervisor_id.to_string(),
+                zone: vol.zone.clone().unwrap_or_default(),
                 vm_id: vol.attached_vm_id.clone(),
             })
             .collect()
@@ -1008,14 +999,14 @@ impl VolumeStateReader for RaftVolumeStateReader {
             .collect()
     }
 
-    async fn storage_config(&self) -> Option<RegionStorageConfig> {
+    async fn storage_config(&self) -> Option<ZoneStorageConfig> {
         let guard = self.sm.read().await;
         let sm = guard.as_ref()?;
 
         let storage = sm.storage.read().unwrap();
-        let cfg = storage.storage_configs.get(&self.region)?;
+        let cfg = storage.storage_configs.get(&self.zone)?;
 
-        Some(RegionStorageConfig {
+        Some(ZoneStorageConfig {
             s3_endpoint: cfg.s3_endpoint.clone(),
             s3_bucket: cfg.s3_bucket.clone(),
             s3_access_key: cfg.s3_access_key.clone(),
@@ -1024,61 +1015,6 @@ impl VolumeStateReader for RaftVolumeStateReader {
             cache_disk_size_bytes: u64::from(cfg.cache_disk_size_gb) * 1024 * 1024 * 1024,
             cache_memory_size_bytes: u64::from(cfg.cache_memory_size_gb) * 1024 * 1024 * 1024,
         })
-    }
-
-    async fn pending_migrations(
-        &self,
-        local_hypervisor_id: &str,
-    ) -> Vec<crate::storage_migration::PendingMigration> {
-        let guard = self.sm.read().await;
-        let sm = match guard.as_ref() {
-            Some(sm) => sm,
-            None => return Vec::new(),
-        };
-
-        let storage = sm.storage.read().unwrap();
-
-        storage
-            .volumes
-            .values()
-            .filter(|vol| {
-                vol.state == syfrah_controlplane::VolumeState::Migrating
-                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
-                    && vol.migration_source_zone.is_some()
-                    && vol.migration_target_zone.is_some()
-            })
-            .filter_map(|vol| {
-                let source_zone = vol.migration_source_zone.as_ref()?;
-                let target_zone = vol.migration_target_zone.as_ref()?;
-                let source_cfg = storage.storage_configs.get(source_zone)?;
-                let target_cfg = storage.storage_configs.get(target_zone)?;
-
-                // Build the S3 prefix from the volume's existing prefix.
-                // The prefix follows the pattern: volumes/{vol_id}/gen-{N}/
-                let s3_prefix = format!(
-                    "volumes/{}/gen-{}/",
-                    vol.id,
-                    vol.placement_generation.saturating_sub(1)
-                );
-
-                Some(crate::storage_migration::PendingMigration {
-                    volume_id: vol.id.clone(),
-                    s3_prefix,
-                    source: crate::storage_migration::S3BucketConfig {
-                        endpoint: source_cfg.s3_endpoint.clone(),
-                        bucket: source_cfg.s3_bucket.clone(),
-                        access_key: source_cfg.s3_access_key.clone(),
-                        secret_key: source_cfg.s3_secret_key.clone(),
-                    },
-                    target: crate::storage_migration::S3BucketConfig {
-                        endpoint: target_cfg.s3_endpoint.clone(),
-                        bucket: target_cfg.s3_bucket.clone(),
-                        access_key: target_cfg.s3_access_key.clone(),
-                        secret_key: target_cfg.s3_secret_key.clone(),
-                    },
-                })
-            })
-            .collect()
     }
 }
 
@@ -1097,7 +1033,7 @@ mod tests {
         desired: Mutex<Vec<DesiredVolume>>,
         detaches: Mutex<Vec<DesiredDetach>>,
         deleted: Mutex<Vec<String>>,
-        config: Mutex<Option<RegionStorageConfig>>,
+        config: Mutex<Option<ZoneStorageConfig>>,
     }
 
     impl MockStateReader {
@@ -1111,7 +1047,7 @@ mod tests {
         }
 
         fn with_config(self) -> Self {
-            *self.config.lock().unwrap() = Some(RegionStorageConfig {
+            *self.config.lock().unwrap() = Some(ZoneStorageConfig {
                 s3_endpoint: "http://localhost:9000".into(),
                 s3_bucket: "test-bucket".into(),
                 s3_access_key: "test-ak".into(),
@@ -1150,15 +1086,8 @@ mod tests {
             self.deleted.lock().unwrap().clone()
         }
 
-        async fn storage_config(&self) -> Option<RegionStorageConfig> {
+        async fn storage_config(&self) -> Option<ZoneStorageConfig> {
             self.config.lock().unwrap().clone()
-        }
-
-        async fn pending_migrations(
-            &self,
-            _local_hypervisor_id: &str,
-        ) -> Vec<crate::storage_migration::PendingMigration> {
-            Vec::new()
         }
     }
 
@@ -1314,6 +1243,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: None,
         }]);
         let mut mgr = VolumeMgr::new();
@@ -1388,6 +1318,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 2,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: None,
         }]);
 
@@ -1426,6 +1357,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 3,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: None,
         }]);
 
@@ -1585,6 +1517,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-10".into()),
         }]);
 
@@ -1611,6 +1544,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 2,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-10".into()),
         }]);
 
@@ -1651,6 +1585,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-loop".into()),
         }]);
 
@@ -1739,6 +1674,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-42".into()),
         }]);
 
@@ -1776,6 +1712,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-99".into()),
         }]);
 
@@ -1813,6 +1750,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: None,
         }]);
 
@@ -1842,6 +1780,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-fail".into()),
         }]);
 
@@ -1902,6 +1841,7 @@ mod tests {
             size_gb: 100,
             placement_generation: 1,
             hypervisor_id: "hv-1".into(),
+            zone: "zone-1".into(),
             vm_id: Some("vm-noop".into()),
         }]);
 
@@ -2198,5 +2138,66 @@ mod tests {
     fn reconcile_report_default_includes_cleaned_up() {
         let report = StorageReconcileReport::default();
         assert_eq!(report.cleaned_up, 0);
+    }
+
+    // ── Zone-local config lookup tests (#1282) ─────────────────────
+
+    #[test]
+    fn desired_volume_has_zone_field() {
+        let vol = DesiredVolume {
+            id: "vol-z1".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            zone: "eu-west-1a".into(),
+            vm_id: None,
+        };
+        assert_eq!(vol.zone, "eu-west-1a");
+    }
+
+    #[test]
+    fn zone_storage_config_fields() {
+        let cfg = ZoneStorageConfig {
+            s3_endpoint: "https://s3.zone-a.example.com".into(),
+            s3_bucket: "zone-a-bucket".into(),
+            s3_access_key: "ak".into(),
+            s3_secret_key: "sk".into(),
+            cache_disk_path: PathBuf::from("/cache"),
+            cache_disk_size_bytes: 1_073_741_824,
+            cache_memory_size_bytes: 268_435_456,
+        };
+        assert_eq!(cfg.s3_bucket, "zone-a-bucket");
+        assert_eq!(cfg.s3_endpoint, "https://s3.zone-a.example.com");
+    }
+
+    #[tokio::test]
+    async fn reconcile_uses_zone_storage_config() {
+        // Verify that the reconciler reads ZoneStorageConfig (renamed from
+        // RegionStorageConfig) and passes the correct S3 config through.
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        // with_config() sets up a ZoneStorageConfig — the reconciler should
+        // read it and proceed without errors (no "no storage config" skip).
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-zone".into(),
+            name: "pgdata".into(),
+            size_gb: 50,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            zone: "eu-west-1a".into(),
+            vm_id: None,
+        }]);
+
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+        // start_volume will fail (no zerofs binary) but the reconciler
+        // should have attempted it — proving it read the config.
+        assert!(
+            !report.errors.is_empty(),
+            "expected start error (no zerofs binary)"
+        );
+        assert_eq!(report.pass_number, 0);
     }
 }

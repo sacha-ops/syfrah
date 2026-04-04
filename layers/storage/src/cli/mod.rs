@@ -241,20 +241,23 @@ pub enum StorageCommand {
     /// Show ZeroFS binary version and path
     #[command(after_help = "Examples:\n  syfrah storage version")]
     Version,
-    /// Configure storage backend (S3 endpoint, bucket, cache)
+    /// Configure storage backend (S3 endpoint, bucket, cache) for a specific zone
     #[command(after_help = "Examples:\n  \
-            syfrah storage configure --region eu-west \\\n    \
-              --s3-endpoint https://s3.par.io.cloud.ovh.net \\\n    \
-              --s3-bucket syfrah-storage --s3-access-key AKID --s3-secret-key SECRET \\\n    \
+            syfrah storage configure --zone fsn1 \\\n    \
+              --s3-endpoint https://fsn1.your-objectstorage.com \\\n    \
+              --s3-bucket syfrah-storage-fsn1 --s3-access-key AKID --s3-secret-key SECRET \\\n    \
               --cache-disk-path /dev/nvme1n1 --cache-disk-size 200 --cache-memory-size 8\n  \
-            syfrah storage configure --region eu-west \\\n    \
-              --s3-endpoint https://s3.par.io.cloud.ovh.net \\\n    \
-              --s3-bucket syfrah-storage --s3-access-key AKID --s3-secret-key SECRET \\\n    \
+            syfrah storage configure --zone fsn1 --region eu-central \\\n    \
+              --s3-endpoint https://fsn1.your-objectstorage.com \\\n    \
+              --s3-bucket syfrah-storage-fsn1 --s3-access-key AKID --s3-secret-key SECRET \\\n    \
               --encryption-passphrase-file /path/to/passphrase\n  \
             syfrah storage configure --cache-disk-path /dev/nvme1n1 \\\n    \
               --cache-disk-size 200 --cache-memory-size 8")]
     Configure {
-        /// Target region for this storage configuration
+        /// Target zone for this storage configuration (e.g. fsn1, nbg1, hel1)
+        #[arg(long)]
+        zone: Option<String>,
+        /// Region metadata (optional, for grouping zones)
         #[arg(long)]
         region: Option<String>,
         /// S3-compatible endpoint URL (must start with https:// or http://)
@@ -336,6 +339,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             Ok(())
         }
         StorageCommand::Configure {
+            zone,
             region,
             s3_endpoint,
             s3_bucket,
@@ -368,7 +372,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
                 || s3_bucket.is_some()
                 || s3_access_key.is_some()
                 || s3_secret_key.is_some()
-                || region.is_some();
+                || zone.is_some();
             let has_cache = cache_disk_path.is_some()
                 || cache_disk_size.is_some()
                 || cache_memory_size.is_some();
@@ -403,7 +407,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
                 anyhow::bail!(
                     "no configuration flags provided.\n\n\
                      Full configuration:\n  \
-                     syfrah storage configure --region <region> \\\n    \
+                     syfrah storage configure --zone <zone> \\\n    \
                        --s3-endpoint <url> --s3-bucket <bucket> \\\n    \
                        --s3-access-key <key> --s3-secret-key <key>\n\n\
                      Cache-only override:\n  \
@@ -412,11 +416,11 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
                 );
             }
 
-            // Full S3 configuration — require all S3 fields
-            let region = region.ok_or_else(|| {
+            // Full S3 configuration — require --zone and all S3 fields
+            let zone = zone.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--region is required for storage configuration.\n\n\
-                     Usage: syfrah storage configure --region <region> \
+                    "--zone is required for storage configuration.\n\n\
+                     Usage: syfrah storage configure --zone <zone> \
                      --s3-endpoint <url> --s3-bucket <bucket> \
                      --s3-access-key <key> --s3-secret-key <key>"
                 )
@@ -424,7 +428,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             let endpoint = s3_endpoint.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--s3-endpoint is required for storage configuration.\n\n\
-                     Usage: syfrah storage configure --region {region} \
+                     Usage: syfrah storage configure --zone {zone} \
                      --s3-endpoint <url> --s3-bucket <bucket> \
                      --s3-access-key <key> --s3-secret-key <key>"
                 )
@@ -432,7 +436,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             let bucket = s3_bucket.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--s3-bucket is required for storage configuration.\n\n\
-                     Usage: syfrah storage configure --region {region} \
+                     Usage: syfrah storage configure --zone {zone} \
                      --s3-endpoint {endpoint} --s3-bucket <bucket> \
                      --s3-access-key <key> --s3-secret-key <key>"
                 )
@@ -440,7 +444,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             let access_key = s3_access_key.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--s3-access-key is required for storage configuration.\n\n\
-                     Usage: syfrah storage configure --region {region} \
+                     Usage: syfrah storage configure --zone {zone} \
                      --s3-endpoint {endpoint} --s3-bucket {bucket} \
                      --s3-access-key <key> --s3-secret-key <key>"
                 )
@@ -448,14 +452,15 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
             let secret_key = s3_secret_key.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--s3-secret-key is required for storage configuration.\n\n\
-                     Usage: syfrah storage configure --region {region} \
+                     Usage: syfrah storage configure --zone {zone} \
                      --s3-endpoint {endpoint} --s3-bucket {bucket} \
                      --s3-access-key {access_key} --s3-secret-key <key>"
                 )
             })?;
 
             configure::run_configure(&configure::ConfigureParams {
-                region: &region,
+                region: region.as_deref().unwrap_or(""),
+                zone: &zone,
                 s3_endpoint: &endpoint,
                 s3_bucket: &bucket,
                 s3_access_key: &access_key,
@@ -576,8 +581,10 @@ mod tests {
     fn configure_full_parse() {
         let cmd = parse(&[
             "configure",
+            "--zone",
+            "fsn1",
             "--region",
-            "eu-west",
+            "eu-central",
             "--s3-endpoint",
             "https://s3.par.io.cloud.ovh.net",
             "--s3-bucket",
@@ -595,6 +602,7 @@ mod tests {
         ]);
         match cmd {
             StorageCommand::Configure {
+                zone,
                 region,
                 s3_endpoint,
                 s3_bucket,
@@ -606,7 +614,8 @@ mod tests {
                 encryption_passphrase,
                 encryption_passphrase_file,
             } => {
-                assert_eq!(region.as_deref(), Some("eu-west"));
+                assert_eq!(zone.as_deref(), Some("fsn1"));
+                assert_eq!(region.as_deref(), Some("eu-central"));
                 assert_eq!(
                     s3_endpoint.as_deref(),
                     Some("https://s3.par.io.cloud.ovh.net")
@@ -660,8 +669,8 @@ mod tests {
     fn configure_with_encryption_passphrase() {
         let cmd = parse(&[
             "configure",
-            "--region",
-            "eu-west",
+            "--zone",
+            "fsn1",
             "--s3-endpoint",
             "https://s3.example.com",
             "--s3-bucket",
@@ -690,8 +699,8 @@ mod tests {
     fn configure_with_encryption_passphrase_file() {
         let cmd = parse(&[
             "configure",
-            "--region",
-            "eu-west",
+            "--zone",
+            "fsn1",
             "--s3-endpoint",
             "https://s3.example.com",
             "--s3-bucket",
@@ -724,6 +733,7 @@ mod tests {
         let cmd = parse(&["configure"]);
         match cmd {
             StorageCommand::Configure {
+                zone,
                 region,
                 s3_endpoint,
                 s3_bucket,
@@ -735,6 +745,7 @@ mod tests {
                 encryption_passphrase,
                 encryption_passphrase_file,
             } => {
+                assert!(zone.is_none());
                 assert!(region.is_none());
                 assert!(s3_endpoint.is_none());
                 assert!(s3_bucket.is_none());
