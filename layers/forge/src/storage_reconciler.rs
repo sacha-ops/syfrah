@@ -292,11 +292,22 @@ pub async fn create_snapshot(
     snapshot_id: &str,
     volume_id: &str,
 ) -> Result<String, String> {
-    // Step 1: Capture manifest from ZeroFS.
-    let manifest = volume_mgr
-        .capture_manifest(volume_id)
+    // Step 1: Capture manifest from ZeroFS (creates checkpoint on disk).
+    volume_mgr
+        .capture_manifest(volume_id, snapshot_id)
         .await
         .map_err(|e| format!("failed to capture manifest for volume {volume_id}: {e}"))?;
+
+    // Step 1b: Read the manifest file written by capture_manifest.
+    let manifest_path = std::path::PathBuf::from(format!(
+        "/tmp/syfrah/{vol}/{vol}.manifest.json",
+        vol = volume_id
+    ));
+    let manifest_json = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|e| format!("failed to read manifest file for volume {volume_id}: {e}"))?;
+    let manifest: VolumeManifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| format!("failed to parse manifest for volume {volume_id}: {e}"))?;
 
     info!(
         volume_id,
