@@ -443,6 +443,20 @@ pub enum StateMachineCommand {
         new_vm_id: String,
     },
 
+    /// Commit a manifest pointer for a volume (ADR-006 §12b).
+    ///
+    /// Validates:
+    /// - `generation` matches the volume's current `placement_generation`
+    /// - `manifest_version` == last committed version + 1 (strict sequential)
+    /// - `published_by` matches the hypervisor the volume is attached to
+    CommitManifest {
+        volume_id: String,
+        generation: u64,
+        manifest_version: u64,
+        s3_key: String,
+        published_by: String,
+    },
+
     // -- Composite Transaction --
     /// Atomic batch of commands applied in a single Raft log entry.
     /// All sub-commands succeed or all fail. Used for placement transactions
@@ -504,6 +518,11 @@ impl std::fmt::Display for StateMachineCommand {
                 f,
                 "RescheduleVolume({volume_id}: {from_hypervisor}->{to_hypervisor})"
             ),
+            Self::CommitManifest {
+                volume_id,
+                manifest_version,
+                ..
+            } => write!(f, "CommitManifest({volume_id}, v{manifest_version})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -820,6 +839,13 @@ mod tests {
                 from_hypervisor: "hv1".into(),
                 to_hypervisor: "hv2".into(),
                 new_vm_id: "vm-new".into(),
+            },
+            StateMachineCommand::CommitManifest {
+                volume_id: "vol-01".into(),
+                generation: 1,
+                manifest_version: 1,
+                s3_key: "manifests/vol-01/v1.json".into(),
+                published_by: "hv1".into(),
             },
         ];
 

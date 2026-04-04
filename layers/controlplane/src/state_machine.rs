@@ -111,6 +111,26 @@ pub struct StorageState {
     pub snapshots: HashMap<String, SnapshotRecord>,
     pub sst_refcounts: SstRefCounts,
     pub storage_configs: HashMap<String, StorageConfig>,
+    /// Manifest pointers keyed by volume_id (ADR-006 §12b).
+    #[serde(default)]
+    pub manifest_pointers: HashMap<String, ManifestPointerRecord>,
+}
+
+/// Manifest pointer record tracked by the state machine (ADR-006 §12b).
+///
+/// Tracks the latest committed manifest for each volume. The `manifest_version`
+/// is strictly sequential: each commit must present `last_committed + 1`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestPointerRecord {
+    pub volume_id: String,
+    /// Must match the volume's current `placement_generation`.
+    pub generation: u64,
+    /// Strictly sequential manifest version (starts at 1).
+    pub manifest_version: u64,
+    /// S3 key where the manifest is stored.
+    pub s3_key: String,
+    /// Hypervisor that published this manifest.
+    pub published_by: String,
 }
 
 /// Error returned when a storage quota is exceeded.
@@ -1863,7 +1883,10 @@ impl RedbStateMachine {
                         vol.state = VolumeState::Available;
                         vol.attached_vm_id = None;
                         vol.attached_hypervisor_id = None;
-                        info!(volume_id, "volume detached");
+                        // Clear manifest pointer so new writer after reattach
+                        // starts at version 1 (ADR-006 §12b).
+                        storage.manifest_pointers.remove(volume_id);
+                        info!(volume_id, "volume detached (manifest pointer cleared)");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2044,6 +2067,81 @@ impl RedbStateMachine {
                         StateMachineResponse::Error(format!("snapshot not found: {snapshot_id}"))
                     }
                 }
+            }
+
+            // -- Storage: CommitManifest (ADR-006 §12b) --
+            StateMachineCommand::CommitManifest {
+                volume_id,
+                generation,
+                manifest_version,
+                s3_key,
+                published_by,
+            } => {
+                let mut storage = self.storage.write().unwrap();
+
+                // 1. Volume must exist and be attached.
+                let vol = match storage.volumes.get(volume_id) {
+                    Some(v) => v,
+                    None => {
+                        return StateMachineResponse::Error(format!(
+                            "volume not found: {volume_id}"
+                        ));
+                    }
+                };
+                if vol.state != VolumeState::Attached {
+                    return StateMachineResponse::Error(format!(
+                        "volume '{volume_id}' is not attached (state: {:?})",
+                        vol.state
+                    ));
+                }
+
+                // 2. Generation must match the volume's current placement_generation.
+                if *generation != vol.placement_generation {
+                    return StateMachineResponse::Error(format!(
+                        "generation mismatch for volume '{volume_id}': \
+                         expected {}, got {generation}",
+                        vol.placement_generation
+                    ));
+                }
+
+                // 3. published_by must match the assigned hypervisor.
+                let assigned_hv = vol.attached_hypervisor_id.as_deref().unwrap_or("");
+                if published_by != assigned_hv {
+                    return StateMachineResponse::Error(format!(
+                        "wrong publisher for volume '{volume_id}': \
+                         expected '{assigned_hv}', got '{published_by}'"
+                    ));
+                }
+
+                // 4. manifest_version must be strictly sequential (last + 1).
+                let last_version = storage
+                    .manifest_pointers
+                    .get(volume_id)
+                    .map_or(0, |p| p.manifest_version);
+                if *manifest_version != last_version + 1 {
+                    return StateMachineResponse::Error(format!(
+                        "manifest version gap for volume '{volume_id}': \
+                         expected {}, got {manifest_version}",
+                        last_version + 1
+                    ));
+                }
+
+                // All checks passed — commit the manifest pointer.
+                storage.manifest_pointers.insert(
+                    volume_id.clone(),
+                    ManifestPointerRecord {
+                        volume_id: volume_id.clone(),
+                        generation: *generation,
+                        manifest_version: *manifest_version,
+                        s3_key: s3_key.clone(),
+                        published_by: published_by.clone(),
+                    },
+                );
+                info!(
+                    volume_id,
+                    generation, manifest_version, published_by, "manifest committed"
+                );
+                StateMachineResponse::Ok
             }
 
             StateMachineCommand::RestoreSnapshot {
@@ -3857,5 +3955,353 @@ mod tests {
             matches!(resp, StateMachineResponse::Error(_)),
             "expected Error for attached data volume deletion, got: {resp:?}"
         );
+    }
+
+    // ── CommitManifest tests (ADR-006 §12b) ────────────────────────────
+
+    /// Helper: set up a volume attached to a hypervisor, ready for manifest commits.
+    fn setup_attached_volume(sm: &RedbStateMachine) {
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+        let resp = create_volume(sm, "vol-m1", "manifest-vol", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-m1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[test]
+    fn commit_manifest_happy_path() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // First manifest commit (version 1).
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1, // VolumeAttach increments from 0 to 1
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got: {resp:?}");
+
+        // Verify the pointer was stored.
+        let storage = sm.storage.read().unwrap();
+        let ptr = storage.manifest_pointers.get("vol-m1").unwrap();
+        assert_eq!(ptr.manifest_version, 1);
+        assert_eq!(ptr.generation, 1);
+        assert_eq!(ptr.s3_key, "manifests/vol-m1/v1.json");
+        assert_eq!(ptr.published_by, "hv-1");
+    }
+
+    #[test]
+    fn commit_manifest_sequential_versions() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Commit v1, v2, v3 sequentially.
+        for v in 1..=3 {
+            let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+                volume_id: "vol-m1".into(),
+                generation: 1,
+                manifest_version: v,
+                s3_key: format!("manifests/vol-m1/v{v}.json"),
+                published_by: "hv-1".into(),
+            });
+            assert!(
+                matches!(resp, StateMachineResponse::Ok),
+                "version {v} failed: {resp:?}"
+            );
+        }
+
+        let storage = sm.storage.read().unwrap();
+        let ptr = storage.manifest_pointers.get("vol-m1").unwrap();
+        assert_eq!(ptr.manifest_version, 3);
+    }
+
+    #[test]
+    fn commit_manifest_rejects_generation_mismatch() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Volume placement_generation is 1 after attach. Try with generation 0.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 0, // wrong — should be 1
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(
+                    msg.contains("generation mismatch"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_generation_too_high() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 99, // way too high
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("generation mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_version_gap() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Skip version 1, try version 2 directly.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 2, // gap — no v1 yet
+            s3_key: "manifests/vol-m1/v2.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(
+                    msg.contains("manifest version gap"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_duplicate_version() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Commit v1 successfully.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Try v1 again — should fail (expected 2).
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 1, // duplicate
+            s3_key: "manifests/vol-m1/v1b.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("manifest version gap"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_wrong_publisher() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Volume is attached to hv-1, try publishing from hv-2.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-2".into(), // wrong hypervisor
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("wrong publisher"), "unexpected error: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_nonexistent_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-ghost".into(),
+            generation: 1,
+            manifest_version: 1,
+            s3_key: "manifests/vol-ghost/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("volume not found"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_rejects_detached_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create volume but don't attach it.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+        let resp = create_volume(&sm, "vol-det", "det-vol", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-det".into(),
+            generation: 0,
+            manifest_version: 1,
+            s3_key: "manifests/vol-det/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("not attached"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_resets_after_reattach() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Commit v1.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Detach and reattach (new generation).
+        sm.apply_command(&StateMachineCommand::VolumeDetach {
+            volume_id: "vol-m1".into(),
+        });
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-m1".into(),
+            vm_id: "vm-2".into(),
+            hypervisor_id: "hv-2".into(),
+        });
+
+        // Old generation (1) should now fail — generation is now 2.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1, // stale
+            manifest_version: 2,
+            s3_key: "manifests/vol-m1/v2.json".into(),
+            published_by: "hv-2".into(),
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(_)),
+            "stale generation should be rejected: {resp:?}"
+        );
+
+        // Pointer was cleared on detach, so new writer must start at version 1.
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 2,
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1-gen2.json".into(),
+            published_by: "hv-2".into(),
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Ok),
+            "new generation commit should succeed at version 1: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn commit_manifest_version_zero_rejected() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        // Version 0 is never valid (first version must be 1).
+        let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 0,
+            s3_key: "manifests/vol-m1/v0.json".into(),
+            published_by: "hv-1".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("manifest version gap"), "msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_manifest_snapshot_includes_pointers() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_attached_volume(&sm);
+
+        sm.apply_command(&StateMachineCommand::CommitManifest {
+            volume_id: "vol-m1".into(),
+            generation: 1,
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1.json".into(),
+            published_by: "hv-1".into(),
+        });
+
+        // Verify manifest_pointers survive snapshot serialization roundtrip.
+        let storage = sm.storage.read().unwrap();
+        let json = serde_json::to_string(&*storage).unwrap();
+        let restored: StorageState = serde_json::from_str(&json).unwrap();
+        let ptr = restored.manifest_pointers.get("vol-m1").unwrap();
+        assert_eq!(ptr.manifest_version, 1);
+        assert_eq!(ptr.published_by, "hv-1");
     }
 }
