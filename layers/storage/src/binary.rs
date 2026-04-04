@@ -116,6 +116,85 @@ pub fn verify_version(binary: &Path) -> Result<(), String> {
     }
 }
 
+/// Install ZeroFS via the official installer script.
+///
+/// Downloads and runs `https://sh.zerofs.net` which installs the binary
+/// to `/usr/local/lib/syfrah/zerofs`. Falls back to downloading from
+/// `https://github.com/Barre/ZeroFS/releases` if the installer is unavailable.
+///
+/// Returns the installed binary path on success.
+pub fn install() -> Result<PathBuf, ZerofsError> {
+    let install_dir = Path::new("/usr/local/lib/syfrah");
+    std::fs::create_dir_all(install_dir).map_err(|e| ZerofsError::NotFound {
+        reason: format!("failed to create install dir: {e}"),
+    })?;
+
+    // Try the official installer script first.
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -sSfL https://sh.zerofs.net | sh")
+        .output()
+        .map_err(|e| ZerofsError::NotFound {
+            reason: format!("failed to run zerofs installer: {e}"),
+        })?;
+
+    if output.status.success() {
+        // The installer puts the binary on PATH; find it and copy to our dir.
+        let installed = resolve_binary(None).or_else(|_| {
+            // Fallback: check common install locations.
+            let candidates = ["/usr/local/bin/zerofs", "/usr/bin/zerofs"];
+            for c in &candidates {
+                let p = PathBuf::from(c);
+                if is_executable(&p) {
+                    return Ok(p);
+                }
+            }
+            Err(ZerofsError::NotFound {
+                reason: "zerofs not found after install".to_string(),
+            })
+        })?;
+
+        let target = install_dir.join("zerofs");
+        if installed != target {
+            std::fs::copy(&installed, &target).map_err(|e| ZerofsError::NotFound {
+                reason: format!("failed to copy zerofs to {}: {e}", target.display()),
+            })?;
+        }
+        return Ok(target);
+    }
+
+    // Fallback: download directly from GitHub releases.
+    let version = PINNED_VERSION;
+    let url =
+        format!("https://github.com/Barre/ZeroFS/releases/download/{version}/zerofs-linux-amd64");
+    let dl_output = std::process::Command::new("curl")
+        .args(["-sSfL", "-o", "/usr/local/lib/syfrah/zerofs", &url])
+        .output()
+        .map_err(|e| ZerofsError::NotFound {
+            reason: format!("failed to download zerofs from GitHub: {e}"),
+        })?;
+
+    if !dl_output.status.success() {
+        let stderr = String::from_utf8_lossy(&dl_output.stderr);
+        return Err(ZerofsError::NotFound {
+            reason: format!("failed to download zerofs: {stderr}"),
+        });
+    }
+
+    let target = install_dir.join("zerofs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+            ZerofsError::NotFound {
+                reason: format!("failed to set zerofs executable: {e}"),
+            }
+        })?;
+    }
+
+    Ok(target)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
