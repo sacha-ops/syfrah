@@ -122,6 +122,29 @@ pub struct HypervisorGossipReport {
     pub storage_health: Option<String>,
     /// Total dirty bytes buffered locally across all volumes.
     pub storage_dirty_bytes: u64,
+    /// Cache metrics for this hypervisor (optional for backwards compat).
+    #[serde(default)]
+    pub cache_metrics: Option<CacheMetricsGossip>,
+}
+
+/// Cache metrics subset disseminated via gossip.
+///
+/// Mirrors `syfrah_storage::CacheMetrics` but lives in the controlplane crate
+/// to avoid a dependency on the storage layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheMetricsGossip {
+    /// Cache hit rate as a percentage (0.0 – 100.0).
+    pub cache_hit_rate: f64,
+    /// Dirty bytes pending writeback to S3.
+    pub dirty_bytes: u64,
+    /// Total cache space used in gigabytes.
+    pub cache_used_gb: f64,
+    /// Eviction rate: evictions per second.
+    pub eviction_rate: f64,
+    /// Number of volumes with active cache data.
+    pub volumes_attached: u32,
+    /// S3 backend health: true if the last probe succeeded.
+    pub s3_health: bool,
 }
 
 impl HypervisorGossipReport {
@@ -386,6 +409,7 @@ pub async fn start_gossip_agent(
             timestamp: now,
             storage_health: None,
             storage_dirty_bytes: 0,
+            cache_metrics: None,
         };
         cluster.update_report(report);
         cluster.set_member_state(&config.bind_addr.to_string(), MemberState::Alive);
@@ -478,6 +502,7 @@ pub async fn start_gossip_agent(
                         timestamp: now,
                         storage_health: None,
                         storage_dirty_bytes: 0,
+                        cache_metrics: None,
                     };
                     report_cluster.update_report(report);
                 }
@@ -593,6 +618,7 @@ mod tests {
             timestamp: 1000,
             storage_health: None,
             storage_dirty_bytes: 0,
+            cache_metrics: None,
         };
         cluster.update_report(report.clone());
 
@@ -634,6 +660,7 @@ mod tests {
             timestamp: 1000,
             storage_health: None,
             storage_dirty_bytes: 0,
+            cache_metrics: None,
         };
         assert!((report.cpu_utilization() - 0.5).abs() < f64::EPSILON);
         assert!((report.memory_utilization() - 0.5).abs() < f64::EPSILON);
@@ -654,5 +681,52 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let deser: MemberState = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, state);
+    }
+
+    #[test]
+    fn report_with_cache_metrics_serde() {
+        let report = HypervisorGossipReport {
+            hypervisor_id: "hv-1".to_string(),
+            node_name: "hv-eu-1".to_string(),
+            region: "eu-west".to_string(),
+            zone: "az-1".to_string(),
+            state: "Available".to_string(),
+            allocatable_vcpus: 8,
+            allocatable_memory_mb: 32768,
+            used_vcpus: 2,
+            used_memory_mb: 8192,
+            instance_count: 1,
+            drain_status: false,
+            timestamp: 2000,
+            cache_metrics: Some(CacheMetricsGossip {
+                cache_hit_rate: 95.5,
+                dirty_bytes: 1_048_576,
+                cache_used_gb: 42.0,
+                eviction_rate: 1.2,
+                volumes_attached: 3,
+                s3_health: true,
+            }),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let deser: HypervisorGossipReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, deser);
+        assert!(deser.cache_metrics.is_some());
+        let cm = deser.cache_metrics.unwrap();
+        assert_eq!(cm.cache_hit_rate, 95.5);
+        assert_eq!(cm.volumes_attached, 3);
+    }
+
+    #[test]
+    fn report_without_cache_metrics_deserializes() {
+        // Backwards compat: old reports without cache_metrics field
+        let json = r#"{
+            "hypervisor_id":"hv-1","node_name":"hv-eu-1",
+            "region":"eu","zone":"az1","state":"Available",
+            "allocatable_vcpus":4,"allocatable_memory_mb":8192,
+            "used_vcpus":1,"used_memory_mb":2048,
+            "instance_count":1,"drain_status":false,"timestamp":100
+        }"#;
+        let report: HypervisorGossipReport = serde_json::from_str(json).unwrap();
+        assert!(report.cache_metrics.is_none());
     }
 }

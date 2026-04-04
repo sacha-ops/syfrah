@@ -213,6 +213,7 @@ mod tests {
             timestamp: 1000,
             storage_health: None,
             storage_dirty_bytes: 0,
+            cache_metrics: None,
         }
     }
 

@@ -10,8 +10,9 @@ pub use api::{
     StorageResponse, StorageStatusReport, VolumeCacheStat,
 };
 pub use cache::{
-    cleanup_volume_cache, create_volume_cache, validate_cache_disk, zerofs_cache_args, CacheConfig,
-    CacheDiskInfo, CacheError, VolumeCacheDir,
+    cleanup_volume_cache, create_volume_cache, evaluate_alerts, validate_cache_disk,
+    zerofs_cache_args, CacheAlert, CacheAlertThresholds, CacheConfig, CacheDiskInfo, CacheError,
+    CacheMetrics, VolumeCacheDir,
 };
 pub use cli::{SnapshotCommand, StorageCommand, VolumeCommand};
 pub use volume_mgr::{

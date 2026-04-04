@@ -1861,6 +1861,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: HashMap::new(),
         };
         let mut map = mgr.vms.write().await;
