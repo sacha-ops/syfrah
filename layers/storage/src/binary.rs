@@ -444,7 +444,7 @@ mod tests {
             Ok(path) => assert!(path.exists(), "returned path should exist"),
             Err(e) => {
                 // Expected in test environments without zerofs or network access.
-                assert!(format!("{e}").len() > 0, "error should have a message");
+                assert!(format!("{e}")!.is_empty(), "error should have a message");
             }
         }
     }
