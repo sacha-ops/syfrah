@@ -80,6 +80,9 @@ pub enum StorageRequest {
     /// Configure storage backend (S3 + cache settings).
     Configure {
         region: String,
+        /// Availability zone. When empty, `region` is used as fallback (#1281).
+        #[serde(default)]
+        zone: String,
         s3_endpoint: String,
         s3_bucket: String,
         s3_access_key: String,
@@ -439,6 +442,7 @@ impl StorageLayerHandler {
 
             StorageRequest::Configure {
                 region,
+                zone,
                 s3_endpoint,
                 s3_bucket,
                 s3_access_key,
@@ -459,6 +463,7 @@ impl StorageLayerHandler {
                 };
                 let cmd = StateMachineCommand::SetStorageConfig {
                     region: region.clone(),
+                    zone: zone.clone(),
                     config: Box::new(config),
                 };
                 match self.submit_raft(cmd).await {
@@ -985,6 +990,7 @@ mod tests {
         let handler = StorageLayerHandler::new_stub();
         let req = StorageRequest::Configure {
             region: "par1".into(),
+            zone: "par1-a".into(),
             s3_endpoint: "https://s3.par.io.cloud.ovh.net".into(),
             s3_bucket: "syfrah-volumes".into(),
             s3_access_key: "key".into(),

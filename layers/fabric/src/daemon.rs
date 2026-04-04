@@ -1451,7 +1451,13 @@ pub async fn run_daemon(
             }
         };
 
-    let storage_region = my_record.region.as_deref().unwrap_or("default").to_string();
+    let storage_region = my_record
+        .zone
+        .as_deref()
+        .filter(|z| !z.is_empty())
+        .or(my_record.region.as_deref())
+        .unwrap_or("default")
+        .to_string();
     let raft_storage_handler: Option<Arc<syfrah_storage::StorageLayerHandler>> =
         if let Some(ref store) = shared_storage_store {
             let handler = Arc::new(syfrah_storage::StorageLayerHandler::new(
@@ -1514,7 +1520,11 @@ pub async fn run_daemon(
     let (storage_shutdown_tx, storage_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let hypervisor_id = my_record.name.clone();
-        let region = my_record.region.as_deref().unwrap_or("default").to_string();
+        let zone = my_record
+            .zone
+            .as_deref()
+            .unwrap_or(my_record.region.as_deref().unwrap_or("default"))
+            .to_string();
         // Read encryption passphrase from /etc/syfrah/storage-key if it exists,
         // otherwise derive from the mesh secret (single-node default).
         let encryption_passphrase: String = match std::fs::read_to_string("/etc/syfrah/storage-key")
@@ -1552,7 +1562,7 @@ pub async fn run_daemon(
             let reader: Arc<dyn syfrah_forge::storage_reconciler::VolumeStateReader> = Arc::new(
                 syfrah_forge::storage_reconciler::RaftVolumeStateReader::new(
                     reconciler_sm_ref,
-                    region,
+                    zone,
                 ),
             );
             let mut volume_mgr = syfrah_storage::VolumeMgr::new();

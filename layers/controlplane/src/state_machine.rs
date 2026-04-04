@@ -122,6 +122,7 @@ pub struct StorageState {
     pub volumes: HashMap<String, VolumeRecord>,
     pub snapshots: HashMap<String, SnapshotRecord>,
     pub sst_refcounts: SstRefCounts,
+    /// Storage configs keyed by zone (migrated from per-region in #1281).
     pub storage_configs: HashMap<String, StorageConfig>,
     /// Manifest pointers keyed by volume_id (ADR-006 §12b).
     #[serde(default)]
@@ -592,8 +593,8 @@ impl RedbStateMachine {
         }
     }
 
-    /// Sync a storage config to the redb store.
-    fn sync_storage_config_to_store(&self, region: &str, config: &StorageConfig) {
+    /// Sync a storage config to the redb store (keyed by zone).
+    fn sync_storage_config_to_store(&self, zone: &str, config: &StorageConfig) {
         let Some(ref store) = self.storage_store else {
             return;
         };
@@ -606,8 +607,8 @@ impl RedbStateMachine {
             cache_disk_size_gb: config.cache_disk_size_gb,
             cache_memory_size_gb: config.cache_memory_size_gb,
         };
-        if let Err(e) = store.set_storage_config(region, &store_config) {
-            warn!(region, error = %e, "failed to sync storage config to redb");
+        if let Err(e) = store.set_storage_config(zone, &store_config) {
+            warn!(zone, error = %e, "failed to sync storage config to redb");
         }
     }
 
@@ -833,13 +834,13 @@ impl RedbStateMachine {
         count
     }
 
-    /// Retrieve the storage configuration for a given region.
+    /// Retrieve the storage configuration for a given zone.
     ///
     /// This is a local read -- it does not go through Raft consensus.
-    /// Returns `None` if no config has been set for the region.
-    pub fn get_storage_config(&self, region: &str) -> Option<StorageConfig> {
+    /// Returns `None` if no config has been set for the zone.
+    pub fn get_storage_config(&self, zone: &str) -> Option<StorageConfig> {
         let storage = self.storage.read().unwrap();
-        storage.storage_configs.get(region).cloned()
+        storage.storage_configs.get(zone).cloned()
     }
 
     /// Apply a single command to the state machine.
@@ -1911,24 +1912,36 @@ impl RedbStateMachine {
                 StateMachineResponse::Ok
             }
 
-            // -- Storage: SetStorageConfig (ADR-006 §9) --
-            StateMachineCommand::SetStorageConfig { region, config } => {
+            // -- Storage: SetStorageConfig (ADR-006 §9, #1281: per-zone) --
+            StateMachineCommand::SetStorageConfig {
+                region,
+                zone,
+                config,
+            } => {
                 // Validate the config before storing.
+                // Backward compat: if zone is empty, fall back to region as key.
+                let zone_key = if zone.is_empty() {
+                    region.clone()
+                } else {
+                    zone.clone()
+                };
                 if let Err(msg) = config.validate() {
                     return StateMachineResponse::Error(format!(
-                        "invalid storage config for region {region}: {msg}"
+                        "invalid storage config for zone {zone_key}: {msg}"
                     ));
                 }
-                if region.is_empty() {
-                    return StateMachineResponse::Error("region must not be empty".to_string());
+                if zone_key.is_empty() {
+                    return StateMachineResponse::Error(
+                        "zone (or region) must not be empty".to_string(),
+                    );
                 }
                 let mut storage = self.storage.write().unwrap();
                 storage
                     .storage_configs
-                    .insert(region.clone(), *config.clone());
+                    .insert(zone_key.clone(), *config.clone());
                 drop(storage);
-                self.sync_storage_config_to_store(region, config);
-                info!(region = %region, "storage config set");
+                self.sync_storage_config_to_store(&zone_key, config);
+                info!(zone = %zone_key, region = %region, "storage config set");
                 StateMachineResponse::Ok
             }
 
@@ -3825,6 +3838,7 @@ mod tests {
 
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(crate::commands::StorageConfig {
                 s3_endpoint: "https://s3.example.com".into(),
                 s3_bucket: "bucket".into(),
@@ -3837,8 +3851,9 @@ mod tests {
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
 
+        // Stored by zone key, not region.
         let storage = sm.storage.read().unwrap();
-        let cfg = storage.storage_configs.get("eu-west").unwrap();
+        let cfg = storage.storage_configs.get("eu-west-a").unwrap();
         assert_eq!(cfg.s3_bucket, "bucket");
     }
 
@@ -3889,12 +3904,13 @@ mod tests {
         let config = make_valid_storage_config();
         let cmd = StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config.clone()),
         };
         let resp = sm.apply_command(&cmd);
         assert!(matches!(resp, StateMachineResponse::Ok));
-        // Verify retrieval.
-        let got = sm.get_storage_config("eu-west").unwrap();
+        // Verify retrieval by zone key.
+        let got = sm.get_storage_config("eu-west-a").unwrap();
         assert_eq!(got.s3_endpoint, config.s3_endpoint);
         assert_eq!(got.s3_bucket, config.s3_bucket);
         assert_eq!(got.s3_access_key, config.s3_access_key);
@@ -3911,6 +3927,7 @@ mod tests {
         let config1 = make_valid_storage_config();
         let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config1),
         });
         // Update with a different bucket.
@@ -3918,15 +3935,16 @@ mod tests {
         config2.s3_bucket = "new-bucket".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config2),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
-        let got = sm.get_storage_config("eu-west").unwrap();
+        let got = sm.get_storage_config("eu-west-a").unwrap();
         assert_eq!(got.s3_bucket, "new-bucket");
     }
 
     #[test]
-    fn get_storage_config_returns_none_for_unknown_region() {
+    fn get_storage_config_returns_none_for_unknown_zone() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
         assert!(sm.get_storage_config("nonexistent").is_none());
@@ -3940,6 +3958,7 @@ mod tests {
         config.s3_endpoint = "ftp://wrong.example.com".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config),
         });
         match resp {
@@ -4022,23 +4041,25 @@ mod tests {
         config.s3_bucket = "".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config),
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
     }
 
     #[test]
-    fn apply_set_storage_config_rejects_empty_region() {
+    fn apply_set_storage_config_rejects_empty_zone_and_region() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
         let config = make_valid_storage_config();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "".into(),
+            zone: "".into(),
             config: Box::new(config),
         });
         match resp {
             StateMachineResponse::Error(msg) => {
-                assert!(msg.contains("region must not be empty"));
+                assert!(msg.contains("must not be empty"));
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -4070,6 +4091,7 @@ mod tests {
         config.s3_access_key = "".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config),
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
@@ -4078,6 +4100,7 @@ mod tests {
         config.s3_secret_key = "".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config),
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
@@ -4091,6 +4114,7 @@ mod tests {
         config.s3_endpoint = "http://minio.local:9000".into();
         let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "local".into(),
+            zone: "local-a".into(),
             config: Box::new(config),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
@@ -4135,7 +4159,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_config_multiple_regions() {
+    fn storage_config_multiple_zones() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
         let mut config_eu = make_valid_storage_config();
@@ -4145,16 +4169,52 @@ mod tests {
         config_us.s3_endpoint = "https://s3.us-east.example.com".into();
         let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west-a".into(),
             config: Box::new(config_eu),
         });
         let _ = sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "us-east".into(),
+            zone: "us-east-1".into(),
             config: Box::new(config_us),
         });
-        let eu = sm.get_storage_config("eu-west").unwrap();
-        let us = sm.get_storage_config("us-east").unwrap();
+        let eu = sm.get_storage_config("eu-west-a").unwrap();
+        let us = sm.get_storage_config("us-east-1").unwrap();
         assert_eq!(eu.s3_bucket, "bucket-eu");
         assert_eq!(us.s3_bucket, "bucket-us");
+    }
+
+    #[test]
+    fn storage_config_backward_compat_empty_zone_falls_back_to_region() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let config = make_valid_storage_config();
+        // Simulate old command with no zone field (deserialized as empty string).
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            zone: String::new(),
+            config: Box::new(config.clone()),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        // Should be stored under the region key as fallback.
+        let got = sm.get_storage_config("eu-west").unwrap();
+        assert_eq!(got.s3_bucket, config.s3_bucket);
+    }
+
+    #[test]
+    fn storage_config_zone_key_takes_precedence_over_region() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let config = make_valid_storage_config();
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            zone: "eu-west-a".into(),
+            config: Box::new(config),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+        // Lookup by zone works.
+        assert!(sm.get_storage_config("eu-west-a").is_some());
+        // Lookup by region does NOT match (zone takes precedence).
+        assert!(sm.get_storage_config("eu-west").is_none());
     }
 
     // -----------------------------------------------------------------------

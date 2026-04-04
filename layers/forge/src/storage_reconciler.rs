@@ -896,19 +896,24 @@ impl VolumeStateReader for EmptyStateReader {
 /// like `EmptyStateReader` (returns no volumes, no config). Once the control
 /// plane injects the SM reference, the reader returns real data.
 ///
-/// The `region` field determines which `StorageConfig` entry to look up.
+/// The `zone` field determines which `StorageConfig` entry to look up (#1281).
 pub struct RaftVolumeStateReader {
     sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
-    region: String,
+    zone: String,
 }
 
 impl RaftVolumeStateReader {
     /// Create a new reader with a late-binding reference to the state machine.
+    ///
+    /// `zone` is the availability zone of this hypervisor, used to look up
+    /// the per-zone `StorageConfig`. Callers that only know the region can
+    /// pass the region string — backward compat is preserved in the state
+    /// machine key.
     pub fn new(
         sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
-        region: String,
+        zone: String,
     ) -> Self {
-        Self { sm, region }
+        Self { sm, zone }
     }
 }
 
@@ -996,7 +1001,7 @@ impl VolumeStateReader for RaftVolumeStateReader {
         let sm = guard.as_ref()?;
 
         let storage = sm.storage.read().unwrap();
-        let cfg = storage.storage_configs.get(&self.region)?;
+        let cfg = storage.storage_configs.get(&self.zone)?;
 
         Some(RegionStorageConfig {
             s3_endpoint: cfg.s3_endpoint.clone(),

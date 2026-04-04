@@ -257,6 +257,9 @@ pub enum StorageCommand {
         /// Target region for this storage configuration
         #[arg(long)]
         region: Option<String>,
+        /// Availability zone (overrides region as the storage config key)
+        #[arg(long)]
+        zone: Option<String>,
         /// S3-compatible endpoint URL (must start with https:// or http://)
         #[arg(long)]
         s3_endpoint: Option<String>,
@@ -337,6 +340,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
         }
         StorageCommand::Configure {
             region,
+            zone,
             s3_endpoint,
             s3_bucket,
             s3_access_key,
@@ -456,6 +460,7 @@ pub async fn run_storage(cmd: StorageCommand) -> anyhow::Result<()> {
 
             configure::run_configure(&configure::ConfigureParams {
                 region: &region,
+                zone: zone.as_deref().unwrap_or(""),
                 s3_endpoint: &endpoint,
                 s3_bucket: &bucket,
                 s3_access_key: &access_key,
@@ -596,6 +601,7 @@ mod tests {
         match cmd {
             StorageCommand::Configure {
                 region,
+                zone,
                 s3_endpoint,
                 s3_bucket,
                 s3_access_key,
@@ -607,6 +613,7 @@ mod tests {
                 encryption_passphrase_file,
             } => {
                 assert_eq!(region.as_deref(), Some("eu-west"));
+                assert!(zone.is_none());
                 assert_eq!(
                     s3_endpoint.as_deref(),
                     Some("https://s3.par.io.cloud.ovh.net")
@@ -725,6 +732,7 @@ mod tests {
         match cmd {
             StorageCommand::Configure {
                 region,
+                zone,
                 s3_endpoint,
                 s3_bucket,
                 s3_access_key,
@@ -736,6 +744,7 @@ mod tests {
                 encryption_passphrase_file,
             } => {
                 assert!(region.is_none());
+                assert!(zone.is_none());
                 assert!(s3_endpoint.is_none());
                 assert!(s3_bucket.is_none());
                 assert!(s3_access_key.is_none());
