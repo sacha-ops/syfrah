@@ -973,6 +973,7 @@ impl VmManager {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         // Populate hypervisor metadata from the local hypervisor record.
@@ -1136,6 +1137,149 @@ impl VmManager {
             },
         );
 
+        Ok(())
+    }
+
+    // ── Hot-plug / hot-unplug volumes (#1199) ──────────────────────────
+
+    /// Hot-plug a data volume to a running VM.
+    ///
+    /// Sends `PUT /vm.add-disk` to Cloud Hypervisor and tracks the returned
+    /// device ID so the volume can be removed later via [`detach_volume`].
+    ///
+    /// Root volumes (`is_root == true`) cannot be hot-plugged — they must be
+    /// specified at VM creation time.
+    pub async fn attach_volume(
+        &self,
+        vm_id: &str,
+        volume_id: &str,
+        path: &str,
+        read_only: bool,
+        is_root: bool,
+    ) -> Result<(), ComputeError> {
+        // Root volumes must be specified at VM creation time, not hot-plugged.
+        if is_root {
+            return Err(ComputeError::Config(
+                crate::error::ConfigError::ConflictingSettings {
+                    detail: format!(
+                        "cannot hot-plug root volume {volume_id} — root volumes must be specified at VM creation time"
+                    ),
+                },
+            ));
+        }
+
+        let vm_arc = self.get_vm(vm_id).await?;
+        let mut guard = vm_arc.lock().await;
+
+        // VM must be running.
+        if guard.current_phase != crate::phase::VmPhase::Running {
+            return Err(ComputeError::InvalidState {
+                vm_id: vm_id.to_string(),
+                detail: format!("VM is not running (phase: {:?})", guard.current_phase),
+            });
+        }
+
+        // Build CH device ID from volume_id for stable tracking.
+        let device_id = format!("_disk_{volume_id}");
+
+        let disk_config = serde_json::json!({
+            "path": path,
+            "readonly": read_only,
+            "id": device_id,
+        });
+
+        let client = crate::client::ChClient::new(guard.socket_path.clone());
+        client.add_disk(disk_config).await?;
+
+        // Track the mapping for later removal.
+        guard
+            .hotplug_devices
+            .insert(volume_id.to_string(), device_id.clone());
+
+        events::emit(
+            &self.event_tx,
+            VmEvent::DeviceAttached {
+                vm_id: VmId(vm_id.to_string()),
+                device: format!("volume:{volume_id}"),
+            },
+        );
+
+        info!(
+            vm_id = vm_id,
+            volume_id = volume_id,
+            device_id = device_id,
+            path = path,
+            "hot-plugged volume"
+        );
+        Ok(())
+    }
+
+    /// Hot-unplug a data volume from a running VM.
+    ///
+    /// Looks up the CH device ID from the tracked `hotplug_devices` map and
+    /// sends `PUT /vm.remove-device`. Root volumes cannot be detached.
+    ///
+    /// # Trust boundary
+    ///
+    /// TODO: The `is_root` flag is currently passed by the caller. The handler
+    /// layer must validate `is_root` from internal state (e.g.,
+    /// `VolumeAttachment::is_root` in the VM spec), not trust the caller.
+    pub async fn detach_volume(
+        &self,
+        vm_id: &str,
+        volume_id: &str,
+        is_root: bool,
+    ) -> Result<(), ComputeError> {
+        if is_root {
+            return Err(ComputeError::Config(
+                crate::error::ConfigError::ConflictingSettings {
+                    detail: format!(
+                        "cannot hot-unplug root volume {volume_id} — root volumes are not hot-pluggable"
+                    ),
+                },
+            ));
+        }
+
+        let vm_arc = self.get_vm(vm_id).await?;
+        let mut guard = vm_arc.lock().await;
+
+        // VM must be running.
+        if guard.current_phase != crate::phase::VmPhase::Running {
+            return Err(ComputeError::InvalidState {
+                vm_id: vm_id.to_string(),
+                detail: format!("VM is not running (phase: {:?})", guard.current_phase),
+            });
+        }
+
+        let device_id = guard
+            .hotplug_devices
+            .get(volume_id)
+            .cloned()
+            .ok_or_else(|| ComputeError::VolumeNotAttached {
+                vm_id: vm_id.to_string(),
+                volume_id: volume_id.to_string(),
+            })?;
+
+        let client = crate::client::ChClient::new(guard.socket_path.clone());
+        client.remove_device(&device_id).await?;
+
+        // Remove tracking entry.
+        guard.hotplug_devices.remove(volume_id);
+
+        events::emit(
+            &self.event_tx,
+            VmEvent::DeviceDetached {
+                vm_id: VmId(vm_id.to_string()),
+                device: format!("volume:{volume_id}"),
+            },
+        );
+
+        info!(
+            vm_id = vm_id,
+            volume_id = volume_id,
+            device_id = device_id,
+            "hot-unplugged volume"
+        );
         Ok(())
     }
 
@@ -1352,6 +1496,7 @@ impl VmManager {
                     hypervisor_id: None,
                     region: None,
                     zone: None,
+                    hotplug_devices: std::collections::HashMap::new(),
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;
@@ -1680,5 +1825,137 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("not found"));
+    }
+
+    // -- Helper: insert a fake VM into the manager's map ----------------------
+
+    use crate::runtime::{ReconnectSource, VmRuntimeState};
+
+    /// Insert a fake VM runtime state into the manager for testing hot-plug
+    /// methods without spawning a real Cloud Hypervisor process.
+    async fn inject_fake_vm(mgr: &VmManager, vm_id: &str, phase: crate::phase::VmPhase) {
+        let state = VmRuntimeState {
+            vm_id: VmId(vm_id.to_string()),
+            pid: 1,
+            socket_path: PathBuf::from(format!("/tmp/ch-{vm_id}.sock")),
+            cgroup_path: None,
+            ch_binary_path: PathBuf::from("/bin/true"),
+            ch_binary_version: "test".to_string(),
+            vcpus: 1,
+            memory_mb: 256,
+            launched_at: 1_700_000_000,
+            last_ping_at: None,
+            last_error: None,
+            current_phase: phase,
+            reconnect_source: ReconnectSource::FreshSpawn,
+            image_name: None,
+            instance_dir_path: None,
+            runtime_handle: None,
+            ip: None,
+            subnet: None,
+            vpc: None,
+            security_groups: vec![],
+            network_info: None,
+            hypervisor_id: None,
+            region: None,
+            zone: None,
+            hotplug_devices: HashMap::new(),
+        };
+        let mut map = mgr.vms.write().await;
+        map.insert(vm_id.to_string(), Arc::new(Mutex::new(state)));
+    }
+
+    // -- attach_volume tests --------------------------------------------------
+
+    #[tokio::test]
+    async fn attach_volume_rejects_root_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+        inject_fake_vm(&mgr, "vm-root-test", crate::phase::VmPhase::Running).await;
+
+        let result = mgr
+            .attach_volume("vm-root-test", "vol-root", "/dev/vda", false, true)
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("root volume"));
+    }
+
+    #[tokio::test]
+    async fn attach_volume_rejects_non_running_vm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+        inject_fake_vm(&mgr, "vm-stopped", crate::phase::VmPhase::Stopped).await;
+
+        let result = mgr
+            .attach_volume("vm-stopped", "vol-1", "/dev/nbd0", false, false)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidState { .. }),
+            "expected InvalidState, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_volume_nonexistent_vm_returns_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+
+        let result = mgr
+            .attach_volume("vm-missing", "vol-1", "/dev/nbd0", false, false)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ComputeError::VmNotFound { .. }
+        ));
+    }
+
+    // -- detach_volume tests --------------------------------------------------
+
+    #[tokio::test]
+    async fn detach_volume_rejects_root_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+        inject_fake_vm(&mgr, "vm-detach-root", crate::phase::VmPhase::Running).await;
+
+        let result = mgr.detach_volume("vm-detach-root", "vol-root", true).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("root volume"));
+    }
+
+    #[tokio::test]
+    async fn detach_volume_rejects_non_running_vm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+        inject_fake_vm(&mgr, "vm-detach-stopped", crate::phase::VmPhase::Stopped).await;
+
+        let result = mgr.detach_volume("vm-detach-stopped", "vol-1", false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidState { .. }),
+            "expected InvalidState, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_volume_unknown_volume_returns_not_attached() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager(tmp.path());
+        inject_fake_vm(&mgr, "vm-detach-miss", crate::phase::VmPhase::Running).await;
+
+        let result = mgr
+            .detach_volume("vm-detach-miss", "vol-unknown", false)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ComputeError::VolumeNotAttached { .. }),
+            "expected VolumeNotAttached, got: {err:?}"
+        );
     }
 }

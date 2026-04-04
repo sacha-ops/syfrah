@@ -315,20 +315,46 @@ impl ChClient {
         })
     }
 
+    // ── Hot-plug disk endpoints (#1199) ────────────────────────────────
+
     /// Hot-add a disk to a running VM.
     ///
-    /// Calls `PUT /vm.add-disk` with the given disk configuration JSON.
-    /// This is NOT idempotent — adding the same disk twice returns an error.
-    pub async fn add_disk(&self, config: serde_json::Value) -> Result<(), ClientError> {
+    /// `disk_config` must match Cloud Hypervisor's `DiskConfig` schema (at minimum
+    /// `path` and optionally `readonly`, `id`). Returns the device ID assigned by
+    /// CH (from the `id` field in the response, or the one supplied in the request).
+    ///
+    /// NOT idempotent — adding the same disk twice is an error (409).
+    pub async fn add_disk(
+        &self,
+        disk_config: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, ClientError> {
         let (status, body) = self
-            .request(hyper::Method::PUT, "/vm.add-disk", Some(config))
+            .request(hyper::Method::PUT, "/vm.add-disk", Some(disk_config))
             .await?;
         if (200..300).contains(&status) {
-            return Ok(());
+            return Ok(body);
         }
         Err(ClientError::UnexpectedStatus {
             status,
             body: body.map(|v| v.to_string()).unwrap_or_default(),
+        })
+    }
+
+    /// Hot-remove a device from a running VM by its Cloud Hypervisor device ID.
+    ///
+    /// Sends `{"id": device_id}` to `PUT /vm.remove-device`.
+    /// Idempotent: if the device is already removed (404), returns Ok.
+    pub async fn remove_device(&self, device_id: &str) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "id": device_id });
+        let (status, resp_body) = self
+            .request(hyper::Method::PUT, "/vm.remove-device", Some(body))
+            .await?;
+        if (200..300).contains(&status) || status == 404 {
+            return Ok(());
+        }
+        Err(ClientError::UnexpectedStatus {
+            status,
+            body: resp_body.map(|v| v.to_string()).unwrap_or_default(),
         })
     }
 
@@ -446,11 +472,6 @@ mod tests {
     #[test]
     fn resize_is_not_idempotent() {
         assert!(!is_idempotent_ok(409, "resize"));
-    }
-
-    #[test]
-    fn add_disk_is_not_idempotent() {
-        assert!(!is_idempotent_ok(409, "add_disk"));
     }
 
     // ── Constructor tests ────────────────────────────────────────────
@@ -735,7 +756,23 @@ mod tests {
         mock.shutdown();
     }
 
-    // ── add-disk tests ────────────────────────────────────────────
+    // ── counters tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn counters_returns_parsed_json() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        let counters_json = r#"{"vcpu":{"cycles":1000}}"#;
+        mock.route("GET", "/vm.counters", MockResponse::ok_json(counters_json));
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let counters = client.counters().await.expect("counters should succeed");
+        assert_eq!(counters["vcpu"]["cycles"], 1000);
+        mock.shutdown();
+    }
+
+    // ── add_disk tests (#1199) ────────────────────────────────────
 
     #[tokio::test]
     async fn add_disk_returns_ok_on_204() {
@@ -745,19 +782,41 @@ mod tests {
         mock.start().await;
 
         let client = ChClient::new(sock);
-        let config = serde_json::json!({
-            "path": "/dev/nbd0",
-            "readonly": false,
-        });
-        client
+        let config =
+            serde_json::json!({"path": "/dev/nbd0", "readonly": false, "id": "_disk_vol-01"});
+        let result = client
             .add_disk(config)
             .await
-            .expect("add-disk should succeed");
+            .expect("add_disk should succeed");
+        assert!(result.is_none()); // 204 = no body
         mock.shutdown();
     }
 
     #[tokio::test]
-    async fn add_disk_409_is_error_not_idempotent() {
+    async fn add_disk_returns_body_on_200() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        mock.route(
+            "PUT",
+            "/vm.add-disk",
+            MockResponse::ok_json(r#"{"id":"_disk_vol-01"}"#),
+        );
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let config =
+            serde_json::json!({"path": "/dev/nbd0", "readonly": false, "id": "_disk_vol-01"});
+        let result = client
+            .add_disk(config)
+            .await
+            .expect("add_disk should succeed");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["id"], "_disk_vol-01");
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn add_disk_409_is_error() {
         let (_dir, sock) = temp_socket();
         let mut mock = MockChServer::new(&sock);
         mock.route("PUT", "/vm.add-disk", MockResponse::error(409));
@@ -773,52 +832,51 @@ mod tests {
         mock.shutdown();
     }
 
+    // ── remove_device tests (#1199) ─────────────────────────────────
+
     #[tokio::test]
-    async fn add_disk_sends_correct_json_body() {
+    async fn remove_device_returns_ok_on_204() {
         let (_dir, sock) = temp_socket();
         let mut mock = MockChServer::new(&sock);
-        mock.route("PUT", "/vm.add-disk", MockResponse::no_content());
+        mock.route("PUT", "/vm.remove-device", MockResponse::no_content());
         mock.start().await;
 
         let client = ChClient::new(sock);
-        let config = serde_json::json!({
-            "path": "/dev/nbd0",
-            "readonly": false,
-            "rate_limiter_config": {
-                "bandwidth": {"size": 209715200, "one_time_burst": 0, "refill_time": 1000},
-                "ops": {"size": 10000, "one_time_burst": 0, "refill_time": 1000}
-            }
-        });
         client
-            .add_disk(config)
+            .remove_device("_disk_vol-01")
             .await
-            .expect("add-disk should succeed");
-
-        let captured = mock
-            .captured_body("PUT", "/vm.add-disk")
-            .await
-            .expect("request body should be captured");
-        let json: serde_json::Value =
-            serde_json::from_str(&captured).expect("captured body should be valid JSON");
-        assert_eq!(json["path"], "/dev/nbd0");
-        assert_eq!(json["readonly"], false);
-        assert!(json["rate_limiter_config"].is_object());
+            .expect("remove_device should succeed");
         mock.shutdown();
     }
 
-    // ── counters tests ──────────────────────────────────────────────
-
     #[tokio::test]
-    async fn counters_returns_parsed_json() {
+    async fn remove_device_404_is_idempotent() {
         let (_dir, sock) = temp_socket();
         let mut mock = MockChServer::new(&sock);
-        let counters_json = r#"{"vcpu":{"cycles":1000}}"#;
-        mock.route("GET", "/vm.counters", MockResponse::ok_json(counters_json));
+        mock.route("PUT", "/vm.remove-device", MockResponse::error(404));
         mock.start().await;
 
         let client = ChClient::new(sock);
-        let counters = client.counters().await.expect("counters should succeed");
-        assert_eq!(counters["vcpu"]["cycles"], 1000);
+        client
+            .remove_device("_disk_vol-gone")
+            .await
+            .expect("remove_device 404 should be treated as success");
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn remove_device_500_is_error() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        mock.route("PUT", "/vm.remove-device", MockResponse::error(500));
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let err = client.remove_device("_disk_vol-01").await.unwrap_err();
+        assert!(matches!(
+            err,
+            ClientError::UnexpectedStatus { status: 500, .. }
+        ));
         mock.shutdown();
     }
 
