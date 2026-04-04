@@ -471,6 +471,47 @@ pub enum StateMachineCommand {
         new_vm_id: String,
     },
 
+    /// Begin a cross-zone volume migration (S3-to-S3 copy).
+    ///
+    /// Transitions the volume to `Migrating` state and records source/target
+    /// zone information. The volume must be in `Available` state (detached)
+    /// before migration can begin. Both source and target zone storage configs
+    /// must exist in Raft.
+    ///
+    /// Security: validates that both zone configs exist and that the caller
+    /// specifies the correct source zone for the volume's current region.
+    MigrateVolumeToZone {
+        volume_id: String,
+        /// Region key for the source zone's StorageConfig.
+        source_zone: String,
+        /// Region key for the target zone's StorageConfig.
+        target_zone: String,
+        /// Target hypervisor where the volume will be placed after migration.
+        target_hypervisor: String,
+        /// Target VM ID (optional — may be re-attached later).
+        target_vm_id: Option<String>,
+    },
+
+    /// Mark a cross-zone migration as complete.
+    ///
+    /// Transitions the volume from `Migrating` to `Available` on the target
+    /// zone, updates the hypervisor assignment, and clears migration metadata.
+    /// Only succeeds if the volume is currently in `Migrating` state.
+    CompleteMigration {
+        volume_id: String,
+    },
+
+    /// Roll back a failed cross-zone migration.
+    ///
+    /// Transitions the volume from `Migrating` back to its pre-migration state
+    /// on the source zone. Clears migration metadata. Only succeeds if the
+    /// volume is currently in `Migrating` state.
+    RollbackMigration {
+        volume_id: String,
+        /// Reason for the rollback (logged for audit).
+        reason: String,
+    },
+
     /// Commit a manifest pointer for a volume (ADR-006 §12b).
     ///
     /// Validates:
@@ -573,6 +614,21 @@ impl std::fmt::Display for StateMachineCommand {
                 f,
                 "RescheduleVolume({volume_id}: {from_hypervisor}->{to_hypervisor})"
             ),
+            Self::MigrateVolumeToZone {
+                volume_id,
+                source_zone,
+                target_zone,
+                ..
+            } => write!(
+                f,
+                "MigrateVolumeToZone({volume_id}: {source_zone}->{target_zone})"
+            ),
+            Self::CompleteMigration { volume_id } => {
+                write!(f, "CompleteMigration({volume_id})")
+            }
+            Self::RollbackMigration { volume_id, .. } => {
+                write!(f, "RollbackMigration({volume_id})")
+            }
             Self::CommitManifest {
                 volume_id,
                 manifest_version,
@@ -903,6 +959,20 @@ mod tests {
                 from_hypervisor: "hv1".into(),
                 to_hypervisor: "hv2".into(),
                 new_vm_id: "vm-new".into(),
+            },
+            StateMachineCommand::MigrateVolumeToZone {
+                volume_id: "vol-01".into(),
+                source_zone: "eu-west".into(),
+                target_zone: "eu-east".into(),
+                target_hypervisor: "hv3".into(),
+                target_vm_id: Some("vm-new".into()),
+            },
+            StateMachineCommand::CompleteMigration {
+                volume_id: "vol-01".into(),
+            },
+            StateMachineCommand::RollbackMigration {
+                volume_id: "vol-01".into(),
+                reason: "S3 copy failed".into(),
             },
             StateMachineCommand::CommitManifest {
                 volume_id: "vol-01".into(),

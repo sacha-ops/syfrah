@@ -60,6 +60,22 @@ pub struct VolumeRecord {
     /// Used for tombstone retention (30-day TTL before purge).
     #[serde(default)]
     pub deleted_at: Option<u64>,
+    /// Source zone (region key) during a cross-zone migration.
+    /// Set when the volume enters the `Migrating` state.
+    #[serde(default)]
+    pub migration_source_zone: Option<String>,
+    /// Target zone (region key) during a cross-zone migration.
+    /// Set when the volume enters the `Migrating` state.
+    #[serde(default)]
+    pub migration_target_zone: Option<String>,
+    /// Hypervisor the volume was attached to before migration started.
+    /// Used for rollback if the migration fails.
+    #[serde(default)]
+    pub pre_migration_hypervisor: Option<String>,
+    /// VM the volume was attached to before migration started.
+    /// Used for rollback if the migration fails.
+    #[serde(default)]
+    pub pre_migration_vm_id: Option<String>,
 }
 
 /// Volume lifecycle state.
@@ -67,6 +83,11 @@ pub struct VolumeRecord {
 pub enum VolumeState {
     Available,
     Attached,
+    /// Volume is being migrated between zones (S3-to-S3 copy in progress).
+    /// The volume is offline during migration. On success, transitions to
+    /// Available on the target zone. On failure, reverts to its pre-migration
+    /// state on the source zone.
+    Migrating,
     /// Tombstone state: volume is logically deleted, pending cleanup.
     /// Retained for audit purposes (30-day TTL).
     Deleted,
@@ -541,6 +562,7 @@ impl RedbStateMachine {
             state: match vol.state {
                 VolumeState::Available => syfrah_org::storage_store::VolumeState::Available,
                 VolumeState::Attached => syfrah_org::storage_store::VolumeState::Attached,
+                VolumeState::Migrating => syfrah_org::storage_store::VolumeState::Migrating,
                 VolumeState::Deleted => syfrah_org::storage_store::VolumeState::Deleted,
             },
             attached_vm_id: vol.attached_vm_id.clone(),
@@ -2028,6 +2050,10 @@ impl RedbStateMachine {
                     zone: zone.clone(),
                     deletion_protection: false,
                     deleted_at: None,
+                    migration_source_zone: None,
+                    migration_target_zone: None,
+                    pre_migration_hypervisor: None,
+                    pre_migration_vm_id: None,
                 };
                 storage.volumes.insert(id.clone(), record);
                 let synced = storage.volumes.get(id).cloned();
@@ -2270,6 +2296,121 @@ impl RedbStateMachine {
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
                         "volume '{}' is not attached (state: {:?}), cannot reschedule",
+                        volume_id, vol.state
+                    )),
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
+                }
+            }
+
+            StateMachineCommand::MigrateVolumeToZone {
+                volume_id,
+                source_zone,
+                target_zone,
+                target_hypervisor,
+                target_vm_id,
+            } => {
+                // Reject migration to the same zone.
+                if source_zone == target_zone {
+                    return StateMachineResponse::Error(format!(
+                        "cannot migrate volume '{}' to the same zone '{}'",
+                        volume_id, source_zone
+                    ));
+                }
+                // Validate both zone storage configs exist.
+                {
+                    let storage = self.storage.read().unwrap();
+                    if !storage.storage_configs.contains_key(source_zone) {
+                        return StateMachineResponse::Error(format!(
+                            "source zone storage config not found: '{}'",
+                            source_zone
+                        ));
+                    }
+                    if !storage.storage_configs.contains_key(target_zone) {
+                        return StateMachineResponse::Error(format!(
+                            "target zone storage config not found: '{}'",
+                            target_zone
+                        ));
+                    }
+                }
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Available => {
+                        // Record pre-migration state for rollback.
+                        vol.pre_migration_hypervisor = vol.attached_hypervisor_id.clone();
+                        vol.pre_migration_vm_id = vol.attached_vm_id.clone();
+                        // Transition to Migrating.
+                        vol.state = VolumeState::Migrating;
+                        vol.migration_source_zone = Some(source_zone.clone());
+                        vol.migration_target_zone = Some(target_zone.clone());
+                        vol.attached_hypervisor_id = Some(target_hypervisor.clone());
+                        vol.attached_vm_id = target_vm_id.clone();
+                        vol.placement_generation += 1;
+                        let synced = vol.clone();
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
+                        info!(
+                            volume_id,
+                            source_zone,
+                            target_zone,
+                            target_hypervisor,
+                            generation = synced.placement_generation,
+                            "volume migration started"
+                        );
+                        StateMachineResponse::Ok
+                    }
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{}' must be available to migrate (state: {:?})",
+                        volume_id, vol.state
+                    )),
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
+                }
+            }
+
+            StateMachineCommand::CompleteMigration { volume_id } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Migrating => {
+                        vol.state = VolumeState::Available;
+                        vol.migration_source_zone = None;
+                        vol.migration_target_zone = None;
+                        vol.pre_migration_hypervisor = None;
+                        vol.pre_migration_vm_id = None;
+                        let synced = vol.clone();
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
+                        info!(volume_id, "volume migration completed");
+                        StateMachineResponse::Ok
+                    }
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{}' is not migrating (state: {:?}), cannot complete migration",
+                        volume_id, vol.state
+                    )),
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
+                }
+            }
+
+            StateMachineCommand::RollbackMigration { volume_id, reason } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Migrating => {
+                        // Restore pre-migration hypervisor and VM assignment.
+                        vol.attached_hypervisor_id = vol.pre_migration_hypervisor.take();
+                        vol.attached_vm_id = vol.pre_migration_vm_id.take();
+                        vol.state = VolumeState::Available;
+                        vol.migration_source_zone = None;
+                        vol.migration_target_zone = None;
+                        let synced = vol.clone();
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
+                        warn!(
+                            volume_id,
+                            reason = reason.as_str(),
+                            "volume migration rolled back"
+                        );
+                        StateMachineResponse::Ok
+                    }
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{}' is not migrating (state: {:?}), cannot rollback",
                         volume_id, vol.state
                     )),
                     None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
@@ -2601,6 +2742,10 @@ impl RedbStateMachine {
                     zone: None,
                     deletion_protection: false,
                     deleted_at: None,
+                    migration_source_zone: None,
+                    migration_target_zone: None,
+                    pre_migration_hypervisor: None,
+                    pre_migration_vm_id: None,
                 };
                 storage.volumes.insert(new_volume_id.clone(), record);
                 let synced = storage.volumes.get(new_volume_id).cloned();
@@ -5370,5 +5515,328 @@ mod tests {
         assert!(state.pending_gc_ssts.is_empty());
         assert!(state.restores_in_progress.is_empty());
         assert_eq!(state.min_wal_position, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-zone migration tests (#1283)
+    // -----------------------------------------------------------------------
+
+    /// Helper: set up storage configs for two zones.
+    fn setup_two_zones(sm: &RedbStateMachine) {
+        sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(crate::commands::StorageConfig {
+                s3_endpoint: "https://s3.eu-west.example.com".into(),
+                s3_bucket: "syfrah-eu-west".into(),
+                s3_access_key: "AK-WEST".into(),
+                s3_secret_key: "SK-WEST".into(),
+                cache_disk_path: "/dev/nvme0".into(),
+                cache_disk_size_gb: 100,
+                cache_memory_size_gb: 4,
+            }),
+        });
+        sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-east".into(),
+            config: Box::new(crate::commands::StorageConfig {
+                s3_endpoint: "https://s3.eu-east.example.com".into(),
+                s3_bucket: "syfrah-eu-east".into(),
+                s3_access_key: "AK-EAST".into(),
+                s3_secret_key: "SK-EAST".into(),
+                cache_disk_path: "/dev/nvme1".into(),
+                cache_disk_size_gb: 100,
+                cache_memory_size_gb: 4,
+            }),
+        });
+    }
+
+    #[test]
+    fn migrate_volume_to_zone_transitions_to_migrating() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        create_volume(&sm, "vol-mig", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-mig".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-east-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-mig").unwrap();
+        assert_eq!(vol.state, VolumeState::Migrating);
+        assert_eq!(vol.migration_source_zone.as_deref(), Some("eu-west"));
+        assert_eq!(vol.migration_target_zone.as_deref(), Some("eu-east"));
+        assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-east-1"));
+        assert_eq!(vol.placement_generation, 1); // bumped from 0
+    }
+
+    #[test]
+    fn migrate_volume_rejects_same_zone() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-1".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-west".into(),
+            target_hypervisor: "hv-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn migrate_volume_rejects_missing_source_zone_config() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Only set up target zone.
+        sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-east".into(),
+            config: Box::new(crate::commands::StorageConfig {
+                s3_endpoint: "https://s3.eu-east.example.com".into(),
+                s3_bucket: "syfrah-eu-east".into(),
+                s3_access_key: "AK".into(),
+                s3_secret_key: "SK".into(),
+                cache_disk_path: "/dev/nvme0".into(),
+                cache_disk_size_gb: 100,
+                cache_memory_size_gb: 4,
+            }),
+        });
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-1".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("source zone"));
+        }
+    }
+
+    #[test]
+    fn migrate_volume_rejects_missing_target_zone_config() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Only set up source zone.
+        sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu-west".into(),
+            config: Box::new(crate::commands::StorageConfig {
+                s3_endpoint: "https://s3.eu-west.example.com".into(),
+                s3_bucket: "syfrah-eu-west".into(),
+                s3_access_key: "AK".into(),
+                s3_secret_key: "SK".into(),
+                cache_disk_path: "/dev/nvme0".into(),
+                cache_disk_size_gb: 100,
+                cache_memory_size_gb: 4,
+            }),
+        });
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-1".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("target zone"));
+        }
+    }
+
+    #[test]
+    fn migrate_volume_rejects_attached_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        // Attach the volume.
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-1".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-east-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("must be available to migrate"));
+        }
+    }
+
+    #[test]
+    fn migrate_volume_rejects_nonexistent_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        let resp = sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-nope".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-1".into(),
+            target_vm_id: None,
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("volume not found"));
+        }
+    }
+
+    #[test]
+    fn complete_migration_transitions_to_available() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        create_volume(&sm, "vol-mig", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-mig".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-east-1".into(),
+            target_vm_id: Some("vm-new".into()),
+        });
+
+        let resp = sm.apply_command(&StateMachineCommand::CompleteMigration {
+            volume_id: "vol-mig".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-mig").unwrap();
+        assert_eq!(vol.state, VolumeState::Available);
+        assert!(vol.migration_source_zone.is_none());
+        assert!(vol.migration_target_zone.is_none());
+        assert!(vol.pre_migration_hypervisor.is_none());
+        // Hypervisor assignment should remain on target.
+        assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-east-1"));
+    }
+
+    #[test]
+    fn complete_migration_rejects_non_migrating_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::CompleteMigration {
+            volume_id: "vol-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("not migrating"));
+        }
+    }
+
+    #[test]
+    fn rollback_migration_restores_pre_migration_state() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        setup_two_zones(&sm);
+
+        create_volume(&sm, "vol-mig", "pgdata", 100, "acme", "myapp", "prod");
+
+        // Record the pre-migration hypervisor by first assigning to a hypervisor
+        // and then detaching (so we have it in the record).
+        {
+            let mut storage = sm.storage.write().unwrap();
+            let vol = storage.volumes.get_mut("vol-mig").unwrap();
+            vol.attached_hypervisor_id = Some("hv-west-1".into());
+        }
+
+        sm.apply_command(&StateMachineCommand::MigrateVolumeToZone {
+            volume_id: "vol-mig".into(),
+            source_zone: "eu-west".into(),
+            target_zone: "eu-east".into(),
+            target_hypervisor: "hv-east-1".into(),
+            target_vm_id: None,
+        });
+
+        // Verify it's migrating.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-mig").unwrap();
+            assert_eq!(vol.state, VolumeState::Migrating);
+            assert_eq!(vol.pre_migration_hypervisor.as_deref(), Some("hv-west-1"));
+        }
+
+        let resp = sm.apply_command(&StateMachineCommand::RollbackMigration {
+            volume_id: "vol-mig".into(),
+            reason: "S3 copy failed at object 5 of 100".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let vol = storage.volumes.get("vol-mig").unwrap();
+        assert_eq!(vol.state, VolumeState::Available);
+        assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-west-1"));
+        assert!(vol.migration_source_zone.is_none());
+        assert!(vol.migration_target_zone.is_none());
+        assert!(vol.pre_migration_hypervisor.is_none());
+    }
+
+    #[test]
+    fn rollback_migration_rejects_non_migrating_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        let resp = sm.apply_command(&StateMachineCommand::RollbackMigration {
+            volume_id: "vol-1".into(),
+            reason: "test".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        if let StateMachineResponse::Error(msg) = resp {
+            assert!(msg.contains("not migrating"));
+        }
+    }
+
+    #[test]
+    fn volume_record_migration_fields_default_to_none() {
+        // Simulates deserializing an old VolumeRecord without migration fields.
+        let json = r#"{
+            "id": "vol-1",
+            "name": "test",
+            "size_gb": 50,
+            "org_id": "acme",
+            "project_id": "proj",
+            "env_id": "prod",
+            "volume_type": "Data",
+            "state": "Available",
+            "attached_vm_id": null,
+            "attached_hypervisor_id": null,
+            "placement_generation": 0,
+            "deletion_protection": false,
+            "deleted_at": null
+        }"#;
+        let vol: VolumeRecord = serde_json::from_str(json).unwrap();
+        assert!(vol.migration_source_zone.is_none());
+        assert!(vol.migration_target_zone.is_none());
+        assert!(vol.pre_migration_hypervisor.is_none());
+        assert!(vol.pre_migration_vm_id.is_none());
     }
 }
