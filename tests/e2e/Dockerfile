@@ -2,7 +2,7 @@ FROM rust:latest AS builder
 WORKDIR /app
 RUN rustup target add x86_64-unknown-linux-musl && \
     apt-get update && apt-get install -y musl-tools
-COPY Cargo.toml Cargo.lock CLOUD_HYPERVISOR_VERSION CRUN_VERSION RUNSC_VERSION ./
+COPY Cargo.toml Cargo.lock CLOUD_HYPERVISOR_VERSION CRUN_VERSION RUNSC_VERSION ZEROFS_VERSION ./
 COPY layers layers
 COPY bin bin
 RUN cargo build --release --bin syfrah --target x86_64-unknown-linux-musl
