@@ -163,6 +163,8 @@ pub enum VolumeReportedState {
     Detaching,
     /// Desired: Available with new size, Observed: resize in progress.
     Resizing,
+    /// Volume is being migrated between zones (S3-to-S3 copy in progress).
+    Migrating,
     /// Desired: Deleted, Observed: S3 objects being removed.
     Deleting,
     /// Desired: Deleted, Observed: all S3 data removed.
@@ -617,6 +619,7 @@ mod tests {
             VolumeReportedState::Attached,
             VolumeReportedState::Detaching,
             VolumeReportedState::Resizing,
+            VolumeReportedState::Migrating,
             VolumeReportedState::Deleting,
             VolumeReportedState::Deleted,
             VolumeReportedState::Error,

@@ -188,6 +188,16 @@ pub trait VolumeStateReader: Send + Sync {
 
     /// Get the storage config for the region, if configured.
     async fn storage_config(&self) -> Option<RegionStorageConfig>;
+
+    /// List volumes pending cross-zone migration on this hypervisor.
+    ///
+    /// Returns volumes in the `Migrating` state that have been assigned to
+    /// this hypervisor as the migration target. The reconciler uses this to
+    /// trigger the S3-to-S3 copy process.
+    async fn pending_migrations(
+        &self,
+        local_hypervisor_id: &str,
+    ) -> Vec<crate::storage_migration::PendingMigration>;
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +892,13 @@ impl VolumeStateReader for EmptyStateReader {
     async fn storage_config(&self) -> Option<RegionStorageConfig> {
         None
     }
+
+    async fn pending_migrations(
+        &self,
+        _local_hypervisor_id: &str,
+    ) -> Vec<crate::storage_migration::PendingMigration> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1025,61 @@ impl VolumeStateReader for RaftVolumeStateReader {
             cache_memory_size_bytes: u64::from(cfg.cache_memory_size_gb) * 1024 * 1024 * 1024,
         })
     }
+
+    async fn pending_migrations(
+        &self,
+        local_hypervisor_id: &str,
+    ) -> Vec<crate::storage_migration::PendingMigration> {
+        let guard = self.sm.read().await;
+        let sm = match guard.as_ref() {
+            Some(sm) => sm,
+            None => return Vec::new(),
+        };
+
+        let storage = sm.storage.read().unwrap();
+
+        storage
+            .volumes
+            .values()
+            .filter(|vol| {
+                vol.state == syfrah_controlplane::VolumeState::Migrating
+                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
+                    && vol.migration_source_zone.is_some()
+                    && vol.migration_target_zone.is_some()
+            })
+            .filter_map(|vol| {
+                let source_zone = vol.migration_source_zone.as_ref()?;
+                let target_zone = vol.migration_target_zone.as_ref()?;
+                let source_cfg = storage.storage_configs.get(source_zone)?;
+                let target_cfg = storage.storage_configs.get(target_zone)?;
+
+                // Build the S3 prefix from the volume's existing prefix.
+                // The prefix follows the pattern: volumes/{vol_id}/gen-{N}/
+                let s3_prefix = format!(
+                    "volumes/{}/gen-{}/",
+                    vol.id,
+                    vol.placement_generation.saturating_sub(1)
+                );
+
+                Some(crate::storage_migration::PendingMigration {
+                    volume_id: vol.id.clone(),
+                    s3_prefix,
+                    source: crate::storage_migration::S3BucketConfig {
+                        endpoint: source_cfg.s3_endpoint.clone(),
+                        bucket: source_cfg.s3_bucket.clone(),
+                        access_key: source_cfg.s3_access_key.clone(),
+                        secret_key: source_cfg.s3_secret_key.clone(),
+                    },
+                    target: crate::storage_migration::S3BucketConfig {
+                        endpoint: target_cfg.s3_endpoint.clone(),
+                        bucket: target_cfg.s3_bucket.clone(),
+                        access_key: target_cfg.s3_access_key.clone(),
+                        secret_key: target_cfg.s3_secret_key.clone(),
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1152,13 @@ mod tests {
 
         async fn storage_config(&self) -> Option<RegionStorageConfig> {
             self.config.lock().unwrap().clone()
+        }
+
+        async fn pending_migrations(
+            &self,
+            _local_hypervisor_id: &str,
+        ) -> Vec<crate::storage_migration::PendingMigration> {
+            Vec::new()
         }
     }
 

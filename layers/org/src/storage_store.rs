@@ -43,6 +43,8 @@ pub enum VolumeState {
     Attached,
     Detaching,
     Resizing,
+    /// Volume is being migrated between zones (S3-to-S3 copy in progress).
+    Migrating,
     Deleting,
     Deleted,
     Error,
