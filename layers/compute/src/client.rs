@@ -340,6 +340,29 @@ impl ChClient {
         })
     }
 
+    /// Hot-add a virtio-fs filesystem share to a running VM.
+    ///
+    /// `fs_config` must match Cloud Hypervisor's `FsConfig` schema (at minimum
+    /// `tag`, `socket`, and `id`). The tag is what the guest uses to mount,
+    /// the socket is the virtiofsd socket path.
+    ///
+    /// NOT idempotent — adding the same fs twice is an error (409).
+    pub async fn add_fs(
+        &self,
+        fs_config: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        let (status, body) = self
+            .request(hyper::Method::PUT, "/vm.add-fs", Some(fs_config))
+            .await?;
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        Err(ClientError::UnexpectedStatus {
+            status,
+            body: body.map(|v| v.to_string()).unwrap_or_default(),
+        })
+    }
+
     /// Hot-remove a device from a running VM by its Cloud Hypervisor device ID.
     ///
     /// Sends `{"id": device_id}` to `PUT /vm.remove-device`.
@@ -825,6 +848,44 @@ mod tests {
         let client = ChClient::new(sock);
         let config = serde_json::json!({"path": "/dev/nbd0"});
         let err = client.add_disk(config).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ClientError::UnexpectedStatus { status: 409, .. }
+        ));
+        mock.shutdown();
+    }
+
+    // ── add_fs tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_fs_returns_ok_on_204() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        mock.route("PUT", "/vm.add-fs", MockResponse::no_content());
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let config = serde_json::json!({
+            "tag": "vol-01",
+            "socket": "/run/syfrah/vms/vm-1/virtiofs_vol-01.sock",
+            "id": "_fs_vol-01",
+            "shared_dir": "/var/lib/syfrah/volumes/vol-01",
+        });
+        let result = client.add_fs(config).await.expect("add_fs should succeed");
+        assert!(result.is_none()); // 204 = no body
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn add_fs_409_is_error() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        mock.route("PUT", "/vm.add-fs", MockResponse::error(409));
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let config = serde_json::json!({"tag": "vol-01", "socket": "/tmp/vfs.sock"});
+        let err = client.add_fs(config).await.unwrap_err();
         assert!(matches!(
             err,
             ClientError::UnexpectedStatus { status: 409, .. }
