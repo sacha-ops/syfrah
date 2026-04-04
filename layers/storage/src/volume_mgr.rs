@@ -22,6 +22,22 @@ use tokio::time;
 use crate::binary;
 
 // ---------------------------------------------------------------------------
+// Manifest types (snapshot capture)
+// ---------------------------------------------------------------------------
+
+/// Point-in-time manifest captured from a running ZeroFS process.
+///
+/// Contains the SST files and WAL position needed to record a
+/// crash-consistent snapshot via the Raft `CreateSnapshot` command.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeManifest {
+    /// SST file keys currently referenced by this volume's LSM tree.
+    pub sst_files: Vec<String>,
+    /// WAL byte offset at the time the manifest was captured.
+    pub wal_position: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Configuration types
 // ---------------------------------------------------------------------------
 
@@ -119,6 +135,12 @@ impl VolumeMgr {
     /// Set an explicit zerofs binary path (overrides resolution order).
     pub fn with_binary(mut self, path: PathBuf) -> Self {
         self.binary_override = Some(path);
+        self
+    }
+
+    /// Override the NBD base path (useful for tests).
+    pub fn with_nbd_base(mut self, path: PathBuf) -> Self {
+        self.nbd_base = path;
         self
     }
 
@@ -318,6 +340,65 @@ impl VolumeMgr {
             .iter()
             .map(|(id, proc)| (id.clone(), proc.generation))
             .collect()
+    }
+
+    /// Capture a point-in-time manifest from a running ZeroFS process.
+    ///
+    /// Sends `SIGUSR1` to the ZeroFS process, which triggers it to write
+    /// the current SST file list and WAL position to
+    /// `{cache_dir}/{volume_id}.manifest.json`. The reconciler reads this
+    /// file and submits a `CreateSnapshot` Raft command.
+    ///
+    /// Returns the parsed manifest, or an error if the volume is not
+    /// running or the manifest cannot be captured.
+    pub async fn capture_manifest(
+        &self,
+        volume_id: &str,
+    ) -> Result<VolumeManifest, VolumeMgrError> {
+        let proc = self
+            .processes
+            .get(volume_id)
+            .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+
+        // Send SIGUSR1 to ask ZeroFS to dump its manifest.
+        #[cfg(unix)]
+        {
+            if let Some(pid) = proc.child.id() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGUSR1);
+                }
+            } else {
+                return Err(VolumeMgrError::Stop(
+                    "cannot capture manifest: process has no PID".to_string(),
+                ));
+            }
+        }
+
+        // Wait for the manifest file to appear.
+        let manifest_path = self
+            .nbd_base
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"))
+            .join(format!("{volume_id}.manifest.json"));
+
+        let deadline = time::Instant::now() + Duration::from_secs(5);
+        while time::Instant::now() < deadline {
+            if manifest_path.exists() {
+                let data = tokio::fs::read_to_string(&manifest_path)
+                    .await
+                    .map_err(|e| VolumeMgrError::Spawn(format!("failed to read manifest: {e}")))?;
+                // Clean up the manifest file after reading.
+                let _ = tokio::fs::remove_file(&manifest_path).await;
+                let manifest: VolumeManifest = serde_json::from_str(&data)
+                    .map_err(|e| VolumeMgrError::Spawn(format!("failed to parse manifest: {e}")))?;
+                return Ok(manifest);
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(VolumeMgrError::Spawn(format!(
+            "manifest file did not appear within 5s for volume {volume_id}"
+        )))
     }
 
     /// Reap any child processes that have exited (crashed or terminated
@@ -763,5 +844,68 @@ mod tests {
         assert!(!fenced, "newer local gen should not be fenced");
         assert!(mgr.is_running("vol-future"));
         mgr.stop_volume("vol-future").await.ok();
+    // ── VolumeManifest tests (#1200) ───────────────────────────────
+
+    #[test]
+    fn volume_manifest_serde_roundtrip() {
+        let manifest = VolumeManifest {
+            sst_files: vec!["sst-001.sst".into(), "sst-002.sst".into()],
+            wal_position: 42,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let deserialized: VolumeManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, deserialized);
+    }
+
+    #[test]
+    fn volume_manifest_empty_sst_files() {
+        let manifest = VolumeManifest {
+            sst_files: vec![],
+            wal_position: 0,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let deserialized: VolumeManifest = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.sst_files.is_empty());
+        assert_eq!(deserialized.wal_position, 0);
+    }
+
+    #[tokio::test]
+    async fn capture_manifest_rejects_unknown_volume() {
+        let mgr = VolumeMgr::new();
+        let result = mgr.capture_manifest("nonexistent").await;
+        assert!(matches!(result, Err(VolumeMgrError::NotRunning(_))));
+    }
+
+    #[tokio::test]
+    async fn capture_manifest_reads_file_when_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = VolumeMgr::new();
+        // Override nbd_base to point inside tmp dir so manifest path resolves there.
+        mgr.nbd_base = tmp.path().join("nbd");
+
+        // Inject a fake process.
+        mgr.inject_fake_process("vol-snap", 1);
+
+        // Pre-write the manifest file that ZeroFS would create on SIGUSR1.
+        let manifest = VolumeManifest {
+            sst_files: vec!["sst-a.sst".into(), "sst-b.sst".into()],
+            wal_position: 100,
+        };
+        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        let result = mgr.capture_manifest("vol-snap").await;
+        assert!(result.is_ok(), "capture_manifest failed: {result:?}");
+        let captured = result.unwrap();
+        assert_eq!(captured.sst_files, vec!["sst-a.sst", "sst-b.sst"]);
+        assert_eq!(captured.wal_position, 100);
+
+        // Manifest file should be cleaned up.
+        assert!(!manifest_path.exists());
+
+        // Cleanup.
+        mgr.stop_volume("vol-snap").await.ok();
     }
 }

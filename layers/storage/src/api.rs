@@ -84,6 +84,20 @@ pub enum StorageRequest {
         cache_disk_size_gb: u32,
         cache_memory_size_gb: u32,
     },
+    /// Create a snapshot of a volume.
+    SnapshotCreate {
+        /// Source volume name (resolved to ID by the handler).
+        volume_name: String,
+        /// Optional project scope for volume lookup.
+        project: Option<String>,
+    },
+    /// List snapshots with optional filters.
+    SnapshotList {
+        volume_name: Option<String>,
+        project: Option<String>,
+    },
+    /// Delete a snapshot.
+    SnapshotDelete { snapshot_id: String },
     /// Run storage health check (S3 probe + cache info).
     Health,
     /// Get storage status (connectivity + cache utilization).
@@ -96,6 +110,10 @@ pub enum StorageResponse {
     Volume(serde_json::Value),
     /// List of volumes.
     VolumeList(Vec<serde_json::Value>),
+    /// Single snapshot info.
+    Snapshot(serde_json::Value),
+    /// List of snapshots.
+    SnapshotList(Vec<serde_json::Value>),
     /// Success with no data.
     Ok,
     /// Storage configuration applied successfully.
@@ -235,6 +253,21 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
             // TODO: persist cache overrides locally
             StorageResponse::Ok
         }
+        StorageRequest::SnapshotCreate { volume_name, .. } => {
+            // TODO: resolve volume_name → volume_id, call VolumeMgr::capture_manifest,
+            // then submit CreateSnapshot Raft command with the manifest data.
+            // For now, return a placeholder snapshot indicating creation in progress.
+            StorageResponse::Snapshot(serde_json::json!({
+                "volume": volume_name,
+                "state": "creating",
+                "sst_files": [],
+                "wal_position": 0,
+            }))
+        }
+        StorageRequest::SnapshotList { .. } => StorageResponse::SnapshotList(vec![]),
+        StorageRequest::SnapshotDelete { snapshot_id } => {
+            StorageResponse::Error(format!("snapshot '{snapshot_id}' not found"))
+        }
         StorageRequest::Health => {
             // Stub: return a placeholder health report.
             // Real implementation reads StorageConfig from Raft and probes S3.
@@ -373,5 +406,75 @@ mod tests {
         let resp_bytes = handler.handle(payload, None).await;
         let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
         assert!(matches!(resp, StorageResponse::VolumeList(v) if v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn handler_returns_snapshot_on_create() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotCreate {
+            volume_name: "pgdata".into(),
+            project: Some("backend".into()),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Snapshot(v) => {
+                assert_eq!(v["volume"], "pgdata");
+                assert_eq!(v["state"], "creating");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_empty_snapshot_list() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotList {
+            volume_name: None,
+            project: None,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(matches!(resp, StorageResponse::SnapshotList(v) if v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn handler_returns_error_on_snapshot_delete_not_found() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotDelete {
+            snapshot_id: "snap-nonexistent".into(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Error(msg) => {
+                assert!(msg.contains("snap-nonexistent"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_request_serde_roundtrip() {
+        let req = StorageRequest::SnapshotCreate {
+            volume_name: "pgdata".into(),
+            project: Some("backend".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let _: StorageRequest = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn snapshot_response_serde_roundtrip() {
+        let resp = StorageResponse::Snapshot(serde_json::json!({
+            "id": "snap-01",
+            "volume": "pgdata",
+            "state": "available",
+        }));
+        let json = serde_json::to_string(&resp).unwrap();
+        let _: StorageResponse = serde_json::from_str(&json).unwrap();
     }
 }
