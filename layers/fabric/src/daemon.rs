@@ -240,6 +240,14 @@ pub fn setup_init(config: &DaemonConfig) -> anyhow::Result<DaemonReady> {
 /// Run the init flow: create a new mesh and run daemon (foreground).
 pub async fn run_init(config: DaemonConfig) -> anyhow::Result<()> {
     let ready = setup_init(&config)?;
+
+    // Auto-bootstrap a single-node Raft cluster so the control plane is
+    // immediately available after `fabric init`.  Without this, the daemon
+    // stays in "bootstrap mode" forever because there are no peers to
+    // auto-join.  This mirrors what `syfrah controlplane init` does but
+    // happens automatically.
+    auto_bootstrap_raft(&ready.my_record.name).await?;
+
     println!();
     println!("Run 'syfrah fabric peering' to accept new nodes.");
     println!("Running daemon... (Ctrl+C to stop)");
@@ -722,6 +730,93 @@ pub async fn run_leave() -> anyhow::Result<bool> {
     }
     ui::step_ok(&sp, "Left the mesh. State cleared.");
     Ok(true)
+}
+
+/// Bootstrap a single-node Raft cluster during `fabric init`.
+///
+/// On a fresh mesh there are no peers, so the daemon's auto-join loop would
+/// spin forever waiting for an existing Raft cluster.  This function creates
+/// a temporary Raft node, initializes it as a single-member cluster, shuts it
+/// down, and writes the `raft_initialized` sentinel.  When `run_daemon` starts
+/// it will pick up the persisted log and become leader immediately.
+async fn auto_bootstrap_raft(node_name: &str) -> anyhow::Result<()> {
+    let syfrah_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/root"))
+        .join(".syfrah");
+    let sentinel = syfrah_dir.join("raft_initialized");
+
+    if sentinel.exists() {
+        info!("raft: already initialized, skipping auto-bootstrap");
+        return Ok(());
+    }
+
+    // Derive node ID with the same hash the rest of the code uses.
+    let node_id = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        node_name.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    // Load the fabric state to derive the node address for Raft membership.
+    let fabric_state = store::load()
+        .map_err(|e| anyhow::anyhow!("failed to load fabric state for raft bootstrap: {e}"))?;
+    let node_addr = format!("[{}]:7200", fabric_state.mesh_ipv6);
+
+    // Create Raft storage.
+    let log_db = syfrah_state::LayerDb::open("raft_log")
+        .map_err(|e| anyhow::anyhow!("failed to create raft_log database: {e}"))?;
+    let log_store = std::sync::Arc::new(syfrah_controlplane::RedbLogStore::new(log_db));
+
+    // Use a temporary org store — the daemon will create the real one.
+    let tmp_dir = tempfile::tempdir()
+        .map_err(|e| anyhow::anyhow!("failed to create temp dir for raft bootstrap: {e}"))?;
+    let tmp_org_db = syfrah_state::LayerDb::open_at(&tmp_dir.path().join("tmp_org.redb"))
+        .map_err(|e| anyhow::anyhow!("failed to create temp org db: {e}"))?;
+    let org_store = std::sync::Arc::new(syfrah_org::OrgStore::new(tmp_org_db));
+    let sm = std::sync::Arc::new(syfrah_controlplane::RedbStateMachine::new(org_store));
+
+    let network = syfrah_controlplane::SyfrahNetworkFactory::new();
+
+    let config = std::sync::Arc::new(openraft::Config {
+        cluster_name: "syfrah-raft".to_string(),
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            syfrah_controlplane::state_machine::DEFAULT_SNAPSHOT_THRESHOLD,
+        ),
+        max_in_snapshot_log_to_keep: 100,
+        ..Default::default()
+    });
+
+    // Create the Raft node.
+    let raft = openraft::Raft::new(node_id, config, network, log_store, sm)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create Raft node for bootstrap: {e}"))?;
+
+    // Initialize as a single-member cluster.
+    let mut members = std::collections::BTreeMap::new();
+    members.insert(
+        node_id,
+        syfrah_controlplane::types::SyfrahNode { addr: node_addr },
+    );
+
+    raft.initialize(members)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to initialize single-node Raft cluster: {e}"))?;
+
+    // Brief pause for leadership election.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Shut down — run_daemon will create the real node from persisted state.
+    raft.shutdown()
+        .await
+        .map_err(|e| anyhow::anyhow!("Raft shutdown error during bootstrap: {e}"))?;
+
+    // Write sentinel so run_daemon enters the initialized branch.
+    std::fs::write(&sentinel, format!("{node_id}"))
+        .map_err(|e| anyhow::anyhow!("failed to write raft_initialized sentinel: {e}"))?;
+
+    info!("raft: auto-bootstrapped single-node cluster (node_id={node_id})");
+    Ok(())
 }
 
 /// Automatically register and enable the local hypervisor through Raft.
