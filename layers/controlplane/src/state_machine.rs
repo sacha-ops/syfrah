@@ -1585,7 +1585,7 @@ impl RedbStateMachine {
                         return StateMachineResponse::Error(format!(
                             "cannot enable hypervisor {name} \u{2014} storage is not configured for zone {zone}.\n\
                              VMs on this hypervisor would fail to pull images or manage volumes.\n\
-                             Run: syfrah storage config --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --access-key <key> --secret-key <secret>"
+                             Run: syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
                         ));
                     }
                 }
@@ -3226,7 +3226,7 @@ mod tests {
                     "expected storage preflight error, got: {msg}"
                 );
                 assert!(
-                    msg.contains("syfrah storage config"),
+                    msg.contains("syfrah storage configure"),
                     "error should suggest the fix command, got: {msg}"
                 );
             }

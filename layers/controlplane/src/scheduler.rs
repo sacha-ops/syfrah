@@ -325,7 +325,7 @@ impl Scheduler {
                     return Err(SchedulerError {
                         message: format!(
                             "cannot create VM in zone {requested_zone} \u{2014} storage is not configured for this zone.\n\
-                             Run: syfrah storage config --zone {requested_zone} --s3-endpoint <url> --s3-bucket <bucket> --access-key <key> --secret-key <secret>"
+                             Run: syfrah storage configure --zone {requested_zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
                         ),
                         constraints_summary: format!("zone={requested_zone}, storage=unconfigured"),
                     });
@@ -352,7 +352,7 @@ impl Scheduler {
                     return Err(SchedulerError {
                         message:
                             "cannot create VM \u{2014} no zone has storage configured.\n\
-                             Run: syfrah storage config --zone <zone> --s3-endpoint <url> --s3-bucket <bucket> --access-key <key> --secret-key <secret>"
+                             Run: syfrah storage configure --zone <zone> --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
                                 .to_string(),
                         constraints_summary: "storage=unconfigured".to_string(),
                     });
@@ -1170,7 +1170,7 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("syfrah storage config"),
+            err.message.contains("syfrah storage configure"),
             "error should suggest the fix command, got: {}",
             err.message
         );
@@ -1289,7 +1289,7 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("syfrah storage config"),
+            err.message.contains("syfrah storage configure"),
             "error should suggest the fix command, got: {}",
             err.message
         );
