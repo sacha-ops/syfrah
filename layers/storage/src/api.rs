@@ -479,10 +479,11 @@ impl StorageLayerHandler {
                     Ok(id) => id,
                     Err(e) => return StorageResponse::Error(e),
                 };
-                // TODO(#1200): sst_files and wal_position must come from the real
-                // ZeroFS manifest capture. Until ZeroFS integration lands, we
-                // pass empty/zero values — snapshots created via CLI will have
-                // no data backing and cannot be safely restored.
+                // Snapshot data is created by ZeroFS's native checkpoint:
+                //   VolumeMgr::capture_manifest(volume_id, snapshot_name)
+                // which runs `zerofs checkpoint create -c {config} {name}`.
+                // The Raft command records the snapshot metadata; the actual
+                // data lives in the ZeroFS checkpoint on S3.
                 let cmd = StateMachineCommand::CreateSnapshot {
                     id: snapshot_id.clone(),
                     source_volume_id: volume_id,
