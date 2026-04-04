@@ -1457,6 +1457,7 @@ pub async fn run_daemon(
             let handler = Arc::new(syfrah_storage::StorageLayerHandler::new(
                 Arc::clone(store),
                 storage_region,
+                my_record.name.clone(),
             ));
             let handler_ref = Arc::clone(&handler);
             router.register("storage", handler_ref);

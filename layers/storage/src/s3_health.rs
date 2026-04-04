@@ -544,7 +544,7 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).unwrap();
         let deserialized: S3HealthSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.s3_reachable, true);
+        assert!(deserialized.s3_reachable);
         assert_eq!(deserialized.s3_put_latency_ms, Some(42));
         assert_eq!(deserialized.s3_get_latency_ms, Some(15));
     }

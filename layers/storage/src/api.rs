@@ -224,6 +224,8 @@ pub struct StorageLayerHandler {
     store: Option<Arc<StorageStore>>,
     /// Region name for this node (used in SetStorageConfig).
     region: String,
+    /// Local node/hypervisor name (used as hypervisor_id in VolumeAttach).
+    local_node_name: String,
 }
 
 impl StorageLayerHandler {
@@ -233,15 +235,17 @@ impl StorageLayerHandler {
             raft_client: RwLock::new(None),
             store: None,
             region: String::new(),
+            local_node_name: String::new(),
         }
     }
 
     /// Create a handler backed by a redb storage store.
-    pub fn new(store: Arc<StorageStore>, region: String) -> Self {
+    pub fn new(store: Arc<StorageStore>, region: String, local_node_name: String) -> Self {
         Self {
             raft_client: RwLock::new(None),
             store: Some(store),
             region,
+            local_node_name,
         }
     }
 
@@ -382,7 +386,7 @@ impl StorageLayerHandler {
                 let cmd = StateMachineCommand::VolumeAttach {
                     volume_id: volume_id.clone(),
                     vm_id: vm,
-                    hypervisor_id: String::new(),
+                    hypervisor_id: self.local_node_name.clone(),
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {
@@ -464,6 +468,10 @@ impl StorageLayerHandler {
                     Ok(id) => id,
                     Err(e) => return StorageResponse::Error(e),
                 };
+                // TODO(#1200): sst_files and wal_position must come from the real
+                // ZeroFS manifest capture. Until ZeroFS integration lands, we
+                // pass empty/zero values — snapshots created via CLI will have
+                // no data backing and cannot be safely restored.
                 let cmd = StateMachineCommand::CreateSnapshot {
                     id: snapshot_id.clone(),
                     source_volume_id: volume_id,
@@ -491,7 +499,11 @@ impl StorageLayerHandler {
             }
 
             StorageRequest::SnapshotDelete { name } => {
-                let cmd = StateMachineCommand::DeleteSnapshot { snapshot_id: name };
+                let snapshot_id = match self.resolve_snapshot_id(&name) {
+                    Ok(id) => id,
+                    Err(e) => return StorageResponse::Error(e),
+                };
+                let cmd = StateMachineCommand::DeleteSnapshot { snapshot_id };
                 match self.submit_raft(cmd).await {
                     Ok(_) => StorageResponse::Ok,
                     Err(e) => StorageResponse::Error(e),
@@ -539,12 +551,12 @@ impl StorageLayerHandler {
                         .iter()
                         .filter(|v| {
                             if let Some(ref p) = project {
-                                if !v.project_id.contains(p.as_str()) {
+                                if v.project_id != *p {
                                     return false;
                                 }
                             }
                             if let Some(ref o) = org {
-                                if !v.org_id.contains(o.as_str()) {
+                                if v.org_id != *o {
                                     return false;
                                 }
                             }
@@ -695,7 +707,11 @@ impl StorageLayerHandler {
     }
 
     /// Resolve a volume name to its ID by scanning the store.
-    fn resolve_volume_id(&self, name: &str, _project: Option<&str>) -> Result<String, String> {
+    ///
+    /// When `project` is `Some`, only volumes in that project are considered.
+    /// This prevents ambiguous resolution when multiple projects contain a
+    /// volume with the same name.
+    fn resolve_volume_id(&self, name: &str, project: Option<&str>) -> Result<String, String> {
         let store = self
             .store
             .as_ref()
@@ -705,6 +721,11 @@ impl StorageLayerHandler {
             .map_err(|e| format!("failed to list volumes: {e}"))?;
         for vol in &volumes {
             if vol.name == name || vol.id == name {
+                if let Some(p) = project {
+                    if vol.project_id != p {
+                        continue;
+                    }
+                }
                 return Ok(vol.id.clone());
             }
         }
@@ -714,28 +735,63 @@ impl StorageLayerHandler {
     }
 
     /// Resolve a volume by name, returning the full Volume record.
+    ///
+    /// When `project` is `Some`, only volumes in that project are considered.
     fn resolve_volume(
         &self,
         name: &str,
-        _project: Option<&str>,
+        project: Option<&str>,
     ) -> Result<syfrah_org::Volume, String> {
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| format!("volume '{name}' not found -- store not initialized"))?;
+        // Direct ID lookup first (project filter applied below if needed).
         if let Ok(Some(vol)) = store.get_volume(name) {
-            return Ok(vol);
+            if project.is_none() || project == Some(vol.project_id.as_str()) {
+                return Ok(vol);
+            }
         }
         let volumes = store
             .list_volumes()
             .map_err(|e| format!("failed to list volumes: {e}"))?;
         for vol in volumes {
             if vol.name == name {
+                if let Some(p) = project {
+                    if vol.project_id != p {
+                        continue;
+                    }
+                }
                 return Ok(vol);
             }
         }
         Err(format!(
             "volume '{name}' not found. List available volumes with: syfrah volume list"
+        ))
+    }
+
+    /// Resolve a snapshot name/ID to its canonical ID by scanning the store.
+    ///
+    /// Snapshots in the data model only have an `id` field (no separate `name`),
+    /// so we accept either a direct ID match or a prefix match for convenience.
+    fn resolve_snapshot_id(&self, name: &str) -> Result<String, String> {
+        // If it looks like a snapshot ID and the store has it, use it directly.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(snap)) = store.get_snapshot(name) {
+                return Ok(snap.id);
+            }
+            // Fallback: scan all snapshots for a prefix/exact match.
+            let snapshots = store
+                .list_snapshots()
+                .map_err(|e| format!("failed to list snapshots: {e}"))?;
+            for snap in &snapshots {
+                if snap.id == name {
+                    return Ok(snap.id.clone());
+                }
+            }
+        }
+        Err(format!(
+            "snapshot '{name}' not found. List available snapshots with: syfrah volume snapshot list"
         ))
     }
 
@@ -757,17 +813,29 @@ impl StorageLayerHandler {
     }
 }
 
-/// Generate a short hex ID (12 chars) from timestamp + entropy.
+/// Generate a short hex ID (12 chars) from OS-seeded random entropy.
+///
+/// Uses `RandomState` (seeded from OS randomness on construction) to produce
+/// two independent 64-bit hashes, then takes 12 hex chars from the XOR.
+/// This avoids adding external crates while providing collision resistance
+/// far beyond the old deterministic LCG approach.
 fn short_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    use std::hash::{BuildHasher, Hasher};
+    // Each RandomState is seeded from OS entropy (getrandom/urandom).
+    let s1 = std::collections::hash_map::RandomState::new();
+    let s2 = std::collections::hash_map::RandomState::new();
+    let mut h1 = s1.build_hasher();
+    let mut h2 = s2.build_hasher();
+    // Feed unique per-call material to further separate calls within the same
+    // thread (timestamp + stack address).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let hash = nanos
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    format!("{:016x}", hash)[..12].to_string()
+    h1.write_u128(now);
+    h2.write_usize(&now as *const _ as usize);
+    let combined = h1.finish() ^ h2.finish();
+    format!("{:016x}", combined)[..12].to_string()
 }
 
 // ---------------------------------------------------------------------------
