@@ -426,6 +426,23 @@ pub enum StateMachineCommand {
         max_age_secs: u64,
     },
 
+    /// Reschedule a volume from one hypervisor to another.
+    ///
+    /// On VM reschedule, volumes attached to the VM must be migrated:
+    /// 1. Source stops ZeroFS (flush), Raft increments placement_generation.
+    /// 2. Target reconciler detects volume, starts ZeroFS with new gen prefix.
+    /// 3. Source self-fences on recovery by detecting stale generation.
+    ///
+    /// The volume remains in `Attached` state throughout — only the
+    /// hypervisor assignment and generation change (zero-copy migration).
+    RescheduleVolume {
+        volume_id: String,
+        from_hypervisor: String,
+        to_hypervisor: String,
+        /// New VM ID on the target hypervisor (may differ if the VM was re-created).
+        new_vm_id: String,
+    },
+
     /// Commit a manifest pointer for a volume (ADR-006 §12b).
     ///
     /// Validates:
@@ -492,6 +509,15 @@ impl std::fmt::Display for StateMachineCommand {
             Self::PurgeTombstones { max_age_secs, .. } => {
                 write!(f, "PurgeTombstones(ttl={max_age_secs}s)")
             }
+            Self::RescheduleVolume {
+                volume_id,
+                from_hypervisor,
+                to_hypervisor,
+                ..
+            } => write!(
+                f,
+                "RescheduleVolume({volume_id}: {from_hypervisor}->{to_hypervisor})"
+            ),
             Self::CommitManifest {
                 volume_id,
                 manifest_version,
@@ -807,6 +833,12 @@ mod tests {
                 max_volumes: 50,
                 max_total_gb: 10000,
                 max_snapshots: 200,
+            },
+            StateMachineCommand::RescheduleVolume {
+                volume_id: "vol-01".into(),
+                from_hypervisor: "hv1".into(),
+                to_hypervisor: "hv2".into(),
+                new_vm_id: "vm-new".into(),
             },
             StateMachineCommand::CommitManifest {
                 volume_id: "vol-01".into(),

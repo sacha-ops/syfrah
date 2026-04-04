@@ -1897,6 +1897,53 @@ impl RedbStateMachine {
                 }
             }
 
+            StateMachineCommand::RescheduleVolume {
+                volume_id,
+                from_hypervisor,
+                to_hypervisor,
+                new_vm_id,
+            } => {
+                // Reject self-reschedule: moving a volume to the same hypervisor
+                // is a no-op that would needlessly bump the generation and fence
+                // the currently-healthy writer.
+                if from_hypervisor == to_hypervisor {
+                    return StateMachineResponse::Error(format!(
+                        "cannot reschedule volume '{}' to the same hypervisor '{}'",
+                        volume_id, from_hypervisor
+                    ));
+                }
+                let mut storage = self.storage.write().unwrap();
+                match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.state == VolumeState::Attached => {
+                        // Validate the volume is currently on the source hypervisor.
+                        if vol.attached_hypervisor_id.as_deref() != Some(from_hypervisor) {
+                            return StateMachineResponse::Error(format!(
+                                "volume '{}' is not on hypervisor '{}' (actual: {:?})",
+                                volume_id, from_hypervisor, vol.attached_hypervisor_id
+                            ));
+                        }
+                        // Increment generation for fencing — new writer uses gen-{N+1}/,
+                        // source self-fences by detecting stale generation.
+                        vol.placement_generation += 1;
+                        vol.attached_hypervisor_id = Some(to_hypervisor.clone());
+                        vol.attached_vm_id = Some(new_vm_id.clone());
+                        info!(
+                            volume_id,
+                            from = from_hypervisor,
+                            to = to_hypervisor,
+                            generation = vol.placement_generation,
+                            "volume rescheduled"
+                        );
+                        StateMachineResponse::Ok
+                    }
+                    Some(vol) => StateMachineResponse::Error(format!(
+                        "volume '{}' is not attached (state: {:?}), cannot reschedule",
+                        volume_id, vol.state
+                    )),
+                    None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
+                }
+            }
+
             StateMachineCommand::ResizeVolume {
                 volume_id,
                 new_size_gb,
@@ -2904,6 +2951,184 @@ mod tests {
             deleted_at: 1_700_000_000,
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[test]
+    fn reschedule_volume_increments_generation_and_moves_hypervisor() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create and attach a volume.
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        // Check initial state: generation is 1 (attach increments from 0).
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-1").unwrap();
+            assert_eq!(vol.placement_generation, 1);
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-1"));
+            assert_eq!(vol.attached_vm_id.as_deref(), Some("vm-1"));
+        }
+
+        // Reschedule: move volume from hv-1 to hv-2.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-1".into(),
+            from_hypervisor: "hv-1".into(),
+            to_hypervisor: "hv-2".into(),
+            new_vm_id: "vm-1-new".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Verify: generation incremented, hypervisor and VM updated.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-1").unwrap();
+            assert_eq!(vol.placement_generation, 2);
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-2"));
+            assert_eq!(vol.attached_vm_id.as_deref(), Some("vm-1-new"));
+            assert_eq!(vol.state, VolumeState::Attached);
+        }
+    }
+
+    #[test]
+    fn reschedule_volume_rejects_wrong_source_hypervisor() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        // Try to reschedule from wrong hypervisor.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-1".into(),
+            from_hypervisor: "hv-wrong".into(),
+            to_hypervisor: "hv-2".into(),
+            new_vm_id: "vm-1-new".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+
+        // Generation should be unchanged.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-1").unwrap();
+            assert_eq!(vol.placement_generation, 1);
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-1"));
+        }
+    }
+
+    #[test]
+    fn reschedule_volume_rejects_detached_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        // Volume is Available (not attached) — cannot reschedule.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-1".into(),
+            from_hypervisor: "hv-1".into(),
+            to_hypervisor: "hv-2".into(),
+            new_vm_id: "vm-1-new".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn reschedule_volume_rejects_nonexistent_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-nope".into(),
+            from_hypervisor: "hv-1".into(),
+            to_hypervisor: "hv-2".into(),
+            new_vm_id: "vm-1-new".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn reschedule_volume_fencing_prevents_stale_writes() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create, attach, reschedule to simulate full migration flow.
+        create_volume(&sm, "vol-fence", "db", 50, "acme", "proj", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-fence".into(),
+            vm_id: "vm-old".into(),
+            hypervisor_id: "hv-src".into(),
+        });
+
+        // Reschedule: hv-src -> hv-dst.
+        sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-fence".into(),
+            from_hypervisor: "hv-src".into(),
+            to_hypervisor: "hv-dst".into(),
+            new_vm_id: "vm-new".into(),
+        });
+
+        // Stale source tries to reschedule again from hv-src — must fail
+        // because the volume is now on hv-dst.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-fence".into(),
+            from_hypervisor: "hv-src".into(),
+            to_hypervisor: "hv-other".into(),
+            new_vm_id: "vm-other".into(),
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(_)),
+            "stale source should be fenced out"
+        );
+
+        // Verify final state is still on hv-dst with generation 2.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-fence").unwrap();
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-dst"));
+            assert_eq!(vol.placement_generation, 2);
+        }
+    }
+
+    #[test]
+    fn reschedule_volume_rejects_self_reschedule() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        // Self-reschedule: from == to — must be rejected.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-1".into(),
+            from_hypervisor: "hv-1".into(),
+            to_hypervisor: "hv-1".into(),
+            new_vm_id: "vm-1".into(),
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("same hypervisor")),
+            "self-reschedule should be rejected, got: {resp:?}"
+        );
+
+        // Generation must NOT have been incremented.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-1").unwrap();
+            assert_eq!(vol.placement_generation, 1);
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-1"));
+        }
     }
 
     #[test]

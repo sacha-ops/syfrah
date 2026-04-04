@@ -298,6 +298,42 @@ impl VolumeMgr {
         self.processes.get(volume_id).map(|p| p.nbd_device.clone())
     }
 
+    /// Get the tracked generation for a running volume.
+    ///
+    /// Returns `None` if the volume is not tracked.
+    pub fn get_generation(&self, volume_id: &str) -> Option<u64> {
+        self.processes.get(volume_id).map(|p| p.generation)
+    }
+
+    /// Self-fence a volume whose generation is stale.
+    ///
+    /// On recovery after a reschedule, the source hypervisor's reconciler
+    /// calls this with the current Raft generation. If the local process is
+    /// running with a lower generation, we stop ZeroFS (SIGKILL — no flush,
+    /// since a new writer at gen-{N+1} is already active) and discard the
+    /// local cache.
+    ///
+    /// Returns `true` if a stale process was stopped, `false` if the volume
+    /// was not running or already at the correct generation.
+    pub async fn self_fence_stale(
+        &mut self,
+        volume_id: &str,
+        current_generation: u64,
+    ) -> Result<bool, VolumeMgrError> {
+        let local_gen = match self.get_generation(volume_id) {
+            Some(g) => g,
+            None => return Ok(false), // not running locally — nothing to fence
+        };
+
+        if local_gen >= current_generation {
+            return Ok(false); // up-to-date — no fencing needed
+        }
+
+        // Stale generation detected — force-kill (no flush, data belongs to new gen).
+        self.stop_volume_flush(volume_id, false).await?;
+        Ok(true)
+    }
+
     /// List all actively tracked volumes as `(volume_id, generation)` pairs.
     pub fn list_active(&self) -> Vec<(String, u64)> {
         self.processes
@@ -747,6 +783,67 @@ mod tests {
     fn nbd_device_path_returns_none_for_unknown_volume() {
         let mgr = VolumeMgr::new();
         assert_eq!(mgr.nbd_device_path("nonexistent"), None);
+    }
+
+    // ── get_generation tests (#1204) ───────────────────────────────
+
+    #[test]
+    fn get_generation_returns_none_for_unknown() {
+        let mgr = VolumeMgr::new();
+        assert_eq!(mgr.get_generation("nonexistent"), None);
+    }
+
+    #[tokio::test]
+    async fn get_generation_returns_tracked_generation() {
+        let mut mgr = VolumeMgr::new();
+        mgr.inject_fake_process("vol-gen", 5);
+        assert_eq!(mgr.get_generation("vol-gen"), Some(5));
+        mgr.stop_volume("vol-gen").await.ok();
+    }
+
+    // ── self_fence_stale tests (#1204) ─────────────────────────────
+
+    #[tokio::test]
+    async fn self_fence_stale_kills_old_generation() {
+        let mut mgr = VolumeMgr::new();
+        mgr.inject_fake_process("vol-stale", 3);
+        assert!(mgr.is_running("vol-stale"));
+
+        // Current Raft generation is 5, local is 3 — stale.
+        let fenced = mgr.self_fence_stale("vol-stale", 5).await.unwrap();
+        assert!(fenced, "stale process should have been fenced");
+        assert!(!mgr.is_running("vol-stale"), "process should be stopped");
+    }
+
+    #[tokio::test]
+    async fn self_fence_stale_noop_for_current_generation() {
+        let mut mgr = VolumeMgr::new();
+        mgr.inject_fake_process("vol-current", 5);
+
+        // Same generation — no fencing needed.
+        let fenced = mgr.self_fence_stale("vol-current", 5).await.unwrap();
+        assert!(!fenced, "current gen should not be fenced");
+        assert!(mgr.is_running("vol-current"), "process should still run");
+        mgr.stop_volume("vol-current").await.ok();
+    }
+
+    #[tokio::test]
+    async fn self_fence_stale_noop_for_unknown_volume() {
+        let mut mgr = VolumeMgr::new();
+        let fenced = mgr.self_fence_stale("vol-unknown", 5).await.unwrap();
+        assert!(!fenced, "unknown volume should not trigger fencing");
+    }
+
+    #[tokio::test]
+    async fn self_fence_stale_noop_for_newer_generation() {
+        let mut mgr = VolumeMgr::new();
+        mgr.inject_fake_process("vol-future", 10);
+
+        // Local gen 10, Raft gen 8 — local is ahead (shouldn't happen, but safe).
+        let fenced = mgr.self_fence_stale("vol-future", 8).await.unwrap();
+        assert!(!fenced, "newer local gen should not be fenced");
+        assert!(mgr.is_running("vol-future"));
+        mgr.stop_volume("vol-future").await.ok();
     }
 
     // ── VolumeManifest tests (#1200) ───────────────────────────────
