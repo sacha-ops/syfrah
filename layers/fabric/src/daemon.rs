@@ -1495,6 +1495,37 @@ pub async fn run_daemon(
             .await;
         });
         info!("storage cleanup loop started");
+
+        // GC worker — two-phase SST/WAL/generation garbage collection.
+        // Runs on all nodes but only performs work on the Raft leader.
+        //
+        // TODO(#1208): Wire up real S3 config from node configuration and
+        // replace NoOpGcStateReader/NoOpGcSubmitter with Raft-backed
+        // implementations. Currently a no-op stub — the NoOpGcStateReader
+        // always reports not-leader so no GC work is performed.
+        let gc_shutdown_rx = storage_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let gc_config = syfrah_forge::gc::GcConfig::default();
+            let s3_config = syfrah_forge::storage_cleanup::S3CleanupConfig {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+            };
+            let state_reader: std::sync::Arc<dyn syfrah_forge::gc::GcStateReader> =
+                std::sync::Arc::new(syfrah_forge::gc::NoOpGcStateReader);
+            let submitter: std::sync::Arc<dyn syfrah_forge::gc::GcCommandSubmitter> =
+                std::sync::Arc::new(syfrah_forge::gc::NoOpGcSubmitter);
+            syfrah_forge::gc::run_gc_loop(
+                gc_config,
+                s3_config,
+                state_reader,
+                submitter,
+                gc_shutdown_rx,
+            )
+            .await;
+        });
+        info!("GC worker started");
     }
 
     // -- Forge HTTP API server -----------------------------------------------
