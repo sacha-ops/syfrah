@@ -215,14 +215,18 @@ fi
 # ── Step 8: Format, mount, write test data ──────────────────
 
 info "Step 8: mkfs.ext4, mount, write test file"
-docker exec "$CONTAINER_NAME" mkfs.ext4 -F "$NBD_DEV" 2>&1
-docker exec "$CONTAINER_NAME" mkdir -p "$MOUNT_POINT"
-docker exec "$CONTAINER_NAME" mount "$NBD_DEV" "$MOUNT_POINT"
-docker exec "$CONTAINER_NAME" bash -c "echo '$TEST_STRING' > ${MOUNT_POINT}/testfile.txt"
-docker exec "$CONTAINER_NAME" sync
-docker exec "$CONTAINER_NAME" umount "$MOUNT_POINT"
-
-pass "Step 8: filesystem created, test file written, unmounted"
+if docker exec "$CONTAINER_NAME" mkfs.ext4 -F "$NBD_DEV" 2>&1 \
+    && docker exec "$CONTAINER_NAME" mkdir -p "$MOUNT_POINT" \
+    && docker exec "$CONTAINER_NAME" mount "$NBD_DEV" "$MOUNT_POINT" \
+    && docker exec "$CONTAINER_NAME" bash -c "echo '$TEST_STRING' > ${MOUNT_POINT}/testfile.txt" \
+    && docker exec "$CONTAINER_NAME" sync \
+    && docker exec "$CONTAINER_NAME" umount "$MOUNT_POINT"; then
+    pass "Step 8: filesystem created, test file written, unmounted"
+else
+    fail "Step 8: failed to format, mount, or write test file"
+    summary
+    exit 1
+fi
 
 # ── Step 9: Disconnect NBD, stop ZeroFS ─────────────────────
 
@@ -238,6 +242,10 @@ pass "Step 9: NBD disconnected, ZeroFS stopped"
 # ── Step 10: Reconnect, verify persistence ──────────────────
 
 info "Step 10: Reconnect ZeroFS + NBD, verify data persists"
+
+# Remove stale NBD socket to prevent race with new ZeroFS instance
+docker exec "$CONTAINER_NAME" rm -f "${VOL_DIR}/zerofs.nbd.sock"
+
 docker exec -d "$CONTAINER_NAME" zerofs run -c "${VOL_DIR}/zerofs.toml"
 
 SOCK_WAIT=0
@@ -251,16 +259,19 @@ done
 
 ZEROFS_PID=$(docker exec "$CONTAINER_NAME" pgrep -f "zerofs run" 2>/dev/null || echo "")
 
-docker exec "$CONTAINER_NAME" \
-    nbd-client -unix "${VOL_DIR}/zerofs.nbd.sock" "$NBD_DEV" 2>&1
-docker exec "$CONTAINER_NAME" mount "$NBD_DEV" "$MOUNT_POINT"
+if docker exec "$CONTAINER_NAME" \
+    nbd-client -unix "${VOL_DIR}/zerofs.nbd.sock" "$NBD_DEV" 2>&1 \
+    && docker exec "$CONTAINER_NAME" mount "$NBD_DEV" "$MOUNT_POINT"; then
 
-PERSISTED=$(docker exec "$CONTAINER_NAME" cat "${MOUNT_POINT}/testfile.txt" 2>&1 || echo "")
+    PERSISTED=$(docker exec "$CONTAINER_NAME" cat "${MOUNT_POINT}/testfile.txt" 2>&1 || echo "")
 
-if [ "$PERSISTED" = "$TEST_STRING" ]; then
-    pass "Step 10: test file persists after ZeroFS restart"
+    if [ "$PERSISTED" = "$TEST_STRING" ]; then
+        pass "Step 10: test file persists after ZeroFS restart"
+    else
+        fail "Step 10: test file content mismatch (expected '$TEST_STRING', got '$PERSISTED')"
+    fi
 else
-    fail "Step 10: test file content mismatch (expected '$TEST_STRING', got '$PERSISTED')"
+    fail "Step 10: failed to reconnect NBD or mount volume after restart"
 fi
 
 docker exec "$CONTAINER_NAME" umount "$MOUNT_POINT"
