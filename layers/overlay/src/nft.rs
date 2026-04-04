@@ -128,11 +128,7 @@ pub fn generate_vm_rules(tap: &str, mac: &str, ip: Ipv4Addr) -> String {
         "add rule inet {TABLE_NAME} {CHAIN_NAME} iif {tap} ip saddr != {ip} drop"
     )
     .unwrap();
-    writeln!(
-        buf,
-        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} drop"
-    )
-    .unwrap();
+    // Accept rules BEFORE the default deny (order matters in nftables)
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} tcp dport 22 accept"
@@ -146,6 +142,12 @@ pub fn generate_vm_rules(tap: &str, mac: &str, ip: Ipv4Addr) -> String {
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} ct state established,related accept"
+    )
+    .unwrap();
+    // Default deny ingress — MUST be AFTER accept rules
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} oif {tap} drop"
     )
     .unwrap();
     writeln!(
@@ -488,7 +490,11 @@ mod tests {
         let ssh_pos = r.find("tcp dport 22 accept").expect("SSH rule");
         assert!(mac_spoof_pos < ip_spoof_pos);
         assert!(ip_spoof_pos < egress_pos);
-        assert!(deny_pos < ssh_pos);
+        // Accept rules must come BEFORE the default deny drop
+        assert!(
+            ssh_pos < deny_pos,
+            "SSH accept must be before default deny drop"
+        );
     }
 
     #[test]
