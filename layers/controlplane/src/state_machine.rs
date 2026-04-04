@@ -2363,6 +2363,38 @@ impl RedbStateMachine {
                 info!(snapshot_id, "restore completed");
                 StateMachineResponse::Ok
             }
+
+            // -- GC: acknowledge SST deletion from S3 --
+            StateMachineCommand::GcCompleteSsts { sst_keys } => {
+                let mut storage = self.storage.write().unwrap();
+                let before = storage.pending_gc_ssts.len();
+                storage
+                    .pending_gc_ssts
+                    .retain(|key| !sst_keys.contains(key));
+                let removed = before - storage.pending_gc_ssts.len();
+                info!(
+                    removed,
+                    remaining = storage.pending_gc_ssts.len(),
+                    "GC: SSTs removed from pending list"
+                );
+                StateMachineResponse::Ok
+            }
+
+            // -- GC: acknowledge WAL segment deletion --
+            StateMachineCommand::GcCompleteWalSegments { below_position } => {
+                let mut storage = self.storage.write().unwrap();
+                let old = storage.min_wal_position;
+                if storage.min_wal_position.is_none_or(|p| *below_position > p) {
+                    storage.min_wal_position = Some(*below_position);
+                }
+                info!(
+                    below_position,
+                    old_min_wal = ?old,
+                    new_min_wal = ?storage.min_wal_position,
+                    "GC: WAL min position advanced"
+                );
+                StateMachineResponse::Ok
+            }
         }
     }
 }
