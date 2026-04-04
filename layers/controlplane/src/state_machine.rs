@@ -1823,6 +1823,19 @@ impl RedbStateMachine {
                         // Cascade: delete all snapshots first and decrement SST refcounts.
                         // SSTs that reach refcount 0 are moved to pending-GC.
                         if *cascade {
+                            // Guard: reject cascade if any snapshot has a restore in progress.
+                            let blocked: Vec<_> = snapshot_ids
+                                .iter()
+                                .filter(|id| storage.restores_in_progress.contains(id))
+                                .collect();
+                            if !blocked.is_empty() {
+                                return StateMachineResponse::Error(format!(
+                                    "cannot cascade-delete volume '{}': snapshot(s) {} have restores in progress",
+                                    volume_id,
+                                    blocked.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(", ")
+                                ));
+                            }
+
                             for snap_id in &snapshot_ids {
                                 if let Some(snap) = storage.snapshots.remove(snap_id) {
                                     for sst in &snap.sst_files {
@@ -3767,6 +3780,73 @@ mod tests {
         let storage = sm.storage.read().unwrap();
         assert!(!storage.sst_refcounts.0.contains_key("sst-a.sst"));
         assert!(!storage.sst_refcounts.0.contains_key("sst-b.sst"));
+    }
+
+    #[test]
+    fn cascade_delete_blocked_by_restore_in_progress() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Mark a restore in progress for the snapshot.
+        let resp = sm.apply_command(&StateMachineCommand::MarkRestoreBegin {
+            snapshot_id: "snap-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Cascade delete should be rejected because snap-1 has a restore in progress.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: true,
+            deleted_at: 1_700_000_000,
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("restores in progress")),
+            "cascade delete should be blocked when a snapshot has a restore in progress"
+        );
+
+        // Snapshot should still exist.
+        let storage = sm.storage.read().unwrap();
+        assert!(storage.snapshots.contains_key("snap-1"));
+        // Volume should NOT be tombstoned.
+        assert_ne!(
+            storage.volumes.get("vol-1").unwrap().state,
+            VolumeState::Deleted
+        );
+    }
+
+    #[test]
+    fn cascade_delete_succeeds_after_restore_completes() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Start and complete a restore.
+        sm.apply_command(&StateMachineCommand::MarkRestoreBegin {
+            snapshot_id: "snap-1".into(),
+        });
+        sm.apply_command(&StateMachineCommand::MarkRestoreComplete {
+            snapshot_id: "snap-1".into(),
+        });
+
+        // Cascade delete should now succeed.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-1".into(),
+            cascade: true,
+            deleted_at: 1_700_000_000,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        assert!(!storage.snapshots.contains_key("snap-1"));
+        assert_eq!(
+            storage.volumes.get("vol-1").unwrap().state,
+            VolumeState::Deleted
+        );
     }
 
     #[test]
