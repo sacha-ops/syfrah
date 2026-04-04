@@ -1068,6 +1068,7 @@ impl VolumeMgr {
                     encryption_passphrase: encryption_passphrase.to_string(),
                 },
                 health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
             },
         );
 
