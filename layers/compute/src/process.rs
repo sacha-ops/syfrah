@@ -731,6 +731,7 @@ pub(crate) async fn spawn_vm_inner(
         hypervisor_id: None,
         region: None,
         zone: None,
+        hotplug_devices: std::collections::HashMap::new(),
     })
 }
 
@@ -1317,6 +1318,7 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         events::emit(
@@ -1714,6 +1716,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1754,6 +1757,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1794,6 +1798,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -1836,6 +1841,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2054,6 +2060,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let vm_arc = Arc::new(Mutex::new(state));
@@ -2200,6 +2207,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = delete_vm(&mut state, &client, &dir).await;
@@ -2260,6 +2268,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let result = kill_vm(&mut state, &client, &dir).await;
@@ -2385,6 +2394,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         let vm_arc = Arc::new(Mutex::new(state));

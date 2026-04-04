@@ -30,6 +30,12 @@ pub enum ComputeError {
     #[error("VM {id} not found")]
     VmNotFound { id: String },
 
+    #[error("invalid state for VM {vm_id}: {detail}")]
+    InvalidState { vm_id: String, detail: String },
+
+    #[error("volume {volume_id} not attached to VM {vm_id}")]
+    VolumeNotAttached { vm_id: String, volume_id: String },
+
     #[error("image error: {0}")]
     Image(#[from] crate::image::error::ImageError),
 
@@ -315,6 +321,28 @@ mod tests {
         };
         let outer: ComputeError = inner.into();
         assert!(matches!(outer, ComputeError::Transition(_)));
+    }
+
+    #[test]
+    fn compute_error_invalid_state_display() {
+        let err = ComputeError::InvalidState {
+            vm_id: "vm-1".to_string(),
+            detail: "VM is not running".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("vm-1"));
+        assert!(msg.contains("VM is not running"));
+    }
+
+    #[test]
+    fn compute_error_volume_not_attached_display() {
+        let err = ComputeError::VolumeNotAttached {
+            vm_id: "vm-1".to_string(),
+            volume_id: "vol-42".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("vol-42"));
+        assert!(msg.contains("vm-1"));
     }
 
     #[test]

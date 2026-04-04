@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::network::NetworkInfo;
@@ -63,6 +64,9 @@ pub(crate) struct VmRuntimeState {
     pub(crate) region: Option<String>,
     /// Zone of the hypervisor.
     pub(crate) zone: Option<String>,
+    /// Hot-plugged volume tracking: volume_id -> CH device_id.
+    /// Used to look up the device_id when detaching a volume.
+    pub(crate) hotplug_devices: HashMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -146,6 +150,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: HashMap::new(),
         }
     }
 
@@ -183,5 +188,39 @@ mod tests {
 
         let recovered = ReconnectSource::Recovered;
         assert!(format!("{recovered:?}").contains("Recovered"));
+    }
+
+    #[test]
+    fn hotplug_devices_initially_empty() {
+        let rt = sample_runtime(VmPhase::Running);
+        assert!(rt.hotplug_devices.is_empty());
+    }
+
+    #[test]
+    fn hotplug_devices_insert_and_lookup() {
+        let mut rt = sample_runtime(VmPhase::Running);
+        rt.hotplug_devices
+            .insert("vol-01".to_string(), "_disk_vol-01".to_string());
+        rt.hotplug_devices
+            .insert("vol-02".to_string(), "_disk_vol-02".to_string());
+
+        assert_eq!(rt.hotplug_devices.len(), 2);
+        assert_eq!(
+            rt.hotplug_devices.get("vol-01"),
+            Some(&"_disk_vol-01".to_string())
+        );
+        assert_eq!(
+            rt.hotplug_devices.get("vol-02"),
+            Some(&"_disk_vol-02".to_string())
+        );
+    }
+
+    #[test]
+    fn hotplug_devices_remove() {
+        let mut rt = sample_runtime(VmPhase::Running);
+        rt.hotplug_devices
+            .insert("vol-01".to_string(), "_disk_vol-01".to_string());
+        assert!(rt.hotplug_devices.remove("vol-01").is_some());
+        assert!(rt.hotplug_devices.is_empty());
     }
 }
