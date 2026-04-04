@@ -269,6 +269,13 @@ impl VolumeMgr {
         self.processes.contains_key(volume_id)
     }
 
+    /// Get the NBD device path for a running volume.
+    ///
+    /// Returns `None` if the volume is not tracked.
+    pub fn get_nbd_device(&self, volume_id: &str) -> Option<PathBuf> {
+        self.processes.get(volume_id).map(|p| p.nbd_device.clone())
+    }
+
     /// List all actively tracked volumes as `(volume_id, generation)` pairs.
     pub fn list_active(&self) -> Vec<(String, u64)> {
         self.processes
@@ -620,6 +627,12 @@ mod tests {
 
     // ── nbd_device_path tests (#1195) ───────────────────────────────
 
+    #[test]
+    fn get_nbd_device_returns_none_for_unknown() {
+        let mgr = VolumeMgr::new();
+        assert!(mgr.get_nbd_device("nonexistent").is_none());
+    }
+
     #[tokio::test]
     async fn nbd_device_path_returns_path_for_running_volume() {
         let mut mgr = VolumeMgr::new();
@@ -641,6 +654,9 @@ mod tests {
             mgr.nbd_device_path("vol-nbd"),
             Some(PathBuf::from("/dev/nbd42"))
         );
+
+        let nbd = mgr.get_nbd_device("vol-nbd");
+        assert_eq!(nbd, Some(PathBuf::from("/dev/nbd42")));
 
         // Cleanup.
         mgr.stop_volume("vol-nbd").await.ok();

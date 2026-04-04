@@ -315,13 +315,13 @@ impl ChClient {
         })
     }
 
-    /// Hot-add a block device to a running VM.
+    /// Hot-add a disk to a running VM.
     ///
-    /// `disk_config` should contain at minimum `{"path": "/dev/nbdN"}`.
-    /// NOT idempotent — adding the same disk twice is an error.
-    pub async fn add_disk(&self, disk_config: serde_json::Value) -> Result<(), ClientError> {
+    /// Calls `PUT /vm.add-disk` with the given disk configuration JSON.
+    /// This is NOT idempotent — adding the same disk twice returns an error.
+    pub async fn add_disk(&self, config: serde_json::Value) -> Result<(), ClientError> {
         let (status, body) = self
-            .request(hyper::Method::PUT, "/vm.add-disk", Some(disk_config))
+            .request(hyper::Method::PUT, "/vm.add-disk", Some(config))
             .await?;
         if (200..300).contains(&status) {
             return Ok(());
@@ -766,7 +766,7 @@ mod tests {
         mock.shutdown();
     }
 
-    // ── add_disk tests ──────────────────────────────────────────────
+    // ── add-disk tests ────────────────────────────────────────────
 
     #[tokio::test]
     async fn add_disk_returns_ok_on_204() {
@@ -776,16 +776,19 @@ mod tests {
         mock.start().await;
 
         let client = ChClient::new(sock);
-        let config = serde_json::json!({"path": "/dev/nbd0"});
+        let config = serde_json::json!({
+            "path": "/dev/nbd0",
+            "readonly": false,
+        });
         client
             .add_disk(config)
             .await
-            .expect("add_disk should succeed");
+            .expect("add-disk should succeed");
         mock.shutdown();
     }
 
     #[tokio::test]
-    async fn add_disk_409_is_error() {
+    async fn add_disk_409_is_error_not_idempotent() {
         let (_dir, sock) = temp_socket();
         let mut mock = MockChServer::new(&sock);
         mock.route("PUT", "/vm.add-disk", MockResponse::error(409));
@@ -853,6 +856,39 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&captured).expect("captured body should be valid JSON");
         assert_eq!(json["id"], "_disk2");
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn add_disk_sends_correct_json_body() {
+        let (_dir, sock) = temp_socket();
+        let mut mock = MockChServer::new(&sock);
+        mock.route("PUT", "/vm.add-disk", MockResponse::no_content());
+        mock.start().await;
+
+        let client = ChClient::new(sock);
+        let config = serde_json::json!({
+            "path": "/dev/nbd0",
+            "readonly": false,
+            "rate_limiter_config": {
+                "bandwidth": {"size": 209715200, "one_time_burst": 0, "refill_time": 1000},
+                "ops": {"size": 10000, "one_time_burst": 0, "refill_time": 1000}
+            }
+        });
+        client
+            .add_disk(config)
+            .await
+            .expect("add-disk should succeed");
+
+        let captured = mock
+            .captured_body("PUT", "/vm.add-disk")
+            .await
+            .expect("request body should be captured");
+        let json: serde_json::Value =
+            serde_json::from_str(&captured).expect("captured body should be valid JSON");
+        assert_eq!(json["path"], "/dev/nbd0");
+        assert_eq!(json["readonly"], false);
+        assert!(json["rate_limiter_config"].is_object());
         mock.shutdown();
     }
 
