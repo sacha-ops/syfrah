@@ -635,6 +635,7 @@ mod tests {
             instance_count: 1,
             drain_status: false,
             timestamp: 1000,
+            cache_metrics: None,
         }
     }
 

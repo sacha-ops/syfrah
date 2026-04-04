@@ -211,6 +211,7 @@ mod tests {
             instance_count: 0,
             drain_status: false,
             timestamp: 1000,
+            cache_metrics: None,
         }
     }
 
