@@ -1949,6 +1949,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires real ZeroFS binary
     async fn create_snapshot_succeeds_with_manifest_file() {
         let vol_id = "vol-forge-snap";
         let mut mgr = VolumeMgr::new();
@@ -1994,6 +1995,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires real ZeroFS binary
     async fn create_snapshot_propagates_raft_error() {
         let vol_id = "vol-forge-snap-err";
         let mut mgr = VolumeMgr::new();
