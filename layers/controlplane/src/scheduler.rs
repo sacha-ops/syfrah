@@ -460,23 +460,34 @@ impl Scheduler {
                 }
 
                 // Capacity check.
-                if c.available_vcpus() < vcpus {
+                // When allocatable values are both 0, capacity is unknown
+                // (gossip/Raft hasn't reported yet). Don't filter these out —
+                // they'll get a scoring penalty instead (see score()).
+                let capacity_unknown = c.allocatable_vcpus == 0 && c.allocatable_memory_mb == 0;
+                if !capacity_unknown {
+                    if c.available_vcpus() < vcpus {
+                        debug!(
+                            "scheduler: filter out '{}' — insufficient vCPUs (need={}, avail={})",
+                            c.name,
+                            vcpus,
+                            c.available_vcpus()
+                        );
+                        return false;
+                    }
+                    if c.available_memory_mb() < memory_mb {
+                        debug!(
+                            "scheduler: filter out '{}' — insufficient memory (need={}, avail={})",
+                            c.name,
+                            memory_mb,
+                            c.available_memory_mb()
+                        );
+                        return false;
+                    }
+                } else {
                     debug!(
-                        "scheduler: filter out '{}' — insufficient vCPUs (need={}, avail={})",
-                        c.name,
-                        vcpus,
-                        c.available_vcpus()
+                        "scheduler: '{}' has unknown capacity (0/0), allowing with penalty",
+                        c.name
                     );
-                    return false;
-                }
-                if c.available_memory_mb() < memory_mb {
-                    debug!(
-                        "scheduler: filter out '{}' — insufficient memory (need={}, avail={})",
-                        c.name,
-                        memory_mb,
-                        c.available_memory_mb()
-                    );
-                    return false;
                 }
 
                 true
@@ -493,7 +504,18 @@ impl Scheduler {
     ) -> f64 {
         let mut score = 0.0;
 
+        // Unknown capacity (0/0): allow but heavily penalize so nodes with
+        // known capacity are always preferred. The node hasn't reported via
+        // gossip yet — we don't know if it can fit the VM.
+        let capacity_unknown =
+            candidate.allocatable_vcpus == 0 && candidate.allocatable_memory_mb == 0;
+        if capacity_unknown {
+            score -= 200.0;
+        }
+
         // Lower utilization → higher score (100 points max for an empty node).
+        // cpu_utilization() / memory_utilization() return 1.0 for 0/0 nodes,
+        // so they get 0 from this component (on top of the -200 penalty above).
         let avg_util = (candidate.cpu_utilization() + candidate.memory_utilization()) / 2.0;
         score += (1.0 - avg_util) * 100.0;
 
@@ -922,5 +944,71 @@ mod tests {
         assert_eq!(c.zone, Some("az-2".to_string()));
         assert_eq!(c.node_selector.get("gpu"), Some(&"a100".to_string()));
         assert_eq!(c.node_selector.get("tier"), Some(&"premium".to_string()));
+    }
+
+    #[test]
+    fn zero_capacity_hypervisor_not_filtered_out() {
+        // A hypervisor with 0/0 capacity (gossip hasn't reported yet)
+        // should NOT be filtered out — it should be schedulable with a
+        // penalty so known-capacity nodes are preferred.
+        let cluster = GossipCluster::new();
+        // hv-1: zero capacity (unknown — gossip hasn't reported)
+        cluster.update_report(make_report("hv-1", "az-1", 0, 0, 0, 0));
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("az-1".to_string()),
+            ..Default::default()
+        };
+
+        // Should succeed — not reject with "no hypervisor matches constraints"
+        let result = scheduler
+            .schedule(2, 4096, &constraints, &cluster, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(result.hypervisor_id, "hv-1");
+        assert!(!result.is_local_fallback);
+    }
+
+    #[test]
+    fn zero_capacity_penalized_vs_known_capacity() {
+        // When both a zero-capacity and a known-capacity hypervisor exist
+        // in the same zone, the known-capacity one should be preferred.
+        let cluster = GossipCluster::new();
+        // hv-1: unknown capacity (0/0)
+        cluster.update_report(make_report("hv-1", "az-1", 0, 0, 0, 0));
+        // hv-2: known capacity, plenty of room
+        cluster.update_report(make_report("hv-2", "az-1", 16, 0, 65536, 0));
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("az-1".to_string()),
+            ..Default::default()
+        };
+
+        let result = scheduler
+            .schedule(2, 4096, &constraints, &cluster, &[], &HashMap::new())
+            .unwrap();
+        // hv-2 should win because hv-1 has a heavy scoring penalty
+        assert_eq!(result.hypervisor_id, "hv-2");
+    }
+
+    #[test]
+    fn zero_capacity_only_candidate_in_zone() {
+        // When the only hypervisor in a zone has 0/0 capacity, the
+        // scheduler should still place there rather than failing.
+        let cluster = GossipCluster::new();
+        cluster.update_report(make_report("hv-fsn", "fsn1", 0, 0, 0, 0));
+        cluster.update_report(make_report("hv-nbg", "nbg1", 16, 0, 65536, 0));
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("fsn1".to_string()),
+            ..Default::default()
+        };
+
+        let result = scheduler
+            .schedule(2, 4096, &constraints, &cluster, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(result.hypervisor_id, "hv-fsn");
     }
 }

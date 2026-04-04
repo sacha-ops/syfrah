@@ -5525,6 +5525,7 @@ mod tests {
     fn setup_two_zones(sm: &RedbStateMachine) {
         sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west".into(),
             config: Box::new(crate::commands::StorageConfig {
                 s3_endpoint: "https://s3.eu-west.example.com".into(),
                 s3_bucket: "syfrah-eu-west".into(),
@@ -5537,6 +5538,7 @@ mod tests {
         });
         sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-east".into(),
+            zone: "eu-east".into(),
             config: Box::new(crate::commands::StorageConfig {
                 s3_endpoint: "https://s3.eu-east.example.com".into(),
                 s3_bucket: "syfrah-eu-east".into(),
@@ -5600,6 +5602,7 @@ mod tests {
         // Only set up target zone.
         sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-east".into(),
+            zone: "eu-east".into(),
             config: Box::new(crate::commands::StorageConfig {
                 s3_endpoint: "https://s3.eu-east.example.com".into(),
                 s3_bucket: "syfrah-eu-east".into(),
@@ -5633,6 +5636,7 @@ mod tests {
         // Only set up source zone.
         sm.apply_command(&StateMachineCommand::SetStorageConfig {
             region: "eu-west".into(),
+            zone: "eu-west".into(),
             config: Box::new(crate::commands::StorageConfig {
                 s3_endpoint: "https://s3.eu-west.example.com".into(),
                 s3_bucket: "syfrah-eu-west".into(),
