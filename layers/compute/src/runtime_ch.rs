@@ -107,6 +107,7 @@ impl ComputeRuntime for ChRuntime {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
 
         // Step 1: validate

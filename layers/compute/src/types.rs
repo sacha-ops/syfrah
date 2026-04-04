@@ -63,6 +63,10 @@ pub struct VmSpec {
     /// Pre-allocated MAC from Raft IPAM (for remote placement).
     #[serde(default)]
     pub pre_allocated_mac: Option<String>,
+    /// Root volume ID (storage layer). Auto-created on VM create,
+    /// auto-deleted on VM delete.
+    #[serde(default)]
+    pub root_volume_id: Option<String>,
 }
 
 /// Resolved subnet information passed through to the VM creation flow.
@@ -173,6 +177,9 @@ pub struct VmStatus {
     /// Availability zone of the hypervisor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Root volume ID (storage layer) associated with this VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_volume_id: Option<String>,
 }
 
 /// Observable events emitted to forge via a broadcast channel.
@@ -263,6 +270,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -286,6 +294,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -385,6 +394,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: VmStatus = serde_json::from_str(&json).unwrap();
@@ -451,6 +461,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: VmSpec = serde_json::from_str(&json).unwrap();
@@ -498,6 +509,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["ip"].as_str(), Some("10.1.1.3"));
@@ -521,6 +533,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["subnet"].as_str(), Some("database"));
@@ -544,6 +557,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         };
         let json_str = serde_json::to_string(&status).unwrap();
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();

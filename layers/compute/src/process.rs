@@ -731,6 +731,7 @@ pub(crate) async fn spawn_vm_inner(
         hypervisor_id: None,
         region: None,
         zone: None,
+        root_volume_id: None,
         hotplug_devices: std::collections::HashMap::new(),
     })
 }
@@ -1318,6 +1319,7 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -1674,6 +1676,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let h1 = compute_spec_hash(&spec);
         let h2 = compute_spec_hash(&spec);
@@ -1716,6 +1719,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -1757,6 +1761,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -1798,6 +1803,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -1841,6 +1847,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -2060,6 +2067,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -2207,6 +2215,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -2268,6 +2277,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -2394,6 +2404,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
             hotplug_devices: std::collections::HashMap::new(),
         };
 

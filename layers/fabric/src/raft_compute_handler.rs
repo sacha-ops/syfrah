@@ -15,8 +15,8 @@ use std::sync::Arc;
 use syfrah_api::handler::LayerHandler;
 use syfrah_compute::control::{ComputeRequest, ComputeResponse};
 use syfrah_controlplane::{
-    GossipCluster, HypervisorGossipReport, PlacementConstraints, RaftClient, RemoteCreateVmRequest,
-    Scheduler, StateMachineCommand, StateMachineResponse,
+    commands::VolumeType, GossipCluster, HypervisorGossipReport, PlacementConstraints, RaftClient,
+    RemoteCreateVmRequest, Scheduler, StateMachineCommand, StateMachineResponse,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -176,6 +176,7 @@ impl RaftComputeHandler {
         node_selector: Vec<String>,
         anti_affinity: Option<String>,
         spread_topology: Option<String>,
+        root_disk_size_gb: u32,
     ) -> Vec<u8> {
         // Check if Raft is available.
         let raft_client = self.raft_client.read().await;
@@ -298,6 +299,15 @@ impl RaftComputeHandler {
                                 }
                                 drop(org_guard);
                             }
+
+                            // Issue CreateVolume Raft command for the root volume.
+                            self.create_root_volume_via_raft(
+                                client,
+                                &name,
+                                root_disk_size_gb,
+                                subnet.as_ref(),
+                            )
+                            .await;
                         }
                     }
 
@@ -422,7 +432,17 @@ impl RaftComputeHandler {
                                 }
                             }
 
+                            // Issue CreateVolume Raft command for the root volume.
+                            self.create_root_volume_via_raft(
+                                client,
+                                &name,
+                                root_disk_size_gb,
+                                subnet.as_ref(),
+                            )
+                            .await;
+
                             // Build a compute response mimicking local create.
+                            let root_vol_id = format!("vol-root-{name}");
                             let vm_json = serde_json::json!({
                                 "id": resp.vm_id.unwrap_or_else(|| name.clone()),
                                 "name": name,
@@ -433,6 +453,7 @@ impl RaftComputeHandler {
                                 "hypervisor": decision.hypervisor_id,
                                 "zone": zone,
                                 "status": "Created",
+                                "root_volume_id": root_vol_id,
                             });
                             let compute_resp = ComputeResponse::Vm(vm_json);
                             serde_json::to_vec(&compute_resp).unwrap_or_default()
@@ -557,6 +578,151 @@ impl RaftComputeHandler {
             }
         }
     }
+
+    /// Issue a CreateVolume Raft command for the auto-created root volume.
+    ///
+    /// Called after a successful VM creation (local or remote). The root volume
+    /// is registered in the Raft state machine so it can be tracked, quota-checked,
+    /// and cleaned up on VM delete.
+    async fn create_root_volume_via_raft(
+        &self,
+        client: &RaftClient,
+        vm_name: &str,
+        size_gb: u32,
+        subnet: Option<&syfrah_compute::types::SubnetInfo>,
+    ) {
+        let root_volume_id = format!("vol-root-{vm_name}");
+        let root_volume_name = format!("root-{vm_name}");
+
+        // Derive org/project/env from the subnet's env_id if available.
+        // env_id format is "org/project/env" — split it to extract each part.
+        // Fall back to "default" when no subnet context is provided.
+        let (org_id, project_id, env_id) = if let Some(si) = subnet {
+            let parts: Vec<&str> = si.env_id.split('/').collect();
+            if parts.len() == 3 {
+                (
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                )
+            } else {
+                // env_id doesn't follow expected format; use it as env, derive rest.
+                (
+                    "default".to_string(),
+                    "default".to_string(),
+                    si.env_id.clone(),
+                )
+            }
+        } else {
+            (
+                "default".to_string(),
+                "default".to_string(),
+                "default".to_string(),
+            )
+        };
+
+        let cmd = StateMachineCommand::CreateVolume {
+            id: root_volume_id.clone(),
+            name: root_volume_name,
+            size_gb,
+            org_id,
+            project_id,
+            env_id,
+            volume_type: VolumeType::Root,
+        };
+
+        match client.write(cmd).await {
+            Ok(StateMachineResponse::Created(id)) => {
+                info!("raft compute: created root volume '{id}' for VM '{vm_name}'");
+            }
+            Ok(StateMachineResponse::Error(e)) => {
+                warn!("raft compute: failed to create root volume '{root_volume_id}': {e}");
+            }
+            Ok(_) => {
+                debug!("raft compute: unexpected response for CreateVolume '{root_volume_id}'");
+            }
+            Err(e) => {
+                warn!("raft compute: Raft write failed for root volume '{root_volume_id}': {e}");
+            }
+        }
+    }
+
+    /// Handle a DeleteVm request: look up the root volume, delete the VM,
+    /// then cascade-delete the root volume via Raft.
+    async fn handle_delete_vm(
+        &self,
+        request: &[u8],
+        caller_uid: Option<u32>,
+        vm_id: &str,
+        _retain_disk: bool,
+    ) -> Vec<u8> {
+        // Before deleting, look up the VM to find its root_volume_id.
+        // We do this by sending a GetVm request to the inner handler.
+        let get_req = ComputeRequest::GetVm {
+            id: vm_id.to_string(),
+        };
+        let get_payload = serde_json::to_vec(&get_req).unwrap_or_default();
+        let get_result = self.inner.handle(get_payload, caller_uid).await;
+        let root_volume_id = serde_json::from_slice::<ComputeResponse>(&get_result)
+            .ok()
+            .and_then(|resp| match resp {
+                ComputeResponse::Vm(v) => v
+                    .get("root_volume_id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            });
+
+        // Now delete the VM via the inner handler.
+        let result = self.inner.handle(request.to_vec(), caller_uid).await;
+
+        // If deletion succeeded and we have a root volume, delete it via Raft.
+        let delete_succeeded = serde_json::from_slice::<ComputeResponse>(&result)
+            .ok()
+            .map(|resp| !matches!(resp, ComputeResponse::Error(_)))
+            .unwrap_or(false);
+
+        if delete_succeeded {
+            if let Some(vol_id) = root_volume_id {
+                let raft_client = self.raft_client.read().await;
+                if let Some(client) = raft_client.as_ref() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    let cmd = StateMachineCommand::DeleteVolume {
+                        volume_id: vol_id.clone(),
+                        cascade: true,
+                        deleted_at: now,
+                    };
+
+                    match client.write(cmd).await {
+                        Ok(StateMachineResponse::Ok) => {
+                            info!("raft compute: deleted root volume '{vol_id}' for VM '{vm_id}'");
+                        }
+                        Ok(StateMachineResponse::Error(e)) => {
+                            warn!("raft compute: failed to delete root volume '{vol_id}': {e}");
+                        }
+                        Ok(_) => {
+                            debug!("raft compute: unexpected response for DeleteVolume '{vol_id}'");
+                        }
+                        Err(e) => {
+                            warn!(
+                                "raft compute: Raft write failed for DeleteVolume '{vol_id}': {e}"
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "raft compute: no raft client, skipping root volume cleanup for '{vm_id}'"
+                    );
+                }
+            }
+        }
+
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -589,6 +755,7 @@ impl LayerHandler for RaftComputeHandler {
                 node_selector,
                 anti_affinity,
                 spread_topology,
+                root_disk_size_gb,
             } => {
                 self.handle_create_vm(
                     &request,
@@ -605,8 +772,13 @@ impl LayerHandler for RaftComputeHandler {
                     node_selector,
                     anti_affinity,
                     spread_topology,
+                    root_disk_size_gb,
                 )
                 .await
+            }
+            ComputeRequest::DeleteVm { id, retain_disk } => {
+                self.handle_delete_vm(&request, caller_uid, &id, retain_disk)
+                    .await
             }
             _ => {
                 // Pass through to inner handler.

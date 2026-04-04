@@ -271,6 +271,7 @@ async fn create_vm(
         security_groups: vec![],
         pre_allocated_ip: None,
         pre_allocated_mac: None,
+        root_volume_id: None,
     };
 
     match mgr.create_vm(spec).await {
@@ -695,6 +696,7 @@ mod tests {
             hypervisor_id: Some("hv-1".to_string()),
             region: Some("eu-west".to_string()),
             zone: Some("az-1".to_string()),
+            root_volume_id: Some("vol-root-test-vm".to_string()),
         };
         let resp = vm_status_to_response(&status);
         assert_eq!(resp.id, "test-vm");
@@ -726,6 +728,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         };
         let resp = vm_status_to_response(&status);
         let json = serde_json::to_string(&resp).unwrap();

@@ -14,6 +14,11 @@ use tokio::net::UnixStream;
 use crate::manager::VmManager;
 use crate::types::{GpuMode, VmId, VmSpec};
 
+/// Default root disk size: 20 GB.
+fn default_root_disk_size_gb() -> u32 {
+    20
+}
+
 use std::path::PathBuf as StdPathBuf;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +56,9 @@ pub enum ComputeRequest {
         /// Spread topology key (e.g. "zone").
         #[serde(default)]
         spread_topology: Option<String>,
+        /// Root disk size in GB for auto-created root volume (default: 20).
+        #[serde(default = "default_root_disk_size_gb")]
+        root_disk_size_gb: u32,
     },
     ListVms,
     GetVm {
@@ -148,6 +156,7 @@ fn vm_status_to_json(s: &crate::types::VmStatus) -> serde_json::Value {
         "hypervisor_id": s.hypervisor_id,
         "region": s.region,
         "zone": s.zone,
+        "root_volume_id": s.root_volume_id,
     })
 }
 
@@ -197,6 +206,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
             node_selector: _node_selector,
             anti_affinity: _anti_affinity,
             spread_topology: _spread_topology,
+            root_disk_size_gb,
         } => {
             let gpu = match gpu_bdf {
                 Some(bdf) => GpuMode::Passthrough { bdf },
@@ -206,6 +216,11 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 tap_name,
                 mac: None,
             });
+            // Generate a root volume ID for the auto-created root volume.
+            // The actual Raft CreateVolume command is issued by the daemon/forge
+            // layer; here we record the intent in the VmSpec.
+            let root_volume_id = Some(format!("vol-root-{name}", name = &name));
+            let _ = root_disk_size_gb; // Carried on the VmSpec for daemon to issue CreateVolume
             let spec = VmSpec {
                 id: VmId(name),
                 vcpus,
@@ -221,6 +236,7 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 security_groups,
                 pre_allocated_ip: None,
                 pre_allocated_mac: None,
+                root_volume_id,
             };
             match mgr.create_vm(spec).await {
                 Ok(status) => ComputeResponse::Vm(vm_status_to_json(&status)),

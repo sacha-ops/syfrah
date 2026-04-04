@@ -973,6 +973,7 @@ impl VmManager {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: spec.root_volume_id.clone(),
             hotplug_devices: std::collections::HashMap::new(),
         };
 
@@ -1496,6 +1497,7 @@ impl VmManager {
                     hypervisor_id: None,
                     region: None,
                     zone: None,
+                    root_volume_id: None,
                     hotplug_devices: std::collections::HashMap::new(),
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
