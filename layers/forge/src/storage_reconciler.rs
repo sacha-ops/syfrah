@@ -10,7 +10,18 @@
 //!    - Desired but not running  -> start_volume (Available + assigned here)
 //!    - Running but not desired  -> stop_volume  (fenced / detached / deleted)
 //!    - Generation mismatch      -> stop_volume  (stale placement, fencing)
+//!    - Pending detach            -> detach_volume (CH remove-device → flush → NBD disconnect)
 //! 4. Reaps crashed ZeroFS processes
+//!
+//! ## Detach flow (#1195)
+//!
+//! When a volume transitions from Attached to Available (detach requested):
+//! 1. CH: `PUT /vm.remove-device` — guest loses the block device
+//! 2. ZeroFS: flush cache to S3 (SIGTERM + graceful shutdown)
+//! 3. NBD: device disconnected when ZeroFS exits
+//!
+//! Force detach (`force=true`) skips the flush: SIGKILL, data since last
+//! fsync is lost.
 //!
 //! The reconciler does NOT modify Raft state. It only reads desired state
 //! and converges local ZeroFS processes to match.
@@ -37,6 +48,20 @@ pub struct DesiredVolume {
     pub size_gb: u32,
     pub placement_generation: u64,
     pub hypervisor_id: String,
+}
+
+/// A volume pending detach — read from Raft when desired state is Available
+/// but the volume is still attached on this hypervisor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesiredDetach {
+    /// Volume ID to detach.
+    pub volume_id: String,
+    /// VM ID the volume is currently attached to (needed for CH remove-device).
+    pub vm_id: String,
+    /// Cloud Hypervisor device ID for the attached block device (e.g. `"_disk0"`).
+    pub ch_device_id: String,
+    /// If true, skip the ZeroFS cache flush (data loss possible).
+    pub force: bool,
 }
 
 /// Storage configuration for the region (from Raft).
@@ -66,6 +91,13 @@ pub trait VolumeStateReader: Send + Sync {
     /// Returns volumes in Attached state with `attached_hypervisor_id == local_id`.
     async fn desired_volumes(&self, local_hypervisor_id: &str) -> Vec<DesiredVolume>;
 
+    /// List volumes pending detach on this hypervisor.
+    ///
+    /// Returns volumes whose desired state is Available but are still attached
+    /// (ZeroFS still running) on this hypervisor. The reconciler will execute
+    /// the detach sequence: CH remove-device → ZeroFS flush → NBD disconnect.
+    async fn pending_detaches(&self, local_hypervisor_id: &str) -> Vec<DesiredDetach>;
+
     /// Get the storage config for the region, if configured.
     async fn storage_config(&self) -> Option<RegionStorageConfig>;
 }
@@ -81,6 +113,12 @@ pub enum StorageReconcileAction {
     StartVolume { volume_id: String, generation: u64 },
     /// Stop a ZeroFS process (fenced, detached, or deleted).
     StopVolume { volume_id: String, reason: String },
+    /// Detach a volume: CH remove-device → ZeroFS flush → NBD disconnect.
+    DetachVolume {
+        volume_id: String,
+        vm_id: String,
+        force: bool,
+    },
     /// Reap a crashed ZeroFS process.
     ReapCrashed { volume_id: String },
 }
@@ -91,9 +129,42 @@ pub struct StorageReconcileReport {
     pub pass_number: u64,
     pub started: usize,
     pub stopped: usize,
+    pub detached: usize,
     pub reaped: usize,
     pub errors: Vec<String>,
     pub duration_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// CH client provider (for detach — needs to talk to Cloud Hypervisor)
+// ---------------------------------------------------------------------------
+
+/// Trait for obtaining a `ChClient` for a given VM.
+///
+/// The reconciler needs to call `PUT /vm.remove-device` during detach,
+/// which requires the CH API socket path for the target VM. In production,
+/// this resolves to `/run/syfrah/vms/{vm_id}/api.sock`.
+#[async_trait::async_trait]
+pub trait ChClientProvider: Send + Sync {
+    /// Remove a device from a running VM.
+    ///
+    /// Implementations should construct a `ChClient` for `vm_id` and call
+    /// `remove_device(ch_device_id)`. Returns an error string on failure.
+    async fn remove_device(&self, vm_id: &str, ch_device_id: &str) -> Result<(), String>;
+}
+
+/// No-op CH client provider — used when no VMs are running or during tests.
+///
+/// Always returns an error, since there is no real CH socket to connect to.
+pub struct NoOpChClientProvider;
+
+#[async_trait::async_trait]
+impl ChClientProvider for NoOpChClientProvider {
+    async fn remove_device(&self, vm_id: &str, ch_device_id: &str) -> Result<(), String> {
+        Err(format!(
+            "no CH client available for vm={vm_id} device={ch_device_id}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,10 +218,31 @@ impl StorageReconciler {
     ///
     /// Reads desired state from `reader`, diffs against `volume_mgr`'s
     /// running processes, and applies start/stop actions.
+    ///
+    /// The `ch_provider` is used during detach to call `PUT /vm.remove-device`
+    /// before stopping ZeroFS. Pass `&NoOpChClientProvider` if no VMs are running.
     pub async fn reconcile_once(
         &self,
         reader: &dyn VolumeStateReader,
         volume_mgr: &mut VolumeMgr,
+    ) -> StorageReconcileReport {
+        self.reconcile_once_with_ch(reader, volume_mgr, &NoOpChClientProvider)
+            .await
+    }
+
+    /// Run a single reconciliation pass with an explicit CH client provider.
+    ///
+    /// This is the full detach-aware reconciliation loop. The detach sequence:
+    /// 1. CH: `PUT /vm.remove-device` (guest loses the block device)
+    /// 2. ZeroFS: flush cache to S3 (SIGTERM + graceful wait)
+    /// 3. NBD: device disconnected when ZeroFS process exits
+    ///
+    /// Force detach skips step 2 (SIGKILL instead of SIGTERM, no flush).
+    pub async fn reconcile_once_with_ch(
+        &self,
+        reader: &dyn VolumeStateReader,
+        volume_mgr: &mut VolumeMgr,
+        ch_provider: &dyn ChClientProvider,
     ) -> StorageReconcileReport {
         let pass = self
             .pass_count
@@ -169,7 +261,79 @@ impl StorageReconciler {
         }
         report.reaped = reaped.len();
 
-        // 2. Read desired state.
+        // 2. Process pending detaches (CH remove-device → ZeroFS flush → NBD disconnect).
+        //    This runs before the start/stop diff so that detached volumes are
+        //    no longer running when we reach step 6/7.
+        //    Track which volumes have pending detaches so step 7 doesn't
+        //    redundantly stop them (especially if detach failed at remove-device
+        //    and the volume should remain running).
+        let detaches = reader.pending_detaches(&self.local_hypervisor_id).await;
+        let pending_detach_ids: std::collections::HashSet<String> =
+            detaches.iter().map(|d| d.volume_id.clone()).collect();
+        for detach in &detaches {
+            if !volume_mgr.is_running(&detach.volume_id) {
+                debug!(
+                    volume_id = %detach.volume_id,
+                    "storage reconciler: detach requested but volume not running, skipping"
+                );
+                continue;
+            }
+
+            info!(
+                volume_id = %detach.volume_id,
+                vm_id = %detach.vm_id,
+                device_id = %detach.ch_device_id,
+                force = detach.force,
+                "storage reconciler: detaching volume"
+            );
+
+            // Step 1: CH remove-device — guest loses the block device.
+            //         Idempotent: 404 means already removed, which is fine.
+            if let Err(e) = ch_provider
+                .remove_device(&detach.vm_id, &detach.ch_device_id)
+                .await
+            {
+                error!(
+                    volume_id = %detach.volume_id,
+                    vm_id = %detach.vm_id,
+                    error = %e,
+                    "storage reconciler: failed to remove device from VM, aborting detach"
+                );
+                report
+                    .errors
+                    .push(format!("detach-remove-device {}: {e}", detach.volume_id));
+                // Do NOT proceed with flush/stop if remove-device failed —
+                // the guest may still be writing to the device.
+                continue;
+            }
+
+            // Step 2+3: Stop ZeroFS (flush=true → SIGTERM+grace, flush=false → SIGKILL).
+            //           ZeroFS flushes its cache to S3 on graceful shutdown.
+            //           The NBD device is disconnected when the process exits.
+            let flush = !detach.force;
+            match volume_mgr.stop_volume_flush(&detach.volume_id, flush).await {
+                Ok(()) => {
+                    info!(
+                        volume_id = %detach.volume_id,
+                        force = detach.force,
+                        "storage reconciler: volume detached successfully"
+                    );
+                    report.detached += 1;
+                }
+                Err(e) => {
+                    error!(
+                        volume_id = %detach.volume_id,
+                        error = %e,
+                        "storage reconciler: failed to stop ZeroFS during detach"
+                    );
+                    report
+                        .errors
+                        .push(format!("detach-stop {}: {e}", detach.volume_id));
+                }
+            }
+        }
+
+        // 3. Read desired state.
         let desired = reader.desired_volumes(&self.local_hypervisor_id).await;
         let config = match reader.storage_config().await {
             Some(c) => c,
@@ -181,7 +345,7 @@ impl StorageReconciler {
             }
         };
 
-        // 3. Build desired set and running map (with generations).
+        // 4. Build desired set and running map (with generations).
         let desired_map: HashMap<String, &DesiredVolume> =
             desired.iter().map(|v| (v.id.clone(), v)).collect();
         let running: HashMap<String, u64> = volume_mgr.list_active().into_iter().collect();
@@ -198,9 +362,9 @@ impl StorageReconciler {
             memory_size_bytes: config.cache_memory_size_bytes,
         };
 
-        // 4. Generation fencing: stop volumes running with a stale generation.
+        // 5. Generation fencing: stop volumes running with a stale generation.
         //    After stopping, the volume will be picked up as "desired but not
-        //    running" in step 5 and restarted with the correct generation.
+        //    running" in step 6 and restarted with the correct generation.
         for (id, vol) in &desired_map {
             if let Some(&running_gen) = running.get(id.as_str()) {
                 if running_gen != vol.placement_generation {
@@ -227,7 +391,7 @@ impl StorageReconciler {
             }
         }
 
-        // 5. Start volumes that are desired but not running (including those
+        // 6. Start volumes that are desired but not running (including those
         //    just stopped due to generation mismatch above).
         for (id, vol) in &desired_map {
             if !volume_mgr.is_running(id) {
@@ -266,11 +430,17 @@ impl StorageReconciler {
             }
         }
 
-        // 6. Stop volumes that are running but not desired (fenced/detached/deleted).
+        // 7. Stop volumes that are running but not desired (fenced/detached/deleted).
         for id in running.keys() {
             if !desired_map.contains_key(id) {
                 // Skip if already stopped during generation fencing above.
                 if !volume_mgr.is_running(id) {
+                    continue;
+                }
+                // Skip volumes with pending detaches — step 2 handles them.
+                // If detach failed (e.g. remove-device error), the volume
+                // must remain running so the guest doesn't lose data.
+                if pending_detach_ids.contains(id) {
                     continue;
                 }
                 let reason =
@@ -294,6 +464,7 @@ impl StorageReconciler {
             pass = pass,
             started = report.started,
             stopped = report.stopped,
+            detached = report.detached,
             reaped = report.reaped,
             errors = report.errors.len(),
             "storage reconciliation pass complete"
@@ -308,6 +479,23 @@ impl StorageReconciler {
         &self,
         reader: Arc<dyn VolumeStateReader>,
         volume_mgr: &mut VolumeMgr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.run_loop_with_ch(
+            reader,
+            volume_mgr,
+            Arc::new(NoOpChClientProvider),
+            shutdown_rx,
+        )
+        .await
+    }
+
+    /// Run the periodic reconciliation loop with an explicit CH client provider.
+    pub async fn run_loop_with_ch(
+        &self,
+        reader: Arc<dyn VolumeStateReader>,
+        volume_mgr: &mut VolumeMgr,
+        ch_provider: Arc<dyn ChClientProvider>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let interval = tokio::time::Duration::from_secs(self.interval_secs);
@@ -320,7 +508,11 @@ impl StorageReconciler {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    self.reconcile_once(reader.as_ref(), volume_mgr).await;
+                    self.reconcile_once_with_ch(
+                        reader.as_ref(),
+                        volume_mgr,
+                        ch_provider.as_ref(),
+                    ).await;
                 }
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
@@ -350,6 +542,10 @@ impl VolumeStateReader for EmptyStateReader {
         Vec::new()
     }
 
+    async fn pending_detaches(&self, _local_hypervisor_id: &str) -> Vec<DesiredDetach> {
+        Vec::new()
+    }
+
     async fn storage_config(&self) -> Option<RegionStorageConfig> {
         None
     }
@@ -368,6 +564,7 @@ mod tests {
     /// Mock VolumeStateReader for tests.
     struct MockStateReader {
         desired: Mutex<Vec<DesiredVolume>>,
+        detaches: Mutex<Vec<DesiredDetach>>,
         config: Mutex<Option<RegionStorageConfig>>,
     }
 
@@ -375,6 +572,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 desired: Mutex::new(Vec::new()),
+                detaches: Mutex::new(Vec::new()),
                 config: Mutex::new(None),
             }
         }
@@ -395,6 +593,10 @@ mod tests {
         fn set_desired(&self, vols: Vec<DesiredVolume>) {
             *self.desired.lock().unwrap() = vols;
         }
+
+        fn set_detaches(&self, detaches: Vec<DesiredDetach>) {
+            *self.detaches.lock().unwrap() = detaches;
+        }
     }
 
     #[async_trait::async_trait]
@@ -403,8 +605,54 @@ mod tests {
             self.desired.lock().unwrap().clone()
         }
 
+        async fn pending_detaches(&self, _local_hypervisor_id: &str) -> Vec<DesiredDetach> {
+            self.detaches.lock().unwrap().clone()
+        }
+
         async fn storage_config(&self) -> Option<RegionStorageConfig> {
             self.config.lock().unwrap().clone()
+        }
+    }
+
+    /// Mock CH client provider for testing detach.
+    struct MockChProvider {
+        /// Track remove_device calls: (vm_id, device_id).
+        calls: Mutex<Vec<(String, String)>>,
+        /// If set, all remove_device calls return this error.
+        fail_with: Mutex<Option<String>>,
+    }
+
+    impl MockChProvider {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_with: Mutex::new(None),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_with: Mutex::new(Some(msg.to_string())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChClientProvider for MockChProvider {
+        async fn remove_device(&self, vm_id: &str, ch_device_id: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((vm_id.to_string(), ch_device_id.to_string()));
+            if let Some(err) = self.fail_with.lock().unwrap().as_ref() {
+                return Err(err.clone());
+            }
+            Ok(())
         }
     }
 
@@ -638,5 +886,163 @@ mod tests {
 
         // Cleanup.
         mgr.stop_volume("vol-ok").await.ok();
+    }
+
+    // ── Detach tests (#1195) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn detach_graceful_removes_device_then_stops_zerofs() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        // Inject a running volume.
+        mgr.inject_fake_process("vol-detach", 1);
+        assert!(mgr.is_running("vol-detach"));
+
+        // Request a graceful detach.
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-detach".into(),
+            vm_id: "vm-1".into(),
+            ch_device_id: "_disk0".into(),
+            force: false,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        assert_eq!(report.detached, 1, "expected 1 detach");
+        assert!(
+            report.errors.is_empty(),
+            "expected no errors: {:?}",
+            report.errors
+        );
+        assert!(
+            !mgr.is_running("vol-detach"),
+            "volume should no longer be running"
+        );
+        assert_eq!(ch.call_count(), 1, "expected 1 remove_device call");
+    }
+
+    #[tokio::test]
+    async fn detach_force_skips_flush() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        mgr.inject_fake_process("vol-force", 1);
+
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-force".into(),
+            vm_id: "vm-2".into(),
+            ch_device_id: "_disk1".into(),
+            force: true,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        assert_eq!(report.detached, 1);
+        assert!(!mgr.is_running("vol-force"));
+        assert_eq!(ch.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn detach_skips_if_volume_not_running() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        // Request detach for a volume that is not running.
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-gone".into(),
+            vm_id: "vm-3".into(),
+            ch_device_id: "_disk0".into(),
+            force: false,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        assert_eq!(report.detached, 0);
+        assert_eq!(
+            ch.call_count(),
+            0,
+            "should not call remove_device if volume not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_aborts_if_remove_device_fails() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::failing("connection refused");
+        let mut mgr = VolumeMgr::new();
+
+        mgr.inject_fake_process("vol-fail", 1);
+
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-fail".into(),
+            vm_id: "vm-4".into(),
+            ch_device_id: "_disk0".into(),
+            force: false,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        // Detach should fail — volume should still be running.
+        assert_eq!(report.detached, 0);
+        assert!(
+            !report.errors.is_empty(),
+            "expected an error from failed remove_device"
+        );
+        assert!(
+            mgr.is_running("vol-fail"),
+            "volume must remain running when remove_device fails"
+        );
+
+        // Cleanup.
+        mgr.stop_volume("vol-fail").await.ok();
+    }
+
+    #[tokio::test]
+    async fn detach_no_pending_produces_zero_detaches() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        assert_eq!(report.detached, 0);
+        assert_eq!(ch.call_count(), 0);
+    }
+
+    #[test]
+    fn detach_action_serializes() {
+        let action = StorageReconcileAction::DetachVolume {
+            volume_id: "vol-01".into(),
+            vm_id: "vm-01".into(),
+            force: false,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("vol-01"));
+        assert!(json.contains("DetachVolume"));
+    }
+
+    #[test]
+    fn reconcile_report_default_includes_detached() {
+        let report = StorageReconcileReport::default();
+        assert_eq!(report.detached, 0);
     }
 }

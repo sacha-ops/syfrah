@@ -226,6 +226,44 @@ impl VolumeMgr {
         }
     }
 
+    /// Stop a running ZeroFS process with explicit flush control.
+    ///
+    /// When `flush` is true (normal detach), sends SIGTERM and waits for the
+    /// process to flush its cache to S3 before exiting. The grace period
+    /// allows time for the flush to complete.
+    ///
+    /// When `flush` is false (force detach), sends SIGKILL immediately,
+    /// skipping the cache flush. Data since the last fsync will be lost.
+    pub async fn stop_volume_flush(
+        &mut self,
+        volume_id: &str,
+        flush: bool,
+    ) -> Result<(), VolumeMgrError> {
+        if !flush {
+            // Force detach: remove from tracking and SIGKILL immediately.
+            let mut proc = self
+                .processes
+                .remove(volume_id)
+                .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+            proc.child
+                .kill()
+                .await
+                .map_err(|e| VolumeMgrError::Stop(format!("SIGKILL failed: {e}")))?;
+            let _ = proc.child.wait().await;
+            return Ok(());
+        }
+
+        // Normal detach: delegate to stop_volume which does SIGTERM + grace.
+        self.stop_volume(volume_id).await
+    }
+
+    /// Get the NBD device path for a running volume.
+    ///
+    /// Returns `None` if the volume is not running.
+    pub fn nbd_device_path(&self, volume_id: &str) -> Option<PathBuf> {
+        self.processes.get(volume_id).map(|p| p.nbd_device.clone())
+    }
+
     /// Returns `true` if the volume has a tracked running process.
     pub fn is_running(&self, volume_id: &str) -> bool {
         self.processes.contains_key(volume_id)
@@ -525,5 +563,92 @@ mod tests {
         let mgr = VolumeMgr::default();
         let active: Vec<(String, u64)> = mgr.list_active();
         assert!(active.is_empty());
+    }
+
+    // ── stop_volume_flush tests (#1195) ─────────────────────────────
+
+    #[tokio::test]
+    async fn stop_volume_flush_graceful_terminates_process() {
+        let mut mgr = VolumeMgr::new();
+        let child = Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        mgr.processes.insert(
+            "vol-flush".to_string(),
+            VolumeProcess {
+                child,
+                nbd_device: PathBuf::from("/dev/nbd80"),
+                generation: 1,
+            },
+        );
+
+        assert!(mgr.is_running("vol-flush"));
+        mgr.stop_volume_flush("vol-flush", true).await.unwrap();
+        assert!(!mgr.is_running("vol-flush"));
+    }
+
+    #[tokio::test]
+    async fn stop_volume_flush_force_kills_immediately() {
+        let mut mgr = VolumeMgr::new();
+        let child = Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        mgr.processes.insert(
+            "vol-force".to_string(),
+            VolumeProcess {
+                child,
+                nbd_device: PathBuf::from("/dev/nbd81"),
+                generation: 1,
+            },
+        );
+
+        assert!(mgr.is_running("vol-force"));
+        mgr.stop_volume_flush("vol-force", false).await.unwrap();
+        assert!(!mgr.is_running("vol-force"));
+    }
+
+    #[tokio::test]
+    async fn stop_volume_flush_unknown_returns_not_running() {
+        let mut mgr = VolumeMgr::new();
+        let result = mgr.stop_volume_flush("nonexistent", true).await;
+        assert!(matches!(result, Err(VolumeMgrError::NotRunning(_))));
+    }
+
+    // ── nbd_device_path tests (#1195) ───────────────────────────────
+
+    #[tokio::test]
+    async fn nbd_device_path_returns_path_for_running_volume() {
+        let mut mgr = VolumeMgr::new();
+        let child = Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        mgr.processes.insert(
+            "vol-nbd".to_string(),
+            VolumeProcess {
+                child,
+                nbd_device: PathBuf::from("/dev/nbd42"),
+                generation: 1,
+            },
+        );
+
+        assert_eq!(
+            mgr.nbd_device_path("vol-nbd"),
+            Some(PathBuf::from("/dev/nbd42"))
+        );
+
+        // Cleanup.
+        mgr.stop_volume("vol-nbd").await.ok();
+    }
+
+    #[test]
+    fn nbd_device_path_returns_none_for_unknown_volume() {
+        let mgr = VolumeMgr::new();
+        assert_eq!(mgr.nbd_device_path("nonexistent"), None);
     }
 }
