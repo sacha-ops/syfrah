@@ -187,7 +187,7 @@ pub async fn cleanup_s3_objects(
 /// Parse `<Key>...</Key>` entries from an S3 ListObjectsV2 XML response.
 ///
 /// This is a minimal parser that avoids pulling in a full XML crate.
-fn parse_s3_list_keys(xml: &str) -> Vec<String> {
+pub fn parse_s3_list_keys(xml: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut search_from = 0;
 
