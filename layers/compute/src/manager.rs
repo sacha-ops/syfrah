@@ -973,6 +973,7 @@ impl VmManager {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: spec.root_volume_id.clone(),
         };
 
         // Populate hypervisor metadata from the local hypervisor record.
@@ -1352,6 +1353,7 @@ impl VmManager {
                     hypervisor_id: None,
                     region: None,
                     zone: None,
+                    root_volume_id: None,
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;

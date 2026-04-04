@@ -373,6 +373,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         }
     }
 
@@ -406,6 +407,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         }
     }
 
@@ -561,6 +563,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let errors = validate(&spec).unwrap_err();
         // Should have at least 5 errors: vcpus, memory, image, bdf, volume, tap
@@ -732,6 +735,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -753,6 +757,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         assert!(validate(&spec).is_ok());
     }
@@ -810,6 +815,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let errors = validate(&spec).unwrap_err();
         assert!(
@@ -852,6 +858,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
         let validated = validate(&spec).unwrap();
         let resolved = resolve(
@@ -1054,6 +1061,7 @@ mod tests {
             security_groups: vec![],
             pre_allocated_ip: None,
             pre_allocated_mac: None,
+            root_volume_id: None,
         };
 
         // Step 1: validate

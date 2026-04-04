@@ -1230,6 +1230,7 @@ async fn create_instance_handler(
         },
         pre_allocated_ip: req.pre_allocated_ip,
         pre_allocated_mac: req.pre_allocated_mac,
+        root_volume_id: None,
     };
 
     match vm_manager.create_vm(spec).await {

@@ -63,6 +63,8 @@ pub(crate) struct VmRuntimeState {
     pub(crate) region: Option<String>,
     /// Zone of the hypervisor.
     pub(crate) zone: Option<String>,
+    /// Root volume ID (storage layer) associated with this VM.
+    pub(crate) root_volume_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -112,6 +114,7 @@ impl VmRuntimeState {
             hypervisor_id: self.hypervisor_id.clone(),
             region: self.region.clone(),
             zone: self.zone.clone(),
+            root_volume_id: self.root_volume_id.clone(),
         }
     }
 }
@@ -146,6 +149,7 @@ mod tests {
             hypervisor_id: None,
             region: None,
             zone: None,
+            root_volume_id: None,
         }
     }
 

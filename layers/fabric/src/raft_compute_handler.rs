@@ -589,6 +589,7 @@ impl LayerHandler for RaftComputeHandler {
                 node_selector,
                 anti_affinity,
                 spread_topology,
+                root_disk_size_gb: _,
             } => {
                 self.handle_create_vm(
                     &request,

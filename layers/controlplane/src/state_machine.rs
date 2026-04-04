@@ -1846,6 +1846,11 @@ impl RedbStateMachine {
             StateMachineCommand::VolumeDetach { volume_id } => {
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get_mut(volume_id) {
+                    Some(vol) if vol.volume_type == VolumeType::Root => {
+                        StateMachineResponse::Error(format!(
+                            "cannot detach root volume '{volume_id}': root volumes are tied to their VM lifecycle"
+                        ))
+                    }
                     Some(vol) if vol.state == VolumeState::Attached => {
                         vol.state = VolumeState::Available;
                         vol.attached_vm_id = None;
@@ -3448,5 +3453,91 @@ mod tests {
 
         // Tombstone should still exist (not old enough).
         assert!(sm.storage.read().unwrap().volumes.contains_key("vol-1"));
+    }
+
+    // -- Root volume detach guard ----------------------------------------------
+
+    #[test]
+    fn cannot_detach_root_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set quota so volume creation succeeds.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+
+        // Create a root volume.
+        let resp = sm.apply_command(&StateMachineCommand::CreateVolume {
+            id: "vol-root-1".into(),
+            name: "root-web-1".into(),
+            size_gb: 20,
+            org_id: "acme".into(),
+            project_id: "myapp".into(),
+            env_id: "prod".into(),
+            volume_type: VolumeType::Root,
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Attach it.
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-root-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Try to detach — should fail because it's a root volume.
+        let resp = sm.apply_command(&StateMachineCommand::VolumeDetach {
+            volume_id: "vol-root-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Error(_)));
+        let msg = match resp {
+            StateMachineResponse::Error(m) => m,
+            _ => unreachable!(),
+        };
+        assert!(
+            msg.contains("cannot detach root volume"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn can_detach_data_volume() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Set quota so volume creation succeeds.
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+
+        // Create a data volume.
+        let resp = create_volume(&sm, "vol-data-1", "pgdata", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Attach it.
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-data-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Detach — should succeed for data volumes.
+        let resp = sm.apply_command(&StateMachineCommand::VolumeDetach {
+            volume_id: "vol-data-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
     }
 }

@@ -40,9 +40,10 @@ pub enum VmCommand {
         /// Path to SSH public key file to inject via cloud-init
         #[arg(long)]
         ssh_key: Option<PathBuf>,
-        /// Disk size in MB (0 = use image default)
-        #[arg(long)]
-        disk_size: Option<u32>,
+        /// Root disk size in GB (default: 20). A root volume is auto-created
+        /// with this size and deleted when the VM is deleted.
+        #[arg(long, default_value = "20")]
+        disk_size: u32,
         /// Subnet name to place the VM in (auto-selected if env has exactly one)
         #[arg(long)]
         subnet: Option<String>,
@@ -217,14 +218,6 @@ pub(crate) fn read_ssh_key(path: &std::path::Path) -> anyhow::Result<String> {
     Ok(trimmed)
 }
 
-/// Convert disk_size: 0 means use image default (None).
-pub(crate) fn normalize_disk_size(disk_size: Option<u32>) -> Option<u32> {
-    match disk_size {
-        Some(0) => None,
-        other => other,
-    }
-}
-
 /// Resolve a subnet for VM placement via the daemon's control socket.
 ///
 /// - If `--subnet` is given, look up that specific subnet in the environment.
@@ -291,7 +284,7 @@ async fn run_create(
     gpu: Option<String>,
     tap: Option<String>,
     ssh_key_path: Option<PathBuf>,
-    disk_size: Option<u32>,
+    disk_size_gb: u32,
     subnet_name: Option<String>,
     env: Option<String>,
     project: Option<String>,
@@ -306,7 +299,8 @@ async fn run_create(
         Some(ref path) => Some(read_ssh_key(path)?),
         None => None,
     };
-    let disk_size_mb = normalize_disk_size(disk_size);
+    // Convert root disk size from GB to MB for the VM spec.
+    let disk_size_mb = Some(disk_size_gb * 1024);
 
     // Resolve subnet if org/project/env context is provided
     let subnet = resolve_subnet(subnet_name, env, project, org).await?;
@@ -333,6 +327,7 @@ async fn run_create(
         node_selector,
         anti_affinity,
         spread_topology,
+        root_disk_size_gb: disk_size_gb,
     };
     let resp = send_compute_request(&control_socket_path(), &req)
         .await
@@ -349,6 +344,9 @@ async fn run_create(
             let vm_vcpus = v.get("vcpus").and_then(|c| c.as_u64()).unwrap_or(0);
             let vm_memory = v.get("memory_mb").and_then(|m| m.as_u64()).unwrap_or(0);
             println!("VM created: {vm_name} ({vm_image}, {vm_vcpus} vCPU, {vm_memory} MB)");
+            if let Some(vol_id) = v.get("root_volume_id").and_then(|v| v.as_str()) {
+                println!("Root volume: {vol_id} ({disk_size_gb} GB)");
+            }
             if ssh_key.is_some() {
                 let mesh_ip = v
                     .get("mesh_ipv6")
@@ -521,6 +519,11 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 println!("  Hypervisor: {hv_id}");
                 println!("  Region:    {hv_region}");
                 println!("  Zone:      {hv_zone}");
+                let root_vol = v
+                    .get("root_volume_id")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("-");
+                println!("  Root Vol:  {root_vol}");
             }
             Ok(())
         }
@@ -770,7 +773,7 @@ mod tests {
                 assert!(gpu.is_none());
                 assert!(tap.is_none());
                 assert!(ssh_key.is_none());
-                assert!(disk_size.is_none());
+                assert_eq!(disk_size, 20); // default
                 assert!(subnet.is_none());
                 assert!(env.is_none());
                 assert!(project.is_none());
@@ -817,7 +820,7 @@ mod tests {
                 assert_eq!(gpu.as_deref(), Some("0000:01:00.0"));
                 assert_eq!(tap.as_deref(), Some("tap0"));
                 assert!(ssh_key.is_none());
-                assert!(disk_size.is_none());
+                assert_eq!(disk_size, 20); // default
             }
             other => panic!("expected Create, got {other:?}"),
         }
@@ -1011,18 +1014,29 @@ mod tests {
     // -- Disk size tests ------------------------------------------------------
 
     #[test]
-    fn disk_size_4096() {
-        assert_eq!(normalize_disk_size(Some(4096)), Some(4096));
+    fn disk_size_default_is_20() {
+        let cmd = parse(&["create", "--name", "test-vm", "--image", "alpine"]);
+        match cmd {
+            VmCommand::Create { disk_size, .. } => assert_eq!(disk_size, 20),
+            other => panic!("expected Create, got {other:?}"),
+        }
     }
 
     #[test]
-    fn disk_size_zero_becomes_none() {
-        assert_eq!(normalize_disk_size(Some(0)), None);
-    }
-
-    #[test]
-    fn disk_size_none_stays_none() {
-        assert_eq!(normalize_disk_size(None), None);
+    fn disk_size_custom() {
+        let cmd = parse(&[
+            "create",
+            "--name",
+            "test-vm",
+            "--image",
+            "alpine",
+            "--disk-size",
+            "50",
+        ]);
+        match cmd {
+            VmCommand::Create { disk_size, .. } => assert_eq!(disk_size, 50),
+            other => panic!("expected Create, got {other:?}"),
+        }
     }
 
     // -- Parse with ssh-key and disk-size flags -------------------------------
@@ -1038,7 +1052,7 @@ mod tests {
             "--ssh-key",
             "/tmp/id_ed25519.pub",
             "--disk-size",
-            "8192",
+            "50",
         ]);
         match cmd {
             VmCommand::Create {
@@ -1049,7 +1063,7 @@ mod tests {
             } => {
                 assert_eq!(name, "web-1");
                 assert_eq!(ssh_key, Some(PathBuf::from("/tmp/id_ed25519.pub")));
-                assert_eq!(disk_size, Some(8192));
+                assert_eq!(disk_size, 50);
             }
             other => panic!("expected Create, got {other:?}"),
         }
