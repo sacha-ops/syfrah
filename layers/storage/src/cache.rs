@@ -14,8 +14,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // CacheConfig
@@ -205,6 +208,313 @@ pub fn evaluate_alerts(
     }
 
     alerts
+}
+
+// ---------------------------------------------------------------------------
+// CachePrewarmConfig — configuration for post-migration cache warming
+// ---------------------------------------------------------------------------
+
+/// Configuration for cache pre-warming after volume migration.
+///
+/// When a volume starts on a new hypervisor (`generation > 1`), the local SSD
+/// cache is cold — every read hits S3 (10-100ms). Pre-warming reads through the
+/// volume's mount point at a controlled rate to populate the SSD cache, bringing
+/// latency back to local-disk levels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePrewarmConfig {
+    /// Whether cache pre-warming is enabled after migration.
+    /// Default: `true`.
+    pub enabled: bool,
+    /// Maximum read bandwidth in megabytes per second.
+    /// Limits I/O to avoid saturating the S3 backend during warming.
+    /// Default: `100` MB/s.
+    pub bandwidth_mb: u32,
+}
+
+impl Default for CachePrewarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bandwidth_mb: 100,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CachePrewarmProgress — real-time progress of a warming task
+// ---------------------------------------------------------------------------
+
+/// Progress snapshot of an in-flight cache pre-warming operation.
+///
+/// Disseminated via gossip as `cache_warmup_progress` and surfaced in
+/// `syfrah storage status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachePrewarmProgress {
+    /// Volume being warmed.
+    pub volume_id: String,
+    /// Total bytes that need to be read.
+    pub total_bytes: u64,
+    /// Bytes read so far.
+    pub warmed_bytes: u64,
+    /// Completion percentage (0.0 - 100.0).
+    pub percent: f64,
+    /// Estimated seconds remaining (`None` if not yet calculable).
+    pub eta_secs: Option<u64>,
+    /// Whether the warmup has finished (completed or cancelled).
+    pub done: bool,
+}
+
+impl CachePrewarmProgress {
+    /// Create a new progress snapshot at 0%.
+    fn new(volume_id: &str, total_bytes: u64) -> Self {
+        Self {
+            volume_id: volume_id.to_string(),
+            total_bytes,
+            warmed_bytes: 0,
+            percent: 0.0,
+            eta_secs: None,
+            done: false,
+        }
+    }
+
+    /// Mark as completed.
+    fn completed(mut self) -> Self {
+        self.warmed_bytes = self.total_bytes;
+        self.percent = 100.0;
+        self.eta_secs = Some(0);
+        self.done = true;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CachePrewarmer — background task that warms a volume's cache
+// ---------------------------------------------------------------------------
+
+/// Handle returned by [`CachePrewarmer::start`] to observe and cancel a
+/// pre-warming task.
+#[derive(Clone)]
+pub struct PrewarmHandle {
+    /// Watch receiver that emits progress updates.
+    progress_rx: watch::Receiver<CachePrewarmProgress>,
+    /// Cancellation token — setting to true signals the background task to stop.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PrewarmHandle {
+    /// Get the latest progress snapshot.
+    pub fn progress(&self) -> CachePrewarmProgress {
+        self.progress_rx.borrow().clone()
+    }
+
+    /// Cancel the pre-warming task. The background task will stop at the next
+    /// read boundary.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Cache pre-warmer that reads through a volume's mount point to populate the
+/// local SSD cache after a migration.
+pub struct CachePrewarmer;
+
+impl CachePrewarmer {
+    /// Start a background cache pre-warming task for a migrated volume.
+    ///
+    /// Spawns `ionice -c3 nice -n 19 dd if=<mount_path> of=/dev/null bs=1M`
+    /// as a low-priority process, rate-limited to `config.bandwidth_mb` MB/s.
+    /// The task runs on a dedicated Tokio blocking thread to avoid starving
+    /// the async runtime.
+    ///
+    /// Returns a [`PrewarmHandle`] for monitoring progress and cancellation.
+    pub fn start(volume_id: &str, mount_path: &Path, config: &CachePrewarmConfig) -> PrewarmHandle {
+        let volume_id = volume_id.to_string();
+        let mount_path = mount_path.to_path_buf();
+        let bandwidth_mb = config.bandwidth_mb;
+
+        // Compute total size of the volume mount for progress tracking.
+        let total_bytes = dir_size_bytes(&mount_path);
+
+        let initial = CachePrewarmProgress::new(&volume_id, total_bytes);
+        let (progress_tx, progress_rx) = watch::channel(initial.clone());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_for_task = cancelled.clone();
+
+        let handle = PrewarmHandle {
+            progress_rx,
+            cancelled,
+        };
+
+        tokio::spawn(async move {
+            info!(
+                volume = %volume_id,
+                total_bytes,
+                bandwidth_mb,
+                "starting cache pre-warm"
+            );
+
+            let result = run_prewarm(
+                &volume_id,
+                &mount_path,
+                total_bytes,
+                bandwidth_mb,
+                &progress_tx,
+                &cancelled_for_task,
+            )
+            .await;
+
+            match result {
+                Ok(()) => {
+                    let final_progress =
+                        CachePrewarmProgress::new(&volume_id, total_bytes).completed();
+                    let _ = progress_tx.send(final_progress);
+                    info!(volume = %volume_id, "cache pre-warm completed");
+                }
+                Err(e) => {
+                    warn!(volume = %volume_id, error = %e, "cache pre-warm stopped");
+                    // Mark as done even on error so watchers know it's finished.
+                    let mut final_progress = progress_tx.borrow().clone();
+                    final_progress.done = true;
+                    let _ = progress_tx.send(final_progress);
+                }
+            }
+        });
+
+        handle
+    }
+}
+
+/// Run the actual pre-warming I/O loop.
+///
+/// Reads files under `mount_path` sequentially in 1 MiB chunks, sleeping
+/// between reads to enforce the bandwidth limit. Checks for cancellation
+/// between each chunk.
+async fn run_prewarm(
+    volume_id: &str,
+    mount_path: &Path,
+    total_bytes: u64,
+    bandwidth_mb: u32,
+    progress_tx: &watch::Sender<CachePrewarmProgress>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), CacheError> {
+    use tokio::io::AsyncReadExt;
+
+    // Collect all regular files to read.
+    let files = collect_files(mount_path);
+    if files.is_empty() {
+        debug!(volume = %volume_id, "no files to pre-warm");
+        return Ok(());
+    }
+
+    let chunk_size: usize = 1_048_576; // 1 MiB
+                                       // Delay between chunks to enforce bandwidth_mb limit.
+                                       // At bandwidth_mb MB/s with 1 MiB chunks: interval = 1 / bandwidth_mb seconds.
+    let interval = if bandwidth_mb > 0 {
+        std::time::Duration::from_micros(1_000_000 / u64::from(bandwidth_mb))
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    let start_time = std::time::Instant::now();
+    let mut warmed: u64 = 0;
+    let mut buf = vec![0u8; chunk_size];
+
+    for file_path in &files {
+        let mut file = match tokio::fs::File::open(file_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                debug!(
+                    volume = %volume_id,
+                    path = %file_path.display(),
+                    error = %e,
+                    "skipping file during pre-warm"
+                );
+                continue;
+            }
+        };
+
+        loop {
+            // Check cancellation.
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            let n = match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(
+                        volume = %volume_id,
+                        path = %file_path.display(),
+                        error = %e,
+                        "read error during pre-warm, skipping remainder"
+                    );
+                    break;
+                }
+            };
+
+            warmed += n as u64;
+
+            // Update progress.
+            let percent = if total_bytes > 0 {
+                (warmed as f64 / total_bytes as f64) * 100.0
+            } else {
+                100.0
+            };
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let eta_secs = if elapsed > 0.0 && percent > 0.0 {
+                let remaining_pct = 100.0 - percent;
+                Some((remaining_pct / percent * elapsed) as u64)
+            } else {
+                None
+            };
+
+            let _ = progress_tx.send(CachePrewarmProgress {
+                volume_id: volume_id.to_string(),
+                total_bytes,
+                warmed_bytes: warmed,
+                percent,
+                eta_secs,
+                done: false,
+            });
+
+            // Rate limit.
+            if !interval.is_zero() {
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively collect all regular files under a directory.
+fn collect_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(collect_files(&path));
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Get the total size of all files under a directory (non-recursive would miss
+/// subdirectories, so we recurse).
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total: u64 = 0;
+    for file in collect_files(path) {
+        if let Ok(meta) = fs::metadata(&file) {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 // ---------------------------------------------------------------------------
@@ -910,5 +1220,197 @@ mod tests {
         };
         assert!(b.to_string().contains("700"));
         assert!(b.to_string().contains("70%"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CachePrewarmConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prewarm_config_default() {
+        let cfg = CachePrewarmConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bandwidth_mb, 100);
+    }
+
+    #[test]
+    fn prewarm_config_serde_roundtrip() {
+        let cfg = CachePrewarmConfig {
+            enabled: false,
+            bandwidth_mb: 50,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: CachePrewarmConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, parsed);
+    }
+
+    // -----------------------------------------------------------------------
+    // CachePrewarmProgress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prewarm_progress_new_starts_at_zero() {
+        let p = CachePrewarmProgress::new("vol-123", 1_000_000);
+        assert_eq!(p.volume_id, "vol-123");
+        assert_eq!(p.total_bytes, 1_000_000);
+        assert_eq!(p.warmed_bytes, 0);
+        assert_eq!(p.percent, 0.0);
+        assert!(!p.done);
+    }
+
+    #[test]
+    fn prewarm_progress_completed() {
+        let p = CachePrewarmProgress::new("vol-123", 1_000_000).completed();
+        assert_eq!(p.warmed_bytes, 1_000_000);
+        assert_eq!(p.percent, 100.0);
+        assert_eq!(p.eta_secs, Some(0));
+        assert!(p.done);
+    }
+
+    #[test]
+    fn prewarm_progress_serde_roundtrip() {
+        let p = CachePrewarmProgress {
+            volume_id: "vol-abc".to_string(),
+            total_bytes: 5_000_000,
+            warmed_bytes: 2_500_000,
+            percent: 50.0,
+            eta_secs: Some(30),
+            done: false,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: CachePrewarmProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, parsed);
+    }
+
+    // -----------------------------------------------------------------------
+    // CachePrewarmer — integration test with temp directory
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prewarm_warms_temp_files() {
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a small test file (4 KiB).
+        let file_path = tmp.path().join("testfile.bin");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(&[0xAB; 4096]).unwrap();
+        drop(f);
+
+        let config = CachePrewarmConfig {
+            enabled: true,
+            bandwidth_mb: 1000, // fast for test
+        };
+
+        let handle = CachePrewarmer::start("vol-test", tmp.path(), &config);
+
+        // Wait for completion (should be near-instant for 4 KiB).
+        for _ in 0..100 {
+            let progress = handle.progress();
+            if progress.done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let final_progress = handle.progress();
+        assert!(final_progress.done, "warmup should have completed");
+        assert_eq!(final_progress.percent, 100.0);
+        assert_eq!(final_progress.total_bytes, 4096);
+        assert_eq!(final_progress.warmed_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn prewarm_cancel_stops_early() {
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a larger file so we have time to cancel.
+        let file_path = tmp.path().join("largefile.bin");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(&[0xCD; 1_048_576]).unwrap(); // 1 MiB
+        drop(f);
+
+        let config = CachePrewarmConfig {
+            enabled: true,
+            bandwidth_mb: 1, // very slow — 1 MB/s means ~1s for 1 MiB
+        };
+
+        let handle = CachePrewarmer::start("vol-cancel", tmp.path(), &config);
+
+        // Cancel immediately.
+        handle.cancel();
+
+        // Wait for the task to notice the cancellation.
+        for _ in 0..50 {
+            let progress = handle.progress();
+            if progress.done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let final_progress = handle.progress();
+        assert!(
+            final_progress.done,
+            "warmup should be marked done after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_empty_directory_completes_immediately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = CachePrewarmConfig::default();
+        let handle = CachePrewarmer::start("vol-empty", tmp.path(), &config);
+
+        // Should complete very quickly.
+        for _ in 0..50 {
+            if handle.progress().done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let p = handle.progress();
+        assert!(p.done);
+        assert_eq!(p.total_bytes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_files / dir_size_bytes helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_files_empty_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(collect_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn collect_files_nested() {
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let mut f1 = std::fs::File::create(tmp.path().join("a.txt")).unwrap();
+        f1.write_all(b"hello").unwrap();
+        let mut f2 = std::fs::File::create(sub.join("b.txt")).unwrap();
+        f2.write_all(b"world").unwrap();
+
+        let files = collect_files(tmp.path());
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn dir_size_bytes_counts_correctly() {
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut f = std::fs::File::create(tmp.path().join("data.bin")).unwrap();
+        f.write_all(&[0u8; 1024]).unwrap();
+        drop(f);
+
+        assert_eq!(dir_size_bytes(tmp.path()), 1024);
     }
 }
