@@ -1749,9 +1749,17 @@ impl RedbStateMachine {
             } => {
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get(volume_id) {
-                    Some(vol) if vol.state == VolumeState::Attached => StateMachineResponse::Error(
-                        format!("volume '{volume_id}' is attached, detach before deleting"),
-                    ),
+                    // Root volumes may still be "attached" after VM deletion (stale
+                    // attachment) — the detach guard prevents explicit detach, so we
+                    // must allow deletion here to avoid a deadlock.
+                    Some(vol)
+                        if vol.state == VolumeState::Attached
+                            && vol.volume_type != VolumeType::Root =>
+                    {
+                        StateMachineResponse::Error(format!(
+                            "volume '{volume_id}' is attached, detach before deleting",
+                        ))
+                    }
                     Some(vol) if vol.state == VolumeState::Deleted => StateMachineResponse::Error(
                         format!("volume '{volume_id}' is already deleted"),
                     ),
@@ -3539,5 +3547,90 @@ mod tests {
             volume_id: "vol-data-1".into(),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
+    }
+
+    #[test]
+    fn delete_attached_root_volume_succeeds() {
+        // Root volumes can't be detached (lifecycle guard), so DeleteVolume
+        // must allow deletion even when state == Attached to avoid a deadlock.
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+
+        // Create a root volume.
+        let resp = sm.apply_command(&StateMachineCommand::CreateVolume {
+            id: "vol-root-del".into(),
+            name: "root-del-test".into(),
+            size_gb: 20,
+            org_id: "acme".into(),
+            project_id: "myapp".into(),
+            env_id: "prod".into(),
+            volume_type: VolumeType::Root,
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        // Attach it (simulating VM creation).
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-root-del".into(),
+            vm_id: "vm-del".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Delete while attached — must succeed for root volumes.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-root-del".into(),
+            cascade: false,
+            deleted_at: 1743638400,
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Ok),
+            "expected Ok for attached root volume deletion, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn delete_attached_data_volume_still_rejected() {
+        // Data volumes must still be detached before deletion.
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        sm.apply_command(&StateMachineCommand::SetStorageQuota {
+            scope: QuotaScope::Org {
+                org_id: "acme".into(),
+            },
+            max_volumes: 10,
+            max_total_gb: 1000,
+            max_snapshots: 10,
+        });
+
+        let resp = create_volume(&sm, "vol-data-guard", "pgdata", 50, "acme", "myapp", "prod");
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-data-guard".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Delete while attached — must fail for data volumes.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteVolume {
+            volume_id: "vol-data-guard".into(),
+            cascade: false,
+            deleted_at: 1743638400,
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(_)),
+            "expected Error for attached data volume deletion, got: {resp:?}"
+        );
     }
 }
