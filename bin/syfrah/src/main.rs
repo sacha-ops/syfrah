@@ -172,6 +172,9 @@ enum FabricCommand {
         /// Start peering with auto-accept PIN after init
         #[arg(long)]
         peering: bool,
+        /// Skip automatic hypervisor registration (for non-compute nodes)
+        #[arg(long)]
+        no_hypervisor: bool,
     },
     /// Join an existing mesh
     Join {
@@ -198,6 +201,9 @@ enum FabricCommand {
         /// Run daemon in foreground instead of backgrounding
         #[arg(long, short)]
         foreground: bool,
+        /// Skip automatic hypervisor registration (for non-compute nodes)
+        #[arg(long)]
+        no_hypervisor: bool,
     },
     /// Start the daemon from saved state
     Start {
@@ -751,6 +757,7 @@ async fn run() -> Result<()> {
                 zone,
                 foreground,
                 peering,
+                no_hypervisor,
             } => {
                 validate_name("Mesh name", &name)?;
                 let resolved_node = node_name.unwrap_or_else(default_node_name);
@@ -766,6 +773,7 @@ async fn run() -> Result<()> {
                     peering_port,
                     region,
                     zone,
+                    no_hypervisor,
                 };
                 if foreground {
                     setup_logging(true);
@@ -790,6 +798,7 @@ async fn run() -> Result<()> {
                 region,
                 zone,
                 foreground,
+                no_hypervisor,
             } => {
                 let resolved_node = node_name.unwrap_or_else(default_node_name);
                 validate_name("Node name", &resolved_node)?;
@@ -804,6 +813,7 @@ async fn run() -> Result<()> {
                     peering_port,
                     region,
                     zone,
+                    no_hypervisor,
                 };
                 // Parse target: "1.2.3.4" -> "1.2.3.4:51821", or "1.2.3.4:9999" as-is
                 let target_addr: SocketAddr = if target.contains(':') {

@@ -112,6 +112,32 @@ pub fn resolve_region_zone(
     (region, zone)
 }
 
+/// Path to the sentinel file that disables automatic hypervisor registration.
+fn no_hypervisor_sentinel_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("no_hypervisor")
+}
+
+/// Write or remove the no-hypervisor sentinel file based on the operator's choice.
+fn write_no_hypervisor_sentinel(no_hypervisor: bool) {
+    let path = no_hypervisor_sentinel_path();
+    if no_hypervisor {
+        if let Err(e) = std::fs::write(&path, "") {
+            warn!("failed to write no_hypervisor sentinel: {e}");
+        }
+    } else {
+        // Remove any stale sentinel from a previous run.
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Check if the operator opted out of automatic hypervisor registration.
+fn no_hypervisor_opted_out() -> bool {
+    no_hypervisor_sentinel_path().exists()
+}
+
 pub struct DaemonConfig {
     pub mesh_name: String,
     pub node_name: String,
@@ -120,6 +146,8 @@ pub struct DaemonConfig {
     pub peering_port: u16,
     pub region: Option<String>,
     pub zone: Option<String>,
+    /// When true, skip automatic hypervisor registration on fabric join/init.
+    pub no_hypervisor: bool,
 }
 
 /// Data produced by `setup_init` / `setup_join`, needed to start the daemon loop.
@@ -179,6 +207,9 @@ pub fn setup_init(config: &DaemonConfig) -> anyhow::Result<DaemonReady> {
         metrics: Default::default(),
     };
     store::save(&state)?;
+
+    // Persist the --no-hypervisor preference so the daemon can read it.
+    write_no_hypervisor_sentinel(config.no_hypervisor);
 
     let sp = ui::spinner("Starting daemon...");
     ui::step_ok(&sp, &format!("Mesh '{}' created", config.mesh_name));
@@ -441,6 +472,9 @@ async fn finalize_join(
     };
     store::save(&state)?;
 
+    // Persist the --no-hypervisor preference so the daemon can read it.
+    write_no_hypervisor_sentinel(config.no_hypervisor);
+
     let sp = ui::spinner("Starting daemon...");
     ui::step_ok(&sp, &format!("Joined mesh '{mesh_name}'"));
     match response.approved_by.as_deref() {
@@ -688,6 +722,106 @@ pub async fn run_leave() -> anyhow::Result<bool> {
     }
     ui::step_ok(&sp, "Left the mesh. State cleared.");
     Ok(true)
+}
+
+/// Automatically register and enable the local hypervisor through Raft.
+///
+/// Called after the Raft client is injected into the hypervisor handler.
+/// Skips gracefully if:
+/// - The operator passed `--no-hypervisor`
+/// - KVM is not available on this node
+/// - The hypervisor is already registered and enabled
+async fn auto_register_and_enable_hypervisor(
+    raft_client: syfrah_controlplane::RaftClient,
+    node_name: String,
+    region: String,
+    zone: String,
+    fabric_ipv6: String,
+) {
+    use syfrah_controlplane::commands::{StateMachineCommand, StateMachineResponse};
+
+    // Check opt-out sentinel.
+    if no_hypervisor_opted_out() {
+        info!("hypervisor: auto-registration skipped (--no-hypervisor)");
+        return;
+    }
+
+    // Check KVM capability.
+    if !syfrah_org::discovery::kvm_available() {
+        info!("hypervisor: auto-registration skipped (no KVM on this node)");
+        return;
+    }
+
+    // Register the hypervisor via Raft.
+    let register_cmd = StateMachineCommand::RegisterHypervisor {
+        name: node_name.clone(),
+        region: region.clone(),
+        zone: zone.clone(),
+        fabric_ipv6,
+    };
+
+    match raft_client.write(register_cmd).await {
+        Ok(StateMachineResponse::Error(msg)) if msg.contains("already") => {
+            info!(
+                "hypervisor: '{}' already registered via Raft, skipping register",
+                node_name
+            );
+        }
+        Ok(StateMachineResponse::Error(msg)) => {
+            warn!(
+                "hypervisor: auto-register failed for '{}': {}",
+                node_name, msg
+            );
+            return;
+        }
+        Ok(_) => {
+            info!(
+                "hypervisor: auto-registered '{}' via Raft (region={}, zone={})",
+                node_name, region, zone
+            );
+        }
+        Err(e) => {
+            warn!(
+                "hypervisor: auto-register Raft error for '{}': {}",
+                node_name, e
+            );
+            return;
+        }
+    }
+
+    // Small delay to let the registration propagate through Raft.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Enable the hypervisor (NotReady -> Available).
+    let enable_cmd = StateMachineCommand::EnableHypervisor {
+        name: node_name.clone(),
+    };
+
+    match raft_client.write(enable_cmd).await {
+        Ok(StateMachineResponse::Error(msg))
+            if msg.contains("already") || msg.contains("Available") =>
+        {
+            info!(
+                "hypervisor: '{}' already enabled, skipping enable",
+                node_name
+            );
+        }
+        Ok(StateMachineResponse::Error(msg)) => {
+            warn!(
+                "hypervisor: auto-enable failed for '{}': {}",
+                node_name, msg
+            );
+        }
+        Ok(_) => {
+            info!("hypervisor: '{}' auto-enabled (Available)", node_name);
+        }
+        Err(e) => {
+            warn!(
+                "hypervisor: auto-enable Raft error for '{}': {}",
+                node_name, e
+            );
+        }
+    }
 }
 
 /// The main daemon loop.
@@ -1866,6 +2000,31 @@ pub async fn run_daemon(
                 });
             }
 
+            // Auto-register and enable the local hypervisor via Raft.
+            {
+                let client = raft_client.clone();
+                let node_name = my_record.name.clone();
+                let region = my_record
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                let zone = my_record
+                    .zone
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                let fabric_ipv6 = my_record.mesh_ipv6.to_string();
+                tokio::spawn(async move {
+                    auto_register_and_enable_hypervisor(
+                        client,
+                        node_name,
+                        region,
+                        zone,
+                        fabric_ipv6,
+                    )
+                    .await;
+                });
+            }
+
             // Inject the Raft client and scheduler into the compute handler
             // so CreateVm goes through the scheduler and can target remote nodes.
             if let Some(ref handler) = raft_compute_handler_ref {
@@ -2700,6 +2859,33 @@ pub async fn run_daemon(
                                     tokio::spawn(async move {
                                         handler.set_raft_client(client).await;
                                         info!("raft: injected Raft client into hypervisor handler (in-process)");
+                                    });
+                                }
+
+                                // Auto-register and enable the local hypervisor via Raft.
+                                {
+                                    let client = raft_client.clone();
+                                    let node_name = aj_my_record.name.clone();
+                                    let region = aj_my_record
+                                        .region
+                                        .clone()
+                                        .unwrap_or_else(|| "default".to_string());
+                                    let zone = aj_my_record
+                                        .zone
+                                        .clone()
+                                        .unwrap_or_else(|| "default".to_string());
+                                    let fabric_ipv6 = aj_my_record.mesh_ipv6.to_string();
+                                    tokio::spawn(async move {
+                                        // Small delay to let the Raft handler injection complete.
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        auto_register_and_enable_hypervisor(
+                                            client,
+                                            node_name,
+                                            region,
+                                            zone,
+                                            fabric_ipv6,
+                                        )
+                                        .await;
                                     });
                                 }
 
@@ -5209,6 +5395,7 @@ mod tests {
             peering_port: 7946,
             region: None,
             zone: None,
+            no_hypervisor: false,
         };
         let ep = resolve_endpoint(&config);
         assert_eq!(ep, "0.0.0.0:51820".parse::<SocketAddr>().unwrap());
@@ -5225,6 +5412,7 @@ mod tests {
             peering_port: 7946,
             region: None,
             zone: None,
+            no_hypervisor: false,
         };
         let ep = resolve_endpoint(&config);
         assert_eq!(ep, custom);
@@ -5703,6 +5891,7 @@ mod tests {
             peering_port: 7946,
             region: None,
             zone: None,
+            no_hypervisor: false,
         };
         let ep = resolve_endpoint(&config);
         assert!(
