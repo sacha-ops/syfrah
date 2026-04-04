@@ -309,12 +309,24 @@ struct VolumeProcess {
     child: Child,
     /// Host mount point for the 9P filesystem.
     mount_point: PathBuf,
+    /// Path to the zerofs.toml config file for this volume.
+    config_path: PathBuf,
     #[allow(dead_code)]
     generation: u64,
+    /// S3 credentials for passing to checkpoint commands.
+    s3_env: S3Env,
     /// S3 health tracker for this volume.
     health_tracker: VolumeHealthTracker,
     /// Handle for an in-flight cache pre-warming task (if any).
     prewarm_handle: Option<PrewarmHandle>,
+}
+
+/// S3 credential environment variables needed by ZeroFS checkpoint commands.
+#[derive(Debug, Clone)]
+struct S3Env {
+    access_key: String,
+    secret_key: String,
+    encryption_passphrase: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +359,9 @@ pub enum VolumeMgrError {
 
     #[error("stop failed: {0}")]
     Stop(String),
+
+    #[error("checkpoint failed: {0}")]
+    Checkpoint(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +532,13 @@ impl VolumeMgr {
             VolumeProcess {
                 child,
                 mount_point: mount_point.clone(),
+                config_path,
                 generation,
+                s3_env: S3Env {
+                    access_key: s3.access_key.clone(),
+                    secret_key: s3.secret_key.clone(),
+                    encryption_passphrase: encryption_passphrase.to_string(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -854,60 +875,204 @@ impl VolumeMgr {
             .collect()
     }
 
-    /// Capture a point-in-time manifest from a running ZeroFS process.
+    /// Create a snapshot of a running volume using ZeroFS's native checkpoint.
     ///
-    /// Sends `SIGUSR1` to the ZeroFS process, which triggers it to write
-    /// the current SST file list and WAL position to
-    /// `{cache_dir}/{volume_id}.manifest.json`. The reconciler reads this
-    /// file and submits a `CreateSnapshot` Raft command.
-    ///
-    /// Returns the parsed manifest, or an error if the volume is not
-    /// running or the manifest cannot be captured.
+    /// Runs `zerofs checkpoint create -c {config} {snapshot_name}` with the
+    /// volume's S3 credentials passed as environment variables. This creates
+    /// a crash-consistent checkpoint that can later be restored with
+    /// `restore_from_checkpoint`.
     pub async fn capture_manifest(
         &self,
         volume_id: &str,
-    ) -> Result<VolumeManifest, VolumeMgrError> {
+        snapshot_name: &str,
+    ) -> Result<(), VolumeMgrError> {
         let proc = self
             .processes
             .get(volume_id)
             .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
 
-        // Send SIGUSR1 to ask ZeroFS to dump its manifest.
-        #[cfg(unix)]
+        let binary_path = binary::resolve_binary(self.binary_override.as_deref())?;
+
+        let output = Command::new(&binary_path)
+            .arg("checkpoint")
+            .arg("create")
+            .arg("-c")
+            .arg(&proc.config_path)
+            .arg(snapshot_name)
+            .env("AWS_ACCESS_KEY_ID", &proc.s3_env.access_key)
+            .env("AWS_SECRET_ACCESS_KEY", &proc.s3_env.secret_key)
+            .env("ZEROFS_PASSWORD", &proc.s3_env.encryption_passphrase)
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Checkpoint(format!("failed to run zerofs checkpoint create: {e}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VolumeMgrError::Checkpoint(format!(
+                "zerofs checkpoint create failed: {stderr}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// List checkpoints for a running volume.
+    ///
+    /// Runs `zerofs checkpoint list -c {config}` and returns the raw
+    /// stdout as a string. The caller is responsible for parsing the
+    /// output into a structured format.
+    pub async fn list_checkpoints(&self, volume_id: &str) -> Result<String, VolumeMgrError> {
+        let proc = self
+            .processes
+            .get(volume_id)
+            .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+
+        let binary_path = binary::resolve_binary(self.binary_override.as_deref())?;
+
+        let output = Command::new(&binary_path)
+            .arg("checkpoint")
+            .arg("list")
+            .arg("-c")
+            .arg(&proc.config_path)
+            .env("AWS_ACCESS_KEY_ID", &proc.s3_env.access_key)
+            .env("AWS_SECRET_ACCESS_KEY", &proc.s3_env.secret_key)
+            .env("ZEROFS_PASSWORD", &proc.s3_env.encryption_passphrase)
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Checkpoint(format!("failed to run zerofs checkpoint list: {e}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VolumeMgrError::Checkpoint(format!(
+                "zerofs checkpoint list failed: {stderr}"
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Restore a volume from a ZeroFS checkpoint.
+    ///
+    /// Generates a new `zerofs.toml` for the restored volume and starts
+    /// a new ZeroFS instance with `zerofs run -c {config} --checkpoint {name} --read-only`.
+    /// The restored volume is mounted at `/var/lib/syfrah/volumes/{target_volume_id}/`.
+    ///
+    /// Returns the host-side mount point for the restored volume.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_from_checkpoint(
+        &mut self,
+        target_volume_id: &str,
+        checkpoint_name: &str,
+        s3: &S3Config,
+        cache: &CacheConfig,
+        encryption_passphrase: &str,
+        generation: u64,
+        size_gb: f64,
+    ) -> Result<PathBuf, VolumeMgrError> {
+        if self.processes.contains_key(target_volume_id) {
+            return Err(VolumeMgrError::AlreadyRunning(target_volume_id.to_string()));
+        }
+
+        let binary_path = binary::resolve_binary(self.binary_override.as_deref())?;
+
+        let mount_point = self.volumes_base.join(target_volume_id);
+
+        // Generate and write a new TOML config for the restored volume.
+        let config_toml = generate_config(target_volume_id, s3, cache, generation, size_gb);
+        let config_dir = PathBuf::from(format!("/tmp/syfrah/{target_volume_id}"));
+        tokio::fs::create_dir_all(&config_dir)
+            .await
+            .map_err(|e| VolumeMgrError::Spawn(format!("failed to create config dir: {e}")))?;
+        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config dir permissions: {e}"))
+            })?;
+        let config_path = config_dir.join("zerofs.toml");
+        tokio::fs::write(&config_path, &config_toml)
+            .await
+            .map_err(|e| VolumeMgrError::Spawn(format!("failed to write zerofs.toml: {e}")))?;
+        tokio::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config file permissions: {e}"))
+            })?;
+
+        // Create the mount point directory.
+        tokio::fs::create_dir_all(&mount_point)
+            .await
+            .map_err(|e| VolumeMgrError::Mount(format!("failed to create mount point: {e}")))?;
+
+        let ninep_socket = format!("/tmp/syfrah/{target_volume_id}/zerofs.9p.sock");
+
+        // Spawn ZeroFS from the checkpoint in read-only mode.
+        let mut child = Command::new(&binary_path)
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .arg("--checkpoint")
+            .arg(checkpoint_name)
+            .arg("--read-only")
+            .env("AWS_ACCESS_KEY_ID", &s3.access_key)
+            .env("AWS_SECRET_ACCESS_KEY", &s3.secret_key)
+            .env("ZEROFS_PASSWORD", encryption_passphrase)
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|e| VolumeMgrError::Spawn(e.to_string()))?;
+
+        // Wait for the 9P socket to appear.
+        if let Err(e) = self
+            .wait_for_path(std::path::Path::new(&ninep_socket))
+            .await
         {
-            if let Some(pid) = proc.child.id() {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGUSR1);
-                }
-            } else {
-                return Err(VolumeMgrError::Stop(
-                    "cannot capture manifest: process has no PID".to_string(),
-                ));
-            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(e);
         }
 
-        // Wait for the manifest file to appear.
-        let manifest_path =
-            PathBuf::from(format!("/tmp/syfrah/{volume_id}/{volume_id}.manifest.json"));
+        // Mount the 9P filesystem on the host.
+        let mount_output = tokio::process::Command::new("mount")
+            .arg("-t")
+            .arg("9p")
+            .arg("-o")
+            .arg("trans=unix,version=9p2000.L,ro")
+            .arg(&ninep_socket)
+            .arg(&mount_point)
+            .output()
+            .await
+            .map_err(|e| VolumeMgrError::Mount(format!("mount command failed to execute: {e}")))?;
 
-        let deadline = time::Instant::now() + Duration::from_secs(5);
-        while time::Instant::now() < deadline {
-            if manifest_path.exists() {
-                let data = tokio::fs::read_to_string(&manifest_path)
-                    .await
-                    .map_err(|e| VolumeMgrError::Spawn(format!("failed to read manifest: {e}")))?;
-                // Clean up the manifest file after reading.
-                let _ = tokio::fs::remove_file(&manifest_path).await;
-                let manifest: VolumeManifest = serde_json::from_str(&data)
-                    .map_err(|e| VolumeMgrError::Spawn(format!("failed to parse manifest: {e}")))?;
-                return Ok(manifest);
-            }
-            time::sleep(Duration::from_millis(100)).await;
+        if !mount_output.status.success() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let stderr = String::from_utf8_lossy(&mount_output.stderr);
+            return Err(VolumeMgrError::Mount(format!(
+                "mount -t 9p failed: {stderr}"
+            )));
         }
 
-        Err(VolumeMgrError::Spawn(format!(
-            "manifest file did not appear within 5s for volume {volume_id}"
-        )))
+        self.processes.insert(
+            target_volume_id.to_string(),
+            VolumeProcess {
+                child,
+                mount_point: mount_point.clone(),
+                config_path,
+                generation,
+                s3_env: S3Env {
+                    access_key: s3.access_key.clone(),
+                    secret_key: s3.secret_key.clone(),
+                    encryption_passphrase: encryption_passphrase.to_string(),
+                },
+                health_tracker: VolumeHealthTracker::new(),
+                prewarm_handle: None,
+            },
+        );
+
+        Ok(mount_point)
     }
 
     /// Reap any child processes that have exited (crashed or terminated
@@ -1000,12 +1165,19 @@ impl VolumeMgr {
             .spawn()
             .expect("failed to spawn sleep for test helper");
         let mount_point = self.volumes_base.join(volume_id);
+        let config_path = PathBuf::from(format!("/tmp/syfrah/{volume_id}/zerofs.toml"));
         self.processes.insert(
             volume_id.to_string(),
             VolumeProcess {
                 child,
                 mount_point,
+                config_path,
                 generation,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1041,7 +1213,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-gen"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-gen/zerofs.toml"),
                 generation: 42,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1075,7 +1253,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-dup"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-dup/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1127,7 +1311,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-stop"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-stop/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1148,7 +1338,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-dead"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-dead/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1175,7 +1371,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-alive"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-alive/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1211,7 +1413,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-flush"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-flush/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1235,7 +1443,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/tmp/test-volumes/vol-force"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-force/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1274,7 +1488,13 @@ mod tests {
             VolumeProcess {
                 child,
                 mount_point: PathBuf::from("/var/lib/syfrah/volumes/vol-9p"),
+                config_path: PathBuf::from("/tmp/syfrah/vol-9p/zerofs.toml"),
                 generation: 1,
+                s3_env: S3Env {
+                    access_key: "test-ak".into(),
+                    secret_key: "test-sk".into(),
+                    encryption_passphrase: "test-pass".into(),
+                },
                 health_tracker: VolumeHealthTracker::new(),
                 prewarm_handle: None,
             },
@@ -1378,41 +1598,45 @@ mod tests {
     #[tokio::test]
     async fn capture_manifest_rejects_unknown_volume() {
         let mgr = VolumeMgr::new();
-        let result = mgr.capture_manifest("nonexistent").await;
+        let result = mgr.capture_manifest("nonexistent", "snap-1").await;
         assert!(matches!(result, Err(VolumeMgrError::NotRunning(_))));
     }
 
     #[tokio::test]
-    async fn capture_manifest_reads_file_when_present() {
+    async fn list_checkpoints_rejects_unknown_volume() {
+        let mgr = VolumeMgr::new();
+        let result = mgr.list_checkpoints("nonexistent").await;
+        assert!(matches!(result, Err(VolumeMgrError::NotRunning(_))));
+    }
+
+    #[tokio::test]
+    async fn restore_from_checkpoint_rejects_duplicate() {
         let mut mgr = VolumeMgr::new();
+        mgr.inject_fake_process("vol-dup-restore", 1);
 
-        // Inject a fake process.
-        mgr.inject_fake_process("vol-snap", 1);
+        let result = mgr
+            .restore_from_checkpoint(
+                "vol-dup-restore",
+                "snap-1",
+                &S3Config {
+                    endpoint: "http://s3:9000".into(),
+                    bucket: "test".into(),
+                    access_key: "ak".into(),
+                    secret_key: "sk".into(),
+                },
+                &CacheConfig {
+                    disk_path: PathBuf::from("/tmp/cache"),
+                    disk_size_bytes: 1_073_741_824,
+                    memory_size_bytes: 268_435_456,
+                },
+                "passphrase",
+                1,
+                50.0,
+            )
+            .await;
 
-        // Create the manifest directory and pre-write the manifest file
-        // that ZeroFS would create on SIGUSR1.
-        let manifest_dir = PathBuf::from("/tmp/syfrah/vol-snap");
-        tokio::fs::create_dir_all(&manifest_dir).await.unwrap();
-        let manifest = VolumeManifest {
-            sst_files: vec!["sst-a.sst".into(), "sst-b.sst".into()],
-            wal_position: 100,
-        };
-        let manifest_path = manifest_dir.join("vol-snap.manifest.json");
-        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
-            .await
-            .unwrap();
-
-        let result = mgr.capture_manifest("vol-snap").await;
-        assert!(result.is_ok(), "capture_manifest failed: {result:?}");
-        let captured = result.unwrap();
-        assert_eq!(captured.sst_files, vec!["sst-a.sst", "sst-b.sst"]);
-        assert_eq!(captured.wal_position, 100);
-
-        // Manifest file should be cleaned up.
-        assert!(!manifest_path.exists());
-
-        // Cleanup.
-        mgr.stop_volume("vol-snap").await.ok();
+        assert!(matches!(result, Err(VolumeMgrError::AlreadyRunning(_))));
+        mgr.stop_volume("vol-dup-restore").await.ok();
     }
 
     // ── VolumeHealth tests (#1209 — S3 outage degradation) ─────────
