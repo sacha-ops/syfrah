@@ -1734,6 +1734,13 @@ pub async fn run_daemon(
                 info!("raft: hypervisor store wired into state machine");
             }
 
+            // Wire shared storage store into the state machine so volume
+            // mutations are synced to the local redb materialized view.
+            if let Some(ref ss) = shared_storage_store {
+                sm_builder = sm_builder.with_storage_store(Arc::clone(ss));
+                info!("raft: storage store wired into state machine");
+            }
+
             let sm = std::sync::Arc::new(sm_builder);
 
             let network = syfrah_controlplane::SyfrahNetworkFactory::new();
@@ -2326,6 +2333,7 @@ pub async fn run_daemon(
             let aj_placement_store = shared_placement_store.clone();
             let aj_sg_rule_store = shared_sg_rule_store.clone();
             let aj_hypervisor_store = shared_hypervisor_store.clone();
+            let aj_storage_store = shared_storage_store.clone();
             let aj_raft_client_holder = Arc::clone(&raft_client_holder);
             let aj_forge_raft_client = Arc::clone(&forge_raft_client);
             let aj_forge_gossip_cluster = Arc::clone(&forge_gossip_cluster);
@@ -2560,6 +2568,12 @@ pub async fn run_daemon(
                                     info!(
                                     "raft: hypervisor store wired into state machine (in-process)"
                                 );
+                                }
+                                if let Some(ref ss) = aj_storage_store {
+                                    sm_builder = sm_builder.with_storage_store(Arc::clone(ss));
+                                    info!(
+                                        "raft: storage store wired into state machine (in-process)"
+                                    );
                                 }
 
                                 let sm = std::sync::Arc::new(sm_builder);

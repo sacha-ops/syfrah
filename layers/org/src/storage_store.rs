@@ -102,7 +102,7 @@ pub struct StorageQuota {
 ///
 /// Mirrors the `StorageConfig` in controlplane commands. Defined here so the
 /// store layer has no upward dependency on the controlplane crate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub s3_endpoint: String,
     pub s3_bucket: String,
@@ -111,6 +111,22 @@ pub struct StorageConfig {
     pub cache_disk_path: String,
     pub cache_disk_size_gb: u32,
     pub cache_memory_size_gb: u32,
+}
+
+// SECURITY: Custom Debug impl to prevent S3 credentials from appearing in logs
+// or error messages. Mirrors the redaction pattern in controlplane StorageConfig.
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key", &"[REDACTED]")
+            .field("s3_secret_key", &"[REDACTED]")
+            .field("cache_disk_path", &self.cache_disk_path)
+            .field("cache_disk_size_gb", &self.cache_disk_size_gb)
+            .field("cache_memory_size_gb", &self.cache_memory_size_gb)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +165,7 @@ impl StorageStore {
 
     // ── Helpers ─────────────────────────────────────────────────────
 
-    fn now() -> u64 {
+    pub fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -481,7 +497,7 @@ impl StorageStore {
         Ok(())
     }
 
-    fn add_to_hypervisor_index(&self, hypervisor_id: &str, volume_id: &str) -> Result<()> {
+    pub fn add_to_hypervisor_index(&self, hypervisor_id: &str, volume_id: &str) -> Result<()> {
         let mut ids: Vec<String> = self
             .db
             .get(VOLUMES_BY_HYPERVISOR_TABLE, hypervisor_id)?
@@ -494,7 +510,7 @@ impl StorageStore {
         Ok(())
     }
 
-    fn remove_from_hypervisor_index(&self, hypervisor_id: &str, volume_id: &str) -> Result<()> {
+    pub fn remove_from_hypervisor_index(&self, hypervisor_id: &str, volume_id: &str) -> Result<()> {
         let mut ids: Vec<String> = self
             .db
             .get(VOLUMES_BY_HYPERVISOR_TABLE, hypervisor_id)?

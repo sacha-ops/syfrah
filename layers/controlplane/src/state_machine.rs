@@ -247,6 +247,7 @@ pub struct RedbStateMachine {
     pub placement_store: Option<Arc<syfrah_org::PlacementStore>>,
     pub sg_rule_store: Option<Arc<syfrah_org::SgRuleStore>>,
     pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
+    pub storage_store: Option<Arc<syfrah_org::StorageStore>>,
     pub sm_state: RwLock<SmState>,
     pub current_snapshot: RwLock<Option<SmSnapshot>>,
     snapshot_idx: std::sync::Mutex<u64>,
@@ -274,6 +275,7 @@ impl RedbStateMachine {
             placement_store: None,
             sg_rule_store: None,
             hypervisor_store: None,
+            storage_store: None,
             sm_state: RwLock::new(SmState::default()),
             current_snapshot: RwLock::new(None),
             snapshot_idx: std::sync::Mutex::new(0),
@@ -371,6 +373,21 @@ impl RedbStateMachine {
             }
         }
 
+        // Export storage store tables.
+        if let Some(ref storage) = self.storage_store {
+            for table_name in syfrah_org::StorageStore::table_names() {
+                match storage.db().export_table_raw(table_name) {
+                    Ok(entries) if !entries.is_empty() => {
+                        tables.insert(table_name.to_string(), entries);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("snapshot: failed to export storage table {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
         tables
     }
 
@@ -428,6 +445,17 @@ impl RedbStateMachine {
                 }
             }
         }
+
+        // Import storage store tables.
+        if let Some(ref storage) = self.storage_store {
+            for table_name in syfrah_org::StorageStore::table_names() {
+                if let Some(entries) = tables.get(*table_name) {
+                    if let Err(e) = storage.db().import_table_raw(table_name, entries) {
+                        warn!("snapshot: failed to import storage table {table_name}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribe to placement events for incremental FDB updates.
@@ -462,6 +490,12 @@ impl RedbStateMachine {
         self
     }
 
+    /// Set the storage store for syncing in-memory StorageState to redb.
+    pub fn with_storage_store(mut self, store: Arc<syfrah_org::StorageStore>) -> Self {
+        self.storage_store = Some(store);
+        self
+    }
+
     /// Replace the internal placement-event broadcast sender with an
     /// externally created one.  This lets the caller subscribe *before*
     /// the state machine (and therefore before openraft) is created,
@@ -469,6 +503,128 @@ impl RedbStateMachine {
     pub fn with_placement_tx(mut self, tx: tokio::sync::broadcast::Sender<PlacementEvent>) -> Self {
         self.placement_tx = tx;
         self
+    }
+
+    // -- redb sync helpers ---------------------------------------------------
+    //
+    // After mutating the in-memory StorageState, these helpers write the
+    // corresponding record to the redb StorageStore so that read-path
+    // queries (e.g. `syfrah volume list`) see the latest state.
+
+    /// Convert an in-memory VolumeRecord to a storage_store::Volume and upsert.
+    ///
+    /// Maintains the `VOLUMES_BY_HYPERVISOR` secondary index by comparing the
+    /// old hypervisor assignment (from redb) with the new one. Also sets
+    /// proper `created_at` / `updated_at` timestamps.
+    fn sync_volume_to_store(&self, vol: &VolumeRecord) {
+        let Some(ref store) = self.storage_store else {
+            return;
+        };
+        let now = syfrah_org::StorageStore::now();
+        let existing = store.get_volume(&vol.id).ok().flatten();
+        let store_vol = syfrah_org::storage_store::Volume {
+            id: vol.id.clone(),
+            name: vol.name.clone(),
+            size_gb: vol.size_gb,
+            org_id: vol.org_id.clone(),
+            project_id: vol.project_id.clone(),
+            env_id: vol.env_id.clone(),
+            volume_type: match vol.volume_type {
+                VolumeType::Root => syfrah_org::storage_store::VolumeType::Root,
+                VolumeType::Data => syfrah_org::storage_store::VolumeType::Data,
+            },
+            state: match vol.state {
+                VolumeState::Available => syfrah_org::storage_store::VolumeState::Available,
+                VolumeState::Attached => syfrah_org::storage_store::VolumeState::Attached,
+                VolumeState::Deleted => syfrah_org::storage_store::VolumeState::Deleted,
+            },
+            attached_vm_id: vol.attached_vm_id.clone(),
+            attached_hypervisor_id: vol.attached_hypervisor_id.clone(),
+            placement_generation: vol.placement_generation,
+            created_at: existing.as_ref().map_or(now, |e| e.created_at),
+            updated_at: now,
+        };
+
+        // Maintain VOLUMES_BY_HYPERVISOR index: compare old ↔ new hypervisor.
+        let old_hv = existing
+            .as_ref()
+            .and_then(|e| e.attached_hypervisor_id.as_deref());
+        let new_hv = vol.attached_hypervisor_id.as_deref();
+        if old_hv != new_hv {
+            // Remove from old hypervisor index.
+            if let Some(hv_id) = old_hv {
+                if let Err(e) = store.remove_from_hypervisor_index(hv_id, &vol.id) {
+                    warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
+                        "failed to remove volume from old hypervisor index");
+                }
+            }
+            // Add to new hypervisor index.
+            if let Some(hv_id) = new_hv {
+                if let Err(e) = store.add_to_hypervisor_index(hv_id, &vol.id) {
+                    warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
+                        "failed to add volume to new hypervisor index");
+                }
+            }
+        }
+
+        // Use create for new volumes, update for existing ones.
+        if existing.is_some() {
+            if let Err(e) = store.update_volume(&store_vol) {
+                warn!(volume_id = %vol.id, error = %e, "failed to sync volume update to redb");
+            }
+        } else {
+            if let Err(e) = store.create_volume(&store_vol) {
+                warn!(volume_id = %vol.id, error = %e, "failed to sync volume create to redb");
+            }
+        }
+    }
+
+    /// Remove a volume from the redb store (hard delete for purged tombstones).
+    fn sync_volume_delete_from_store(&self, volume_id: &str) {
+        let Some(ref store) = self.storage_store else {
+            return;
+        };
+        if let Err(e) = store.delete_volume(volume_id) {
+            // Not-found is fine — the volume may not have been synced yet.
+            if !e.to_string().contains("not found") {
+                warn!(volume_id, error = %e, "failed to sync volume delete to redb");
+            }
+        }
+    }
+
+    /// Sync a storage config to the redb store.
+    fn sync_storage_config_to_store(&self, region: &str, config: &StorageConfig) {
+        let Some(ref store) = self.storage_store else {
+            return;
+        };
+        let store_config = syfrah_org::storage_store::StorageConfig {
+            s3_endpoint: config.s3_endpoint.clone(),
+            s3_bucket: config.s3_bucket.clone(),
+            s3_access_key: config.s3_access_key.clone(),
+            s3_secret_key: config.s3_secret_key.clone(),
+            cache_disk_path: config.cache_disk_path.clone(),
+            cache_disk_size_gb: config.cache_disk_size_gb,
+            cache_memory_size_gb: config.cache_memory_size_gb,
+        };
+        if let Err(e) = store.set_storage_config(region, &store_config) {
+            warn!(region, error = %e, "failed to sync storage config to redb");
+        }
+    }
+
+    /// Sync a storage quota to the redb store.
+    fn sync_quota_to_store(&self, scope: &QuotaScope, quota: &StorageQuota) {
+        let Some(ref store) = self.storage_store else {
+            return;
+        };
+        let key = Self::quota_key(scope);
+        let store_quota = syfrah_org::storage_store::StorageQuota {
+            max_volumes: quota.max_volumes,
+            max_total_gb: quota.max_total_gb,
+            max_snapshots: quota.max_snapshots,
+        };
+        if let Err(e) = store.set_storage_quota(&key, &store_quota) {
+            warn!(scope = %key, error = %e, "failed to sync storage quota to redb");
+        }
     }
 
     /// Serialize a `QuotaScope` into a deterministic key for the quotas map.
@@ -1693,7 +1849,9 @@ impl RedbStateMachine {
                     max_snapshots: *max_snapshots,
                 };
                 let mut storage = self.storage.write().unwrap();
-                storage.quotas.insert(key, quota);
+                storage.quotas.insert(key, quota.clone());
+                drop(storage);
+                self.sync_quota_to_store(scope, &quota);
                 info!(%scope, max_volumes, max_total_gb, max_snapshots, "storage quota set");
                 StateMachineResponse::Ok
             }
@@ -1713,6 +1871,8 @@ impl RedbStateMachine {
                 storage
                     .storage_configs
                     .insert(region.clone(), *config.clone());
+                drop(storage);
+                self.sync_storage_config_to_store(region, config);
                 info!(region = %region, "storage config set");
                 StateMachineResponse::Ok
             }
@@ -1731,6 +1891,10 @@ impl RedbStateMachine {
                 }
                 for id in &purged {
                     storage.volumes.remove(id);
+                }
+                drop(storage);
+                for id in &purged {
+                    self.sync_volume_delete_from_store(id);
                 }
                 if !purged.is_empty() {
                     info!(count = purged.len(), "purged expired volume tombstones");
@@ -1785,6 +1949,11 @@ impl RedbStateMachine {
                     deleted_at: None,
                 };
                 storage.volumes.insert(id.clone(), record);
+                let synced = storage.volumes.get(id).cloned();
+                drop(storage);
+                if let Some(ref vol) = synced {
+                    self.sync_volume_to_store(vol);
+                }
                 info!(
                     id,
                     name, size_gb, org_id, project_id, env_id, "volume created"
@@ -1908,6 +2077,11 @@ impl RedbStateMachine {
                             vol.attached_vm_id = None;
                             vol.attached_hypervisor_id = None;
                         }
+                        let synced = storage.volumes.get(volume_id).cloned();
+                        drop(storage);
+                        if let Some(ref vol) = synced {
+                            self.sync_volume_to_store(vol);
+                        }
 
                         info!(volume_id, "volume marked as deleted (tombstone)");
                         StateMachineResponse::Ok
@@ -1928,6 +2102,9 @@ impl RedbStateMachine {
                         vol.attached_vm_id = Some(vm_id.clone());
                         vol.attached_hypervisor_id = Some(hypervisor_id.clone());
                         vol.placement_generation += 1;
+                        let synced = vol.clone();
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
                         info!(volume_id, vm_id, hypervisor_id, "volume attached");
                         StateMachineResponse::Ok
                     }
@@ -1951,9 +2128,12 @@ impl RedbStateMachine {
                         vol.state = VolumeState::Available;
                         vol.attached_vm_id = None;
                         vol.attached_hypervisor_id = None;
+                        let synced = vol.clone();
                         // Clear manifest pointer so new writer after reattach
                         // starts at version 1 (ADR-006 §12b).
                         storage.manifest_pointers.remove(volume_id);
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
                         info!(volume_id, "volume detached (manifest pointer cleared)");
                         StateMachineResponse::Ok
                     }
@@ -1995,11 +2175,14 @@ impl RedbStateMachine {
                         vol.placement_generation += 1;
                         vol.attached_hypervisor_id = Some(to_hypervisor.clone());
                         vol.attached_vm_id = Some(new_vm_id.clone());
+                        let synced = vol.clone();
+                        drop(storage);
+                        self.sync_volume_to_store(&synced);
                         info!(
                             volume_id,
                             from = from_hypervisor,
                             to = to_hypervisor,
-                            generation = vol.placement_generation,
+                            generation = synced.placement_generation,
                             "volume rescheduled"
                         );
                         StateMachineResponse::Ok
@@ -2052,6 +2235,9 @@ impl RedbStateMachine {
                 let mut storage = self.storage.write().unwrap();
                 if let Some(vol) = storage.volumes.get_mut(volume_id) {
                     vol.size_gb = *new_size_gb;
+                    let synced = vol.clone();
+                    drop(storage);
+                    self.sync_volume_to_store(&synced);
                     info!(volume_id, new_size_gb, "volume resized");
                     StateMachineResponse::Ok
                 } else {
@@ -2335,6 +2521,11 @@ impl RedbStateMachine {
                     deleted_at: None,
                 };
                 storage.volumes.insert(new_volume_id.clone(), record);
+                let synced = storage.volumes.get(new_volume_id).cloned();
+                drop(storage);
+                if let Some(ref vol) = synced {
+                    self.sync_volume_to_store(vol);
+                }
                 info!(
                     snapshot_id,
                     new_volume_id, new_volume_name, size_gb, "snapshot restored"
