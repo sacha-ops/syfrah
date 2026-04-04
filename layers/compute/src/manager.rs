@@ -805,6 +805,36 @@ impl VmManager {
             spec.network.clone()
         };
 
+        // -- Volume setup: wait for ZeroFS root volume to be ready -----------
+        // When a root_volume_id is set, the Raft reconciler has already started
+        // ZeroFS and mounted the 9P filesystem. We poll until the mount path
+        // exists before booting the workload — similar to how NetworkSetup
+        // prepares networking before VM start.
+        let volume_mount_path = if let Some(ref vol_id) = spec.root_volume_id {
+            match crate::volume_setup::wait_for_volume_ready(vol_id).await {
+                Ok(path) => {
+                    info!(
+                        vm_id = %vm_id_str,
+                        volume_id = %vol_id,
+                        mount_path = %path.display(),
+                        "root volume ready, will be mounted inside workload"
+                    );
+                    Some(path)
+                }
+                Err(e) => {
+                    warn!(
+                        vm_id = %vm_id_str,
+                        volume_id = %vol_id,
+                        error = %e,
+                        "root volume not ready, proceeding without volume mount"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let runtime_spec = RuntimeSpec {
             vcpus: spec.vcpus,
             memory_mb: spec.memory_mb,
@@ -814,6 +844,7 @@ impl VmManager {
             gpu: spec.gpu.clone(),
             image_name: Some(spec.image.clone()),
             ssh_public_key: spec.ssh_key.clone(),
+            volume_mount_path,
         };
 
         let handle = match self.runtime.create(&vm_id_str, &runtime_spec).await {

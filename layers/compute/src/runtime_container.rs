@@ -421,7 +421,7 @@ fn generate_oci_config(id: &str, spec: &RuntimeSpec) -> serde_json::Value {
         vec!["/bin/sh", "-c", "exec /sbin/init || exec sleep infinity"]
     };
 
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "ociVersion": "1.0.0",
         "process": {
             "terminal": false,
@@ -519,7 +519,22 @@ fn generate_oci_config(id: &str, spec: &RuntimeSpec) -> serde_json::Value {
                 { "type": "network" }
             ]
         }
-    })
+    });
+
+    // If a ZeroFS volume mount path is available, add a bind-mount at /data
+    // so persistent storage is accessible inside the container.
+    if let Some(ref vol_path) = spec.volume_mount_path {
+        if let Some(mounts) = config["mounts"].as_array_mut() {
+            mounts.push(serde_json::json!({
+                "destination": "/data",
+                "type": "none",
+                "source": vol_path.to_string_lossy(),
+                "options": ["bind", "rw"]
+            }));
+        }
+    }
+
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,6 +1537,7 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let config = generate_oci_config("test-vm-1", &spec);
         assert_eq!(config["hostname"], "test-vm-1");
@@ -1538,6 +1554,7 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let config = generate_oci_config("mem-test", &spec);
         let limit = config["linux"]["resources"]["memory"]["limit"]
@@ -1557,6 +1574,7 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let config = generate_oci_config("cpu-test", &spec);
         let shares = config["linux"]["resources"]["cpu"]["shares"]
@@ -1576,6 +1594,7 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let config = generate_oci_config("ns-test", &spec);
         let namespaces = config["linux"]["namespaces"].as_array().unwrap();
@@ -1600,9 +1619,60 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let config = generate_oci_config("ver-test", &spec);
         assert_eq!(config["ociVersion"], "1.0.0");
+    }
+
+    #[test]
+    fn generate_oci_config_with_volume_mount() {
+        let spec = RuntimeSpec {
+            vcpus: 1,
+            memory_mb: 256,
+            rootfs_path: PathBuf::from("/tmp/rootfs"),
+            cloud_init_path: None,
+            network: None,
+            gpu: GpuMode::None,
+            image_name: None,
+            ssh_public_key: None,
+            volume_mount_path: Some(PathBuf::from("/var/lib/syfrah/volumes/vol-root-test")),
+        };
+        let config = generate_oci_config("vol-test", &spec);
+        let mounts = config["mounts"].as_array().unwrap();
+        // The last mount should be the /data bind-mount.
+        let data_mount = mounts.iter().find(|m| m["destination"] == "/data");
+        assert!(
+            data_mount.is_some(),
+            "expected /data bind-mount in OCI config"
+        );
+        let dm = data_mount.unwrap();
+        assert_eq!(dm["source"], "/var/lib/syfrah/volumes/vol-root-test");
+        let opts = dm["options"].as_array().unwrap();
+        assert!(opts.iter().any(|o| o == "bind"));
+        assert!(opts.iter().any(|o| o == "rw"));
+    }
+
+    #[test]
+    fn generate_oci_config_without_volume_mount() {
+        let spec = RuntimeSpec {
+            vcpus: 1,
+            memory_mb: 256,
+            rootfs_path: PathBuf::from("/tmp/rootfs"),
+            cloud_init_path: None,
+            network: None,
+            gpu: GpuMode::None,
+            image_name: None,
+            ssh_public_key: None,
+            volume_mount_path: None,
+        };
+        let config = generate_oci_config("no-vol-test", &spec);
+        let mounts = config["mounts"].as_array().unwrap();
+        let data_mount = mounts.iter().find(|m| m["destination"] == "/data");
+        assert!(
+            data_mount.is_none(),
+            "should not have /data mount when volume_mount_path is None"
+        );
     }
 
     #[test]
