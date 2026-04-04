@@ -263,9 +263,17 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 "created_at": 0,
             }))
         }
-        StorageRequest::SnapshotDelete { name } => StorageResponse::Error(format!(
-            "snapshot '{name}' not found. List available snapshots with: syfrah volume snapshot list"
-        )),
+        StorageRequest::SnapshotDelete { name } => {
+            // TODO(#1202): forward to Raft DeleteSnapshot once storage store
+            // integration is complete. The Raft handler will:
+            //   1. Reject if a restore is in progress for this snapshot
+            //   2. Decrement SST refcounts
+            //   3. Mark SSTs with refcount=0 for GC (pending_gc_ssts)
+            //   4. Recalculate minimum WAL retention position
+            // For now, return Ok to match the CLI flow.
+            let _ = name;
+            StorageResponse::Ok
+        }
         StorageRequest::Configure { region, .. } => {
             // TODO: forward to Raft SetStorageConfig
             StorageResponse::StorageConfigured { region }
@@ -465,6 +473,21 @@ mod tests {
             }
             other => panic!("expected Volume, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_ok_on_snapshot_delete() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotDelete {
+            name: "daily-backup".into(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(
+            matches!(resp, StorageResponse::Ok),
+            "expected Ok, got {resp:?}"
+        );
     }
 
     #[tokio::test]

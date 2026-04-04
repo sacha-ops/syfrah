@@ -400,6 +400,16 @@ pub enum StateMachineCommand {
         new_volume_id: String,
         new_volume_name: String,
     },
+    /// Mark a snapshot as having a restore in progress. While this flag
+    /// is set, `DeleteSnapshot` will be rejected for this snapshot.
+    MarkRestoreBegin {
+        snapshot_id: String,
+    },
+    /// Clear the restore-in-progress flag for a snapshot. Called by the
+    /// reconciler once the restored volume is fully materialized.
+    MarkRestoreComplete {
+        snapshot_id: String,
+    },
     /// Set per-region S3 storage configuration (replicated to all nodes).
     /// NOTE: The encryption_passphrase is NOT included — it is stored locally
     /// on each hypervisor with 0600 permissions, never replicated via Raft.
@@ -504,6 +514,12 @@ impl std::fmt::Display for StateMachineCommand {
                 new_volume_id,
                 ..
             } => write!(f, "RestoreSnapshot({snapshot_id}→{new_volume_id})"),
+            Self::MarkRestoreBegin { snapshot_id } => {
+                write!(f, "MarkRestoreBegin({snapshot_id})")
+            }
+            Self::MarkRestoreComplete { snapshot_id } => {
+                write!(f, "MarkRestoreComplete({snapshot_id})")
+            }
             Self::SetStorageConfig { region, .. } => write!(f, "SetStorageConfig({region})"),
             Self::SetStorageQuota { scope, .. } => write!(f, "SetStorageQuota({scope})"),
             Self::PurgeTombstones { max_age_secs, .. } => {
@@ -846,6 +862,12 @@ mod tests {
                 manifest_version: 1,
                 s3_key: "manifests/vol-01/v1.json".into(),
                 published_by: "hv1".into(),
+            },
+            StateMachineCommand::MarkRestoreBegin {
+                snapshot_id: "snap-01".into(),
+            },
+            StateMachineCommand::MarkRestoreComplete {
+                snapshot_id: "snap-01".into(),
             },
         ];
 
