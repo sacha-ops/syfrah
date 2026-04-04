@@ -179,6 +179,13 @@ pub trait VolumeStateReader: Send + Sync {
     /// the detach sequence: CH remove-device → ZeroFS flush → NBD disconnect.
     async fn pending_detaches(&self, local_hypervisor_id: &str) -> Vec<DesiredDetach>;
 
+    /// List volume IDs in the Deleted state that were assigned to this hypervisor.
+    ///
+    /// The reconciler uses this to trigger full cleanup (config dir, cache dir)
+    /// after stopping a deleted volume. Volumes that are merely detached or
+    /// fenced are NOT returned here — only tombstoned (Deleted) volumes.
+    async fn deleted_volumes(&self, local_hypervisor_id: &str) -> Vec<String>;
+
     /// Get the storage config for the region, if configured.
     async fn storage_config(&self) -> Option<RegionStorageConfig>;
 }
@@ -215,6 +222,8 @@ pub struct StorageReconcileReport {
     pub detached: usize,
     pub reaped: usize,
     pub attached: usize,
+    /// Number of deleted volumes that had local dirs cleaned up.
+    pub cleaned_up: usize,
     pub errors: Vec<String>,
     pub duration_ms: u64,
 }
@@ -631,6 +640,12 @@ impl StorageReconciler {
         }
 
         // 7. Stop volumes that are running but not desired (fenced/detached/deleted).
+        //    Also query deleted volumes so we can clean up local dirs after stopping.
+        let deleted_ids: std::collections::HashSet<String> = reader
+            .deleted_volumes(&self.local_hypervisor_id)
+            .await
+            .into_iter()
+            .collect();
         for id in running.keys() {
             if !desired_map.contains_key(id) {
                 // Skip if already stopped during generation fencing above.
@@ -643,14 +658,42 @@ impl StorageReconciler {
                 if pending_detach_ids.contains(id) {
                     continue;
                 }
-                let reason =
-                    "volume no longer desired on this hypervisor (detached/deleted/fenced)";
+                let is_deleted = deleted_ids.contains(id);
+                let reason = if is_deleted {
+                    "volume deleted — stopping ZeroFS and cleaning up"
+                } else {
+                    "volume no longer desired on this hypervisor (detached/fenced)"
+                };
                 info!(volume_id = %id, reason, "storage reconciler: stopping volume");
                 match volume_mgr.stop_volume(id).await {
                     Ok(()) => {
                         report.stopped += 1;
                         // Remove from attached set — volume is no longer running.
                         self.attached_volumes.lock().unwrap().remove(id);
+
+                        // For deleted volumes, clean up config dir and cache dir.
+                        if is_deleted {
+                            info!(volume_id = %id, "storage reconciler: cleaning up dirs for deleted volume");
+                            volume_mgr.cleanup_volume_dirs(id).await;
+                            // Clean up cache dir via the storage layer.
+                            let cache_config = syfrah_storage::CacheConfig {
+                                ssd_path: config.cache_disk_path.clone(),
+                                ssd_size_gb: (config.cache_disk_size_bytes / (1024 * 1024 * 1024))
+                                    as u32,
+                                memory_size_gb: (config.cache_memory_size_bytes
+                                    / (1024 * 1024 * 1024))
+                                    as u32,
+                            };
+                            if let Err(e) = syfrah_storage::cleanup_volume_cache(&cache_config, id)
+                            {
+                                warn!(
+                                    volume_id = %id,
+                                    error = %e,
+                                    "storage reconciler: cache cleanup failed for deleted volume"
+                                );
+                            }
+                            report.cleaned_up += 1;
+                        }
                     }
                     Err(e) => {
                         error!(volume_id = %id, error = %e, "storage reconciler: failed to stop volume");
@@ -734,6 +777,7 @@ impl StorageReconciler {
             stopped = report.stopped,
             attached = report.attached,
             detached = report.detached,
+            cleaned_up = report.cleaned_up,
             reaped = report.reaped,
             errors = report.errors.len(),
             "storage reconciliation pass complete"
@@ -817,6 +861,10 @@ impl VolumeStateReader for EmptyStateReader {
     }
 
     async fn pending_detaches(&self, _local_hypervisor_id: &str) -> Vec<DesiredDetach> {
+        Vec::new()
+    }
+
+    async fn deleted_volumes(&self, _local_hypervisor_id: &str) -> Vec<String> {
         Vec::new()
     }
 
@@ -913,6 +961,25 @@ impl VolumeStateReader for RaftVolumeStateReader {
             .collect()
     }
 
+    async fn deleted_volumes(&self, local_hypervisor_id: &str) -> Vec<String> {
+        let guard = self.sm.read().await;
+        let sm = match guard.as_ref() {
+            Some(sm) => sm,
+            None => return Vec::new(),
+        };
+
+        let storage = sm.storage.read().unwrap();
+        storage
+            .volumes
+            .values()
+            .filter(|vol| {
+                vol.state == syfrah_controlplane::VolumeState::Deleted
+                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
+            })
+            .map(|vol| vol.id.clone())
+            .collect()
+    }
+
     async fn storage_config(&self) -> Option<RegionStorageConfig> {
         let guard = self.sm.read().await;
         let sm = guard.as_ref()?;
@@ -946,6 +1013,7 @@ mod tests {
     struct MockStateReader {
         desired: Mutex<Vec<DesiredVolume>>,
         detaches: Mutex<Vec<DesiredDetach>>,
+        deleted: Mutex<Vec<String>>,
         config: Mutex<Option<RegionStorageConfig>>,
     }
 
@@ -954,6 +1022,7 @@ mod tests {
             Self {
                 desired: Mutex::new(Vec::new()),
                 detaches: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
                 config: Mutex::new(None),
             }
         }
@@ -978,6 +1047,10 @@ mod tests {
         fn set_detaches(&self, detaches: Vec<DesiredDetach>) {
             *self.detaches.lock().unwrap() = detaches;
         }
+
+        fn set_deleted(&self, ids: Vec<String>) {
+            *self.deleted.lock().unwrap() = ids;
+        }
     }
 
     #[async_trait::async_trait]
@@ -988,6 +1061,10 @@ mod tests {
 
         async fn pending_detaches(&self, _local_hypervisor_id: &str) -> Vec<DesiredDetach> {
             self.detaches.lock().unwrap().clone()
+        }
+
+        async fn deleted_volumes(&self, _local_hypervisor_id: &str) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
         }
 
         async fn storage_config(&self) -> Option<RegionStorageConfig> {
@@ -1933,5 +2010,101 @@ mod tests {
         assert!(result.unwrap_err().contains("raft: not leader"));
 
         mgr.stop_volume(vol_id).await.ok();
+    }
+
+    // ── Volume delete cleanup tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn reconcile_stops_and_cleans_up_deleted_volume() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        let vol_id = "vol-del-cleanup";
+
+        // Create the config dir that start_volume would normally create.
+        let config_dir = std::path::PathBuf::from(format!("/tmp/syfrah/{vol_id}"));
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(config_dir.join("zerofs.toml"), b"# test config")
+            .await
+            .unwrap();
+
+        // Inject a fake running process (simulates ZeroFS running).
+        mgr.inject_fake_process(vol_id, 1);
+        assert!(mgr.is_running(vol_id));
+
+        // No desired volumes — the volume has been deleted from Raft.
+        // Mark it as deleted so cleanup triggers.
+        reader.set_desired(vec![]);
+        reader.set_deleted(vec![vol_id.to_string()]);
+
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+
+        // Volume should have been stopped.
+        assert_eq!(report.stopped, 1, "expected 1 stop, got {}", report.stopped);
+        assert!(
+            !mgr.is_running(vol_id),
+            "volume should no longer be running"
+        );
+
+        // Config dir should have been cleaned up.
+        assert!(
+            !config_dir.exists(),
+            "config dir should be removed after delete cleanup"
+        );
+
+        // Cleanup counter should reflect the work done.
+        assert_eq!(
+            report.cleaned_up, 1,
+            "expected 1 cleaned_up, got {}",
+            report.cleaned_up
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_stops_non_deleted_volume_without_cleanup() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+
+        let vol_id = "vol-fenced";
+
+        // Create the config dir.
+        let config_dir = std::path::PathBuf::from(format!("/tmp/syfrah/{vol_id}"));
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(config_dir.join("zerofs.toml"), b"# test config")
+            .await
+            .unwrap();
+
+        mgr.inject_fake_process(vol_id, 1);
+        assert!(mgr.is_running(vol_id));
+
+        // Volume not in desired list (fenced/detached), but NOT marked as deleted.
+        reader.set_desired(vec![]);
+        reader.set_deleted(vec![]); // Not deleted — just fenced.
+
+        let report = reconciler.reconcile_once(&reader, &mut mgr).await;
+
+        // Volume should be stopped.
+        assert_eq!(report.stopped, 1);
+        assert!(!mgr.is_running(vol_id));
+
+        // Config dir should NOT be cleaned up (volume is fenced, not deleted).
+        assert!(
+            config_dir.exists(),
+            "config dir should NOT be removed for fenced (non-deleted) volume"
+        );
+
+        // No cleanup reported.
+        assert_eq!(report.cleaned_up, 0);
+
+        // Manual cleanup for test hygiene.
+        let _ = tokio::fs::remove_dir_all(&config_dir).await;
+    }
+
+    #[test]
+    fn reconcile_report_default_includes_cleaned_up() {
+        let report = StorageReconcileReport::default();
+        assert_eq!(report.cleaned_up, 0);
     }
 }
