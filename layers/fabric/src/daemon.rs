@@ -661,6 +661,14 @@ pub fn setup_start() -> anyhow::Result<DaemonReady> {
 /// Restart daemon from saved state (foreground).
 pub async fn run_start() -> anyhow::Result<()> {
     let ready = setup_start()?;
+
+    // Auto-bootstrap Raft for the init node if it was not already done.
+    // This covers the background-daemon path where `setup_init()` runs in the
+    // parent process but `auto_bootstrap_raft()` was never called because the
+    // parent is not async.  The function is idempotent (checks the sentinel
+    // file) and skips nodes that already have peers (join nodes).
+    auto_bootstrap_raft(&ready.my_record.name).await?;
+
     println!("Running daemon... (Ctrl+C to stop)");
     run_daemon(
         ready.my_record,
@@ -747,6 +755,19 @@ async fn auto_bootstrap_raft(node_name: &str) -> anyhow::Result<()> {
 
     if sentinel.exists() {
         info!("raft: already initialized, skipping auto-bootstrap");
+        return Ok(());
+    }
+
+    // Only bootstrap on the init node (no peers).  Join nodes should wait
+    // for the auto-join loop in run_daemon to discover the existing Raft
+    // cluster instead of creating a conflicting single-node cluster.
+    let fabric_state_check = store::load()
+        .map_err(|e| anyhow::anyhow!("failed to load fabric state for raft bootstrap: {e}"))?;
+    if !fabric_state_check.peers.is_empty() {
+        info!(
+            "raft: node has {} peers — skipping single-node bootstrap (auto-join will handle it)",
+            fabric_state_check.peers.len()
+        );
         return Ok(());
     }
 
