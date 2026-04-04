@@ -182,6 +182,8 @@ fn error_to_status(err: &ComputeError) -> StatusCode {
         ComputeError::Transition(_) => StatusCode::CONFLICT,
         ComputeError::Concurrency(_) => StatusCode::CONFLICT,
         ComputeError::VmNotFound { .. } => StatusCode::NOT_FOUND,
+        ComputeError::InvalidState { .. } => StatusCode::CONFLICT,
+        ComputeError::VolumeNotAttached { .. } => StatusCode::NOT_FOUND,
         ComputeError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ComputeError::Client(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ComputeError::Image(_) => StatusCode::UNPROCESSABLE_ENTITY,

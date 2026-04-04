@@ -66,7 +66,6 @@ pub(crate) struct VmRuntimeState {
     pub(crate) zone: Option<String>,
     /// Hot-plugged volume tracking: volume_id -> CH device_id.
     /// Used to look up the device_id when detaching a volume.
-    #[allow(dead_code)]
     pub(crate) hotplug_devices: HashMap<String, String>,
 }
 
