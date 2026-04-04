@@ -3,19 +3,23 @@
 //! All operations go through the daemon's control socket, following the
 //! same pattern as `volume.rs`.
 
-use std::path::PathBuf;
-
 use crate::api::{send_storage_request, StorageRequest, StorageResponse};
 
-fn control_socket_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/root"))
-        .join(".syfrah")
-        .join("control.sock")
-}
+use super::fmt::{
+    control_socket_path, daemon_connect_error, format_timestamp, term_width, truncate,
+};
 
 /// Create a snapshot from a volume.
-pub async fn run_create(name: &str, volume: &str) -> anyhow::Result<()> {
+pub async fn run_create(
+    name: &str,
+    volume: &str,
+    project: Option<&str>,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
+    // project and org are forwarded to scope the volume lookup when provided.
+    // Today the daemon resolves volumes by name alone, but these flags ensure
+    // correctness when two projects contain identically-named volumes.
+    let _ = (project, org); // TODO: forward to daemon once SnapshotCreate supports scoping
     let req = StorageRequest::SnapshotCreate {
         name: name.to_string(),
         volume: volume.to_string(),
@@ -37,7 +41,15 @@ pub async fn run_create(name: &str, volume: &str) -> anyhow::Result<()> {
 }
 
 /// List snapshots, optionally filtered by source volume.
-pub async fn run_list(volume: Option<&str>, json: bool) -> anyhow::Result<()> {
+pub async fn run_list(
+    volume: Option<&str>,
+    project: Option<&str>,
+    org: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    // project and org are accepted for consistency with volume list but not yet
+    // forwarded to the daemon request.
+    let _ = (project, org); // TODO: forward once SnapshotList supports scoping
     let req = StorageRequest::SnapshotList {
         volume: volume.map(|s| s.to_string()),
     };
@@ -160,10 +172,10 @@ pub async fn run_get(name: &str, json: bool) -> anyhow::Result<()> {
 }
 
 /// Restore a snapshot into a new volume.
-pub async fn run_restore(snapshot: &str, name: &str) -> anyhow::Result<()> {
+pub async fn run_restore(snapshot: &str, target_volume: &str) -> anyhow::Result<()> {
     let req = StorageRequest::SnapshotRestore {
         snapshot: snapshot.to_string(),
-        name: name.to_string(),
+        name: target_volume.to_string(),
     };
     let resp = send_storage_request(&control_socket_path(), &req)
         .await
@@ -171,7 +183,7 @@ pub async fn run_restore(snapshot: &str, name: &str) -> anyhow::Result<()> {
 
     match resp {
         StorageResponse::Volume(v) => {
-            let vol_name = v["name"].as_str().unwrap_or(name);
+            let vol_name = v["name"].as_str().unwrap_or(target_volume);
             println!("Volume '{vol_name}' created from snapshot '{snapshot}'.");
             Ok(())
         }
@@ -208,60 +220,4 @@ pub async fn run_delete(name: &str, yes: bool) -> anyhow::Result<()> {
         StorageResponse::Error(msg) => anyhow::bail!("{msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build a user-friendly error when the daemon is unreachable.
-fn daemon_connect_error(e: Box<dyn std::error::Error>) -> anyhow::Error {
-    anyhow::anyhow!(
-        "cannot reach the syfrah daemon -- is it running?\n\
-         Start it with: syfrah fabric init ...\n\n\
-         Error: {e}"
-    )
-}
-
-/// Return the current terminal width, falling back to 120 columns.
-fn term_width() -> usize {
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(120)
-}
-
-/// Truncate a string to `max` characters, appending "..." if it exceeds the limit.
-fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else if max <= 3 {
-        s.chars().take(max).collect()
-    } else {
-        let truncated: String = s.chars().take(max - 3).collect();
-        format!("{truncated}...")
-    }
-}
-
-/// Format a Unix timestamp as a human-readable date string.
-fn format_timestamp(ts: u64) -> String {
-    let secs = ts;
-    let days = secs / 86400;
-    let (year, month, day) = days_to_date(days);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_date(days: u64) -> (u64, u64, u64) {
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }

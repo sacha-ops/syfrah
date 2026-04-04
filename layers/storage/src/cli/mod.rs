@@ -152,7 +152,7 @@ pub enum VolumeCommand {
             syfrah volume snapshot create daily-backup --volume pgdata\n  \
             syfrah volume snapshot list --volume pgdata\n  \
             syfrah volume snapshot get daily-backup\n  \
-            syfrah volume snapshot restore daily-backup --name pgdata-restored\n  \
+            syfrah volume snapshot restore daily-backup --target-volume pgdata-restored\n  \
             syfrah volume snapshot delete daily-backup")]
     Snapshot {
         #[command(subcommand)]
@@ -166,23 +166,35 @@ pub enum SnapshotCommand {
     /// Create a snapshot from a volume
     #[command(after_help = "Examples:\n  \
             syfrah volume snapshot create daily-backup --volume pgdata\n  \
-            syfrah volume snapshot create pre-migration --volume redis-data")]
+            syfrah volume snapshot create pre-migration --volume redis-data --project backend --org acme")]
     Create {
         /// Snapshot name (lowercase alphanumeric and hyphens, 3-63 chars)
         name: String,
         /// Source volume to snapshot
         #[arg(long)]
         volume: String,
+        /// Project the volume belongs to (auto-detected if volume name is unique)
+        #[arg(long)]
+        project: Option<String>,
+        /// Organization the volume belongs to (auto-detected if volume name is unique)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// List snapshots
     #[command(after_help = "Examples:\n  \
             syfrah volume snapshot list\n  \
             syfrah volume snapshot list --volume pgdata\n  \
-            syfrah volume snapshot list --json")]
+            syfrah volume snapshot list --project backend --org acme --json")]
     List {
         /// Filter by source volume name
         #[arg(long)]
         volume: Option<String>,
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by organization name
+        #[arg(long)]
+        org: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -200,14 +212,14 @@ pub enum SnapshotCommand {
     },
     /// Restore a snapshot into a new volume
     #[command(after_help = "Examples:\n  \
-            syfrah volume snapshot restore daily-backup --name pgdata-restored\n  \
-            syfrah volume snapshot restore pre-migration --name redis-data-v2")]
+            syfrah volume snapshot restore daily-backup --target-volume pgdata-restored\n  \
+            syfrah volume snapshot restore pre-migration --target-volume redis-data-v2")]
     Restore {
         /// Snapshot name to restore from
         snapshot: String,
-        /// Name for the new volume
+        /// Name for the new volume to create from the snapshot
         #[arg(long)]
-        name: String,
+        target_volume: String,
     },
     /// Delete a snapshot
     #[command(after_help = "Examples:\n  \
@@ -521,12 +533,23 @@ pub async fn run(cmd: VolumeCommand) -> anyhow::Result<()> {
 /// Execute a snapshot CLI command.
 pub async fn run_snapshot(cmd: SnapshotCommand) -> anyhow::Result<()> {
     match cmd {
-        SnapshotCommand::Create { name, volume } => snapshot::run_create(&name, &volume).await,
-        SnapshotCommand::List { volume, json } => snapshot::run_list(volume.as_deref(), json).await,
+        SnapshotCommand::Create {
+            name,
+            volume,
+            project,
+            org,
+        } => snapshot::run_create(&name, &volume, project.as_deref(), org.as_deref()).await,
+        SnapshotCommand::List {
+            volume,
+            project,
+            org,
+            json,
+        } => snapshot::run_list(volume.as_deref(), project.as_deref(), org.as_deref(), json).await,
         SnapshotCommand::Get { name, json } => snapshot::run_get(&name, json).await,
-        SnapshotCommand::Restore { snapshot, name } => {
-            snapshot::run_restore(&snapshot, &name).await
-        }
+        SnapshotCommand::Restore {
+            snapshot,
+            target_volume,
+        } => snapshot::run_restore(&snapshot, &target_volume).await,
         SnapshotCommand::Delete { name, yes } => snapshot::run_delete(&name, yes).await,
     }
 }
