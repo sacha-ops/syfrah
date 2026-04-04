@@ -195,19 +195,44 @@ pub fn apply_ruleset(ruleset: &str) -> std::io::Result<()> {
 
 // ── VPC bridge base rules ───────────────────────────────────────────
 
-/// Generate nftables rules to allow intra-VPC traffic (same bridge in/out)
-/// and internet egress from a VPC bridge.
+/// Generate nftables rules to allow intra-VPC traffic (same bridge in/out),
+/// cross-node VXLAN overlay traffic, and internet egress from a VPC bridge.
 ///
 /// With `policy drop` on the forward chain, traffic between bridges is
 /// blocked by default (VPC isolation). These rules explicitly allow:
 /// 1. Same-bridge traffic (intra-VPC communication between subnets)
-/// 2. Outbound internet egress (bridge → non-bridge interface)
+/// 2. Bridge-to-VXLAN traffic (local VM → remote VM via VXLAN tunnel)
+/// 3. VXLAN-to-bridge traffic (remote VM → local VM arriving via VXLAN)
+/// 4. Outbound internet egress (bridge → non-bridge interface)
+///
+/// Rules 2 and 3 are essential for cross-AZ / cross-node communication:
+/// VXLAN packets decapsulated on the receiving node arrive on the `syfx-*`
+/// interface and must be forwarded to the local bridge (`syfb-*`). Without
+/// these rules the forward chain's `policy drop` silently discards the
+/// decapsulated traffic.
 pub fn generate_bridge_accept_rules(bridge: &str) -> String {
+    // Derive the matching VXLAN interface name.  Bridge names use the
+    // format `syfb-{hash}` and the corresponding VXLAN interface is
+    // `syfx-{hash}` (same hash suffix).
+    let vxlan = bridge.replacen(crate::naming::BRIDGE_PREFIX, crate::naming::VXLAN_PREFIX, 1);
+
     let mut buf = String::new();
     // Same bridge: intra-VPC traffic allowed
     writeln!(
         buf,
         "add rule inet {TABLE_NAME} {CHAIN_NAME} iifname \"{bridge}\" oifname \"{bridge}\" accept"
+    )
+    .unwrap();
+    // Bridge → VXLAN: local VM sending to remote VM via overlay tunnel
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iifname \"{bridge}\" oifname \"{vxlan}\" accept"
+    )
+    .unwrap();
+    // VXLAN → Bridge: remote VM traffic arriving via overlay tunnel
+    writeln!(
+        buf,
+        "add rule inet {TABLE_NAME} {CHAIN_NAME} iifname \"{vxlan}\" oifname \"{bridge}\" accept"
     )
     .unwrap();
     // Internet egress: bridge → any non-bridge interface
@@ -417,6 +442,28 @@ mod tests {
         assert!(
             rules.contains(&format!("iifname \"{br}\" oifname \"{br}\" accept")),
             "same-bridge traffic must be accepted"
+        );
+    }
+
+    #[test]
+    fn bridge_accept_rules_vxlan_to_bridge() {
+        let br = crate::naming::bridge_name("100");
+        let vx = crate::naming::vxlan_name("100");
+        let rules = generate_bridge_accept_rules(&br);
+        assert!(
+            rules.contains(&format!("iifname \"{vx}\" oifname \"{br}\" accept")),
+            "VXLAN-to-bridge traffic must be accepted for cross-node communication"
+        );
+    }
+
+    #[test]
+    fn bridge_accept_rules_bridge_to_vxlan() {
+        let br = crate::naming::bridge_name("100");
+        let vx = crate::naming::vxlan_name("100");
+        let rules = generate_bridge_accept_rules(&br);
+        assert!(
+            rules.contains(&format!("iifname \"{br}\" oifname \"{vx}\" accept")),
+            "bridge-to-VXLAN traffic must be accepted for cross-node communication"
         );
     }
 

@@ -3940,6 +3940,31 @@ pub async fn run_daemon(
                 None => continue,
             };
 
+            // Build expected bridges for VPCs that have VMs on THIS node.
+            // This ensures bridge accept rules (including VXLAN ↔ bridge
+            // forwarding rules) are re-applied on every node, not only the
+            // Raft leader.  Without these rules, cross-node (cross-AZ) VXLAN
+            // traffic is silently dropped by the forward chain's policy drop.
+            let mut expected_bridges: Vec<syfrah_overlay::ExpectedBridge> = Vec::new();
+            if let Some(ref placement_store) = overlay_reconcile_placement_store {
+                match placement_store.list_by_node(&overlay_reconcile_local_node) {
+                    Ok(placements) => {
+                        let mut seen_vpcs = std::collections::HashSet::new();
+                        for p in &placements {
+                            if seen_vpcs.insert(p.vpc_id.clone()) {
+                                expected_bridges.push(syfrah_overlay::ExpectedBridge {
+                                    name: syfrah_overlay::naming::bridge_name(&p.vpc_id),
+                                    vpc_id: p.vpc_id.clone(),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "overlay reconcile: failed to list local placements");
+                    }
+                }
+            }
+
             // Build expected peerings from the org store.
             let peerings = match org_store.list_peerings() {
                 Ok(p) => p,
@@ -3975,6 +4000,7 @@ pub async fn run_daemon(
             }
 
             let state = syfrah_overlay::NetworkState {
+                bridges: expected_bridges,
                 peerings: expected_peerings,
                 ..Default::default()
             };
