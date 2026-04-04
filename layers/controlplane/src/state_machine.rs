@@ -1883,7 +1883,10 @@ impl RedbStateMachine {
                         vol.state = VolumeState::Available;
                         vol.attached_vm_id = None;
                         vol.attached_hypervisor_id = None;
-                        info!(volume_id, "volume detached");
+                        // Clear manifest pointer so new writer after reattach
+                        // starts at version 1 (ADR-006 §12b).
+                        storage.manifest_pointers.remove(volume_id);
+                        info!(volume_id, "volume detached (manifest pointer cleared)");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -4018,17 +4021,17 @@ mod tests {
             "stale generation should be rejected: {resp:?}"
         );
 
-        // New generation with correct version (still v2 since pointer wasn't cleared).
+        // Pointer was cleared on detach, so new writer must start at version 1.
         let resp = sm.apply_command(&StateMachineCommand::CommitManifest {
             volume_id: "vol-m1".into(),
             generation: 2,
-            manifest_version: 2,
-            s3_key: "manifests/vol-m1/v2.json".into(),
+            manifest_version: 1,
+            s3_key: "manifests/vol-m1/v1-gen2.json".into(),
             published_by: "hv-2".into(),
         });
         assert!(
             matches!(resp, StateMachineResponse::Ok),
-            "new generation commit should succeed: {resp:?}"
+            "new generation commit should succeed at version 1: {resp:?}"
         );
     }
 
