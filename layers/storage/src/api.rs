@@ -192,6 +192,9 @@ pub struct StorageStatusReport {
     /// Active cache alerts (empty when healthy).
     #[serde(default)]
     pub cache_alerts: Vec<String>,
+    /// Cache pre-warming progress for migrated volumes.
+    #[serde(default)]
+    pub warmup_progress: Vec<crate::cache::CachePrewarmProgress>,
 }
 
 /// Per-volume cache utilization (placeholder structure).
@@ -691,6 +694,7 @@ impl StorageLayerHandler {
                     volume_health: vec![],
                     cache_metrics: Some(crate::cache::CacheMetrics::default()),
                     cache_alerts: vec![],
+                    warmup_progress: vec![],
                 })
             }
         }

@@ -1145,8 +1145,14 @@ impl VmManager {
 
     /// Hot-plug a data volume to a running VM.
     ///
-    /// Sends `PUT /vm.add-disk` to Cloud Hypervisor and tracks the returned
-    /// device ID so the volume can be removed later via [`detach_volume`].
+    /// Sends `PUT /vm.add-fs` to Cloud Hypervisor to share a host directory
+    /// with the guest via virtio-fs, and tracks the device ID so the volume
+    /// can be removed later via [`detach_volume`].
+    ///
+    /// `mount_path` is the host-side 9P mount point (e.g.
+    /// `/var/lib/syfrah/volumes/vol-xxx`) where ZeroFS exposes the volume.
+    /// Cloud Hypervisor shares this directory with the guest via virtiofs.
+    /// The guest can then mount the share using the volume ID as the tag.
     ///
     /// Root volumes (`is_root == true`) cannot be hot-plugged — they must be
     /// specified at VM creation time.
@@ -1154,7 +1160,7 @@ impl VmManager {
         &self,
         vm_id: &str,
         volume_id: &str,
-        path: &str,
+        mount_path: &str,
         read_only: bool,
         is_root: bool,
     ) -> Result<(), ComputeError> {
@@ -1181,16 +1187,28 @@ impl VmManager {
         }
 
         // Build CH device ID from volume_id for stable tracking.
-        let device_id = format!("_disk_{volume_id}");
+        let device_id = format!("_fs_{volume_id}");
 
-        let disk_config = serde_json::json!({
-            "path": path,
-            "readonly": read_only,
+        // virtiofsd socket path — one per volume, co-located with the VM
+        // runtime directory.
+        let socket_path = guard
+            .socket_path
+            .parent()
+            .unwrap_or(std::path::Path::new("/run/syfrah/vms"))
+            .join(format!("virtiofs_{volume_id}.sock"));
+
+        // Use the volume_id as the virtiofs tag — the guest mounts this tag
+        // (e.g. `mount -t virtiofs vol-xxx /mnt/data`).
+        let fs_config = serde_json::json!({
+            "tag": volume_id,
+            "socket": socket_path.to_string_lossy(),
             "id": device_id,
+            "shared_dir": mount_path,
+            "readonly": read_only,
         });
 
         let client = crate::client::ChClient::new(guard.socket_path.clone());
-        client.add_disk(disk_config).await?;
+        client.add_fs(fs_config).await?;
 
         // Track the mapping for later removal.
         guard
@@ -1209,8 +1227,8 @@ impl VmManager {
             vm_id = vm_id,
             volume_id = volume_id,
             device_id = device_id,
-            path = path,
-            "hot-plugged volume"
+            mount_path = mount_path,
+            "hot-plugged volume via virtio-fs"
         );
         Ok(())
     }
@@ -1877,7 +1895,13 @@ mod tests {
         inject_fake_vm(&mgr, "vm-root-test", crate::phase::VmPhase::Running).await;
 
         let result = mgr
-            .attach_volume("vm-root-test", "vol-root", "/dev/vda", false, true)
+            .attach_volume(
+                "vm-root-test",
+                "vol-root",
+                "/var/lib/syfrah/volumes/vol-root",
+                false,
+                true,
+            )
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1891,7 +1915,13 @@ mod tests {
         inject_fake_vm(&mgr, "vm-stopped", crate::phase::VmPhase::Stopped).await;
 
         let result = mgr
-            .attach_volume("vm-stopped", "vol-1", "/dev/nbd0", false, false)
+            .attach_volume(
+                "vm-stopped",
+                "vol-1",
+                "/var/lib/syfrah/volumes/vol-1",
+                false,
+                false,
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1907,7 +1937,13 @@ mod tests {
         let mgr = make_test_manager(tmp.path());
 
         let result = mgr
-            .attach_volume("vm-missing", "vol-1", "/dev/nbd0", false, false)
+            .attach_volume(
+                "vm-missing",
+                "vol-1",
+                "/var/lib/syfrah/volumes/vol-1",
+                false,
+                false,
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(

@@ -1771,7 +1771,7 @@ impl RedbStateMachine {
             }
             StateMachineCommand::RescheduleVm {
                 vm_id,
-                from: _,
+                from,
                 to,
                 generation,
             } => {
@@ -1786,18 +1786,73 @@ impl RedbStateMachine {
                 // Update the placement in-place: change hypervisor_id and generation.
                 match placement_store.list_all() {
                     Ok(placements) => {
+                        let mut found = false;
                         for p in &placements {
                             if p.vm_id == *vm_id {
                                 let mut updated = p.clone();
                                 updated.hypervisor_id = to.clone();
                                 updated.placement_generation = *generation;
-                                return match placement_store.add_placement(&updated) {
-                                    Ok(()) => StateMachineResponse::Ok,
-                                    Err(e) => StateMachineResponse::Error(e.to_string()),
-                                };
+                                match placement_store.add_placement(&updated) {
+                                    Ok(()) => {
+                                        found = true;
+                                        break;
+                                    }
+                                    Err(e) => return StateMachineResponse::Error(e.to_string()),
+                                }
                             }
                         }
-                        StateMachineResponse::Error(format!("placement not found for VM: {vm_id}"))
+                        if !found {
+                            return StateMachineResponse::Error(format!(
+                                "placement not found for VM: {vm_id}"
+                            ));
+                        }
+
+                        // Reschedule all volumes attached to this VM.
+                        // This moves volumes from the source hypervisor to the target,
+                        // incrementing placement_generation for fencing so the source
+                        // node's reconciler stops ZeroFS and the target's starts it
+                        // with the new gen prefix (zero-copy migration via S3).
+                        let mut storage = self.storage.write().unwrap();
+                        let vol_ids: Vec<String> = storage
+                            .volumes
+                            .iter()
+                            .filter(|(_, vol)| {
+                                vol.state == VolumeState::Attached
+                                    && vol.attached_vm_id.as_deref() == Some(vm_id)
+                                    && vol.attached_hypervisor_id.as_deref() == Some(from)
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect();
+
+                        for vol_id in &vol_ids {
+                            if let Some(vol) = storage.volumes.get_mut(vol_id) {
+                                vol.placement_generation += 1;
+                                vol.attached_hypervisor_id = Some(to.clone());
+                                let synced = vol.clone();
+                                // Release storage lock temporarily to sync to redb.
+                                drop(storage);
+                                self.sync_volume_to_store(&synced);
+                                info!(
+                                    volume_id = vol_id,
+                                    from = from,
+                                    to = to,
+                                    generation = synced.placement_generation,
+                                    "volume rescheduled with VM"
+                                );
+                                storage = self.storage.write().unwrap();
+                            }
+                        }
+
+                        if !vol_ids.is_empty() {
+                            info!(
+                                vm_id = vm_id,
+                                volume_count = vol_ids.len(),
+                                "rescheduled {} volume(s) along with VM",
+                                vol_ids.len()
+                            );
+                        }
+
+                        StateMachineResponse::Ok
                     }
                     Err(e) => StateMachineResponse::Error(e.to_string()),
                 }
@@ -3507,6 +3562,102 @@ mod tests {
             assert_eq!(vol.placement_generation, 1);
             assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-1"));
         }
+    }
+
+    #[test]
+    fn reschedule_vm_cascades_to_attached_volumes() {
+        // Create a placement store so RescheduleVm can update placements.
+        let ps_dir = tempfile::tempdir().unwrap();
+        let ps_path = ps_dir.path().join("placement.redb");
+        let ps_db = syfrah_state::LayerDb::open_at(&ps_path).unwrap();
+        let ps = Arc::new(syfrah_org::PlacementStore::new(ps_db));
+
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store).with_placement_store(ps.clone());
+
+        // Seed a VM placement for "vm-1" on "hv-src".
+        let placement = syfrah_org::types::VmPlacement {
+            vpc_id: "vpc-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            vm_mac: "02:00:00:00:00:01".to_string(),
+            vm_ip: "10.0.0.1".to_string(),
+            subnet_id: "vpc-1/sub-1".to_string(),
+            hypervisor_id: "hv-src".to_string(),
+            action: syfrah_org::types::PlacementAction::Add,
+            created_at: 1000,
+            placement_generation: 1,
+        };
+        ps.add_placement(&placement).unwrap();
+
+        // Create two volumes and attach them to vm-1 on hv-src.
+        create_volume(&sm, "vol-root-vm-1", "root-vm-1", 50, "acme", "p1", "prod");
+        create_volume(&sm, "vol-data-vm-1", "data-vm-1", 100, "acme", "p1", "prod");
+
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-root-vm-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-src".into(),
+        });
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-data-vm-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-src".into(),
+        });
+
+        // Also create a volume attached to a different VM (should NOT move).
+        create_volume(&sm, "vol-other", "other", 20, "acme", "p1", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-other".into(),
+            vm_id: "vm-other".into(),
+            hypervisor_id: "hv-src".into(),
+        });
+
+        // Verify initial state.
+        {
+            let storage = sm.storage.read().unwrap();
+            let v1 = storage.volumes.get("vol-root-vm-1").unwrap();
+            assert_eq!(v1.placement_generation, 1);
+            assert_eq!(v1.attached_hypervisor_id.as_deref(), Some("hv-src"));
+            let v2 = storage.volumes.get("vol-data-vm-1").unwrap();
+            assert_eq!(v2.placement_generation, 1);
+            assert_eq!(v2.attached_hypervisor_id.as_deref(), Some("hv-src"));
+        }
+
+        // Reschedule VM from hv-src to hv-dst.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVm {
+            vm_id: "vm-1".into(),
+            from: "hv-src".into(),
+            to: "hv-dst".into(),
+            generation: 2,
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok), "got: {resp:?}");
+
+        // Both volumes should have been rescheduled to hv-dst with bumped gen.
+        {
+            let storage = sm.storage.read().unwrap();
+
+            let v1 = storage.volumes.get("vol-root-vm-1").unwrap();
+            assert_eq!(v1.placement_generation, 2);
+            assert_eq!(v1.attached_hypervisor_id.as_deref(), Some("hv-dst"));
+            assert_eq!(v1.attached_vm_id.as_deref(), Some("vm-1"));
+
+            let v2 = storage.volumes.get("vol-data-vm-1").unwrap();
+            assert_eq!(v2.placement_generation, 2);
+            assert_eq!(v2.attached_hypervisor_id.as_deref(), Some("hv-dst"));
+            assert_eq!(v2.attached_vm_id.as_deref(), Some("vm-1"));
+
+            // Volume attached to a different VM must NOT have moved.
+            let vother = storage.volumes.get("vol-other").unwrap();
+            assert_eq!(vother.placement_generation, 1);
+            assert_eq!(vother.attached_hypervisor_id.as_deref(), Some("hv-src"));
+            assert_eq!(vother.attached_vm_id.as_deref(), Some("vm-other"));
+        }
+
+        // Verify placement was also updated.
+        let placements = ps.list_all().unwrap();
+        let p = placements.iter().find(|p| p.vm_id == "vm-1").unwrap();
+        assert_eq!(p.hypervisor_id, "hv-dst");
+        assert_eq!(p.placement_generation, 2);
     }
 
     #[test]

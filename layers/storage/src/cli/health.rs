@@ -174,6 +174,30 @@ fn print_status_report(r: &StorageStatusReport) {
         }
     }
 
+    // -- Warmup progress section --
+    if !r.warmup_progress.is_empty() {
+        println!();
+        super::fmt::print_heading("Cache Warmup", is_tty);
+        for wp in &r.warmup_progress {
+            let status = if wp.done {
+                "done".to_string()
+            } else {
+                let eta = wp
+                    .eta_secs
+                    .map(|s| format!("ETA {s}s"))
+                    .unwrap_or_else(|| "calculating...".to_string());
+                format!(
+                    "{:.1}%  ({} / {})  {}",
+                    wp.percent,
+                    format_bytes(wp.warmed_bytes),
+                    format_bytes(wp.total_bytes),
+                    eta,
+                )
+            };
+            super::fmt::print_kv(&wp.volume_id, &status, is_tty);
+        }
+    }
+
     println!();
 
     if r.volume_cache_stats.is_empty() {
@@ -333,6 +357,7 @@ mod tests {
             volume_health: vec![],
             cache_metrics: None,
             cache_alerts: vec![],
+            warmup_progress: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("access_key"));
