@@ -467,6 +467,24 @@ pub enum StateMachineCommand {
         published_by: String,
     },
 
+    // -- GC --
+    /// Acknowledge that SST files have been deleted from S3 by the GC worker.
+    /// Removes the given keys from `pending_gc_ssts` so they are no longer
+    /// retried on subsequent GC passes. Only the leader submits this after
+    /// successfully deleting the objects from object storage.
+    GcCompleteSsts {
+        /// SST keys that were successfully deleted from S3.
+        sst_keys: Vec<String>,
+    },
+
+    /// Acknowledge that WAL segments below `below_position` have been deleted
+    /// from S3 by the GC worker. Updates `min_wal_position` to reflect that
+    /// segments below this position no longer exist.
+    GcCompleteWalSegments {
+        /// All WAL segments at or below this position were deleted.
+        below_position: u64,
+    },
+
     // -- Composite Transaction --
     /// Atomic batch of commands applied in a single Raft log entry.
     /// All sub-commands succeed or all fail. Used for placement transactions
@@ -539,6 +557,12 @@ impl std::fmt::Display for StateMachineCommand {
                 manifest_version,
                 ..
             } => write!(f, "CommitManifest({volume_id}, v{manifest_version})"),
+            Self::GcCompleteSsts { sst_keys } => {
+                write!(f, "GcCompleteSsts({})", sst_keys.len())
+            }
+            Self::GcCompleteWalSegments { below_position } => {
+                write!(f, "GcCompleteWalSegments(below={below_position})")
+            }
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -869,6 +893,10 @@ mod tests {
             StateMachineCommand::MarkRestoreComplete {
                 snapshot_id: "snap-01".into(),
             },
+            StateMachineCommand::GcCompleteSsts {
+                sst_keys: vec!["sst-001".into(), "sst-002".into()],
+            },
+            StateMachineCommand::GcCompleteWalSegments { below_position: 42 },
         ];
 
         for cmd in &commands {

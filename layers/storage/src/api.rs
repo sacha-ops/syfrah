@@ -174,6 +174,14 @@ pub struct StorageStatusReport {
     /// Duration of current S3 outage in seconds (0 if healthy).
     #[serde(default)]
     pub s3_outage_duration_secs: Option<u64>,
+    /// Per-volume S3 health state (ADR-006 §25).
+    pub volume_health: Vec<crate::volume_mgr::VolumeHealthReport>,
+    /// Aggregated cache metrics for this node.
+    #[serde(default)]
+    pub cache_metrics: Option<crate::cache::CacheMetrics>,
+    /// Active cache alerts (empty when healthy).
+    #[serde(default)]
+    pub cache_alerts: Vec<String>,
 }
 
 /// Per-volume cache utilization (placeholder structure).
@@ -324,6 +332,9 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 s3_get_latency_ms: None,
                 s3_degradation_level: None,
                 s3_outage_duration_secs: None,
+                volume_health: vec![],
+                cache_metrics: Some(crate::cache::CacheMetrics::default()),
+                cache_alerts: vec![],
             })
         }
     }
@@ -504,6 +515,24 @@ mod tests {
             matches!(resp, StorageResponse::Ok),
             "expected Ok, got {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn handler_returns_status_with_cache_metrics() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::Status;
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Status(s) => {
+                assert!(s.cache_metrics.is_some());
+                let cm = s.cache_metrics.unwrap();
+                assert_eq!(cm.cache_hit_rate, 100.0);
+                assert!(s.cache_alerts.is_empty());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[tokio::test]

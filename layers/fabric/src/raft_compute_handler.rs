@@ -125,6 +125,9 @@ impl RaftComputeHandler {
                 s3_put_latency_ms: None,
                 s3_get_latency_ms: None,
                 s3_degradation_level: None,
+                storage_health: None,
+                storage_dirty_bytes: 0,
+                cache_metrics: None,
             };
             debug!(
                 "populated local scheduler candidate: {} (zone={})",
@@ -157,6 +160,9 @@ impl RaftComputeHandler {
                 s3_put_latency_ms: None,
                 s3_get_latency_ms: None,
                 s3_degradation_level: None,
+                storage_health: None,
+                storage_dirty_bytes: 0,
+                cache_metrics: None,
             };
             debug!(
                 "populated peer scheduler candidate: {} (zone={})",

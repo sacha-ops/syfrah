@@ -1495,6 +1495,37 @@ pub async fn run_daemon(
             .await;
         });
         info!("storage cleanup loop started");
+
+        // GC worker — two-phase SST/WAL/generation garbage collection.
+        // Runs on all nodes but only performs work on the Raft leader.
+        //
+        // TODO(#1208): Wire up real S3 config from node configuration and
+        // replace NoOpGcStateReader/NoOpGcSubmitter with Raft-backed
+        // implementations. Currently a no-op stub — the NoOpGcStateReader
+        // always reports not-leader so no GC work is performed.
+        let gc_shutdown_rx = storage_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let gc_config = syfrah_forge::gc::GcConfig::default();
+            let s3_config = syfrah_forge::storage_cleanup::S3CleanupConfig {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+            };
+            let state_reader: std::sync::Arc<dyn syfrah_forge::gc::GcStateReader> =
+                std::sync::Arc::new(syfrah_forge::gc::NoOpGcStateReader);
+            let submitter: std::sync::Arc<dyn syfrah_forge::gc::GcCommandSubmitter> =
+                std::sync::Arc::new(syfrah_forge::gc::NoOpGcSubmitter);
+            syfrah_forge::gc::run_gc_loop(
+                gc_config,
+                s3_config,
+                state_reader,
+                submitter,
+                gc_shutdown_rx,
+            )
+            .await;
+        });
+        info!("GC worker started");
     }
 
     // S3 health probe (ADR-006 §25) — periodic PUT+GET+DELETE probe
@@ -1846,11 +1877,16 @@ pub async fn run_daemon(
 
                 let gossip_shutdown_rx = raft_shutdown_rx.clone();
                 tokio::spawn(async move {
+                    // TODO(#1209): Pass a StorageHealthFn once VolumeMgr is
+                    // shared via Arc<Mutex<>> between the reconciler and gossip
+                    // agent, so that storage_health/storage_dirty_bytes are
+                    // populated in gossip reports.
                     if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
                         gossip_config,
                         gossip_cluster,
                         capacity_fn,
                         s3_health_fn,
+                        None, // storage_health_fn — TODO(#1209)
                         gossip_shutdown_rx,
                     )
                     .await
@@ -2651,12 +2687,14 @@ pub async fn run_daemon(
 
                                     let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
                                     tokio::spawn(async move {
+                                        // TODO(#1209): Pass StorageHealthFn — see above.
                                         if let Err(e) =
                                             syfrah_controlplane::gossip::start_gossip_agent(
                                                 gossip_config,
                                                 gossip_cluster,
                                                 capacity_fn,
                                                 aj_s3_health_fn,
+                                                None, // storage_health_fn — TODO(#1209)
                                                 gossip_shutdown_rx,
                                             )
                                             .await
