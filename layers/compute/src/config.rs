@@ -392,10 +392,14 @@ mod tests {
                 VolumeAttachment {
                     path: "/dev/nbd0".to_string(),
                     read_only: false,
+                    volume_id: None,
+                    is_root: false,
                 },
                 VolumeAttachment {
                     path: "/dev/nbd1".to_string(),
                     read_only: true,
+                    volume_id: None,
+                    is_root: false,
                 },
             ],
             gpu: GpuMode::Passthrough {
@@ -518,6 +522,8 @@ mod tests {
         spec.volumes = vec![VolumeAttachment {
             path: String::new(),
             read_only: false,
+            volume_id: None,
+            is_root: false,
         }];
         let errors = validate(&spec).unwrap_err();
         assert!(errors
@@ -553,6 +559,8 @@ mod tests {
             volumes: vec![VolumeAttachment {
                 path: String::new(),
                 read_only: false,
+                volume_id: None,
+                is_root: false,
             }],
             gpu: GpuMode::Passthrough {
                 bdf: "bad".to_string(),
@@ -850,6 +858,8 @@ mod tests {
             volumes: vec![VolumeAttachment {
                 path: "/nonexistent/volume".to_string(),
                 read_only: false,
+                volume_id: None,
+                is_root: false,
             }],
             gpu: GpuMode::None,
             ssh_key: None,
@@ -1051,6 +1061,8 @@ mod tests {
             volumes: vec![VolumeAttachment {
                 path: "/dev/nbd0".to_string(),
                 read_only: false,
+                volume_id: None,
+                is_root: false,
             }],
             gpu: GpuMode::Passthrough {
                 bdf: "0000:03:00.0".to_string(),

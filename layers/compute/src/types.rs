@@ -110,6 +110,13 @@ pub struct VolumeAttachment {
     pub path: String,
     /// Whether the volume should be attached as read-only.
     pub read_only: bool,
+    /// Unique volume identifier for hot-plug tracking.
+    /// Used to map volume_id -> CH device_id for later removal.
+    #[serde(default)]
+    pub volume_id: Option<String>,
+    /// Whether this is a root volume. Root volumes cannot be hot-unplugged.
+    #[serde(default)]
+    pub is_root: bool,
 }
 
 /// GPU mode for a VM.
@@ -251,6 +258,8 @@ mod tests {
             volumes: vec![VolumeAttachment {
                 path: "/dev/sda1".to_string(),
                 read_only: false,
+                volume_id: None,
+                is_root: false,
             }],
             gpu: GpuMode::Passthrough {
                 bdf: "0000:01:00.0".to_string(),
@@ -336,10 +345,35 @@ mod tests {
         let vol = VolumeAttachment {
             path: "/mnt/data".to_string(),
             read_only: true,
+            volume_id: Some("vol-001".to_string()),
+            is_root: false,
         };
         let json = serde_json::to_string(&vol).unwrap();
         let back: VolumeAttachment = serde_json::from_str(&json).unwrap();
         assert_eq!(vol, back);
+    }
+
+    #[test]
+    fn volume_attachment_with_volume_id_and_root() {
+        let vol = VolumeAttachment {
+            path: "/dev/vda".to_string(),
+            read_only: false,
+            volume_id: Some("vol-root-001".to_string()),
+            is_root: true,
+        };
+        let json = serde_json::to_string(&vol).unwrap();
+        let back: VolumeAttachment = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.volume_id, Some("vol-root-001".to_string()));
+        assert!(back.is_root);
+    }
+
+    #[test]
+    fn volume_attachment_without_new_fields_deserializes() {
+        // Backward compatibility: JSON without volume_id/is_root should deserialize.
+        let json = r#"{"path":"/dev/nbd0","read_only":false}"#;
+        let vol: VolumeAttachment = serde_json::from_str(json).unwrap();
+        assert!(vol.volume_id.is_none());
+        assert!(!vol.is_root);
     }
 
     #[test]
