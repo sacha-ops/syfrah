@@ -13,6 +13,7 @@
 //!    detect crashed processes and update internal state.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -248,6 +249,58 @@ pub struct CacheConfig {
     pub memory_size_bytes: u64,
 }
 
+// ---------------------------------------------------------------------------
+// TOML config generation for ZeroFS
+// ---------------------------------------------------------------------------
+
+/// Generate a ZeroFS TOML configuration file for a volume.
+///
+/// Secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `ZEROFS_PASSWORD`)
+/// are referenced via `${ENV_VAR}` placeholders and passed as environment
+/// variables when spawning the process.
+pub fn generate_config(
+    volume_id: &str,
+    s3: &S3Config,
+    cache: &CacheConfig,
+    generation: u64,
+    size_gb: f64,
+) -> String {
+    let cache_dir = format!("/tmp/syfrah-cache/{volume_id}");
+    let disk_size_gb = cache.disk_size_bytes as f64 / 1_073_741_824.0;
+    let memory_size_gb = cache.memory_size_bytes as f64 / 1_073_741_824.0;
+    let s3_url = format!("s3://{}/volumes/{volume_id}/gen-{generation}/", s3.bucket);
+    let nbd_socket = format!("/tmp/syfrah/{volume_id}/zerofs.nbd.sock");
+    let endpoint = &s3.endpoint;
+
+    format!(
+        r#"[cache]
+dir = "{cache_dir}"
+disk_size_gb = {disk_size_gb:.1}
+memory_size_gb = {memory_size_gb:.1}
+
+[storage]
+url = "{s3_url}"
+encryption_password = "${{ZEROFS_PASSWORD}}"
+
+[filesystem]
+max_size_gb = {size_gb:.1}
+compression = "lz4"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+unix_socket = "{nbd_socket}"
+
+[lsm]
+wal_enabled = true
+
+[aws]
+endpoint = "{endpoint}"
+access_key_id = "${{AWS_ACCESS_KEY_ID}}"
+secret_access_key = "${{AWS_SECRET_ACCESS_KEY}}"
+"#
+    )
+}
+
 /// Tracked state for a running ZeroFS process.
 struct VolumeProcess {
     child: Child,
@@ -347,8 +400,13 @@ impl VolumeMgr {
 
     /// Start a ZeroFS process for `volume_id`.
     ///
-    /// The process is spawned with the given S3 + cache configuration and
-    /// generation prefix `volumes/{volume_id}/gen-{generation}/`.
+    /// Generates a TOML config file, writes it to `/tmp/syfrah/{volume_id}/zerofs.toml`,
+    /// then spawns ZeroFS with `zerofs run -c <config_path>`. Secrets are passed via
+    /// environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `ZEROFS_PASSWORD`)
+    /// to avoid exposure in `/proc/pid/cmdline`.
+    ///
+    /// After ZeroFS starts with an NBD unix socket, `nbd-client` connects the
+    /// socket to `/dev/nbdN`.
     pub async fn start_volume(
         &mut self,
         volume_id: &str,
@@ -356,6 +414,7 @@ impl VolumeMgr {
         cache: &CacheConfig,
         encryption_passphrase: &str,
         generation: u64,
+        size_gb: f64,
     ) -> Result<PathBuf, VolumeMgrError> {
         if self.processes.contains_key(volume_id) {
             return Err(VolumeMgrError::AlreadyRunning(volume_id.to_string()));
@@ -364,39 +423,64 @@ impl VolumeMgr {
         let binary_path = binary::resolve_binary(self.binary_override.as_deref())?;
 
         let nbd_device = self.allocate_nbd_device();
-        let prefix = format!("volumes/{volume_id}/gen-{generation}/");
+        let nbd_socket = format!("/tmp/syfrah/{volume_id}/zerofs.nbd.sock");
 
+        // Generate and write the TOML config.
+        let config_toml = generate_config(volume_id, s3, cache, generation, size_gb);
+        let config_dir = PathBuf::from(format!("/tmp/syfrah/{volume_id}"));
+        tokio::fs::create_dir_all(&config_dir)
+            .await
+            .map_err(|e| VolumeMgrError::Spawn(format!("failed to create config dir: {e}")))?;
+        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config dir permissions: {e}"))
+            })?;
+        let config_path = config_dir.join("zerofs.toml");
+        tokio::fs::write(&config_path, &config_toml)
+            .await
+            .map_err(|e| VolumeMgrError::Spawn(format!("failed to write zerofs.toml: {e}")))?;
+        tokio::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config file permissions: {e}"))
+            })?;
+
+        // Spawn ZeroFS with TOML config; secrets via env vars.
         let mut child = Command::new(&binary_path)
-            .arg("--s3-endpoint")
-            .arg(&s3.endpoint)
-            .arg("--s3-bucket")
-            .arg(&s3.bucket)
-            .arg("--s3-access-key")
-            .arg(&s3.access_key)
-            .arg("--prefix")
-            .arg(&prefix)
-            .arg("--cache-dir")
-            .arg(&cache.disk_path)
-            .arg("--cache-size")
-            .arg(cache.disk_size_bytes.to_string())
-            .arg("--memory-size")
-            .arg(cache.memory_size_bytes.to_string())
-            .arg("--nbd-device")
-            .arg(&nbd_device)
-            // Pass secrets via environment variables instead of CLI args
-            // to avoid exposure in /proc/pid/cmdline.
-            .env("ZEROFS_S3_SECRET_KEY", &s3.secret_key)
-            .env("ZEROFS_ENCRYPTION_KEY", encryption_passphrase)
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .env("AWS_ACCESS_KEY_ID", &s3.access_key)
+            .env("AWS_SECRET_ACCESS_KEY", &s3.secret_key)
+            .env("ZEROFS_PASSWORD", encryption_passphrase)
             .kill_on_drop(false)
             .spawn()
             .map_err(|e| VolumeMgrError::Spawn(e.to_string()))?;
 
-        // Wait for NBD device to appear. If it times out, kill the orphaned
-        // child process before returning the error.
-        if let Err(e) = self.wait_for_nbd(&nbd_device).await {
+        // Wait for the NBD socket to appear before connecting nbd-client.
+        if let Err(e) = self.wait_for_path(std::path::Path::new(&nbd_socket)).await {
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(e);
+        }
+
+        // Connect the unix socket to /dev/nbdN via nbd-client.
+        let nbd_connect = tokio::process::Command::new("nbd-client")
+            .arg("-unix")
+            .arg(&nbd_socket)
+            .arg(&nbd_device)
+            .output()
+            .await
+            .map_err(|e| VolumeMgrError::Spawn(format!("nbd-client failed to execute: {e}")))?;
+
+        if !nbd_connect.status.success() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let stderr = String::from_utf8_lossy(&nbd_connect.stderr);
+            return Err(VolumeMgrError::Spawn(format!(
+                "nbd-client failed: {stderr}"
+            )));
         }
 
         self.processes.insert(
@@ -421,6 +505,13 @@ impl VolumeMgr {
             .processes
             .remove(volume_id)
             .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+
+        // Disconnect the NBD device first so the kernel releases /dev/nbdN.
+        let _ = tokio::process::Command::new("nbd-client")
+            .arg("-d")
+            .arg(&proc.nbd_device)
+            .output()
+            .await;
 
         // Send SIGTERM.
         #[cfg(unix)]
@@ -469,6 +560,12 @@ impl VolumeMgr {
                 .processes
                 .remove(volume_id)
                 .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+            // Disconnect the NBD device so /dev/nbdN is released.
+            let _ = tokio::process::Command::new("nbd-client")
+                .arg("-d")
+                .arg(&proc.nbd_device)
+                .output()
+                .await;
             proc.child
                 .kill()
                 .await
@@ -745,8 +842,8 @@ impl VolumeMgr {
         PathBuf::from(format!("{}{idx}", self.nbd_base.display()))
     }
 
-    /// Wait for an NBD device file to appear on disk.
-    async fn wait_for_nbd(&self, path: &Path) -> Result<(), VolumeMgrError> {
+    /// Wait for a file/socket to appear on disk.
+    async fn wait_for_path(&self, path: &Path) -> Result<(), VolumeMgrError> {
         let deadline = time::Instant::now() + NBD_WAIT_TIMEOUT;
         while time::Instant::now() < deadline {
             if path.exists() {
@@ -908,6 +1005,7 @@ mod tests {
                 },
                 "passphrase",
                 1,
+                50.0,
             )
             .await;
 
@@ -1487,5 +1585,154 @@ mod tests {
         let deser: VolumeHealthReport = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.health, VolumeHealth::Degraded);
         assert_eq!(deser.dirty_bytes, 1024);
+    }
+
+    // ── generate_config tests (#1250) ─────────────────────────────────
+
+    #[test]
+    fn generate_config_produces_valid_toml() {
+        let s3 = S3Config {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            bucket: "my-bucket".into(),
+            access_key: "AKID".into(),
+            secret_key: "SECRET".into(),
+        };
+        let cache = CacheConfig {
+            disk_path: PathBuf::from("/tmp/cache"),
+            disk_size_bytes: 10 * 1_073_741_824,  // 10 GiB
+            memory_size_bytes: 2 * 1_073_741_824, // 2 GiB
+        };
+        let toml_str = generate_config("vol-abc", &s3, &cache, 1, 50.0);
+
+        // Verify key TOML sections and values are present.
+        assert!(
+            toml_str.contains("[cache]"),
+            "missing [cache] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("dir = \"/tmp/syfrah-cache/vol-abc\""),
+            "wrong cache dir:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("disk_size_gb = 10.0"),
+            "wrong disk_size_gb:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("memory_size_gb = 2.0"),
+            "wrong memory_size_gb:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("[storage]"),
+            "missing [storage] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("url = \"s3://my-bucket/volumes/vol-abc/gen-1/\""),
+            "wrong s3 url:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("encryption_password = \"${ZEROFS_PASSWORD}\""),
+            "missing encryption_password placeholder:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("[filesystem]"),
+            "missing [filesystem] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("max_size_gb = 50.0"),
+            "wrong max_size_gb:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("compression = \"lz4\""),
+            "missing compression:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("[servers.nbd]"),
+            "missing [servers.nbd] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("unix_socket = \"/tmp/syfrah/vol-abc/zerofs.nbd.sock\""),
+            "wrong unix_socket:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("[lsm]"),
+            "missing [lsm] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("wal_enabled = true"),
+            "missing wal_enabled:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("[aws]"),
+            "missing [aws] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("endpoint = \"https://s3.us-east-1.amazonaws.com\""),
+            "missing aws endpoint:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("access_key_id = \"${AWS_ACCESS_KEY_ID}\""),
+            "missing aws access_key_id placeholder:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\""),
+            "missing aws secret_access_key placeholder:\n{toml_str}"
+        );
+    }
+
+    #[test]
+    fn generate_config_different_volumes_produce_unique_paths() {
+        let s3 = S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "bucket".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        };
+        let cache = CacheConfig {
+            disk_path: PathBuf::from("/tmp/cache"),
+            disk_size_bytes: 1_073_741_824,
+            memory_size_bytes: 268_435_456,
+        };
+
+        let config_a = generate_config("vol-aaa", &s3, &cache, 1, 10.0);
+        let config_b = generate_config("vol-bbb", &s3, &cache, 3, 20.0);
+
+        // Each volume gets its own cache dir, socket, and S3 prefix.
+        assert!(config_a.contains("vol-aaa"));
+        assert!(config_b.contains("vol-bbb"));
+        assert!(config_a.contains("gen-1"));
+        assert!(config_b.contains("gen-3"));
+        assert!(config_a.contains("max_size_gb = 10.0"));
+        assert!(config_b.contains("max_size_gb = 20.0"));
+    }
+
+    #[test]
+    fn generate_config_no_cli_secrets() {
+        let s3 = S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "bucket".into(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+        };
+        let cache = CacheConfig {
+            disk_path: PathBuf::from("/tmp/cache"),
+            disk_size_bytes: 1_073_741_824,
+            memory_size_bytes: 268_435_456,
+        };
+
+        let toml_str = generate_config("vol-sec", &s3, &cache, 1, 50.0);
+
+        // Secrets should NOT appear as literal values in the config.
+        assert!(
+            !toml_str.contains("AKIAIOSFODNN7EXAMPLE"),
+            "access key should not be in config"
+        );
+        assert!(
+            !toml_str.contains("wJalrXUtnFEMI"),
+            "secret key should not be in config"
+        );
+        // Instead, env var placeholders should be used.
+        assert!(toml_str.contains("${AWS_ACCESS_KEY_ID}"));
+        assert!(toml_str.contains("${AWS_SECRET_ACCESS_KEY}"));
+        assert!(toml_str.contains("${ZEROFS_PASSWORD}"));
     }
 }

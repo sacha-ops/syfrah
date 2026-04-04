@@ -21,6 +21,6 @@ pub use s3_health::{
     S3HealthSnapshot, S3HealthThresholds,
 };
 pub use volume_mgr::{
-    S3Config, S3HealthConfig, VolumeHealth, VolumeHealthReport, VolumeHealthTracker, VolumeMgr,
-    VolumeMgrError,
+    generate_config, S3Config, S3HealthConfig, VolumeHealth, VolumeHealthReport,
+    VolumeHealthTracker, VolumeMgr, VolumeMgrError,
 };
