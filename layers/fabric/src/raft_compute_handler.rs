@@ -9,7 +9,7 @@
 //!   3. If scheduler picks THIS hypervisor: create locally via inner handler
 //!   4. Record PlaceVm in Raft
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use syfrah_api::handler::LayerHandler;
@@ -38,6 +38,8 @@ pub struct RaftComputeHandler {
     hypervisor_store: RwLock<Option<Arc<syfrah_org::HypervisorStore>>>,
     /// Org store — used to resolve subnets for Raft-based IP allocation.
     org_store: RwLock<Option<Arc<syfrah_org::OrgStore>>>,
+    /// Storage store — used to read configured storage zones for preflight checks.
+    storage_store: RwLock<Option<Arc<syfrah_org::StorageStore>>>,
 }
 
 impl RaftComputeHandler {
@@ -51,6 +53,7 @@ impl RaftComputeHandler {
             local_node_name,
             hypervisor_store: RwLock::new(None),
             org_store: RwLock::new(None),
+            storage_store: RwLock::new(None),
         }
     }
 
@@ -76,6 +79,26 @@ impl RaftComputeHandler {
     pub async fn set_org_store(&self, store: Arc<syfrah_org::OrgStore>) {
         let mut guard = self.org_store.write().await;
         *guard = Some(store);
+    }
+
+    /// Set the storage store (called during daemon init for storage preflight checks).
+    pub async fn set_storage_store(&self, store: Arc<syfrah_org::StorageStore>) {
+        let mut guard = self.storage_store.write().await;
+        *guard = Some(store);
+    }
+
+    /// Build a set of zone names that have storage configured.
+    /// Returns None if the storage store is not available.
+    async fn configured_storage_zones(&self) -> Option<HashSet<String>> {
+        let guard = self.storage_store.read().await;
+        let store = guard.as_ref()?;
+        match store.list_storage_configs() {
+            Ok(configs) => Some(configs.into_iter().map(|(zone, _)| zone).collect()),
+            Err(e) => {
+                warn!("scheduler: failed to list storage configs: {e}");
+                None
+            }
+        }
     }
 
     /// Get a reference to the gossip cluster state.
@@ -248,14 +271,16 @@ impl RaftComputeHandler {
         // Falls back to gossip cluster if store is not wired.
         let hv_store_guard = self.hypervisor_store.read().await;
         let existing_placements: HashMap<String, u32> = HashMap::new();
+        let storage_zones = self.configured_storage_zones().await;
         let schedule_result = if let Some(ref hv_store) = *hv_store_guard {
-            scheduler.schedule_from_store(
+            scheduler.schedule_from_store_with_storage(
                 vcpus,
                 memory_mb as u64,
                 &constraints,
                 hv_store,
                 &[],
                 &existing_placements,
+                storage_zones.as_ref(),
             )
         } else {
             // Fallback: populate gossip cluster from fabric peers.
