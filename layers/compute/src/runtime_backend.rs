@@ -39,6 +39,12 @@ pub struct RuntimeSpec {
     pub image_name: Option<String>,
     /// SSH public key to inject into the workload for root access.
     pub ssh_public_key: Option<String>,
+    /// Host-side mount path of the ZeroFS root volume.
+    ///
+    /// When set, the runtime exposes this directory inside the workload:
+    /// - Containers: bind-mounted at `/data`
+    /// - Cloud Hypervisor: shared via virtiofs at tag `data`
+    pub volume_mount_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +226,7 @@ mod tests {
             gpu: GpuMode::None,
             image_name: None,
             ssh_public_key: None,
+            volume_mount_path: None,
         };
         let cloned = spec.clone();
         assert_eq!(cloned.vcpus, 4);
