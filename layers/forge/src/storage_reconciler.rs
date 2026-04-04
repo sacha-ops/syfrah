@@ -321,6 +321,10 @@ impl StorageReconciler {
                     match volume_mgr.stop_volume(id).await {
                         Ok(()) => {
                             report.stopped += 1;
+                            // Clear from attached set so the volume can be
+                            // re-attached after restarting with the new
+                            // generation.
+                            self.attached_volumes.lock().unwrap().remove(id.as_str());
                         }
                         Err(e) => {
                             error!(
@@ -467,10 +471,16 @@ impl StorageReconciler {
     }
 
     /// Run the periodic reconciliation loop.
+    ///
+    /// When `attacher` is `Some`, each pass will attempt to attach NBD
+    /// devices to Cloud Hypervisor VMs via the `VmDiskAttacher` trait.
+    /// Without an attacher the attach step is skipped (volumes still
+    /// start/stop normally).
     pub async fn run_loop(
         &self,
         reader: Arc<dyn VolumeStateReader>,
         volume_mgr: &mut VolumeMgr,
+        attacher: Option<Arc<dyn VmDiskAttacher>>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let interval = tokio::time::Duration::from_secs(self.interval_secs);
@@ -483,7 +493,11 @@ impl StorageReconciler {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    self.reconcile_once(reader.as_ref(), volume_mgr).await;
+                    self.reconcile_once_with_attacher(
+                        reader.as_ref(),
+                        volume_mgr,
+                        attacher.as_deref(),
+                    ).await;
                 }
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
@@ -683,7 +697,9 @@ mod tests {
             async move {
                 // We need to pass mgr by ref but it's moved into the closure.
                 // Use a separate scope.
-                reconciler.run_loop(reader, &mut mgr, shutdown_rx).await;
+                reconciler
+                    .run_loop(reader, &mut mgr, None, shutdown_rx)
+                    .await;
                 reconciler.pass_count()
             }
         });
@@ -782,6 +798,109 @@ mod tests {
 
         // Cleanup.
         mgr.stop_volume("vol-ok").await.ok();
+    }
+
+    #[tokio::test]
+    async fn generation_fencing_clears_attached_volumes() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let mut mgr = VolumeMgr::new();
+        let attacher = MockDiskAttacher::new();
+
+        // Inject a fake running ZeroFS process at generation 1.
+        mgr.inject_fake_process("vol-fence", 1);
+
+        // Desired: volume attached to vm-10 at generation 1.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-fence".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-10".into()),
+        }]);
+
+        // Pass 1: attach succeeds.
+        let r1 = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+        assert_eq!(r1.attached, 1);
+
+        // Confirm attached_volumes contains the entry.
+        assert!(reconciler
+            .attached_volumes
+            .lock()
+            .unwrap()
+            .contains("vol-fence"));
+
+        // Re-inject at generation 1 so we can trigger a gen mismatch stop.
+        mgr.inject_fake_process("vol-fence", 1);
+
+        // Desired state bumps to generation 2.
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-fence".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 2,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-10".into()),
+        }]);
+
+        // Pass 2: generation mismatch -> stop -> should clear attached_volumes.
+        let r2 = reconciler
+            .reconcile_once_with_attacher(&reader, &mut mgr, Some(&attacher))
+            .await;
+        assert!(
+            r2.stopped >= 1,
+            "expected stop for stale generation, got {}",
+            r2.stopped
+        );
+
+        // The key assertion: attached_volumes must NOT contain the entry
+        // so that re-attachment can happen after restart.
+        assert!(
+            !reconciler
+                .attached_volumes
+                .lock()
+                .unwrap()
+                .contains("vol-fence"),
+            "attached_volumes should be cleared after generation-fencing stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_forwards_attacher() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into()).with_interval(1);
+        let reader = Arc::new(MockStateReader::new().with_config());
+        let mut mgr = VolumeMgr::new();
+        let attacher: Arc<dyn VmDiskAttacher> = Arc::new(MockDiskAttacher::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        mgr.inject_fake_process("vol-loop", 1);
+        reader.set_desired(vec![DesiredVolume {
+            id: "vol-loop".into(),
+            name: "pgdata".into(),
+            size_gb: 100,
+            placement_generation: 1,
+            hypervisor_id: "hv-1".into(),
+            vm_id: Some("vm-loop".into()),
+        }]);
+
+        let handle = tokio::spawn({
+            let reader = Arc::clone(&reader);
+            let attacher = Arc::clone(&attacher);
+            async move {
+                reconciler
+                    .run_loop(reader, &mut mgr, Some(attacher), shutdown_rx)
+                    .await;
+                reconciler.pass_count()
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+        shutdown_tx.send(true).unwrap();
+        let passes = handle.await.unwrap();
+        assert!(passes >= 1, "expected at least 1 pass, got {passes}");
     }
 
     // -- Attach flow tests ---------------------------------------------------
