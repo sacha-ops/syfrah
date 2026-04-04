@@ -77,6 +77,137 @@ impl VolumeCacheDir {
 }
 
 // ---------------------------------------------------------------------------
+// CacheMetrics — runtime cache health snapshot
+// ---------------------------------------------------------------------------
+
+/// Runtime cache metrics reported via gossip and surfaced in `syfrah storage status`.
+///
+/// These are placeholder values until real ZeroFS metrics collection is wired up.
+/// The struct is designed to be cheaply cloneable and serializable for gossip
+/// dissemination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheMetrics {
+    /// Cache hit rate as a percentage (0.0 – 100.0).
+    pub cache_hit_rate: f64,
+    /// Dirty bytes pending writeback to S3.
+    pub dirty_bytes: u64,
+    /// Total cache space used in gigabytes.
+    pub cache_used_gb: f64,
+    /// Eviction rate: evictions per second over the last reporting interval.
+    pub eviction_rate: f64,
+    /// Number of volumes with active cache data.
+    pub volumes_attached: u32,
+    /// S3 backend health: true if the last probe succeeded.
+    pub s3_health: bool,
+}
+
+impl Default for CacheMetrics {
+    fn default() -> Self {
+        Self {
+            cache_hit_rate: 100.0,
+            dirty_bytes: 0,
+            cache_used_gb: 0.0,
+            eviction_rate: 0.0,
+            volumes_attached: 0,
+            s3_health: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CacheAlertThresholds — configurable warning thresholds
+// ---------------------------------------------------------------------------
+
+/// Configurable thresholds for cache health alerts.
+///
+/// When metrics cross these thresholds, warnings are emitted in
+/// `syfrah storage status` output and gossip reports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheAlertThresholds {
+    /// Warn when cache hit rate drops below this percentage (default: 80.0).
+    pub min_hit_rate_pct: f64,
+    /// Warn when dirty bytes exceed this fraction of total cache (default: 0.5 = 50%).
+    pub max_dirty_ratio: f64,
+}
+
+impl Default for CacheAlertThresholds {
+    fn default() -> Self {
+        Self {
+            min_hit_rate_pct: 80.0,
+            max_dirty_ratio: 0.5,
+        }
+    }
+}
+
+/// A cache alert that has been triggered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheAlert {
+    /// Cache hit rate is below the configured threshold.
+    LowHitRate {
+        current_pct: u32,
+        threshold_pct: u32,
+    },
+    /// Dirty bytes exceed the configured ratio of total cache.
+    HighDirtyRatio { dirty_bytes: u64, cache_bytes: u64 },
+}
+
+impl std::fmt::Display for CacheAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheAlert::LowHitRate {
+                current_pct,
+                threshold_pct,
+            } => write!(
+                f,
+                "cache hit rate {current_pct}% is below threshold {threshold_pct}%"
+            ),
+            CacheAlert::HighDirtyRatio {
+                dirty_bytes,
+                cache_bytes,
+            } => {
+                let ratio = if *cache_bytes > 0 {
+                    (*dirty_bytes as f64 / *cache_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                write!(
+                    f,
+                    "dirty bytes ({dirty_bytes}) are {ratio:.0}% of cache ({cache_bytes})"
+                )
+            }
+        }
+    }
+}
+
+/// Evaluate cache metrics against thresholds and return any triggered alerts.
+pub fn evaluate_alerts(
+    metrics: &CacheMetrics,
+    thresholds: &CacheAlertThresholds,
+    total_cache_bytes: u64,
+) -> Vec<CacheAlert> {
+    let mut alerts = Vec::new();
+
+    if metrics.cache_hit_rate < thresholds.min_hit_rate_pct {
+        alerts.push(CacheAlert::LowHitRate {
+            current_pct: metrics.cache_hit_rate as u32,
+            threshold_pct: thresholds.min_hit_rate_pct as u32,
+        });
+    }
+
+    if total_cache_bytes > 0 {
+        let dirty_ratio = metrics.dirty_bytes as f64 / total_cache_bytes as f64;
+        if dirty_ratio > thresholds.max_dirty_ratio {
+            alerts.push(CacheAlert::HighDirtyRatio {
+                dirty_bytes: metrics.dirty_bytes,
+                cache_bytes: total_cache_bytes,
+            });
+        }
+    }
+
+    alerts
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -646,5 +777,138 @@ mod tests {
             matches!(err, CacheError::DiskQuery { .. }),
             "expected DiskQuery, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CacheMetrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_metrics_default() {
+        let m = CacheMetrics::default();
+        assert_eq!(m.cache_hit_rate, 100.0);
+        assert_eq!(m.dirty_bytes, 0);
+        assert_eq!(m.cache_used_gb, 0.0);
+        assert_eq!(m.eviction_rate, 0.0);
+        assert_eq!(m.volumes_attached, 0);
+        assert!(!m.s3_health);
+    }
+
+    #[test]
+    fn cache_metrics_serde_roundtrip() {
+        let m = CacheMetrics {
+            cache_hit_rate: 92.5,
+            dirty_bytes: 1_048_576,
+            cache_used_gb: 45.2,
+            eviction_rate: 3.1,
+            volumes_attached: 4,
+            s3_health: true,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: CacheMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, parsed);
+    }
+
+    // -----------------------------------------------------------------------
+    // CacheAlertThresholds + evaluate_alerts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alert_thresholds_default() {
+        let t = CacheAlertThresholds::default();
+        assert_eq!(t.min_hit_rate_pct, 80.0);
+        assert_eq!(t.max_dirty_ratio, 0.5);
+    }
+
+    #[test]
+    fn evaluate_alerts_no_alerts_when_healthy() {
+        let metrics = CacheMetrics {
+            cache_hit_rate: 95.0,
+            dirty_bytes: 100,
+            ..Default::default()
+        };
+        let thresholds = CacheAlertThresholds::default();
+        let alerts = evaluate_alerts(&metrics, &thresholds, 1000);
+        assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_alerts_low_hit_rate() {
+        let metrics = CacheMetrics {
+            cache_hit_rate: 70.0,
+            dirty_bytes: 0,
+            ..Default::default()
+        };
+        let thresholds = CacheAlertThresholds::default();
+        let alerts = evaluate_alerts(&metrics, &thresholds, 1000);
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(
+            alerts[0],
+            CacheAlert::LowHitRate {
+                current_pct: 70,
+                threshold_pct: 80,
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_alerts_high_dirty_ratio() {
+        let metrics = CacheMetrics {
+            cache_hit_rate: 95.0,
+            dirty_bytes: 600,
+            ..Default::default()
+        };
+        let thresholds = CacheAlertThresholds::default();
+        let alerts = evaluate_alerts(&metrics, &thresholds, 1000);
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(
+            alerts[0],
+            CacheAlert::HighDirtyRatio {
+                dirty_bytes: 600,
+                cache_bytes: 1000,
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_alerts_both_triggered() {
+        let metrics = CacheMetrics {
+            cache_hit_rate: 50.0,
+            dirty_bytes: 800,
+            ..Default::default()
+        };
+        let thresholds = CacheAlertThresholds::default();
+        let alerts = evaluate_alerts(&metrics, &thresholds, 1000);
+        assert_eq!(alerts.len(), 2);
+    }
+
+    #[test]
+    fn evaluate_alerts_zero_cache_no_dirty_alert() {
+        let metrics = CacheMetrics {
+            cache_hit_rate: 50.0,
+            dirty_bytes: 100,
+            ..Default::default()
+        };
+        let thresholds = CacheAlertThresholds::default();
+        // zero total cache bytes -> no dirty ratio alert
+        let alerts = evaluate_alerts(&metrics, &thresholds, 0);
+        assert_eq!(alerts.len(), 1); // only hit rate alert
+    }
+
+    #[test]
+    fn cache_alert_display() {
+        let a = CacheAlert::LowHitRate {
+            current_pct: 65,
+            threshold_pct: 80,
+        };
+        assert!(a.to_string().contains("65%"));
+        assert!(a.to_string().contains("80%"));
+
+        let b = CacheAlert::HighDirtyRatio {
+            dirty_bytes: 700,
+            cache_bytes: 1000,
+        };
+        assert!(b.to_string().contains("700"));
+        assert!(b.to_string().contains("70%"));
     }
 }

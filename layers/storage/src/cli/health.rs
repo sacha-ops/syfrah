@@ -133,6 +133,47 @@ fn print_status_report(r: &StorageStatusReport) {
         is_tty,
     );
 
+    // -- Cache metrics section --
+    if let Some(ref cm) = r.cache_metrics {
+        println!();
+        super::fmt::print_heading("Cache Metrics", is_tty);
+        super::fmt::print_kv("Hit Rate", &format!("{:.1}%", cm.cache_hit_rate), is_tty);
+        super::fmt::print_kv("Dirty Bytes", &format_bytes(cm.dirty_bytes), is_tty);
+        super::fmt::print_kv(
+            "Cache Used",
+            &format!("{:.2} GiB", cm.cache_used_gb),
+            is_tty,
+        );
+        super::fmt::print_kv(
+            "Eviction Rate",
+            &format!("{:.1}/s", cm.eviction_rate),
+            is_tty,
+        );
+        super::fmt::print_kv("Volumes Attached", &cm.volumes_attached.to_string(), is_tty);
+        super::fmt::print_kv(
+            "S3 Health",
+            if cm.s3_health { "ok" } else { "degraded" },
+            is_tty,
+        );
+    }
+
+    // -- Alerts section --
+    if !r.cache_alerts.is_empty() {
+        println!();
+        super::fmt::print_heading("Alerts", is_tty);
+        for alert in &r.cache_alerts {
+            if is_tty {
+                println!(
+                    "  {} {}",
+                    console::Style::new().yellow().apply_to("WARNING:"),
+                    alert
+                );
+            } else {
+                println!("  WARNING: {alert}");
+            }
+        }
+    }
+
     println!();
 
     if r.volume_cache_stats.is_empty() {
@@ -285,6 +326,8 @@ mod tests {
                 dirty_bytes: 524_288,
             }],
             total_dirty_bytes: 524_288,
+            cache_metrics: None,
+            cache_alerts: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("access_key"));

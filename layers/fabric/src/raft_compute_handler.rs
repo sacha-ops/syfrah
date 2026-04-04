@@ -121,6 +121,7 @@ impl RaftComputeHandler {
                 instance_count: 0,
                 drain_status: false,
                 timestamp: now,
+                cache_metrics: None,
             };
             debug!(
                 "populated local scheduler candidate: {} (zone={})",
@@ -149,6 +150,7 @@ impl RaftComputeHandler {
                 instance_count: 0,
                 drain_status: false,
                 timestamp: now,
+                cache_metrics: None,
             };
             debug!(
                 "populated peer scheduler candidate: {} (zone={})",
