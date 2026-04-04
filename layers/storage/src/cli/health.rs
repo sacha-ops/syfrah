@@ -133,6 +133,19 @@ fn print_status_report(r: &StorageStatusReport) {
         is_tty,
     );
 
+    // -- Per-zone configs section --
+    if !r.zone_configs.is_empty() {
+        println!();
+        super::fmt::print_heading("Per-Zone Configs", is_tty);
+        for zc in &r.zone_configs {
+            super::fmt::print_kv(
+                &zc.zone,
+                &format!("{} ({})", zc.s3_endpoint, zc.s3_bucket),
+                is_tty,
+            );
+        }
+    }
+
     // -- Cache metrics section --
     if let Some(ref cm) = r.cache_metrics {
         println!();
@@ -344,6 +357,7 @@ mod tests {
         let report = StorageStatusReport {
             s3_connected: true,
             s3_endpoint: "https://s3.example.com".into(),
+            zone_configs: vec![],
             volume_cache_stats: vec![VolumeCacheStat {
                 name: "pgdata".into(),
                 cached_bytes: 1_073_741_824,
