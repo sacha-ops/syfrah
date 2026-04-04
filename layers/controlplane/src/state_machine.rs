@@ -71,6 +71,15 @@ pub enum VolumeState {
 /// Default tombstone retention period: 30 days in seconds.
 pub const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 3600;
 
+/// Snapshot lifecycle state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SnapshotState {
+    #[default]
+    Available,
+    /// Tombstone: snapshot is logically deleted, SST refcounts already decremented.
+    Deleted,
+}
+
 /// Snapshot record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRecord {
@@ -93,6 +102,9 @@ pub struct SnapshotRecord {
     /// volume_type inherited from the source volume at creation time.
     #[serde(default = "default_volume_type")]
     pub volume_type: VolumeType,
+    /// Snapshot lifecycle state. Defaults to Available for backward compat.
+    #[serde(default)]
+    pub state: SnapshotState,
 }
 
 fn default_volume_type() -> VolumeType {
@@ -644,9 +656,13 @@ impl RedbStateMachine {
     }
 
     /// Compute snapshot count within the effective scope.
+    /// Excludes snapshots in the Deleted state (tombstones).
     fn compute_snapshot_count(storage: &StorageState, scope: &QuotaScope) -> u64 {
         let mut count = 0u64;
         for snap in storage.snapshots.values() {
+            if snap.state == SnapshotState::Deleted {
+                continue;
+            }
             let in_scope = match scope {
                 QuotaScope::Org { org_id: oid } => snap.org_id == *oid,
                 QuotaScope::Project {
@@ -1804,11 +1820,14 @@ impl RedbStateMachine {
                         ),
                     ),
                     Some(_) => {
-                        // Check for snapshots referencing this volume.
+                        // Check for non-deleted snapshots referencing this volume.
                         let snapshot_ids: Vec<String> = storage
                             .snapshots
                             .iter()
-                            .filter(|(_, s)| s.source_volume_id == *volume_id)
+                            .filter(|(_, s)| {
+                                s.source_volume_id == *volume_id
+                                    && s.state != SnapshotState::Deleted
+                            })
                             .map(|(id, _)| id.clone())
                             .collect();
 
@@ -1820,7 +1839,7 @@ impl RedbStateMachine {
                             ));
                         }
 
-                        // Cascade: delete all snapshots first and decrement SST refcounts.
+                        // Cascade: soft-delete all snapshots and decrement SST refcounts.
                         // SSTs that reach refcount 0 are moved to pending-GC.
                         if *cascade {
                             // Guard: reject cascade if any snapshot has a restore in progress.
@@ -1836,32 +1855,46 @@ impl RedbStateMachine {
                                 ));
                             }
 
-                            for snap_id in &snapshot_ids {
-                                if let Some(snap) = storage.snapshots.remove(snap_id) {
-                                    for sst in &snap.sst_files {
-                                        let count = storage
+                            // Collect SST files first to avoid borrow conflicts.
+                            let snap_ssts: Vec<(String, Vec<String>)> = snapshot_ids
+                                .iter()
+                                .filter_map(|snap_id| {
+                                    let snap = storage.snapshots.get(snap_id)?;
+                                    if snap.state == SnapshotState::Deleted {
+                                        return None;
+                                    }
+                                    Some((snap_id.clone(), snap.sst_files.clone()))
+                                })
+                                .collect();
+
+                            for (snap_id, sst_files) in &snap_ssts {
+                                for sst in sst_files {
+                                    let count = storage
+                                        .sst_refcounts
+                                        .0
+                                        .get(sst)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    if count <= 1 {
+                                        storage.sst_refcounts.0.remove(sst);
+                                        storage.pending_gc_ssts.push(sst.clone());
+                                    } else {
+                                        storage
                                             .sst_refcounts
                                             .0
-                                            .get(sst)
-                                            .copied()
-                                            .unwrap_or(0);
-                                        if count <= 1 {
-                                            storage.sst_refcounts.0.remove(sst);
-                                            storage.pending_gc_ssts.push(sst.clone());
-                                        } else {
-                                            storage
-                                                .sst_refcounts
-                                                .0
-                                                .insert(sst.clone(), count - 1);
-                                        }
+                                            .insert(sst.clone(), count - 1);
                                     }
-                                    info!(snapshot_id = %snap_id, volume_id, "snapshot cascade-deleted");
                                 }
+                                if let Some(snap) = storage.snapshots.get_mut(snap_id) {
+                                    snap.state = SnapshotState::Deleted;
+                                }
+                                info!(snapshot_id = %snap_id, volume_id, "snapshot cascade-deleted");
                             }
-                            // Recalculate minimum WAL retention.
+                            // Recalculate minimum WAL retention (excluding soft-deleted).
                             storage.min_wal_position = storage
                                 .snapshots
                                 .values()
+                                .filter(|s| s.state != SnapshotState::Deleted)
                                 .map(|s| s.wal_position)
                                 .min();
                         }
@@ -2076,6 +2109,7 @@ impl RedbStateMachine {
                     size_gb,
                     env_id,
                     volume_type,
+                    state: SnapshotState::Available,
                 };
                 storage.snapshots.insert(id.clone(), record);
 
@@ -2099,31 +2133,40 @@ impl RedbStateMachine {
                     ));
                 }
 
-                match storage.snapshots.remove(snapshot_id) {
-                    Some(snap) => {
-                        // Decrement SST refcounts; SSTs that reach 0 are moved to
-                        // the pending-GC list rather than being removed immediately.
-                        for sst in &snap.sst_files {
-                            if let Some(count) = storage.sst_refcounts.0.get_mut(sst) {
-                                *count = count.saturating_sub(1);
-                                if *count == 0 {
-                                    storage.sst_refcounts.0.remove(sst);
-                                    storage.pending_gc_ssts.push(sst.clone());
-                                }
-                            }
-                        }
-
-                        // Recalculate minimum WAL retention across remaining snapshots.
-                        storage.min_wal_position =
-                            storage.snapshots.values().map(|s| s.wal_position).min();
-
-                        info!(snapshot_id, "snapshot deleted");
-                        StateMachineResponse::Ok
+                let sst_files = match storage.snapshots.get(snapshot_id) {
+                    Some(snap) if snap.state == SnapshotState::Deleted => {
+                        return StateMachineResponse::Error(format!(
+                            "snapshot '{snapshot_id}' is already deleted"
+                        ));
                     }
+                    Some(snap) => snap.sst_files.clone(),
                     None => {
-                        StateMachineResponse::Error(format!("snapshot not found: {snapshot_id}"))
+                        return StateMachineResponse::Error(format!(
+                            "snapshot not found: {snapshot_id}"
+                        ));
+                    }
+                };
+                // Decrement SST refcounts; SSTs that reach 0 are moved to pending-GC.
+                for sst in &sst_files {
+                    if let Some(count) = storage.sst_refcounts.0.get_mut(sst) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            storage.sst_refcounts.0.remove(sst);
+                            storage.pending_gc_ssts.push(sst.clone());
+                        }
                     }
                 }
+                storage.snapshots.get_mut(snapshot_id).unwrap().state = SnapshotState::Deleted;
+
+                // Recalculate minimum WAL retention across remaining (non-deleted) snapshots.
+                storage.min_wal_position = storage
+                    .snapshots
+                    .values()
+                    .filter(|s| s.state != SnapshotState::Deleted)
+                    .map(|s| s.wal_position)
+                    .min();
+                info!(snapshot_id, "snapshot deleted");
+                StateMachineResponse::Ok
             }
 
             // -- Storage: CommitManifest (ADR-006 §12b) --
@@ -2209,6 +2252,11 @@ impl RedbStateMachine {
                 let snap = {
                     let storage = self.storage.read().unwrap();
                     match storage.snapshots.get(snapshot_id) {
+                        Some(s) if s.state == SnapshotState::Deleted => {
+                            return StateMachineResponse::Error(format!(
+                                "cannot restore from deleted snapshot '{snapshot_id}'"
+                            ))
+                        }
                         Some(s) => s.clone(),
                         None => {
                             return StateMachineResponse::Error(format!(
@@ -2251,6 +2299,26 @@ impl RedbStateMachine {
                         "volume with id '{new_volume_id}' already exists"
                     ));
                 }
+
+                // Increment SST refcounts: the new volume references the
+                // snapshot's SST files, so they must not be GC'd.
+                for sst in &snap.sst_files {
+                    *storage.sst_refcounts.0.entry(sst.clone()).or_insert(0) += 1;
+                }
+
+                // Seed a manifest pointer so the new volume reads from the
+                // snapshot's SST files at generation 0.
+                storage.manifest_pointers.insert(
+                    new_volume_id.clone(),
+                    ManifestPointerRecord {
+                        volume_id: new_volume_id.clone(),
+                        generation: 0,
+                        manifest_version: 1,
+                        s3_key: format!("snapshots/{snapshot_id}/manifest.json"),
+                        published_by: format!("restore:{snapshot_id}"),
+                    },
+                );
+
                 let record = VolumeRecord {
                     id: new_volume_id.clone(),
                     name: new_volume_name.clone(),
@@ -3280,6 +3348,95 @@ mod tests {
     }
 
     #[test]
+    fn restore_snapshot_increments_sst_refcounts() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+
+        // Create snapshot with known SST files.
+        sm.apply_command(&StateMachineCommand::CreateSnapshot {
+            id: "snap-1".into(),
+            source_volume_id: "vol-1".into(),
+            sst_files: vec!["sst-x".into(), "sst-y".into()],
+            wal_position: 10,
+        });
+
+        // Baseline: each SST has refcount 1 from the snapshot.
+        {
+            let storage = sm.storage.read().unwrap();
+            assert_eq!(storage.sst_refcounts.0.get("sst-x"), Some(&1));
+            assert_eq!(storage.sst_refcounts.0.get("sst-y"), Some(&1));
+        }
+
+        // Restore: refcounts should increment to 2.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Created(_)));
+
+        let storage = sm.storage.read().unwrap();
+        assert_eq!(storage.sst_refcounts.0.get("sst-x"), Some(&2));
+        assert_eq!(storage.sst_refcounts.0.get("sst-y"), Some(&2));
+    }
+
+    #[test]
+    fn restore_snapshot_seeds_manifest_pointer() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+
+        let storage = sm.storage.read().unwrap();
+        let ptr = storage
+            .manifest_pointers
+            .get("vol-2")
+            .expect("manifest pointer should be seeded");
+        assert_eq!(ptr.volume_id, "vol-2");
+        assert_eq!(ptr.generation, 0);
+        assert_eq!(ptr.manifest_version, 1);
+        assert!(ptr.s3_key.contains("snap-1"));
+        assert!(ptr.published_by.contains("restore"));
+    }
+
+    #[test]
+    fn restore_from_deleted_snapshot_fails() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        create_snapshot(&sm, "snap-1", "vol-1");
+
+        // Delete the snapshot.
+        let resp = sm.apply_command(&StateMachineCommand::DeleteSnapshot {
+            snapshot_id: "snap-1".into(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Attempt restore from deleted snapshot.
+        let resp = sm.apply_command(&StateMachineCommand::RestoreSnapshot {
+            snapshot_id: "snap-1".into(),
+            new_volume_id: "vol-2".into(),
+            new_volume_name: "pgdata-restored".into(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(msg.contains("deleted"), "should mention deleted: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn set_storage_config() {
         let (_dir, store) = make_org_store();
         let sm = RedbStateMachine::new(store);
@@ -3738,9 +3895,10 @@ mod tests {
         assert!(matches!(resp, StateMachineResponse::Ok));
 
         let storage = sm.storage.read().unwrap();
-        assert!(
-            !storage.snapshots.contains_key("snap-1"),
-            "snapshot should be cascade-deleted"
+        assert_eq!(
+            storage.snapshots.get("snap-1").unwrap().state,
+            SnapshotState::Deleted,
+            "snapshot should be cascade-deleted (soft)"
         );
         assert_eq!(
             storage.volumes.get("vol-1").unwrap().state,
@@ -3842,7 +4000,10 @@ mod tests {
         assert!(matches!(resp, StateMachineResponse::Ok));
 
         let storage = sm.storage.read().unwrap();
-        assert!(!storage.snapshots.contains_key("snap-1"));
+        assert_eq!(
+            storage.snapshots.get("snap-1").unwrap().state,
+            SnapshotState::Deleted
+        );
         assert_eq!(
             storage.volumes.get("vol-1").unwrap().state,
             VolumeState::Deleted
