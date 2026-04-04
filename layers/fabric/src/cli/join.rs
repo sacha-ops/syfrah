@@ -32,6 +32,7 @@ pub async fn run(
             peering_port: port + 1,
             region,
             zone,
+            no_hypervisor: false,
         },
         pin,
     )

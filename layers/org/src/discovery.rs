@@ -20,6 +20,16 @@ pub fn kvm_available() -> bool {
     Path::new("/dev/kvm").exists()
 }
 
+/// Check if the operator opted out of automatic hypervisor registration
+/// via `--no-hypervisor`. The sentinel file is `~/.syfrah/no_hypervisor`.
+pub fn no_hypervisor_opted_out() -> bool {
+    let sentinel = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/root"))
+        .join(".syfrah")
+        .join("no_hypervisor");
+    sentinel.exists()
+}
+
 /// Probe CPU information from /proc/cpuinfo.
 fn probe_cpu() -> (String, u32, u32) {
     let content = match std::fs::read_to_string("/proc/cpuinfo") {
@@ -265,6 +275,11 @@ pub fn discover_hypervisor(
     public_ip: &str,
     fabric_ipv6: &str,
 ) -> Option<String> {
+    if no_hypervisor_opted_out() {
+        info!("hypervisor: discovery skipped (--no-hypervisor)");
+        return None;
+    }
+
     if !kvm_available() {
         info!("hypervisor: /dev/kvm not found, node is mesh-only");
         return None;
