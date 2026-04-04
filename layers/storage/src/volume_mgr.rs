@@ -642,6 +642,34 @@ impl VolumeMgr {
         self.stop_volume(volume_id).await
     }
 
+    /// Clean up local directories for a deleted volume.
+    ///
+    /// Removes the ZeroFS config directory (`/tmp/syfrah/{volume_id}/`) which
+    /// contains `zerofs.toml`, the 9P socket, and the manifest file. This
+    /// should only be called after `stop_volume()` has already terminated the
+    /// ZeroFS process and unmounted the 9P filesystem.
+    ///
+    /// Cache directory cleanup is handled separately via
+    /// `syfrah_storage::cleanup_volume_cache()`.
+    pub async fn cleanup_volume_dirs(&self, volume_id: &str) {
+        let config_dir = PathBuf::from(format!("/tmp/syfrah/{volume_id}"));
+        if config_dir.exists() {
+            match tokio::fs::remove_dir_all(&config_dir).await {
+                Ok(()) => {
+                    tracing::info!(volume_id, path = %config_dir.display(), "removed config dir for deleted volume");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        volume_id,
+                        path = %config_dir.display(),
+                        error = %e,
+                        "failed to remove config dir for deleted volume"
+                    );
+                }
+            }
+        }
+    }
+
     /// Get the mount path for a running volume.
     ///
     /// Returns the host-side mount point where the 9P filesystem is mounted.
