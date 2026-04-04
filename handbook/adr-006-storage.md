@@ -17,7 +17,7 @@ This ADR defines the complete storage architecture: the volume resource model, s
 
 ### Why now
 
-The compute layer (ADR-001, compute README) defines `virtio-block` integration and expects block device paths from the storage layer. Forge (ADR-003) defines `VolumeMgr` as a placeholder for ZeroFS/NBD management. The control plane (ADR-005) includes `CreateVolume`, `DeleteVolume`, `AttachVolume`, and `DetachVolume` as Raft commands but does not specify their semantics. The hypervisor model (ADR-004) explicitly notes that remote volumes (ZeroFS/S3) are not hypervisor-bounded — they attach over the network and backed by S3. This ADR fills the gap.
+The compute layer (ADR-001, compute README) defines `virtio-block` integration and expects block device paths from the storage layer. Forge (ADR-003) defines `VolumeMgr` as a placeholder for ZeroFS/NBD management. The control plane (ADR-005) includes `CreateVolume`, `DeleteVolume`, `VolumeAttach`, and `VolumeDetach` as Raft commands but does not specify their semantics. The hypervisor model (ADR-004) explicitly notes that remote volumes (ZeroFS/S3) are not hypervisor-bounded — they attach over the network and backed by S3. This ADR fills the gap.
 
 ### Relationship to existing decisions
 
@@ -415,7 +415,7 @@ When a snapshot is created at wal_position P:
 
 A volume can be attached to exactly one VM at a time. This is enforced by the Raft state machine:
 
-- `AttachVolume { volume_id, vm_id }` checks that `volume.attached_to` is `None`
+- `VolumeAttach { volume_id, vm_id }` checks that `volume.attached_to` is `None`
 - If `attached_to` is `Some(other_vm_id)`, the command is rejected with `VolumeAlreadyAttached`
 - There is no multi-attach mode in v1 (no shared filesystems, no clustered databases)
 
@@ -429,7 +429,7 @@ Control plane (Raft leader)           Forge (target hypervisor)
 
 1. Validate: volume is Available,
    VM exists and is on this HV
-2. Commit AttachVolume to Raft
+2. Commit VolumeAttach to Raft
    (volume.desired → AttachedTo(vm, hv),
     volume.placement_generation++)
                                       3. Reconciler sees: volume should
@@ -450,7 +450,7 @@ Control plane (Raft leader)           Forge (target hypervisor)
 ─────────────────────────────         ────────────────────────────
 
 1. Validate: volume is Attached
-2. Commit DetachVolume to Raft
+2. Commit VolumeDetach to Raft
    (volume.desired → Available)
                                       3. Cloud Hypervisor: PUT /vm.remove-device
                                          (guest loses /dev/vdX)
@@ -735,8 +735,8 @@ t=0     Node A is healthy                      ZeroFS active   -
 t=1     Node A becomes unreachable             (unreachable)   -
 t=2     Gossip detects failure (~15s)           (unreachable)   -
 t=3     Raft reschedules VM                    (unreachable)   -
-        DetachVolume(gen=41→42)
-        AttachVolume(gen=42, hv=B)
+        VolumeDetach(gen=41→42)
+        VolumeAttach(gen=42, hv=B)
 t=4     Node B starts ZeroFS                   (unreachable)   ZeroFS active
                                                                gen=42
                                                                prefix: gen-42/
@@ -1003,12 +1003,12 @@ Volume metadata goes through Raft for consistency. Volume data goes directly to 
 | Resource | Raft commands | Why in Raft |
 |---|---|---|
 | Volume CRUD | `CreateVolume`, `DeleteVolume`, `ResizeVolume` | Must be consistent — no duplicate IDs, no double-create |
-| Attachment state | `AttachVolume`, `DetachVolume` | Single-writer invariant — Raft enforces exclusive attachment |
+| Attachment state | `VolumeAttach`, `VolumeDetach` | Single-writer invariant — Raft enforces exclusive attachment |
 | Snapshot records | `CreateSnapshot`, `DeleteSnapshot`, `RestoreSnapshot` | Must be consistent — snapshot IDs unique, source volume valid |
 | SST refcounts | Updated on snapshot/volume create/delete | GC safety — Raft is source of truth for reachability |
 | Storage config | `SetStorageConfig` | Per-region S3 config, replicated to all nodes |
 | Storage quotas | `SetStorageQuota`, `CheckQuota` | Per-org/project limits, enforced at commit time |
-| Placement generation | Incremented on `AttachVolume`, `DetachVolume`, reschedule | Fencing (see §12) |
+| Placement generation | Incremented on `VolumeAttach`, `VolumeDetach`, reschedule | Fencing (see §12) |
 
 ### What ZeroFS manages (locally, not through Raft)
 
@@ -1036,12 +1036,12 @@ enum StorageCommand {
     DeleteVolume {
         volume_id: VolumeId,
     },
-    AttachVolume {
+    VolumeAttach {
         volume_id: VolumeId,
         vm_id: VmId,
         hypervisor_id: HypervisorId,
     },
-    DetachVolume {
+    VolumeDetach {
         volume_id: VolumeId,
     },
     ResizeVolume {
@@ -1078,8 +1078,8 @@ enum StorageCommand {
 Each command is validated by the Raft state machine before committing:
 
 - `CreateVolume`: check quota, check name uniqueness within environment
-- `AttachVolume`: check volume is `Available`, check VM exists and is on the target HV, increment `placement_generation`
-- `DetachVolume`: check volume is `Attached`, set desired state to `Available`
+- `VolumeAttach`: check volume is `Available`, check VM exists and is on the target HV, increment `placement_generation`
+- `VolumeDetach`: check volume is `Attached`, set desired state to `Available`
 - `DeleteVolume`: check volume is `Available` (not attached), check no in-flight snapshot/restore operations reference it, set desired state to `Deleted`. Physical S3 deletion happens after a tombstone period — Raft marks the intent, Forge executes the cleanup.
 - `ResizeVolume`: check volume is `Available`, check new size >= current size (no shrink in v1)
 - `CreateSnapshot`: increment refcounts for all referenced SST files
