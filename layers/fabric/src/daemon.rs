@@ -1497,6 +1497,17 @@ pub async fn run_daemon(
         tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>,
     > = Arc::new(tokio::sync::RwLock::new(None));
 
+    // -- ZeroFS + NBD prerequisites ---------------------------------------------
+    //
+    // Ensure the ZeroFS binary is installed and the NBD kernel module is loaded
+    // before the storage reconciler starts. This mirrors the kernel auto-install
+    // pattern in `layers/compute/src/boot.rs`.
+    syfrah_storage::ensure_nbd_module();
+    match syfrah_storage::ensure_zerofs() {
+        Ok(path) => info!("zerofs ready at {}", path.display()),
+        Err(e) => warn!("zerofs auto-install failed (storage may be degraded): {e}"),
+    }
+
     // -- Storage reconciler (background task) ----------------------------------
     //
     // Start the StorageReconciler as a periodic background loop that converges
