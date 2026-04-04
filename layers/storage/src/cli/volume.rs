@@ -2,16 +2,11 @@
 //!
 //! All operations go through the daemon's control socket.
 
-use std::path::PathBuf;
-
 use crate::api::{send_storage_request, StorageRequest, StorageResponse};
 
-fn control_socket_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/root"))
-        .join(".syfrah")
-        .join("control.sock")
-}
+use super::fmt::{
+    control_socket_path, daemon_connect_error, format_timestamp, term_width, truncate,
+};
 
 /// Create a new volume.
 pub async fn run_create(
@@ -363,69 +358,11 @@ pub async fn run_detach(name: &str, project: Option<&str>, force: bool) -> anyho
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build a user-friendly error when the daemon is unreachable.
-fn daemon_connect_error(e: Box<dyn std::error::Error>) -> anyhow::Error {
-    anyhow::anyhow!(
-        "cannot reach the syfrah daemon -- is it running?\n\
-         Start it with: syfrah fabric init ...\n\n\
-         Error: {e}"
-    )
-}
-
-/// Return the current terminal width, falling back to 120 columns.
-fn term_width() -> usize {
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(120)
-}
-
-/// Truncate a string to `max` characters, appending "..." if it exceeds the limit.
-///
-/// Uses `char_indices` to avoid panicking on multi-byte UTF-8 strings.
-fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else if max <= 3 {
-        s.chars().take(max).collect()
-    } else {
-        let truncated: String = s.chars().take(max - 3).collect();
-        format!("{truncated}...")
-    }
-}
-
-/// Format a Unix timestamp as a human-readable date string.
-fn format_timestamp(ts: u64) -> String {
-    let secs = ts;
-    let days = secs / 86400;
-    let (year, month, day) = days_to_date(days);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_date(days: u64) -> (u64, u64, u64) {
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::super::VolumeCommand;
+    use super::super::{SnapshotCommand, VolumeCommand};
 
     /// Helper to parse volume commands from an arg list.
     #[derive(Debug, Parser)]
@@ -437,6 +374,17 @@ mod tests {
     fn parse(args: &[&str]) -> VolumeCommand {
         let full_args = std::iter::once("test").chain(args.iter().copied());
         TestCli::parse_from(full_args).cmd
+    }
+
+    fn parse_snapshot(args: &[&str]) -> SnapshotCommand {
+        let full_args: Vec<&str> = std::iter::once("test")
+            .chain(std::iter::once("snapshot"))
+            .chain(args.iter().copied())
+            .collect();
+        match TestCli::parse_from(full_args).cmd {
+            VolumeCommand::Snapshot { command } => command,
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
     }
 
     #[test]
@@ -716,6 +664,188 @@ mod tests {
                 assert!(force);
             }
             other => panic!("expected Detach, got {other:?}"),
+        }
+    }
+
+    // -- Snapshot subcommand tests ------------------------------------------
+
+    #[test]
+    fn snapshot_create_parse() {
+        let cmd = parse_snapshot(&["create", "daily-backup", "--volume", "pgdata"]);
+        match cmd {
+            SnapshotCommand::Create {
+                name,
+                volume,
+                project,
+                org,
+            } => {
+                assert_eq!(name, "daily-backup");
+                assert_eq!(volume, "pgdata");
+                assert!(project.is_none());
+                assert!(org.is_none());
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_create_with_project_and_org() {
+        let cmd = parse_snapshot(&[
+            "create",
+            "daily-backup",
+            "--volume",
+            "pgdata",
+            "--project",
+            "backend",
+            "--org",
+            "acme",
+        ]);
+        match cmd {
+            SnapshotCommand::Create {
+                name,
+                volume,
+                project,
+                org,
+            } => {
+                assert_eq!(name, "daily-backup");
+                assert_eq!(volume, "pgdata");
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert_eq!(org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_list_parse_empty() {
+        let cmd = parse_snapshot(&["list"]);
+        assert!(matches!(
+            cmd,
+            SnapshotCommand::List {
+                volume: None,
+                project: None,
+                org: None,
+                json: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn snapshot_list_parse_with_volume() {
+        let cmd = parse_snapshot(&["list", "--volume", "pgdata", "--json"]);
+        match cmd {
+            SnapshotCommand::List { volume, json, .. } => {
+                assert_eq!(volume.as_deref(), Some("pgdata"));
+                assert!(json);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_list_parse_with_project_and_org() {
+        let cmd = parse_snapshot(&[
+            "list",
+            "--volume",
+            "pgdata",
+            "--project",
+            "backend",
+            "--org",
+            "acme",
+        ]);
+        match cmd {
+            SnapshotCommand::List {
+                volume,
+                project,
+                org,
+                json,
+            } => {
+                assert_eq!(volume.as_deref(), Some("pgdata"));
+                assert_eq!(project.as_deref(), Some("backend"));
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert!(!json);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_get_parse() {
+        let cmd = parse_snapshot(&["get", "daily-backup"]);
+        match cmd {
+            SnapshotCommand::Get { name, json } => {
+                assert_eq!(name, "daily-backup");
+                assert!(!json);
+            }
+            other => panic!("expected Get, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_get_with_json() {
+        let cmd = parse_snapshot(&["get", "daily-backup", "--json"]);
+        match cmd {
+            SnapshotCommand::Get { name, json } => {
+                assert_eq!(name, "daily-backup");
+                assert!(json);
+            }
+            other => panic!("expected Get, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_parse() {
+        let cmd = parse_snapshot(&[
+            "restore",
+            "daily-backup",
+            "--target-volume",
+            "pgdata-restored",
+        ]);
+        match cmd {
+            SnapshotCommand::Restore {
+                snapshot,
+                target_volume,
+            } => {
+                assert_eq!(snapshot, "daily-backup");
+                assert_eq!(target_volume, "pgdata-restored");
+            }
+            other => panic!("expected Restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_delete_parse() {
+        let cmd = parse_snapshot(&["delete", "daily-backup", "--yes"]);
+        match cmd {
+            SnapshotCommand::Delete { name, yes } => {
+                assert_eq!(name, "daily-backup");
+                assert!(yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_delete_short_yes() {
+        let cmd = parse_snapshot(&["delete", "-y", "daily-backup"]);
+        match cmd {
+            SnapshotCommand::Delete { name, yes } => {
+                assert_eq!(name, "daily-backup");
+                assert!(yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_delete_without_confirm() {
+        let cmd = parse_snapshot(&["delete", "daily-backup"]);
+        match cmd {
+            SnapshotCommand::Delete { name, yes } => {
+                assert_eq!(name, "daily-backup");
+                assert!(!yes);
+            }
+            other => panic!("expected Delete, got {other:?}"),
         }
     }
 }
