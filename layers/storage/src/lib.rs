@@ -14,7 +14,8 @@ pub use binary::ensure_zerofs;
 pub use cache::{
     cleanup_volume_cache, create_volume_cache, evaluate_alerts, validate_cache_disk,
     zerofs_cache_args, CacheAlert, CacheAlertThresholds, CacheConfig, CacheDiskInfo, CacheError,
-    CacheMetrics, VolumeCacheDir,
+    CacheMetrics, CachePrewarmConfig, CachePrewarmProgress, CachePrewarmer, PrewarmHandle,
+    VolumeCacheDir,
 };
 pub use cli::{SnapshotCommand, StorageCommand, VolumeCommand};
 pub use s3_health::{
