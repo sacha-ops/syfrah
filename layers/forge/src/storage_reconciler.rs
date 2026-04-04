@@ -511,6 +511,28 @@ impl StorageReconciler {
 }
 
 // ---------------------------------------------------------------------------
+// EmptyStateReader — no-op reader for bootstrapping
+// ---------------------------------------------------------------------------
+
+/// A no-op `VolumeStateReader` that returns no desired volumes and no config.
+///
+/// Used during daemon startup before the Raft state machine is available.
+/// Once the control plane initialises, the daemon should replace this with a
+/// Raft-backed reader.
+pub struct EmptyStateReader;
+
+#[async_trait::async_trait]
+impl VolumeStateReader for EmptyStateReader {
+    async fn desired_volumes(&self, _local_hypervisor_id: &str) -> Vec<DesiredVolume> {
+        Vec::new()
+    }
+
+    async fn storage_config(&self) -> Option<RegionStorageConfig> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1820,7 +1820,7 @@ impl RedbStateMachine {
                 }
             }
 
-            StateMachineCommand::AttachVolume {
+            StateMachineCommand::VolumeAttach {
                 volume_id,
                 vm_id,
                 hypervisor_id,
@@ -1843,7 +1843,7 @@ impl RedbStateMachine {
                 }
             }
 
-            StateMachineCommand::DetachVolume { volume_id } => {
+            StateMachineCommand::VolumeDetach { volume_id } => {
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get_mut(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => {
@@ -2751,7 +2751,7 @@ mod tests {
         let resp = create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
         assert!(matches!(resp, StateMachineResponse::Created(_)));
 
-        let resp = sm.apply_command(&StateMachineCommand::AttachVolume {
+        let resp = sm.apply_command(&StateMachineCommand::VolumeAttach {
             volume_id: "vol-1".into(),
             vm_id: "vm-1".into(),
             hypervisor_id: "hv-1".into(),
@@ -2767,7 +2767,7 @@ mod tests {
         assert!(matches!(resp, StateMachineResponse::Error(_)));
 
         // Detach.
-        let resp = sm.apply_command(&StateMachineCommand::DetachVolume {
+        let resp = sm.apply_command(&StateMachineCommand::VolumeDetach {
             volume_id: "vol-1".into(),
         });
         assert!(matches!(resp, StateMachineResponse::Ok));
@@ -3234,7 +3234,7 @@ mod tests {
         let sm = RedbStateMachine::new(store);
 
         create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
-        sm.apply_command(&StateMachineCommand::AttachVolume {
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
             volume_id: "vol-1".into(),
             vm_id: "vm-1".into(),
             hypervisor_id: "hv-1".into(),

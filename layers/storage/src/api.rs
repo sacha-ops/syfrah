@@ -55,6 +55,18 @@ pub enum StorageRequest {
         project: Option<String>,
         deletion_protection: Option<bool>,
     },
+    /// Attach a volume to a VM.
+    VolumeAttach {
+        name: String,
+        vm: String,
+        project: Option<String>,
+    },
+    /// Detach a volume from its VM.
+    VolumeDetach {
+        name: String,
+        project: Option<String>,
+        force: bool,
+    },
     /// Configure storage backend (S3 + cache settings).
     Configure {
         region: String,
@@ -199,6 +211,22 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
         StorageRequest::VolumeUpdate { name, .. } => StorageResponse::Error(format!(
             "volume '{name}' not found. List available volumes with: syfrah volume list"
         )),
+        StorageRequest::VolumeAttach { name, vm, .. } => {
+            // TODO: forward to Raft VolumeAttach
+            StorageResponse::Volume(serde_json::json!({
+                "name": name,
+                "state": "attached",
+                "attached_to": vm,
+            }))
+        }
+        StorageRequest::VolumeDetach { name, .. } => {
+            // TODO: forward to Raft VolumeDetach
+            StorageResponse::Volume(serde_json::json!({
+                "name": name,
+                "state": "available",
+                "attached_to": null,
+            }))
+        }
         StorageRequest::Configure { region, .. } => {
             // TODO: forward to Raft SetStorageConfig
             StorageResponse::StorageConfigured { region }
@@ -286,6 +314,48 @@ mod tests {
             StorageResponse::Volume(v) => {
                 assert_eq!(v["name"], "pgdata");
                 assert_eq!(v["size_gb"], 50);
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_attached_volume() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::VolumeAttach {
+            name: "pgdata".into(),
+            vm: "web-1".into(),
+            project: None,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Volume(v) => {
+                assert_eq!(v["name"], "pgdata");
+                assert_eq!(v["attached_to"], "web-1");
+                assert_eq!(v["state"], "attached");
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_detached_volume() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::VolumeDetach {
+            name: "pgdata".into(),
+            project: None,
+            force: false,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Volume(v) => {
+                assert_eq!(v["name"], "pgdata");
+                assert!(v["attached_to"].is_null());
+                assert_eq!(v["state"], "available");
             }
             other => panic!("expected Volume, got {other:?}"),
         }

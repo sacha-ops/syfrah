@@ -16,6 +16,7 @@ syfrah-overlay = { path = "../overlay" }
 syfrah-state = { path = "../state" }
 syfrah-api = { path = "../api" }
 syfrah-forge = { path = "../forge" }
+syfrah-storage = { path = "../storage" }
 syfrah-controlplane = { path = "../controlplane" }
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 wireguard-control = "1.7"
