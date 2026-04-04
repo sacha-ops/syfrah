@@ -13,5 +13,5 @@ pub use cache::{
     cleanup_volume_cache, create_volume_cache, validate_cache_disk, zerofs_cache_args, CacheConfig,
     CacheDiskInfo, CacheError, VolumeCacheDir,
 };
-pub use cli::{StorageCommand, VolumeCommand};
+pub use cli::{SnapshotCommand, StorageCommand, VolumeCommand};
 pub use volume_mgr::{S3Config, VolumeMgr, VolumeMgrError};

@@ -84,6 +84,16 @@ pub enum StorageRequest {
         cache_disk_size_gb: u32,
         cache_memory_size_gb: u32,
     },
+    /// Create a snapshot of a volume.
+    SnapshotCreate { name: String, volume: String },
+    /// List snapshots, optionally filtered by source volume.
+    SnapshotList { volume: Option<String> },
+    /// Get details of a single snapshot.
+    SnapshotGet { name: String },
+    /// Restore a snapshot into a new volume.
+    SnapshotRestore { snapshot: String, name: String },
+    /// Delete a snapshot.
+    SnapshotDelete { name: String },
     /// Run storage health check (S3 probe + cache info).
     Health,
     /// Get storage status (connectivity + cache utilization).
@@ -96,6 +106,10 @@ pub enum StorageResponse {
     Volume(serde_json::Value),
     /// List of volumes.
     VolumeList(Vec<serde_json::Value>),
+    /// Single snapshot info.
+    Snapshot(serde_json::Value),
+    /// List of snapshots.
+    SnapshotList(Vec<serde_json::Value>),
     /// Success with no data.
     Ok,
     /// Storage configuration applied successfully.
@@ -227,6 +241,31 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 "attached_to": null,
             }))
         }
+        StorageRequest::SnapshotCreate { name, volume } => {
+            // TODO: persist snapshot via storage store
+            StorageResponse::Snapshot(serde_json::json!({
+                "name": name,
+                "source_volume": volume,
+                "state": "creating",
+                "created_at": 0,
+            }))
+        }
+        StorageRequest::SnapshotList { .. } => StorageResponse::SnapshotList(vec![]),
+        StorageRequest::SnapshotGet { name } => StorageResponse::Error(format!(
+            "snapshot '{name}' not found. List available snapshots with: syfrah volume snapshot list"
+        )),
+        StorageRequest::SnapshotRestore { snapshot, name } => {
+            // TODO: forward to Raft SnapshotRestore
+            StorageResponse::Volume(serde_json::json!({
+                "name": name,
+                "source_snapshot": snapshot,
+                "state": "creating",
+                "created_at": 0,
+            }))
+        }
+        StorageRequest::SnapshotDelete { name } => StorageResponse::Error(format!(
+            "snapshot '{name}' not found. List available snapshots with: syfrah volume snapshot list"
+        )),
         StorageRequest::Configure { region, .. } => {
             // TODO: forward to Raft SetStorageConfig
             StorageResponse::StorageConfigured { region }
@@ -356,6 +395,73 @@ mod tests {
                 assert_eq!(v["name"], "pgdata");
                 assert!(v["attached_to"].is_null());
                 assert_eq!(v["state"], "available");
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_snapshot_on_create() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotCreate {
+            name: "daily-backup".into(),
+            volume: "pgdata".into(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Snapshot(s) => {
+                assert_eq!(s["name"], "daily-backup");
+                assert_eq!(s["source_volume"], "pgdata");
+                assert_eq!(s["state"], "creating");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_empty_snapshot_list() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotList { volume: None };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(matches!(resp, StorageResponse::SnapshotList(v) if v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn handler_returns_error_on_snapshot_get_not_found() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotGet {
+            name: "missing".into(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Error(msg) => {
+                assert!(msg.contains("missing"));
+                assert!(msg.contains("syfrah volume snapshot list"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_returns_volume_on_snapshot_restore() {
+        let handler = StorageLayerHandler;
+        let req = StorageRequest::SnapshotRestore {
+            snapshot: "daily-backup".into(),
+            name: "pgdata-restored".into(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let resp_bytes = handler.handle(payload, None).await;
+        let resp: StorageResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        match resp {
+            StorageResponse::Volume(v) => {
+                assert_eq!(v["name"], "pgdata-restored");
+                assert_eq!(v["source_snapshot"], "daily-backup");
             }
             other => panic!("expected Volume, got {other:?}"),
         }
