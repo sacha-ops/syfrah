@@ -1432,6 +1432,13 @@ pub async fn run_daemon(
         info!("hypervisor layer initialised");
     }
 
+    // -- Storage layer integration ---------------------------------------------
+    //
+    // Register the StorageLayerHandler so CLI commands like `syfrah volume create`
+    // and `syfrah storage configure` are routed through the daemon's control socket.
+    router.register("storage", Arc::new(syfrah_storage::StorageLayerHandler));
+    info!("storage layer handler registered");
+
     // Register the forge layer handler on the control socket so future
     // `syfrah forge` CLI commands can be routed through the daemon.
     // Currently returns "not implemented" — real Forge operations use HTTP.
@@ -1450,6 +1457,45 @@ pub async fn run_daemon(
         Arc::new(tokio::sync::RwLock::new(None));
     let forge_gossip_cluster: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::GossipCluster>>> =
         Arc::new(tokio::sync::RwLock::new(None));
+
+    // -- Storage reconciler (background task) ----------------------------------
+    //
+    // Start the StorageReconciler as a periodic background loop that converges
+    // local ZeroFS processes to match the desired Raft state. Also start the
+    // storage cleanup loop that garbage-collects deleted volumes.
+    let (storage_shutdown_tx, storage_shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let hypervisor_id = my_record.name.clone();
+        let encryption_passphrase: String = mesh_secret
+            .encryption_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let reconciler = syfrah_forge::storage_reconciler::StorageReconciler::new(
+            hypervisor_id,
+            encryption_passphrase,
+        );
+        let reconciler_shutdown_rx = storage_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let reader: Arc<dyn syfrah_forge::storage_reconciler::VolumeStateReader> =
+                Arc::new(syfrah_forge::storage_reconciler::EmptyStateReader);
+            let mut volume_mgr = syfrah_storage::VolumeMgr::new();
+            reconciler
+                .run_loop(reader, &mut volume_mgr, reconciler_shutdown_rx)
+                .await;
+        });
+        info!("storage reconciler started");
+
+        let cleanup_shutdown_rx = storage_shutdown_rx.clone();
+        tokio::spawn(async move {
+            syfrah_forge::storage_cleanup::run_storage_cleanup_loop(
+                std::time::Duration::from_secs(300),
+                cleanup_shutdown_rx,
+            )
+            .await;
+        });
+        info!("storage cleanup loop started");
+    }
 
     // -- Forge HTTP API server -----------------------------------------------
     //
@@ -4083,6 +4129,9 @@ pub async fn run_daemon(
 
     // Signal Forge HTTP API server to shut down gracefully.
     let _ = forge_shutdown_tx.send(true);
+
+    // Signal storage reconciler and cleanup loop to shut down gracefully.
+    let _ = storage_shutdown_tx.send(true);
 
     // Signal Raft HTTP server to shut down gracefully.
     let _ = raft_shutdown_tx.send(true);
