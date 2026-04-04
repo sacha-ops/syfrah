@@ -1481,7 +1481,7 @@ pub async fn run_daemon(
                 Arc::new(syfrah_forge::storage_reconciler::EmptyStateReader);
             let mut volume_mgr = syfrah_storage::VolumeMgr::new();
             reconciler
-                .run_loop(reader, &mut volume_mgr, reconciler_shutdown_rx)
+                .run_loop(reader, &mut volume_mgr, None, reconciler_shutdown_rx)
                 .await;
         });
         info!("storage reconciler started");
