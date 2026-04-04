@@ -823,6 +823,108 @@ impl VolumeStateReader for EmptyStateReader {
 }
 
 // ---------------------------------------------------------------------------
+// RaftVolumeStateReader — reads desired state from the Raft state machine
+// ---------------------------------------------------------------------------
+
+/// A `VolumeStateReader` backed by the Raft state machine's materialized view.
+///
+/// Holds a late-binding reference to the `RedbStateMachine` via
+/// `Arc<tokio::sync::RwLock<Option<Arc<RedbStateMachine>>>>`. Before the Raft
+/// state machine is initialised the Option is `None` and the reader behaves
+/// like `EmptyStateReader` (returns no volumes, no config). Once the control
+/// plane injects the SM reference, the reader returns real data.
+///
+/// The `region` field determines which `StorageConfig` entry to look up.
+pub struct RaftVolumeStateReader {
+    sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
+    region: String,
+}
+
+impl RaftVolumeStateReader {
+    /// Create a new reader with a late-binding reference to the state machine.
+    pub fn new(
+        sm: Arc<tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>>,
+        region: String,
+    ) -> Self {
+        Self { sm, region }
+    }
+}
+
+#[async_trait::async_trait]
+impl VolumeStateReader for RaftVolumeStateReader {
+    async fn desired_volumes(&self, local_hypervisor_id: &str) -> Vec<DesiredVolume> {
+        let guard = self.sm.read().await;
+        let sm = match guard.as_ref() {
+            Some(sm) => sm,
+            None => return Vec::new(),
+        };
+
+        let storage = sm.storage.read().unwrap();
+        storage
+            .volumes
+            .values()
+            .filter(|vol| {
+                vol.state == syfrah_controlplane::VolumeState::Attached
+                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
+            })
+            .map(|vol| DesiredVolume {
+                id: vol.id.clone(),
+                name: vol.name.clone(),
+                size_gb: vol.size_gb,
+                placement_generation: vol.placement_generation,
+                hypervisor_id: local_hypervisor_id.to_string(),
+                vm_id: vol.attached_vm_id.clone(),
+            })
+            .collect()
+    }
+
+    async fn pending_detaches(&self, local_hypervisor_id: &str) -> Vec<DesiredDetach> {
+        let guard = self.sm.read().await;
+        let sm = match guard.as_ref() {
+            Some(sm) => sm,
+            None => return Vec::new(),
+        };
+
+        let storage = sm.storage.read().unwrap();
+        storage
+            .volumes
+            .values()
+            .filter(|vol| {
+                // Volume is Available (detach requested) but still assigned to
+                // this hypervisor — meaning ZeroFS may still be running locally.
+                vol.state == syfrah_controlplane::VolumeState::Available
+                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
+            })
+            .map(|vol| DesiredDetach {
+                volume_id: vol.id.clone(),
+                vm_id: vol.attached_vm_id.clone().unwrap_or_default(),
+                // CH device ID follows the naming convention used during attach.
+                ch_device_id: format!("_disk_{}", vol.id),
+                force: false,
+            })
+            .collect()
+    }
+
+    async fn storage_config(&self) -> Option<RegionStorageConfig> {
+        let guard = self.sm.read().await;
+        let sm = guard.as_ref()?;
+
+        let storage = sm.storage.read().unwrap();
+        let cfg = storage.storage_configs.get(&self.region)?;
+
+        Some(RegionStorageConfig {
+            s3_endpoint: cfg.s3_endpoint.clone(),
+            s3_bucket: cfg.s3_bucket.clone(),
+            s3_access_key: cfg.s3_access_key.clone(),
+            s3_secret_key: cfg.s3_secret_key.clone(),
+            cache_disk_path: PathBuf::from(&cfg.cache_disk_path),
+            cache_disk_size_bytes: u64::from(cfg.cache_disk_size_gb) * 1024 * 1024 * 1024,
+            cache_memory_size_bytes: u64::from(cfg.cache_memory_size_gb) * 1024 * 1024 * 1024,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1458,6 +1458,13 @@ pub async fn run_daemon(
     let forge_gossip_cluster: Arc<tokio::sync::RwLock<Option<syfrah_controlplane::GossipCluster>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
+    // Late-binding holder for the Raft state machine — the storage reconciler
+    // starts before Raft is initialised, so it reads through this Option.
+    // Once Raft is ready, the SM reference is injected below.
+    let reconciler_sm: Arc<
+        tokio::sync::RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>,
+    > = Arc::new(tokio::sync::RwLock::new(None));
+
     // -- Storage reconciler (background task) ----------------------------------
     //
     // Start the StorageReconciler as a periodic background loop that converges
@@ -1466,6 +1473,7 @@ pub async fn run_daemon(
     let (storage_shutdown_tx, storage_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let hypervisor_id = my_record.name.clone();
+        let region = my_record.region.as_deref().unwrap_or("default").to_string();
         let encryption_passphrase: String = mesh_secret
             .encryption_key()
             .iter()
@@ -1476,9 +1484,14 @@ pub async fn run_daemon(
             encryption_passphrase,
         );
         let reconciler_shutdown_rx = storage_shutdown_rx.clone();
+        let reconciler_sm_ref = Arc::clone(&reconciler_sm);
         tokio::spawn(async move {
-            let reader: Arc<dyn syfrah_forge::storage_reconciler::VolumeStateReader> =
-                Arc::new(syfrah_forge::storage_reconciler::EmptyStateReader);
+            let reader: Arc<dyn syfrah_forge::storage_reconciler::VolumeStateReader> = Arc::new(
+                syfrah_forge::storage_reconciler::RaftVolumeStateReader::new(
+                    reconciler_sm_ref,
+                    region,
+                ),
+            );
             let mut volume_mgr = syfrah_storage::VolumeMgr::new();
             reconciler
                 .run_loop(reader, &mut volume_mgr, None, reconciler_shutdown_rx)
@@ -1713,7 +1726,7 @@ pub async fn run_daemon(
                 ..Default::default()
             });
 
-            let raft = openraft::Raft::new(node_id, config, network, log_store, sm)
+            let raft = openraft::Raft::new(node_id, config, network, log_store, sm.clone())
                 .await
                 .expect("failed to create Raft node");
 
@@ -1736,6 +1749,19 @@ pub async fn run_daemon(
                     let mut guard = holder.write().await;
                     *guard = Some(client);
                     info!("raft: injected Raft client into Forge API for leader forwarding");
+                });
+            }
+
+            // Inject the Raft state machine into the storage reconciler so it
+            // can read volume desired state from Raft instead of the no-op
+            // EmptyStateReader.
+            {
+                let holder = Arc::clone(&reconciler_sm);
+                let sm_ref = Arc::clone(&sm);
+                tokio::spawn(async move {
+                    let mut guard = holder.write().await;
+                    *guard = Some(sm_ref);
+                    info!("raft: injected state machine into storage reconciler");
                 });
             }
 
@@ -2260,6 +2286,7 @@ pub async fn run_daemon(
             let aj_raft_client_holder = Arc::clone(&raft_client_holder);
             let aj_forge_raft_client = Arc::clone(&forge_raft_client);
             let aj_forge_gossip_cluster = Arc::clone(&forge_gossip_cluster);
+            let aj_reconciler_sm = Arc::clone(&reconciler_sm);
             let aj_raft_org_handler = raft_org_handler.clone();
             let aj_raft_hv_handler_ref = raft_hv_handler_ref.clone();
             let aj_raft_compute_handler_ref = raft_compute_handler_ref.clone();
@@ -2504,7 +2531,11 @@ pub async fn run_daemon(
                             });
 
                                 let raft = match openraft::Raft::new(
-                                    node_id, config, network, log_store, sm,
+                                    node_id,
+                                    config,
+                                    network,
+                                    log_store,
+                                    sm.clone(),
                                 )
                                 .await
                                 {
@@ -2537,6 +2568,17 @@ pub async fn run_daemon(
                                         let mut guard = holder.write().await;
                                         *guard = Some(client);
                                         info!("raft: injected Raft client into Forge API (in-process)");
+                                    });
+                                }
+
+                                // Inject Raft state machine into storage reconciler.
+                                {
+                                    let holder = Arc::clone(&aj_reconciler_sm);
+                                    let sm_ref = Arc::clone(&sm);
+                                    tokio::spawn(async move {
+                                        let mut guard = holder.write().await;
+                                        *guard = Some(sm_ref);
+                                        info!("raft: injected state machine into storage reconciler (in-process)");
                                     });
                                 }
 
