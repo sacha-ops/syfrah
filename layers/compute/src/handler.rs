@@ -258,6 +258,8 @@ async fn create_vm(
             .map(|v| VolumeAttachment {
                 path: v.path,
                 read_only: v.read_only,
+                volume_id: None,
+                is_root: false,
             })
             .collect(),
         gpu: parse_gpu_mode(body.gpu),

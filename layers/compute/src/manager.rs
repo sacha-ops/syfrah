@@ -973,6 +973,7 @@ impl VmManager {
             hypervisor_id: None,
             region: None,
             zone: None,
+            hotplug_devices: std::collections::HashMap::new(),
         };
 
         // Populate hypervisor metadata from the local hypervisor record.
@@ -1136,6 +1137,128 @@ impl VmManager {
             },
         );
 
+        Ok(())
+    }
+
+    // ── Hot-plug / hot-unplug volumes (#1199) ──────────────────────────
+
+    /// Hot-plug a data volume to a running VM.
+    ///
+    /// Sends `PUT /vm.add-disk` to Cloud Hypervisor and tracks the returned
+    /// device ID so the volume can be removed later via [`detach_volume`].
+    ///
+    /// Root volumes (`is_root == true`) cannot be hot-plugged — they must be
+    /// specified at VM creation time.
+    pub async fn attach_volume(
+        &self,
+        vm_id: &str,
+        volume_id: &str,
+        path: &str,
+        read_only: bool,
+    ) -> Result<(), ComputeError> {
+        let vm_arc = self.get_vm(vm_id).await?;
+        let mut guard = vm_arc.lock().await;
+
+        // VM must be running.
+        if guard.current_phase != crate::phase::VmPhase::Running {
+            return Err(ComputeError::VmNotFound {
+                id: format!("{vm_id} is not running (phase: {:?})", guard.current_phase),
+            });
+        }
+
+        // Build CH device ID from volume_id for stable tracking.
+        let device_id = format!("_disk_{volume_id}");
+
+        let disk_config = serde_json::json!({
+            "path": path,
+            "readonly": read_only,
+            "id": device_id,
+        });
+
+        let client = crate::client::ChClient::new(guard.socket_path.clone());
+        client.add_disk(disk_config).await?;
+
+        // Track the mapping for later removal.
+        guard
+            .hotplug_devices
+            .insert(volume_id.to_string(), device_id.clone());
+
+        events::emit(
+            &self.event_tx,
+            VmEvent::DeviceAttached {
+                vm_id: VmId(vm_id.to_string()),
+                device: format!("volume:{volume_id}"),
+            },
+        );
+
+        info!(
+            vm_id = vm_id,
+            volume_id = volume_id,
+            device_id = device_id,
+            path = path,
+            "hot-plugged volume"
+        );
+        Ok(())
+    }
+
+    /// Hot-unplug a data volume from a running VM.
+    ///
+    /// Looks up the CH device ID from the tracked `hotplug_devices` map and
+    /// sends `PUT /vm.remove-device`. Root volumes cannot be detached.
+    pub async fn detach_volume(
+        &self,
+        vm_id: &str,
+        volume_id: &str,
+        is_root: bool,
+    ) -> Result<(), ComputeError> {
+        if is_root {
+            return Err(ComputeError::Config(
+                crate::error::ConfigError::ConflictingSettings {
+                    detail: format!(
+                        "cannot hot-unplug root volume {volume_id} — root volumes are not hot-pluggable"
+                    ),
+                },
+            ));
+        }
+
+        let vm_arc = self.get_vm(vm_id).await?;
+        let mut guard = vm_arc.lock().await;
+
+        // VM must be running.
+        if guard.current_phase != crate::phase::VmPhase::Running {
+            return Err(ComputeError::VmNotFound {
+                id: format!("{vm_id} is not running (phase: {:?})", guard.current_phase),
+            });
+        }
+
+        let device_id = guard
+            .hotplug_devices
+            .get(volume_id)
+            .cloned()
+            .ok_or_else(|| ComputeError::VmNotFound {
+                id: format!("volume {volume_id} not found in hotplug device map for VM {vm_id}"),
+            })?;
+
+        let client = crate::client::ChClient::new(guard.socket_path.clone());
+        client.remove_device(&device_id).await?;
+
+        // Remove tracking entry.
+        guard.hotplug_devices.remove(volume_id);
+
+        events::emit(
+            &self.event_tx,
+            VmEvent::DeviceDetached {
+                vm_id: VmId(vm_id.to_string()),
+                device: format!("volume:{volume_id}"),
+            },
+        );
+
+        info!(
+            vm_id = vm_id,
+            volume_id = volume_id,
+            device_id = device_id,
+            "hot-unplugged volume"
+        );
         Ok(())
     }
 
@@ -1352,6 +1475,7 @@ impl VmManager {
                     hypervisor_id: None,
                     region: None,
                     zone: None,
+                    hotplug_devices: std::collections::HashMap::new(),
                 };
                 map.insert(id, Arc::new(Mutex::new(state)));
                 recovered_count += 1;
