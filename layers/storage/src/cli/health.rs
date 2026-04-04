@@ -285,6 +285,10 @@ mod tests {
                 dirty_bytes: 524_288,
             }],
             total_dirty_bytes: 524_288,
+            s3_put_latency_ms: Some(12),
+            s3_get_latency_ms: Some(8),
+            s3_degradation_level: Some("Healthy".into()),
+            s3_outage_duration_secs: Some(0),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("access_key"));

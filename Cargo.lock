@@ -3037,6 +3037,7 @@ dependencies = [
  "console",
  "dirs",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "syfrah-api",
@@ -3044,6 +3045,7 @@ dependencies = [
  "terminal_size",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

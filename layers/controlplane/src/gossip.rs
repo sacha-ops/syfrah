@@ -117,6 +117,18 @@ pub struct HypervisorGossipReport {
     pub instance_count: u32,
     pub drain_status: bool,
     pub timestamp: u64,
+    /// S3 reachability from the latest health probe (None if probe not running).
+    #[serde(default)]
+    pub s3_reachable: Option<bool>,
+    /// S3 PUT latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_put_latency_ms: Option<u64>,
+    /// S3 GET latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_get_latency_ms: Option<u64>,
+    /// S3 degradation level string (Healthy, FsyncBlocking, EIO, Degraded, Error).
+    #[serde(default)]
+    pub s3_degradation_level: Option<String>,
 }
 
 impl HypervisorGossipReport {
@@ -379,6 +391,10 @@ pub async fn start_gossip_agent(
             instance_count: vm_count,
             drain_status: false,
             timestamp: now,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
         };
         cluster.update_report(report);
         cluster.set_member_state(&config.bind_addr.to_string(), MemberState::Alive);
@@ -469,6 +485,10 @@ pub async fn start_gossip_agent(
                         instance_count: vm_count,
                         drain_status: false,
                         timestamp: now,
+                        s3_reachable: None,
+                        s3_put_latency_ms: None,
+                        s3_get_latency_ms: None,
+                        s3_degradation_level: None,
                     };
                     report_cluster.update_report(report);
                 }
@@ -582,6 +602,10 @@ mod tests {
             instance_count: 2,
             drain_status: false,
             timestamp: 1000,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
         };
         cluster.update_report(report.clone());
 
@@ -621,6 +645,10 @@ mod tests {
             instance_count: 3,
             drain_status: false,
             timestamp: 1000,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
         };
         assert!((report.cpu_utilization() - 0.5).abs() < f64::EPSILON);
         assert!((report.memory_utilization() - 0.5).abs() < f64::EPSILON);
