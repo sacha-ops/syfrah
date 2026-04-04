@@ -14,12 +14,191 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::time;
 
 use crate::binary;
+
+// ---------------------------------------------------------------------------
+// Volume health (ADR-006 §25 — S3 outage degradation)
+// ---------------------------------------------------------------------------
+
+/// Health state of a volume's S3 backend.
+///
+/// Transitions are driven by S3 reachability probes:
+/// - `Healthy` → `Degraded` when S3 is unreachable for longer than
+///   `S3HealthConfig::degraded_after`.
+/// - `Degraded` → `Error` when S3 is unreachable for longer than
+///   `S3HealthConfig::error_after`.
+/// - Any state → `Healthy` when S3 becomes reachable again and the
+///   dirty buffer has been flushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VolumeHealth {
+    /// S3 is reachable and all data is synced.
+    Healthy,
+    /// S3 has been unreachable for > `degraded_after` but < `error_after`.
+    /// Writes are still accepted but buffered locally.
+    Degraded,
+    /// S3 has been unreachable for > `error_after`.
+    /// New writes are rejected to prevent unbounded local buffer growth.
+    Error,
+}
+
+impl std::fmt::Display for VolumeHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VolumeHealth::Healthy => write!(f, "Healthy"),
+            VolumeHealth::Degraded => write!(f, "Degraded"),
+            VolumeHealth::Error => write!(f, "Error"),
+        }
+    }
+}
+
+/// Configurable thresholds for S3 health transitions.
+#[derive(Debug, Clone)]
+pub struct S3HealthConfig {
+    /// Duration of S3 unreachability before transitioning to `Degraded`.
+    /// Default: 5 minutes.
+    pub degraded_after: Duration,
+    /// Duration of S3 unreachability before transitioning to `Error`.
+    /// Default: 30 minutes.
+    pub error_after: Duration,
+    /// Maximum dirty bytes before rejecting new writes in `Degraded` state.
+    /// Default: 1 GiB.
+    pub max_dirty_bytes: u64,
+}
+
+impl Default for S3HealthConfig {
+    fn default() -> Self {
+        Self {
+            degraded_after: Duration::from_secs(5 * 60),
+            error_after: Duration::from_secs(30 * 60),
+            max_dirty_bytes: 1_073_741_824, // 1 GiB
+        }
+    }
+}
+
+/// Per-volume S3 health tracker.
+///
+/// Tracks when S3 became unreachable for a specific volume and how
+/// many dirty bytes are buffered locally. The `VolumeMgr` uses this
+/// to compute the current `VolumeHealth` and to decide whether new
+/// writes should be accepted.
+#[derive(Debug, Clone)]
+pub struct VolumeHealthTracker {
+    /// Current health state.
+    health: VolumeHealth,
+    /// When S3 became unreachable (`None` if currently reachable).
+    s3_unreachable_since: Option<Instant>,
+    /// Bytes written locally but not yet flushed to S3.
+    dirty_bytes: u64,
+    /// Whether a flush is currently in progress (recovery).
+    flush_in_progress: bool,
+}
+
+impl VolumeHealthTracker {
+    fn new() -> Self {
+        Self {
+            health: VolumeHealth::Healthy,
+            s3_unreachable_since: None,
+            dirty_bytes: 0,
+            flush_in_progress: false,
+        }
+    }
+
+    /// Current health state.
+    pub fn health(&self) -> VolumeHealth {
+        self.health
+    }
+
+    /// Current dirty bytes count.
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty_bytes
+    }
+
+    /// Whether a recovery flush is in progress.
+    pub fn flush_in_progress(&self) -> bool {
+        self.flush_in_progress
+    }
+
+    /// Record that S3 is unreachable. Call on each failed probe.
+    /// The first call records the timestamp; subsequent calls are no-ops
+    /// for the timestamp but still re-evaluate the health state.
+    fn record_s3_unreachable(&mut self, config: &S3HealthConfig) {
+        if self.s3_unreachable_since.is_none() {
+            self.s3_unreachable_since = Some(Instant::now());
+        }
+        self.recompute_health(config);
+    }
+
+    /// Record that S3 is reachable. Resets the unreachable timer.
+    /// If there are dirty bytes, starts the flush process.
+    fn record_s3_reachable(&mut self) {
+        self.s3_unreachable_since = None;
+        if self.dirty_bytes > 0 {
+            self.flush_in_progress = true;
+        } else {
+            self.health = VolumeHealth::Healthy;
+            self.flush_in_progress = false;
+        }
+    }
+
+    /// Record additional dirty bytes (writes buffered locally during outage).
+    fn add_dirty_bytes(&mut self, bytes: u64) {
+        self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
+    }
+
+    /// Record that `bytes` have been flushed to S3 (recovery).
+    fn flush_bytes(&mut self, bytes: u64) {
+        self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+        if self.dirty_bytes == 0 {
+            self.flush_in_progress = false;
+            if self.s3_unreachable_since.is_none() {
+                self.health = VolumeHealth::Healthy;
+            }
+        }
+    }
+
+    /// Check whether new writes should be accepted.
+    ///
+    /// Writes are rejected when:
+    /// - Health is `Error` (S3 unreachable > `error_after`), OR
+    /// - Dirty bytes exceed `max_dirty_bytes` threshold.
+    fn can_accept_write(&self, config: &S3HealthConfig) -> bool {
+        if self.health == VolumeHealth::Error {
+            return false;
+        }
+        self.dirty_bytes < config.max_dirty_bytes
+    }
+
+    /// Recompute health state based on how long S3 has been unreachable.
+    fn recompute_health(&mut self, config: &S3HealthConfig) {
+        let elapsed = match self.s3_unreachable_since {
+            Some(since) => since.elapsed(),
+            None => return, // S3 reachable — health managed by record_s3_reachable
+        };
+
+        if elapsed >= config.error_after {
+            self.health = VolumeHealth::Error;
+        } else if elapsed >= config.degraded_after {
+            self.health = VolumeHealth::Degraded;
+        }
+        // Below degraded_after: health stays at whatever it was (Healthy).
+    }
+}
+
+/// Summary of a volume's health state, suitable for gossip dissemination
+/// and storage status reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeHealthReport {
+    pub volume_id: String,
+    pub health: VolumeHealth,
+    pub dirty_bytes: u64,
+    pub flush_in_progress: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Manifest types (snapshot capture)
@@ -29,7 +208,7 @@ use crate::binary;
 ///
 /// Contains the SST files and WAL position needed to record a
 /// crash-consistent snapshot via the Raft `CreateSnapshot` command.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeManifest {
     /// SST file keys currently referenced by this volume's LSM tree.
     pub sst_files: Vec<String>,
@@ -68,6 +247,8 @@ struct VolumeProcess {
     nbd_device: PathBuf,
     #[allow(dead_code)]
     generation: u64,
+    /// S3 health tracker for this volume.
+    health_tracker: VolumeHealthTracker,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +263,9 @@ pub enum VolumeMgrError {
 
     #[error("volume {0} is not running")]
     NotRunning(String),
+
+    #[error("volume {0}: write rejected, S3 backend in Error state")]
+    WriteRejected(String),
 
     #[error("zerofs binary: {0}")]
     Binary(#[from] binary::ZerofsError),
@@ -119,6 +303,8 @@ pub struct VolumeMgr {
     nbd_base: PathBuf,
     /// Next NBD device index to allocate.
     next_nbd_index: u32,
+    /// S3 health transition thresholds (ADR-006 §25).
+    s3_health_config: S3HealthConfig,
 }
 
 impl VolumeMgr {
@@ -129,12 +315,19 @@ impl VolumeMgr {
             binary_override: None,
             nbd_base: PathBuf::from("/dev/nbd"),
             next_nbd_index: 0,
+            s3_health_config: S3HealthConfig::default(),
         }
     }
 
     /// Set an explicit zerofs binary path (overrides resolution order).
     pub fn with_binary(mut self, path: PathBuf) -> Self {
         self.binary_override = Some(path);
+        self
+    }
+
+    /// Override S3 health transition thresholds.
+    pub fn with_s3_health_config(mut self, config: S3HealthConfig) -> Self {
+        self.s3_health_config = config;
         self
     }
 
@@ -204,6 +397,7 @@ impl VolumeMgr {
                 child,
                 nbd_device: nbd_device.clone(),
                 generation,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -339,6 +533,112 @@ impl VolumeMgr {
         self.processes
             .iter()
             .map(|(id, proc)| (id.clone(), proc.generation))
+            .collect()
+    }
+
+    // -------------------------------------------------------------------
+    // S3 health tracking (ADR-006 §25)
+    // -------------------------------------------------------------------
+
+    /// Get the current S3 health config.
+    pub fn s3_health_config(&self) -> &S3HealthConfig {
+        &self.s3_health_config
+    }
+
+    /// Get the health state for a volume. Returns `None` if not running.
+    pub fn volume_health(&self, volume_id: &str) -> Option<VolumeHealth> {
+        self.processes
+            .get(volume_id)
+            .map(|p| p.health_tracker.health())
+    }
+
+    /// Record an S3 probe result for a specific volume.
+    ///
+    /// Called by the reconciler after probing S3. When `reachable` is false,
+    /// the tracker records the outage start time and recomputes health
+    /// based on configured thresholds.
+    pub fn record_s3_probe(&mut self, volume_id: &str, reachable: bool) {
+        if let Some(proc) = self.processes.get_mut(volume_id) {
+            if reachable {
+                proc.health_tracker.record_s3_reachable();
+            } else {
+                proc.health_tracker
+                    .record_s3_unreachable(&self.s3_health_config);
+            }
+        }
+    }
+
+    /// Record S3 probe result for ALL running volumes at once.
+    ///
+    /// Useful when the S3 endpoint is shared across volumes — a single
+    /// probe applies to every volume on this hypervisor.
+    pub fn record_s3_probe_all(&mut self, reachable: bool) {
+        let config = self.s3_health_config.clone();
+        for proc in self.processes.values_mut() {
+            if reachable {
+                proc.health_tracker.record_s3_reachable();
+            } else {
+                proc.health_tracker.record_s3_unreachable(&config);
+            }
+        }
+    }
+
+    /// Check whether a volume can accept new writes.
+    ///
+    /// Returns `Ok(())` if the write is allowed, or
+    /// `Err(VolumeMgrError::WriteRejected)` if the volume is in Error
+    /// state or has exceeded the dirty bytes threshold.
+    pub fn check_write_allowed(&self, volume_id: &str) -> Result<(), VolumeMgrError> {
+        let proc = self
+            .processes
+            .get(volume_id)
+            .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+
+        if proc.health_tracker.can_accept_write(&self.s3_health_config) {
+            Ok(())
+        } else {
+            Err(VolumeMgrError::WriteRejected(volume_id.to_string()))
+        }
+    }
+
+    /// Record dirty bytes buffered locally for a volume during an S3 outage.
+    pub fn add_dirty_bytes(&mut self, volume_id: &str, bytes: u64) {
+        if let Some(proc) = self.processes.get_mut(volume_id) {
+            proc.health_tracker.add_dirty_bytes(bytes);
+        }
+    }
+
+    /// Record that `bytes` have been successfully flushed to S3 (recovery).
+    ///
+    /// When all dirty bytes are flushed and S3 is reachable, the volume
+    /// transitions back to `Healthy`.
+    pub fn record_flush(&mut self, volume_id: &str, bytes: u64) {
+        if let Some(proc) = self.processes.get_mut(volume_id) {
+            proc.health_tracker.flush_bytes(bytes);
+        }
+    }
+
+    /// Get the total dirty bytes across all running volumes.
+    pub fn total_dirty_bytes(&self) -> u64 {
+        self.processes
+            .values()
+            .map(|p| p.health_tracker.dirty_bytes())
+            .sum()
+    }
+
+    /// Produce health reports for all running volumes.
+    ///
+    /// These reports are suitable for gossip dissemination and inclusion
+    /// in the `StorageStatusReport`.
+    pub fn health_reports(&self) -> Vec<VolumeHealthReport> {
+        self.processes
+            .iter()
+            .map(|(id, proc)| VolumeHealthReport {
+                volume_id: id.clone(),
+                health: proc.health_tracker.health(),
+                dirty_bytes: proc.health_tracker.dirty_bytes(),
+                flush_in_progress: proc.health_tracker.flush_in_progress(),
+            })
             .collect()
     }
 
@@ -504,6 +804,7 @@ impl VolumeMgr {
                 child,
                 nbd_device,
                 generation,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
     }
@@ -538,6 +839,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd50"),
                 generation: 42,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -578,6 +880,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd99"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -627,6 +930,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd98"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -646,6 +950,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd97"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -671,6 +976,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd96"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -705,6 +1011,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd80"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -727,6 +1034,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd81"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -764,6 +1072,7 @@ mod tests {
                 child,
                 nbd_device: PathBuf::from("/dev/nbd42"),
                 generation: 1,
+                health_tracker: VolumeHealthTracker::new(),
             },
         );
 
@@ -909,5 +1218,212 @@ mod tests {
 
         // Cleanup.
         mgr.stop_volume("vol-snap").await.ok();
+    }
+
+    // ── VolumeHealth tests (#1209 — S3 outage degradation) ─────────
+
+    #[test]
+    fn volume_health_display() {
+        assert_eq!(VolumeHealth::Healthy.to_string(), "Healthy");
+        assert_eq!(VolumeHealth::Degraded.to_string(), "Degraded");
+        assert_eq!(VolumeHealth::Error.to_string(), "Error");
+    }
+
+    #[test]
+    fn volume_health_serde_roundtrip() {
+        let health = VolumeHealth::Degraded;
+        let json = serde_json::to_string(&health).unwrap();
+        let deser: VolumeHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, health);
+    }
+
+    #[test]
+    fn health_tracker_starts_healthy() {
+        let tracker = VolumeHealthTracker::new();
+        assert_eq!(tracker.health(), VolumeHealth::Healthy);
+        assert_eq!(tracker.dirty_bytes(), 0);
+        assert!(!tracker.flush_in_progress());
+    }
+
+    #[test]
+    fn health_tracker_transitions_to_degraded() {
+        let mut tracker = VolumeHealthTracker::new();
+        // Use very short thresholds for testing.
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 1_073_741_824,
+        };
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Degraded);
+    }
+
+    #[test]
+    fn health_tracker_transitions_to_error() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_millis(0),
+            max_dirty_bytes: 1_073_741_824,
+        };
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Error);
+    }
+
+    #[test]
+    fn health_tracker_recovers_when_s3_returns() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 1_073_741_824,
+        };
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Degraded);
+
+        // S3 returns, no dirty bytes → immediate Healthy.
+        tracker.record_s3_reachable();
+        assert_eq!(tracker.health(), VolumeHealth::Healthy);
+    }
+
+    #[test]
+    fn health_tracker_recovery_with_dirty_bytes() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 1_073_741_824,
+        };
+        tracker.record_s3_unreachable(&config);
+        tracker.add_dirty_bytes(1000);
+
+        // S3 returns but there are dirty bytes → flush needed.
+        tracker.record_s3_reachable();
+        assert!(tracker.flush_in_progress());
+        assert_ne!(tracker.health(), VolumeHealth::Healthy);
+
+        // Flush completes.
+        tracker.flush_bytes(1000);
+        assert_eq!(tracker.health(), VolumeHealth::Healthy);
+        assert!(!tracker.flush_in_progress());
+        assert_eq!(tracker.dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn health_tracker_rejects_writes_at_threshold() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 100,
+        };
+        tracker.record_s3_unreachable(&config);
+        tracker.add_dirty_bytes(50);
+        assert!(tracker.can_accept_write(&config));
+
+        tracker.add_dirty_bytes(60); // now at 110, exceeds 100
+        assert!(!tracker.can_accept_write(&config));
+    }
+
+    #[test]
+    fn health_tracker_rejects_writes_in_error_state() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_millis(0),
+            max_dirty_bytes: u64::MAX,
+        };
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Error);
+        assert!(!tracker.can_accept_write(&config));
+    }
+
+    #[tokio::test]
+    async fn volume_mgr_health_tracking() {
+        let mut mgr = VolumeMgr::new().with_s3_health_config(S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 1_073_741_824,
+        });
+        mgr.inject_fake_process("vol-h", 1);
+
+        // Initially healthy.
+        assert_eq!(mgr.volume_health("vol-h"), Some(VolumeHealth::Healthy));
+        assert!(mgr.check_write_allowed("vol-h").is_ok());
+
+        // S3 goes down.
+        mgr.record_s3_probe("vol-h", false);
+        assert_eq!(mgr.volume_health("vol-h"), Some(VolumeHealth::Degraded));
+
+        // Buffer some dirty bytes.
+        mgr.add_dirty_bytes("vol-h", 500);
+        assert_eq!(mgr.total_dirty_bytes(), 500);
+
+        // S3 comes back.
+        mgr.record_s3_probe("vol-h", true);
+        // Flush dirty data.
+        mgr.record_flush("vol-h", 500);
+        assert_eq!(mgr.volume_health("vol-h"), Some(VolumeHealth::Healthy));
+        assert_eq!(mgr.total_dirty_bytes(), 0);
+
+        mgr.stop_volume("vol-h").await.ok();
+    }
+
+    #[tokio::test]
+    async fn volume_mgr_health_reports() {
+        let mut mgr = VolumeMgr::new().with_s3_health_config(S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_secs(3600),
+            max_dirty_bytes: 1_073_741_824,
+        });
+        mgr.inject_fake_process("vol-r1", 1);
+        mgr.inject_fake_process("vol-r2", 1);
+
+        mgr.record_s3_probe_all(false);
+        let reports = mgr.health_reports();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert_eq!(r.health, VolumeHealth::Degraded);
+        }
+
+        mgr.stop_volume("vol-r1").await.ok();
+        mgr.stop_volume("vol-r2").await.ok();
+    }
+
+    #[test]
+    fn volume_health_unknown_volume() {
+        let mgr = VolumeMgr::new();
+        assert_eq!(mgr.volume_health("nonexistent"), None);
+    }
+
+    #[test]
+    fn check_write_rejected_unknown_volume() {
+        let mgr = VolumeMgr::new();
+        assert!(matches!(
+            mgr.check_write_allowed("nonexistent"),
+            Err(VolumeMgrError::NotRunning(_))
+        ));
+    }
+
+    #[test]
+    fn s3_health_config_defaults() {
+        let config = S3HealthConfig::default();
+        assert_eq!(config.degraded_after, Duration::from_secs(300));
+        assert_eq!(config.error_after, Duration::from_secs(1800));
+        assert_eq!(config.max_dirty_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn volume_health_report_serde() {
+        let report = VolumeHealthReport {
+            volume_id: "vol-1".into(),
+            health: VolumeHealth::Degraded,
+            dirty_bytes: 1024,
+            flush_in_progress: false,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let deser: VolumeHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.health, VolumeHealth::Degraded);
+        assert_eq!(deser.dirty_bytes, 1024);
     }
 }

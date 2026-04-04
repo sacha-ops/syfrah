@@ -285,6 +285,7 @@ mod tests {
                 dirty_bytes: 524_288,
             }],
             total_dirty_bytes: 524_288,
+            volume_health: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("access_key"));

@@ -117,6 +117,11 @@ pub struct HypervisorGossipReport {
     pub instance_count: u32,
     pub drain_status: bool,
     pub timestamp: u64,
+    /// Worst volume health state on this hypervisor (ADR-006 §25).
+    /// `None` when no volumes are running.
+    pub storage_health: Option<String>,
+    /// Total dirty bytes buffered locally across all volumes.
+    pub storage_dirty_bytes: u64,
 }
 
 impl HypervisorGossipReport {
@@ -379,6 +384,8 @@ pub async fn start_gossip_agent(
             instance_count: vm_count,
             drain_status: false,
             timestamp: now,
+            storage_health: None,
+            storage_dirty_bytes: 0,
         };
         cluster.update_report(report);
         cluster.set_member_state(&config.bind_addr.to_string(), MemberState::Alive);
@@ -469,6 +476,8 @@ pub async fn start_gossip_agent(
                         instance_count: vm_count,
                         drain_status: false,
                         timestamp: now,
+                        storage_health: None,
+                        storage_dirty_bytes: 0,
                     };
                     report_cluster.update_report(report);
                 }
@@ -582,6 +591,8 @@ mod tests {
             instance_count: 2,
             drain_status: false,
             timestamp: 1000,
+            storage_health: None,
+            storage_dirty_bytes: 0,
         };
         cluster.update_report(report.clone());
 
@@ -621,6 +632,8 @@ mod tests {
             instance_count: 3,
             drain_status: false,
             timestamp: 1000,
+            storage_health: None,
+            storage_dirty_bytes: 0,
         };
         assert!((report.cpu_utilization() - 0.5).abs() < f64::EPSILON);
         assert!((report.memory_utilization() - 0.5).abs() < f64::EPSILON);

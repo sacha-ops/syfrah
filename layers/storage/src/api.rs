@@ -162,6 +162,8 @@ pub struct StorageStatusReport {
     pub volume_cache_stats: Vec<VolumeCacheStat>,
     /// Total dirty bytes across all volumes (placeholder).
     pub total_dirty_bytes: u64,
+    /// Per-volume S3 health state (ADR-006 §25).
+    pub volume_health: Vec<crate::volume_mgr::VolumeHealthReport>,
 }
 
 /// Per-volume cache utilization (placeholder structure).
@@ -308,6 +310,7 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 s3_endpoint: "(not configured)".into(),
                 volume_cache_stats: vec![],
                 total_dirty_bytes: 0,
+                volume_health: vec![],
             })
         }
     }
