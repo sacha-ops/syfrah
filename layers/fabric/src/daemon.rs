@@ -1436,7 +1436,38 @@ pub async fn run_daemon(
     //
     // Register the StorageLayerHandler so CLI commands like `syfrah volume create`
     // and `syfrah storage configure` are routed through the daemon's control socket.
-    router.register("storage", Arc::new(syfrah_storage::StorageLayerHandler));
+    // When the redb store is available, reads are served from the local materialized
+    // view and mutations are routed through Raft (injected later).
+    let shared_storage_store: Option<Arc<syfrah_org::StorageStore>> =
+        match syfrah_state::LayerDb::open("storage") {
+            Ok(storage_db) => {
+                let store = Arc::new(syfrah_org::StorageStore::new(storage_db));
+                info!("storage: opened redb store");
+                Some(store)
+            }
+            Err(e) => {
+                tracing::warn!("storage: failed to open redb store, running in stub mode: {e}");
+                None
+            }
+        };
+
+    let storage_region = my_record.region.as_deref().unwrap_or("default").to_string();
+    let raft_storage_handler: Option<Arc<syfrah_storage::StorageLayerHandler>> =
+        if let Some(ref store) = shared_storage_store {
+            let handler = Arc::new(syfrah_storage::StorageLayerHandler::new(
+                Arc::clone(store),
+                storage_region,
+            ));
+            let handler_ref = Arc::clone(&handler);
+            router.register("storage", handler_ref);
+            Some(handler)
+        } else {
+            router.register(
+                "storage",
+                Arc::new(syfrah_storage::StorageLayerHandler::new_stub()),
+            );
+            None
+        };
     info!("storage layer handler registered");
 
     // Register the forge layer handler on the control socket so future
@@ -1772,6 +1803,17 @@ pub async fn run_daemon(
                     let scheduler = syfrah_controlplane::Scheduler::new(local_node, local_addr);
                     handler.set_scheduler(scheduler).await;
                     info!("raft: injected Raft client + scheduler into compute handler");
+                });
+            }
+
+            // Inject the Raft client into the storage handler so volume
+            // mutations go through Raft.
+            if let Some(ref handler) = raft_storage_handler {
+                let handler = Arc::clone(handler);
+                let client = raft_client.clone();
+                tokio::spawn(async move {
+                    handler.set_raft_client(client).await;
+                    info!("raft: injected Raft client into storage handler");
                 });
             }
 
@@ -2263,6 +2305,7 @@ pub async fn run_daemon(
             let aj_raft_org_handler = raft_org_handler.clone();
             let aj_raft_hv_handler_ref = raft_hv_handler_ref.clone();
             let aj_raft_compute_handler_ref = raft_compute_handler_ref.clone();
+            let aj_raft_storage_handler = raft_storage_handler.clone();
             let aj_capacity_for_raft = Arc::clone(&capacity_for_raft);
             let aj_shared_vm_manager = shared_vm_manager.clone();
             let aj_raft_bind_addr = raft_bind_addr;
@@ -2575,6 +2618,18 @@ pub async fn run_daemon(
                                         );
                                         handler.set_scheduler(scheduler).await;
                                         info!("raft: injected Raft client + scheduler into compute handler (in-process)");
+                                    });
+                                }
+
+                                // Inject Raft client into storage handler.
+                                if let Some(ref handler) = aj_raft_storage_handler {
+                                    let handler = Arc::clone(handler);
+                                    let client = raft_client.clone();
+                                    tokio::spawn(async move {
+                                        handler.set_raft_client(client).await;
+                                        info!(
+                                            "raft: injected Raft client into storage handler (in-process)"
+                                        );
                                     });
                                 }
 
