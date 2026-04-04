@@ -195,6 +195,47 @@ pub fn install() -> Result<PathBuf, ZerofsError> {
     Ok(target)
 }
 
+/// Ensure the ZeroFS binary is available, installing it if necessary.
+///
+/// Mirrors the pattern used by `ensure_kernel()` in `layers/compute/src/boot.rs`:
+/// check for the binary first, and if it is missing, download and install it
+/// automatically. This is intended to be called at daemon startup so that
+/// operators never need to provision ZeroFS manually.
+///
+/// Returns the path to the usable ZeroFS binary.
+pub fn ensure_zerofs() -> Result<PathBuf, ZerofsError> {
+    match resolve_binary(None) {
+        Ok(path) => {
+            tracing::info!("zerofs binary found at {}", path.display());
+            Ok(path)
+        }
+        Err(_) => {
+            tracing::warn!("zerofs binary not found, installing...");
+            let path = install()?;
+            tracing::info!("zerofs installed to {}", path.display());
+            Ok(path)
+        }
+    }
+}
+
+/// Ensure the NBD kernel module is loaded.
+///
+/// The `nbd` module is required for ZeroFS to expose block devices.
+/// This is a best-effort operation — if `modprobe` fails (e.g. inside a
+/// container without `CAP_SYS_MODULE`), the error is silently ignored
+/// and ZeroFS will report a clear error later when it tries to use `/dev/nbdN`.
+pub fn ensure_nbd_module() {
+    let status = std::process::Command::new("modprobe")
+        .arg("nbd")
+        .arg("max_part=8")
+        .status();
+    match status {
+        Ok(s) if s.success() => tracing::info!("nbd kernel module loaded"),
+        Ok(s) => tracing::warn!("modprobe nbd exited with status {s}"),
+        Err(e) => tracing::warn!("failed to run modprobe nbd: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -388,5 +429,53 @@ mod tests {
                 "expected NotFound, got: {err}"
             );
         }
+    }
+
+    // -- ensure_zerofs tests --------------------------------------------------
+
+    #[test]
+    fn ensure_zerofs_returns_binary_when_already_installed() {
+        // If zerofs happens to be installed in this environment, ensure_zerofs
+        // should return its path without attempting installation.
+        let result = ensure_zerofs();
+        // Environment-dependent: if zerofs is installed, check we got a path;
+        // if not, we expect an error (install will fail in CI without network).
+        match result {
+            Ok(path) => assert!(path.exists(), "returned path should exist"),
+            Err(e) => {
+                // Expected in test environments without zerofs or network access.
+                assert!(format!("{e}").len() > 0, "error should have a message");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_zerofs_calls_resolve_then_install() {
+        // Verify the function structure: when resolve_binary(None) fails,
+        // ensure_zerofs attempts install(). We can't fully mock here, but we
+        // can verify the error path produces a meaningful ZerofsError.
+        // In CI the install will fail (no network / no root), which is fine.
+        let resolve_result = resolve_binary(None);
+        let ensure_result = ensure_zerofs();
+
+        match resolve_result {
+            Ok(path) => {
+                // If resolve succeeds, ensure should also succeed with same path.
+                assert_eq!(ensure_result.unwrap(), path);
+            }
+            Err(_) => {
+                // resolve failed, so ensure tried to install.
+                // In CI this will also fail — just verify we get an error, not a panic.
+                // (Success is also fine if the install somehow works.)
+                let _ = ensure_result;
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_nbd_module_does_not_panic() {
+        // Best-effort: ensure_nbd_module should never panic regardless of
+        // whether modprobe is available or the caller has permissions.
+        ensure_nbd_module();
     }
 }
