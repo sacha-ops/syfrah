@@ -117,14 +117,16 @@ impl DiskRateLimitConfig {
 /// calling `ChClient::add_disk`. In tests, a mock records calls.
 #[async_trait::async_trait]
 pub trait VmDiskAttacher: Send + Sync {
-    /// Attach an NBD device to the specified VM as a virtio-block disk.
+    /// Attach a volume's filesystem to the specified VM via virtio-fs.
     ///
-    /// `vm_id` identifies the VM. `nbd_path` is the block device path
-    /// (e.g. `/dev/nbd0`). `rate_limit` configures I/O throttling.
+    /// `vm_id` identifies the VM. `mount_path` is the host-side 9P mount
+    /// point (e.g. `/var/lib/syfrah/volumes/vol-xxx`). Cloud Hypervisor
+    /// shares this directory with the guest via virtio-fs.
+    /// `rate_limit` configures I/O throttling.
     async fn attach_disk(
         &self,
         vm_id: &str,
-        nbd_path: &std::path::Path,
+        mount_path: &std::path::Path,
         rate_limit: &DiskRateLimitConfig,
     ) -> Result<(), String>;
 }
@@ -669,15 +671,15 @@ impl StorageReconciler {
                     let already_attached =
                         self.attached_volumes.lock().unwrap().contains(id.as_str());
                     if volume_mgr.is_running(id) && !already_attached {
-                        if let Some(nbd_path) = volume_mgr.get_nbd_device(id) {
+                        if let Some(mount_path) = volume_mgr.get_mount_path(id) {
                             info!(
                                 volume_id = %id,
                                 vm_id = %vm_id,
-                                nbd_device = %nbd_path.display(),
-                                "storage reconciler: attaching volume to VM"
+                                mount_path = %mount_path.display(),
+                                "storage reconciler: attaching volume to VM via virtio-fs"
                             );
                             match attacher
-                                .attach_disk(vm_id, &nbd_path, &self.disk_rate_limit)
+                                .attach_disk(vm_id, &mount_path, &self.disk_rate_limit)
                                 .await
                             {
                                 Ok(()) => {
@@ -1526,10 +1528,10 @@ mod tests {
         async fn attach_disk(
             &self,
             vm_id: &str,
-            nbd_path: &std::path::Path,
+            mount_path: &std::path::Path,
             _rate_limit: &DiskRateLimitConfig,
         ) -> Result<(), String> {
-            let vol_hint = nbd_path.display().to_string();
+            let vol_hint = mount_path.display().to_string();
             if self
                 .fail_for
                 .lock()
@@ -1657,8 +1659,8 @@ mod tests {
         let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
         let reader = MockStateReader::new().with_config();
         let mut mgr = VolumeMgr::new();
-        // This attacher fails for any path containing "nbd" (all of them).
-        let attacher = MockDiskAttacher::new().fail_for_volume("nbd");
+        // This attacher fails for any path containing "vol-fail".
+        let attacher = MockDiskAttacher::new().fail_for_volume("vol-fail");
 
         mgr.inject_fake_process("vol-fail", 1);
 
@@ -1855,23 +1857,24 @@ mod tests {
 
     #[tokio::test]
     async fn create_snapshot_succeeds_with_manifest_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_id = "vol-forge-snap";
         let mut mgr = VolumeMgr::new();
-        mgr = mgr.with_nbd_base(tmp.path().join("nbd"));
-        mgr.inject_fake_process("vol-snap", 1);
+        mgr.inject_fake_process(vol_id, 1);
 
-        // Pre-write manifest file.
+        // Pre-write manifest file at the path capture_manifest expects.
         let manifest = VolumeManifest {
             sst_files: vec!["sst-a.sst".into()],
             wal_position: 42,
         };
-        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        let manifest_dir = std::path::PathBuf::from(format!("/tmp/syfrah/{vol_id}"));
+        tokio::fs::create_dir_all(&manifest_dir).await.unwrap();
+        let manifest_path = manifest_dir.join(format!("{vol_id}.manifest.json"));
         tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
             .await
             .unwrap();
 
         let submitter = MockSnapshotSubmitter::new();
-        let result = create_snapshot(&mgr, &submitter, "snap-01", "vol-snap").await;
+        let result = create_snapshot(&mgr, &submitter, "snap-01", vol_id).await;
 
         assert!(result.is_ok(), "create_snapshot failed: {result:?}");
         assert_eq!(result.unwrap(), "snap-01");
@@ -1879,11 +1882,11 @@ mod tests {
 
         let (sid, vid, m) = submitter.last_call().unwrap();
         assert_eq!(sid, "snap-01");
-        assert_eq!(vid, "vol-snap");
+        assert_eq!(vid, vol_id);
         assert_eq!(m.sst_files, vec!["sst-a.sst"]);
         assert_eq!(m.wal_position, 42);
 
-        mgr.stop_volume("vol-snap").await.ok();
+        mgr.stop_volume(vol_id).await.ok();
     }
 
     #[tokio::test]
@@ -1899,13 +1902,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_snapshot_propagates_raft_error() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_id = "vol-forge-snap-err";
         let mut mgr = VolumeMgr::new();
-        mgr = mgr.with_nbd_base(tmp.path().join("nbd"));
-        mgr.inject_fake_process("vol-snap", 1);
+        mgr.inject_fake_process(vol_id, 1);
 
-        // Pre-write manifest file.
-        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        // Pre-write manifest file at the path capture_manifest expects.
+        let manifest_dir = std::path::PathBuf::from(format!("/tmp/syfrah/{vol_id}"));
+        tokio::fs::create_dir_all(&manifest_dir).await.unwrap();
+        let manifest_path = manifest_dir.join(format!("{vol_id}.manifest.json"));
         tokio::fs::write(
             &manifest_path,
             serde_json::to_string(&VolumeManifest {
@@ -1918,11 +1922,11 @@ mod tests {
         .unwrap();
 
         let submitter = MockSnapshotSubmitter::failing("raft: not leader");
-        let result = create_snapshot(&mgr, &submitter, "snap-01", "vol-snap").await;
+        let result = create_snapshot(&mgr, &submitter, "snap-01", vol_id).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("raft: not leader"));
 
-        mgr.stop_volume("vol-snap").await.ok();
+        mgr.stop_volume(vol_id).await.ok();
     }
 }

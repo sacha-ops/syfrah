@@ -1,14 +1,16 @@
 //! Volume manager — start/stop ZeroFS processes per volume.
 //!
 //! `VolumeMgr` is the runtime process supervisor for volumes on a single node.
-//! Each volume is backed by one ZeroFS child process that exposes an NBD device.
+//! Each volume is backed by one ZeroFS child process that exposes a 9P socket.
+//! The host mounts the 9P filesystem at `/var/lib/syfrah/volumes/{volume_id}/`,
+//! which Cloud Hypervisor can share via virtio-fs or containers can bind-mount.
 //!
 //! ## Lifecycle
 //!
 //! 1. `start_volume` resolves the ZeroFS binary, spawns the process, waits
-//!    for the NBD device to appear, and tracks the child PID.
-//! 2. `stop_volume` sends SIGTERM, waits up to a grace period, then SIGKILLs
-//!    if the process is still running.
+//!    for the 9P socket to appear, mounts it on the host, and tracks the PID.
+//! 2. `stop_volume` unmounts the 9P filesystem, sends SIGTERM, waits up to a
+//!    grace period, then SIGKILLs if the process is still running.
 //! 3. Background reaping: callers should poll `reap_exited` periodically to
 //!    detect crashed processes and update internal state.
 
@@ -269,7 +271,7 @@ pub fn generate_config(
     let disk_size_gb = cache.disk_size_bytes as f64 / 1_073_741_824.0;
     let memory_size_gb = cache.memory_size_bytes as f64 / 1_073_741_824.0;
     let s3_url = format!("s3://{}/volumes/{volume_id}/gen-{generation}/", s3.bucket);
-    let nbd_socket = format!("/tmp/syfrah/{volume_id}/zerofs.nbd.sock");
+    let ninep_socket = format!("/tmp/syfrah/{volume_id}/zerofs.9p.sock");
     let endpoint = &s3.endpoint;
 
     format!(
@@ -286,9 +288,8 @@ encryption_password = "${{ZEROFS_PASSWORD}}"
 max_size_gb = {size_gb:.1}
 compression = "lz4"
 
-[servers.nbd]
-addresses = ["127.0.0.1:10809"]
-unix_socket = "{nbd_socket}"
+[servers.ninep]
+unix_socket = "{ninep_socket}"
 
 [lsm]
 wal_enabled = true
@@ -304,8 +305,8 @@ secret_access_key = "${{AWS_SECRET_ACCESS_KEY}}"
 /// Tracked state for a running ZeroFS process.
 struct VolumeProcess {
     child: Child,
-    #[allow(dead_code)]
-    nbd_device: PathBuf,
+    /// Host mount point for the 9P filesystem.
+    mount_point: PathBuf,
     #[allow(dead_code)]
     generation: u64,
     /// S3 health tracker for this volume.
@@ -334,8 +335,11 @@ pub enum VolumeMgrError {
     #[error("spawn failed: {0}")]
     Spawn(String),
 
-    #[error("nbd device did not appear within {0:?}")]
-    NbdTimeout(Duration),
+    #[error("9p socket did not appear within {0:?}")]
+    SocketTimeout(Duration),
+
+    #[error("mount failed: {0}")]
+    Mount(String),
 
     #[error("stop failed: {0}")]
     Stop(String),
@@ -345,14 +349,17 @@ pub enum VolumeMgrError {
 // VolumeMgr
 // ---------------------------------------------------------------------------
 
-/// Default timeout waiting for the NBD device to appear after spawning ZeroFS.
-const NBD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout waiting for the 9P socket to appear after spawning ZeroFS.
+const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll interval when waiting for the NBD device.
-const NBD_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Poll interval when waiting for the 9P socket.
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Grace period before SIGKILL on stop.
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Base directory for host-side 9P mount points.
+const VOLUMES_BASE: &str = "/var/lib/syfrah/volumes";
 
 /// Manages ZeroFS child processes — one per volume.
 pub struct VolumeMgr {
@@ -360,10 +367,8 @@ pub struct VolumeMgr {
     processes: HashMap<String, VolumeProcess>,
     /// Optional explicit path to the zerofs binary.
     binary_override: Option<PathBuf>,
-    /// Base NBD device path (e.g. `/dev/nbd`). Devices are `{base}{N}`.
-    nbd_base: PathBuf,
-    /// Next NBD device index to allocate.
-    next_nbd_index: u32,
+    /// Base directory for volume mount points. Defaults to `VOLUMES_BASE`.
+    volumes_base: PathBuf,
     /// S3 health transition thresholds (ADR-006 §25).
     s3_health_config: S3HealthConfig,
 }
@@ -374,8 +379,7 @@ impl VolumeMgr {
         Self {
             processes: HashMap::new(),
             binary_override: None,
-            nbd_base: PathBuf::from("/dev/nbd"),
-            next_nbd_index: 0,
+            volumes_base: PathBuf::from(VOLUMES_BASE),
             s3_health_config: S3HealthConfig::default(),
         }
     }
@@ -392,9 +396,9 @@ impl VolumeMgr {
         self
     }
 
-    /// Override the NBD base path (useful for tests).
-    pub fn with_nbd_base(mut self, path: PathBuf) -> Self {
-        self.nbd_base = path;
+    /// Override the volumes base directory (useful for tests).
+    pub fn with_volumes_base(mut self, path: PathBuf) -> Self {
+        self.volumes_base = path;
         self
     }
 
@@ -405,8 +409,9 @@ impl VolumeMgr {
     /// environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `ZEROFS_PASSWORD`)
     /// to avoid exposure in `/proc/pid/cmdline`.
     ///
-    /// After ZeroFS starts with an NBD unix socket, `nbd-client` connects the
-    /// socket to `/dev/nbdN`.
+    /// After ZeroFS starts and exposes the 9P unix socket, the host mounts it at
+    /// `/var/lib/syfrah/volumes/{volume_id}/` via `mount -t 9p`. Cloud Hypervisor
+    /// shares this directory with the guest via virtio-fs; containers bind-mount it.
     pub async fn start_volume(
         &mut self,
         volume_id: &str,
@@ -422,8 +427,8 @@ impl VolumeMgr {
 
         let binary_path = binary::resolve_binary(self.binary_override.as_deref())?;
 
-        let nbd_device = self.allocate_nbd_device();
-        let nbd_socket = format!("/tmp/syfrah/{volume_id}/zerofs.nbd.sock");
+        let ninep_socket = format!("/tmp/syfrah/{volume_id}/zerofs.9p.sock");
+        let mount_point = self.volumes_base.join(volume_id);
 
         // Generate and write the TOML config.
         let config_toml = generate_config(volume_id, s3, cache, generation, size_gb);
@@ -446,6 +451,11 @@ impl VolumeMgr {
                 VolumeMgrError::Spawn(format!("failed to set config file permissions: {e}"))
             })?;
 
+        // Create the mount point directory.
+        tokio::fs::create_dir_all(&mount_point)
+            .await
+            .map_err(|e| VolumeMgrError::Mount(format!("failed to create mount point: {e}")))?;
+
         // Spawn ZeroFS with TOML config; secrets via env vars.
         let mut child = Command::new(&binary_path)
             .arg("run")
@@ -458,28 +468,34 @@ impl VolumeMgr {
             .spawn()
             .map_err(|e| VolumeMgrError::Spawn(e.to_string()))?;
 
-        // Wait for the NBD socket to appear before connecting nbd-client.
-        if let Err(e) = self.wait_for_path(std::path::Path::new(&nbd_socket)).await {
+        // Wait for the 9P socket to appear.
+        if let Err(e) = self
+            .wait_for_path(std::path::Path::new(&ninep_socket))
+            .await
+        {
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(e);
         }
 
-        // Connect the unix socket to /dev/nbdN via nbd-client.
-        let nbd_connect = tokio::process::Command::new("nbd-client")
-            .arg("-unix")
-            .arg(&nbd_socket)
-            .arg(&nbd_device)
+        // Mount the 9P filesystem on the host.
+        let mount_output = tokio::process::Command::new("mount")
+            .arg("-t")
+            .arg("9p")
+            .arg("-o")
+            .arg("trans=unix,version=9p2000.L")
+            .arg(&ninep_socket)
+            .arg(&mount_point)
             .output()
             .await
-            .map_err(|e| VolumeMgrError::Spawn(format!("nbd-client failed to execute: {e}")))?;
+            .map_err(|e| VolumeMgrError::Mount(format!("mount command failed to execute: {e}")))?;
 
-        if !nbd_connect.status.success() {
+        if !mount_output.status.success() {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let stderr = String::from_utf8_lossy(&nbd_connect.stderr);
-            return Err(VolumeMgrError::Spawn(format!(
-                "nbd-client failed: {stderr}"
+            let stderr = String::from_utf8_lossy(&mount_output.stderr);
+            return Err(VolumeMgrError::Mount(format!(
+                "mount -t 9p failed: {stderr}"
             )));
         }
 
@@ -487,29 +503,29 @@ impl VolumeMgr {
             volume_id.to_string(),
             VolumeProcess {
                 child,
-                nbd_device: nbd_device.clone(),
+                mount_point: mount_point.clone(),
                 generation,
                 health_tracker: VolumeHealthTracker::new(),
             },
         );
 
-        Ok(nbd_device)
+        Ok(mount_point)
     }
 
     /// Stop a running ZeroFS process for `volume_id`.
     ///
-    /// Sends SIGTERM and waits up to `STOP_GRACE_PERIOD`. If the process
-    /// does not exit, it is killed with SIGKILL.
+    /// Unmounts the 9P filesystem, sends SIGTERM, and waits up to
+    /// `STOP_GRACE_PERIOD`. If the process does not exit, it is killed
+    /// with SIGKILL. The mount point directory is cleaned up afterward.
     pub async fn stop_volume(&mut self, volume_id: &str) -> Result<(), VolumeMgrError> {
         let mut proc = self
             .processes
             .remove(volume_id)
             .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
 
-        // Disconnect the NBD device first so the kernel releases /dev/nbdN.
-        let _ = tokio::process::Command::new("nbd-client")
-            .arg("-d")
-            .arg(&proc.nbd_device)
+        // Unmount the 9P filesystem before stopping ZeroFS.
+        let _ = tokio::process::Command::new("umount")
+            .arg(&proc.mount_point)
             .output()
             .await;
 
@@ -524,7 +540,7 @@ impl VolumeMgr {
         }
 
         // Wait for graceful exit.
-        match time::timeout(STOP_GRACE_PERIOD, proc.child.wait()).await {
+        let result = match time::timeout(STOP_GRACE_PERIOD, proc.child.wait()).await {
             Ok(Ok(_status)) => Ok(()),
             Ok(Err(e)) => Err(VolumeMgrError::Stop(format!(
                 "error waiting for process: {e}"
@@ -538,7 +554,12 @@ impl VolumeMgr {
                 let _ = proc.child.wait().await;
                 Ok(())
             }
-        }
+        };
+
+        // Clean up mount point directory.
+        let _ = tokio::fs::remove_dir(&proc.mount_point).await;
+
+        result
     }
 
     /// Stop a running ZeroFS process with explicit flush control.
@@ -549,6 +570,8 @@ impl VolumeMgr {
     ///
     /// When `flush` is false (force detach), sends SIGKILL immediately,
     /// skipping the cache flush. Data since the last fsync will be lost.
+    ///
+    /// In both cases the 9P mount is unmounted before stopping ZeroFS.
     pub async fn stop_volume_flush(
         &mut self,
         volume_id: &str,
@@ -560,10 +583,9 @@ impl VolumeMgr {
                 .processes
                 .remove(volume_id)
                 .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
-            // Disconnect the NBD device so /dev/nbdN is released.
-            let _ = tokio::process::Command::new("nbd-client")
-                .arg("-d")
-                .arg(&proc.nbd_device)
+            // Unmount the 9P filesystem.
+            let _ = tokio::process::Command::new("umount")
+                .arg(&proc.mount_point)
                 .output()
                 .await;
             proc.child
@@ -571,6 +593,8 @@ impl VolumeMgr {
                 .await
                 .map_err(|e| VolumeMgrError::Stop(format!("SIGKILL failed: {e}")))?;
             let _ = proc.child.wait().await;
+            // Clean up mount point directory.
+            let _ = tokio::fs::remove_dir(&proc.mount_point).await;
             return Ok(());
         }
 
@@ -578,23 +602,20 @@ impl VolumeMgr {
         self.stop_volume(volume_id).await
     }
 
-    /// Get the NBD device path for a running volume.
+    /// Get the mount path for a running volume.
+    ///
+    /// Returns the host-side mount point where the 9P filesystem is mounted.
+    /// Cloud Hypervisor uses this path for virtio-fs sharing; containers
+    /// bind-mount it directly.
     ///
     /// Returns `None` if the volume is not running.
-    pub fn nbd_device_path(&self, volume_id: &str) -> Option<PathBuf> {
-        self.processes.get(volume_id).map(|p| p.nbd_device.clone())
+    pub fn get_mount_path(&self, volume_id: &str) -> Option<PathBuf> {
+        self.processes.get(volume_id).map(|p| p.mount_point.clone())
     }
 
     /// Returns `true` if the volume has a tracked running process.
     pub fn is_running(&self, volume_id: &str) -> bool {
         self.processes.contains_key(volume_id)
-    }
-
-    /// Get the NBD device path for a running volume.
-    ///
-    /// Returns `None` if the volume is not tracked.
-    pub fn get_nbd_device(&self, volume_id: &str) -> Option<PathBuf> {
-        self.processes.get(volume_id).map(|p| p.nbd_device.clone())
     }
 
     /// Get the tracked generation for a running volume.
@@ -780,11 +801,8 @@ impl VolumeMgr {
         }
 
         // Wait for the manifest file to appear.
-        let manifest_path = self
-            .nbd_base
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/tmp"))
-            .join(format!("{volume_id}.manifest.json"));
+        let manifest_path =
+            PathBuf::from(format!("/tmp/syfrah/{volume_id}/{volume_id}.manifest.json"));
 
         let deadline = time::Instant::now() + Duration::from_secs(5);
         while time::Instant::now() < deadline {
@@ -835,23 +853,16 @@ impl VolumeMgr {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Allocate the next NBD device path.
-    fn allocate_nbd_device(&mut self) -> PathBuf {
-        let idx = self.next_nbd_index;
-        self.next_nbd_index += 1;
-        PathBuf::from(format!("{}{idx}", self.nbd_base.display()))
-    }
-
     /// Wait for a file/socket to appear on disk.
     async fn wait_for_path(&self, path: &Path) -> Result<(), VolumeMgrError> {
-        let deadline = time::Instant::now() + NBD_WAIT_TIMEOUT;
+        let deadline = time::Instant::now() + SOCKET_WAIT_TIMEOUT;
         while time::Instant::now() < deadline {
             if path.exists() {
                 return Ok(());
             }
-            time::sleep(NBD_POLL_INTERVAL).await;
+            time::sleep(SOCKET_POLL_INTERVAL).await;
         }
-        Err(VolumeMgrError::NbdTimeout(NBD_WAIT_TIMEOUT))
+        Err(VolumeMgrError::SocketTimeout(SOCKET_WAIT_TIMEOUT))
     }
 }
 
@@ -902,12 +913,12 @@ impl VolumeMgr {
             .kill_on_drop(true)
             .spawn()
             .expect("failed to spawn sleep for test helper");
-        let nbd_device = self.allocate_nbd_device();
+        let mount_point = self.volumes_base.join(volume_id);
         self.processes.insert(
             volume_id.to_string(),
             VolumeProcess {
                 child,
-                nbd_device,
+                mount_point,
                 generation,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -942,7 +953,7 @@ mod tests {
             "vol-gen".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd50"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-gen"),
                 generation: 42,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -962,14 +973,6 @@ mod tests {
         assert_eq!(mgr.binary_override, Some(PathBuf::from("/opt/zerofs")));
     }
 
-    #[test]
-    fn allocate_nbd_devices_increments() {
-        let mut mgr = VolumeMgr::new();
-        assert_eq!(mgr.allocate_nbd_device(), PathBuf::from("/dev/nbd0"));
-        assert_eq!(mgr.allocate_nbd_device(), PathBuf::from("/dev/nbd1"));
-        assert_eq!(mgr.allocate_nbd_device(), PathBuf::from("/dev/nbd2"));
-    }
-
     #[tokio::test]
     async fn start_volume_rejects_duplicate() {
         let mut mgr = VolumeMgr::new();
@@ -983,7 +986,7 @@ mod tests {
             "vol-dup".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd99"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-dup"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1034,7 +1037,7 @@ mod tests {
             "vol-stop".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd98"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-stop"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1054,7 +1057,7 @@ mod tests {
             "vol-dead".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd97"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-dead"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1080,7 +1083,7 @@ mod tests {
             "vol-alive".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd96"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-alive"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1115,7 +1118,7 @@ mod tests {
             "vol-flush".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd80"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-flush"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1138,7 +1141,7 @@ mod tests {
             "vol-force".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd81"),
+                mount_point: PathBuf::from("/tmp/test-volumes/vol-force"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
@@ -1156,16 +1159,16 @@ mod tests {
         assert!(matches!(result, Err(VolumeMgrError::NotRunning(_))));
     }
 
-    // ── nbd_device_path tests (#1195) ───────────────────────────────
+    // ── get_mount_path tests ──────────────────────────────────────────
 
     #[test]
-    fn get_nbd_device_returns_none_for_unknown() {
+    fn get_mount_path_returns_none_for_unknown() {
         let mgr = VolumeMgr::new();
-        assert!(mgr.get_nbd_device("nonexistent").is_none());
+        assert!(mgr.get_mount_path("nonexistent").is_none());
     }
 
     #[tokio::test]
-    async fn nbd_device_path_returns_path_for_running_volume() {
+    async fn get_mount_path_returns_path_for_running_volume() {
         let mut mgr = VolumeMgr::new();
         let child = Command::new("sleep")
             .arg("3600")
@@ -1173,31 +1176,22 @@ mod tests {
             .spawn()
             .unwrap();
         mgr.processes.insert(
-            "vol-nbd".to_string(),
+            "vol-9p".to_string(),
             VolumeProcess {
                 child,
-                nbd_device: PathBuf::from("/dev/nbd42"),
+                mount_point: PathBuf::from("/var/lib/syfrah/volumes/vol-9p"),
                 generation: 1,
                 health_tracker: VolumeHealthTracker::new(),
             },
         );
 
         assert_eq!(
-            mgr.nbd_device_path("vol-nbd"),
-            Some(PathBuf::from("/dev/nbd42"))
+            mgr.get_mount_path("vol-9p"),
+            Some(PathBuf::from("/var/lib/syfrah/volumes/vol-9p"))
         );
 
-        let nbd = mgr.get_nbd_device("vol-nbd");
-        assert_eq!(nbd, Some(PathBuf::from("/dev/nbd42")));
-
         // Cleanup.
-        mgr.stop_volume("vol-nbd").await.ok();
-    }
-
-    #[test]
-    fn nbd_device_path_returns_none_for_unknown_volume() {
-        let mgr = VolumeMgr::new();
-        assert_eq!(mgr.nbd_device_path("nonexistent"), None);
+        mgr.stop_volume("vol-9p").await.ok();
     }
 
     // ── get_generation tests (#1204) ───────────────────────────────
@@ -1295,20 +1289,20 @@ mod tests {
 
     #[tokio::test]
     async fn capture_manifest_reads_file_when_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut mgr = VolumeMgr::new();
-        // Override nbd_base to point inside tmp dir so manifest path resolves there.
-        mgr.nbd_base = tmp.path().join("nbd");
 
         // Inject a fake process.
         mgr.inject_fake_process("vol-snap", 1);
 
-        // Pre-write the manifest file that ZeroFS would create on SIGUSR1.
+        // Create the manifest directory and pre-write the manifest file
+        // that ZeroFS would create on SIGUSR1.
+        let manifest_dir = PathBuf::from("/tmp/syfrah/vol-snap");
+        tokio::fs::create_dir_all(&manifest_dir).await.unwrap();
         let manifest = VolumeManifest {
             sst_files: vec!["sst-a.sst".into(), "sst-b.sst".into()],
             wal_position: 100,
         };
-        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        let manifest_path = manifest_dir.join("vol-snap.manifest.json");
         tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
             .await
             .unwrap();
@@ -1646,11 +1640,11 @@ mod tests {
             "missing compression:\n{toml_str}"
         );
         assert!(
-            toml_str.contains("[servers.nbd]"),
-            "missing [servers.nbd] section:\n{toml_str}"
+            toml_str.contains("[servers.ninep]"),
+            "missing [servers.ninep] section:\n{toml_str}"
         );
         assert!(
-            toml_str.contains("unix_socket = \"/tmp/syfrah/vol-abc/zerofs.nbd.sock\""),
+            toml_str.contains("unix_socket = \"/tmp/syfrah/vol-abc/zerofs.9p.sock\""),
             "wrong unix_socket:\n{toml_str}"
         );
         assert!(
