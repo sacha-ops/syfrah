@@ -320,6 +320,7 @@ impl RaftComputeHandler {
                                 &name,
                                 root_disk_size_gb,
                                 subnet.as_ref(),
+                                &self.local_node_name,
                             )
                             .await;
                         }
@@ -452,6 +453,7 @@ impl RaftComputeHandler {
                                 &name,
                                 root_disk_size_gb,
                                 subnet.as_ref(),
+                                &decision.hypervisor_id,
                             )
                             .await;
 
@@ -604,6 +606,7 @@ impl RaftComputeHandler {
         vm_name: &str,
         size_gb: u32,
         subnet: Option<&syfrah_compute::types::SubnetInfo>,
+        target_hypervisor: &str,
     ) {
         let root_volume_id = format!("vol-root-{vm_name}");
         let root_volume_name = format!("root-{vm_name}");
@@ -643,7 +646,7 @@ impl RaftComputeHandler {
             project_id,
             env_id,
             volume_type: VolumeType::Root,
-            hypervisor_id: None,
+            hypervisor_id: Some(target_hypervisor.to_string()),
             zone: None, // TODO(#1282): inherit zone from target hypervisor
         };
 
