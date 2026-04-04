@@ -13,6 +13,7 @@
 //!    detect crashed processes and update internal state.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -269,6 +270,7 @@ pub fn generate_config(
     let memory_size_gb = cache.memory_size_bytes as f64 / 1_073_741_824.0;
     let s3_url = format!("s3://{}/volumes/{volume_id}/gen-{generation}/", s3.bucket);
     let nbd_socket = format!("/tmp/syfrah/{volume_id}/zerofs.nbd.sock");
+    let endpoint = &s3.endpoint;
 
     format!(
         r#"[cache]
@@ -292,6 +294,7 @@ unix_socket = "{nbd_socket}"
 wal_enabled = true
 
 [aws]
+endpoint = "{endpoint}"
 access_key_id = "${{AWS_ACCESS_KEY_ID}}"
 secret_access_key = "${{AWS_SECRET_ACCESS_KEY}}"
 "#
@@ -428,10 +431,20 @@ impl VolumeMgr {
         tokio::fs::create_dir_all(&config_dir)
             .await
             .map_err(|e| VolumeMgrError::Spawn(format!("failed to create config dir: {e}")))?;
+        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config dir permissions: {e}"))
+            })?;
         let config_path = config_dir.join("zerofs.toml");
         tokio::fs::write(&config_path, &config_toml)
             .await
             .map_err(|e| VolumeMgrError::Spawn(format!("failed to write zerofs.toml: {e}")))?;
+        tokio::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| {
+                VolumeMgrError::Spawn(format!("failed to set config file permissions: {e}"))
+            })?;
 
         // Spawn ZeroFS with TOML config; secrets via env vars.
         let mut child = Command::new(&binary_path)
@@ -493,6 +506,13 @@ impl VolumeMgr {
             .remove(volume_id)
             .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
 
+        // Disconnect the NBD device first so the kernel releases /dev/nbdN.
+        let _ = tokio::process::Command::new("nbd-client")
+            .arg("-d")
+            .arg(&proc.nbd_device)
+            .output()
+            .await;
+
         // Send SIGTERM.
         #[cfg(unix)]
         {
@@ -540,6 +560,12 @@ impl VolumeMgr {
                 .processes
                 .remove(volume_id)
                 .ok_or_else(|| VolumeMgrError::NotRunning(volume_id.to_string()))?;
+            // Disconnect the NBD device so /dev/nbdN is released.
+            let _ = tokio::process::Command::new("nbd-client")
+                .arg("-d")
+                .arg(&proc.nbd_device)
+                .output()
+                .await;
             proc.child
                 .kill()
                 .await
@@ -1638,6 +1664,10 @@ mod tests {
         assert!(
             toml_str.contains("[aws]"),
             "missing [aws] section:\n{toml_str}"
+        );
+        assert!(
+            toml_str.contains("endpoint = \"https://s3.us-east-1.amazonaws.com\""),
+            "missing aws endpoint:\n{toml_str}"
         );
         assert!(
             toml_str.contains("access_key_id = \"${AWS_ACCESS_KEY_ID}\""),
