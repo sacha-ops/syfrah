@@ -331,6 +331,13 @@ pub struct GossipConfig {
     pub local_zone: String,
 }
 
+/// Callback that returns the latest S3 health snapshot for gossip reports.
+///
+/// Returns `(s3_reachable, put_latency_ms, get_latency_ms, degradation_level)`.
+/// When `None`, gossip reports carry `s3_reachable: None` etc.
+pub type S3HealthSnapshotFn =
+    Arc<dyn Fn() -> (bool, Option<u64>, Option<u64>, String) + Send + Sync>;
+
 /// Start the gossip agent. Returns a handle to the shared cluster state.
 ///
 /// The agent runs in background tokio tasks:
@@ -341,6 +348,7 @@ pub async fn start_gossip_agent(
     config: GossipConfig,
     cluster: GossipCluster,
     capacity_fn: Arc<dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync>,
+    s3_health_fn: Option<S3HealthSnapshotFn>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(std::net::SocketAddr::V6(config.bind_addr)).await?;
@@ -374,6 +382,13 @@ pub async fn start_gossip_agent(
     // Publish initial local report.
     {
         let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+        let (s3r, s3p, s3g, s3d) = match &s3_health_fn {
+            Some(f) => {
+                let (r, p, g, d) = f();
+                (Some(r), p, g, Some(d))
+            }
+            None => (None, None, None, None),
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -391,10 +406,10 @@ pub async fn start_gossip_agent(
             instance_count: vm_count,
             drain_status: false,
             timestamp: now,
-            s3_reachable: None,
-            s3_put_latency_ms: None,
-            s3_get_latency_ms: None,
-            s3_degradation_level: None,
+            s3_reachable: s3r,
+            s3_put_latency_ms: s3p,
+            s3_get_latency_ms: s3g,
+            s3_degradation_level: s3d,
         };
         cluster.update_report(report);
         cluster.set_member_state(&config.bind_addr.to_string(), MemberState::Alive);
@@ -468,6 +483,13 @@ pub async fn start_gossip_agent(
                 _ = shutdown_rx.wait_for(|v| *v) => break,
                 _ = tokio::time::sleep(REPORT_REFRESH_INTERVAL) => {
                     let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+                    let (s3r, s3p, s3g, s3d) = match &s3_health_fn {
+                        Some(f) => {
+                            let (r, p, g, d) = f();
+                            (Some(r), p, g, Some(d))
+                        }
+                        None => (None, None, None, None),
+                    };
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -485,10 +507,10 @@ pub async fn start_gossip_agent(
                         instance_count: vm_count,
                         drain_status: false,
                         timestamp: now,
-                        s3_reachable: None,
-                        s3_put_latency_ms: None,
-                        s3_get_latency_ms: None,
-                        s3_degradation_level: None,
+                        s3_reachable: s3r,
+                        s3_put_latency_ms: s3p,
+                        s3_get_latency_ms: s3g,
+                        s3_degradation_level: s3d,
                     };
                     report_cluster.update_report(report);
                 }

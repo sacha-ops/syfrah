@@ -1495,33 +1495,30 @@ pub async fn run_daemon(
             .await;
         });
         info!("storage cleanup loop started");
-
-        // GC worker — two-phase SST/WAL/generation garbage collection.
-        // Runs on all nodes but only performs work on the Raft leader.
-        let gc_shutdown_rx = storage_shutdown_rx.clone();
-        tokio::spawn(async move {
-            let gc_config = syfrah_forge::gc::GcConfig::default();
-            let s3_config = syfrah_forge::storage_cleanup::S3CleanupConfig {
-                endpoint: String::new(),
-                bucket: String::new(),
-                access_key: String::new(),
-                secret_key: String::new(),
-            };
-            let state_reader: std::sync::Arc<dyn syfrah_forge::gc::GcStateReader> =
-                std::sync::Arc::new(syfrah_forge::gc::NoOpGcStateReader);
-            let submitter: std::sync::Arc<dyn syfrah_forge::gc::GcCommandSubmitter> =
-                std::sync::Arc::new(syfrah_forge::gc::NoOpGcSubmitter);
-            syfrah_forge::gc::run_gc_loop(
-                gc_config,
-                s3_config,
-                state_reader,
-                submitter,
-                gc_shutdown_rx,
-            )
-            .await;
-        });
-        info!("GC worker started");
     }
+
+    // S3 health probe (ADR-006 §25) — periodic PUT+GET+DELETE probe
+    // against S3 to track reachability and latency. The handle is read
+    // by the gossip agent to populate S3 health fields in reports.
+    let s3_health_handle: Option<syfrah_storage::S3HealthHandle> = {
+        let s3_probe_shutdown_rx = storage_shutdown_rx.clone();
+        let s3_health_probe_config = syfrah_storage::S3HealthProbeConfig {
+            endpoint: std::env::var("S3_ENDPOINT").unwrap_or_default(),
+            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "syfrah".to_string()),
+            access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
+            secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
+            thresholds: syfrah_storage::S3HealthThresholds::default(),
+        };
+        if !s3_health_probe_config.endpoint.is_empty() {
+            let handle =
+                syfrah_storage::start_s3_health_probe(s3_health_probe_config, s3_probe_shutdown_rx);
+            info!("S3 health probe started");
+            Some(handle)
+        } else {
+            info!("S3 health probe skipped: S3_ENDPOINT not configured");
+            None
+        }
+    };
 
     // -- Forge HTTP API server -----------------------------------------------
     //
@@ -1831,12 +1828,29 @@ pub async fn run_daemon(
                         (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
                     });
 
+                // Build the S3 health snapshot callback from the probe handle.
+                let s3_health_fn: Option<syfrah_controlplane::gossip::S3HealthSnapshotFn> =
+                    s3_health_handle.clone().map(|handle| {
+                        let f: syfrah_controlplane::gossip::S3HealthSnapshotFn =
+                            std::sync::Arc::new(move || {
+                                let snap = handle.snapshot();
+                                (
+                                    snap.s3_reachable,
+                                    snap.s3_put_latency_ms,
+                                    snap.s3_get_latency_ms,
+                                    snap.degradation_level.to_string(),
+                                )
+                            });
+                        f
+                    });
+
                 let gossip_shutdown_rx = raft_shutdown_rx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
                         gossip_config,
                         gossip_cluster,
                         capacity_fn,
+                        s3_health_fn,
                         gossip_shutdown_rx,
                     )
                     .await
@@ -2618,6 +2632,23 @@ pub async fn run_daemon(
                                         (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
                                     });
 
+                                    // Build S3 health callback for auto-join gossip path.
+                                    let aj_s3_health_fn: Option<
+                                        syfrah_controlplane::gossip::S3HealthSnapshotFn,
+                                    > = s3_health_handle.clone().map(|handle| {
+                                        let f: syfrah_controlplane::gossip::S3HealthSnapshotFn =
+                                            std::sync::Arc::new(move || {
+                                                let snap = handle.snapshot();
+                                                (
+                                                    snap.s3_reachable,
+                                                    snap.s3_put_latency_ms,
+                                                    snap.s3_get_latency_ms,
+                                                    snap.degradation_level.to_string(),
+                                                )
+                                            });
+                                        f
+                                    });
+
                                     let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) =
@@ -2625,6 +2656,7 @@ pub async fn run_daemon(
                                                 gossip_config,
                                                 gossip_cluster,
                                                 capacity_fn,
+                                                aj_s3_health_fn,
                                                 gossip_shutdown_rx,
                                             )
                                             .await

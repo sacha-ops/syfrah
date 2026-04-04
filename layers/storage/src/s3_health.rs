@@ -3,11 +3,12 @@
 //! Background task: every `probe_interval` (default 30s), PUT + GET + DELETE
 //! a small test object to S3. Tracks put/get latency and reachability.
 //!
-//! Degradation thresholds per ADR-006 S25:
-//! - < 30s outage:  fsync blocks (Healthy — transient)
-//! - 30s-5min:      EIO (Degraded, I/O errors to guests)
-//! - > 5min:        Degraded (volumes marked degraded)
-//! - > 30min:       Error (volumes marked error)
+//! Degradation thresholds per ADR-006 S25 (defaults):
+//! - < 30s outage:  Healthy (transient, fsyncs may block)
+//! - 30s–5min:      FsyncBlocking (fsyncs blocked, no I/O errors yet)
+//! - 5min–15min:    EIO (I/O errors returned to guests)
+//! - 15min–30min:   Degraded (volumes marked degraded)
+//! - > 30min:       Error (volumes marked error, operator intervention needed)
 //!
 //! All thresholds are configurable operational policy values.
 
@@ -61,10 +62,9 @@ pub struct S3HealthThresholds {
     pub fsync_block: Duration,
     /// Outage duration at which we start returning EIO (default 5min).
     pub eio: Duration,
-    /// Outage duration at which volumes are marked degraded (default 30min).
+    /// Outage duration at which volumes are marked degraded (default 15min).
     pub degraded: Duration,
-    /// Outage duration at which volumes are marked error (default 60min).
-    /// (ADR says 30min for degraded, implies a higher threshold for error.)
+    /// Outage duration at which volumes are marked error (default 30min).
     pub error: Duration,
     /// How often to probe S3 (default 30s).
     pub probe_interval: Duration,
@@ -75,8 +75,8 @@ impl Default for S3HealthThresholds {
         Self {
             fsync_block: Duration::from_secs(30),
             eio: Duration::from_secs(5 * 60),
-            degraded: Duration::from_secs(30 * 60),
-            error: Duration::from_secs(60 * 60),
+            degraded: Duration::from_secs(15 * 60),
+            error: Duration::from_secs(30 * 60),
             probe_interval: Duration::from_secs(30),
         }
     }
@@ -259,6 +259,16 @@ async fn run_probe_loop(
 /// Execute a single PUT + GET + DELETE probe against S3.
 ///
 /// Returns (put_latency_ms, get_latency_ms) on success.
+///
+/// **Auth placeholder:** Uses HTTP Basic Auth which is NOT supported by
+/// real S3 endpoints. AWS S3 and most S3-compatible backends (MinIO,
+/// Ceph RGW) require AWS Signature V4 request signing. Basic Auth is
+/// used here as a temporary placeholder so the probe logic can be
+/// validated end-to-end. Before deploying against a real S3 backend,
+/// replace with SigV4 signing (e.g. via `aws-sdk-s3`, `rust-s3`, or
+/// manual SigV4 implementation) using credentials from the storage
+/// config or `S3_ACCESS_KEY` / `S3_SECRET_KEY` environment variables.
+// TODO(s3-auth): replace basic_auth with AWS SigV4 request signing.
 async fn probe_s3_once(
     client: &reqwest::Client,
     config: &S3HealthProbeConfig,
@@ -398,12 +408,13 @@ mod tests {
     #[test]
     fn classify_outage_degraded() {
         let t = S3HealthThresholds::default();
+        // degraded default = 15min, error default = 30min
         assert_eq!(
-            classify_outage(&t, Duration::from_secs(30 * 60)),
+            classify_outage(&t, Duration::from_secs(15 * 60)),
             S3DegradationLevel::Degraded
         );
         assert_eq!(
-            classify_outage(&t, Duration::from_secs(45 * 60)),
+            classify_outage(&t, Duration::from_secs(20 * 60)),
             S3DegradationLevel::Degraded
         );
     }
@@ -411,12 +422,13 @@ mod tests {
     #[test]
     fn classify_outage_error() {
         let t = S3HealthThresholds::default();
+        // error default = 30min
         assert_eq!(
-            classify_outage(&t, Duration::from_secs(60 * 60)),
+            classify_outage(&t, Duration::from_secs(30 * 60)),
             S3DegradationLevel::Error
         );
         assert_eq!(
-            classify_outage(&t, Duration::from_secs(120 * 60)),
+            classify_outage(&t, Duration::from_secs(60 * 60)),
             S3DegradationLevel::Error
         );
     }
