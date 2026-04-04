@@ -336,11 +336,18 @@ pub struct StorageReconciler {
     /// Set of volume IDs already attached to CH in previous passes.
     /// Cleared when a volume is stopped or no longer desired.
     attached_volumes: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Cached reqwest client for S3 probes (reused across reconciler passes
+    /// to avoid TLS handshake + connection setup on every tick).
+    s3_probe_client: reqwest::Client,
 }
 
 impl StorageReconciler {
     /// Create a new storage reconciler.
     pub fn new(local_hypervisor_id: String, encryption_passphrase: String) -> Self {
+        let s3_probe_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             local_hypervisor_id,
             interval_secs: 5,
@@ -349,6 +356,7 @@ impl StorageReconciler {
             encryption_passphrase,
             disk_rate_limit: DiskRateLimitConfig::default(),
             attached_volumes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            s3_probe_client,
         }
     }
 
@@ -705,7 +713,7 @@ impl StorageReconciler {
         //    and update per-volume health trackers. A single probe covers
         //    all volumes since they share the same S3 backend.
         {
-            let s3_reachable = Self::probe_s3_reachable(&config.s3_endpoint).await;
+            let s3_reachable = self.probe_s3_reachable(&config.s3_endpoint).await;
             volume_mgr.record_s3_probe_all(s3_reachable);
             if !s3_reachable {
                 warn!(
@@ -776,15 +784,8 @@ impl StorageReconciler {
     /// Performs a lightweight HEAD request against the S3 endpoint.
     /// Returns `true` if the endpoint responds (any HTTP status), `false`
     /// on connection timeout or network error.
-    async fn probe_s3_reachable(endpoint: &str) -> bool {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        match client.head(endpoint).send().await {
+    async fn probe_s3_reachable(&self, endpoint: &str) -> bool {
+        match self.s3_probe_client.head(endpoint).send().await {
             Ok(_) => true,
             Err(e) => {
                 // Connection refused, DNS failure, or timeout — all count as unreachable.

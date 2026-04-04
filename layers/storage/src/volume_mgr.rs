@@ -135,11 +135,19 @@ impl VolumeHealthTracker {
     }
 
     /// Record that S3 is reachable. Resets the unreachable timer.
-    /// If there are dirty bytes, starts the flush process.
+    /// If there are dirty bytes, starts the flush process and downgrades
+    /// from `Error` to `Degraded` so that writes can resume while the
+    /// backlog drains (ADR-006 §25 recovery).
     fn record_s3_reachable(&mut self) {
         self.s3_unreachable_since = None;
         if self.dirty_bytes > 0 {
             self.flush_in_progress = true;
+            // Allow writes to resume while flush drains the backlog.
+            // Error → Degraded ensures can_accept_write returns true.
+            // Degraded stays Degraded (no change needed).
+            if self.health == VolumeHealth::Error {
+                self.health = VolumeHealth::Degraded;
+            }
         } else {
             self.health = VolumeHealth::Healthy;
             self.flush_in_progress = false;
@@ -1394,6 +1402,60 @@ mod tests {
     fn volume_health_unknown_volume() {
         let mgr = VolumeMgr::new();
         assert_eq!(mgr.volume_health("nonexistent"), None);
+    }
+
+    #[test]
+    fn health_tracker_error_recovery_with_dirty_bytes() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_millis(0),
+            max_dirty_bytes: 1_073_741_824,
+        };
+
+        // Drive into Error state.
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Error);
+        assert!(
+            !tracker.can_accept_write(&config),
+            "Error state rejects writes"
+        );
+
+        // Accumulate dirty bytes while in Error.
+        tracker.add_dirty_bytes(5000);
+
+        // S3 returns — should downgrade to Degraded so writes resume.
+        tracker.record_s3_reachable();
+        assert_eq!(tracker.health(), VolumeHealth::Degraded);
+        assert!(tracker.flush_in_progress());
+        assert!(
+            tracker.can_accept_write(&config),
+            "writes should resume during flush"
+        );
+
+        // Flush completes → Healthy.
+        tracker.flush_bytes(5000);
+        assert_eq!(tracker.health(), VolumeHealth::Healthy);
+        assert!(!tracker.flush_in_progress());
+    }
+
+    #[test]
+    fn health_tracker_error_recovery_no_dirty_bytes() {
+        let mut tracker = VolumeHealthTracker::new();
+        let config = S3HealthConfig {
+            degraded_after: Duration::from_millis(0),
+            error_after: Duration::from_millis(0),
+            max_dirty_bytes: 1_073_741_824,
+        };
+
+        // Drive into Error state with no dirty bytes.
+        tracker.record_s3_unreachable(&config);
+        assert_eq!(tracker.health(), VolumeHealth::Error);
+
+        // S3 returns, no dirty bytes → immediate Healthy.
+        tracker.record_s3_reachable();
+        assert_eq!(tracker.health(), VolumeHealth::Healthy);
+        assert!(!tracker.flush_in_progress());
     }
 
     #[test]
