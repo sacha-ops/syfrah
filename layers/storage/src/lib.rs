@@ -15,4 +15,7 @@ pub use cache::{
     CacheMetrics, VolumeCacheDir,
 };
 pub use cli::{SnapshotCommand, StorageCommand, VolumeCommand};
-pub use volume_mgr::{S3Config, VolumeMgr, VolumeMgrError};
+pub use volume_mgr::{
+    S3Config, S3HealthConfig, VolumeHealth, VolumeHealthReport, VolumeHealthTracker, VolumeMgr,
+    VolumeMgrError,
+};

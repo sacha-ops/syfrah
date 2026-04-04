@@ -117,6 +117,16 @@ pub struct HypervisorGossipReport {
     pub instance_count: u32,
     pub drain_status: bool,
     pub timestamp: u64,
+    /// Worst volume health state on this hypervisor (ADR-006 §25).
+    /// `None` when no volumes are running.
+    /// TODO(#1209): Currently scaffolding — populated via `storage_health_fn`
+    /// closure when the VolumeMgr is shared with the gossip agent.
+    #[serde(default)]
+    pub storage_health: Option<String>,
+    /// Total dirty bytes buffered locally across all volumes.
+    /// TODO(#1209): See `storage_health` above.
+    #[serde(default)]
+    pub storage_dirty_bytes: u64,
     /// Cache metrics for this hypervisor (optional for backwards compat).
     #[serde(default)]
     pub cache_metrics: Option<CacheMetricsGossip>,
@@ -342,6 +352,11 @@ pub struct GossipConfig {
     pub local_zone: String,
 }
 
+/// Return type for the storage health closure: `(worst_health, total_dirty_bytes)`.
+///
+/// `worst_health` is `None` when no volumes are running.
+pub type StorageHealthFn = Arc<dyn Fn() -> (Option<String>, u64) + Send + Sync>;
+
 /// Start the gossip agent. Returns a handle to the shared cluster state.
 ///
 /// The agent runs in background tokio tasks:
@@ -352,6 +367,7 @@ pub async fn start_gossip_agent(
     config: GossipConfig,
     cluster: GossipCluster,
     capacity_fn: Arc<dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync>,
+    storage_health_fn: Option<StorageHealthFn>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(std::net::SocketAddr::V6(config.bind_addr)).await?;
@@ -385,6 +401,7 @@ pub async fn start_gossip_agent(
     // Publish initial local report.
     {
         let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+        let (sh, sdb) = storage_health_fn.as_ref().map(|f| f()).unwrap_or((None, 0));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -402,6 +419,8 @@ pub async fn start_gossip_agent(
             instance_count: vm_count,
             drain_status: false,
             timestamp: now,
+            storage_health: sh,
+            storage_dirty_bytes: sdb,
             cache_metrics: None,
         };
         cluster.update_report(report);
@@ -476,6 +495,10 @@ pub async fn start_gossip_agent(
                 _ = shutdown_rx.wait_for(|v| *v) => break,
                 _ = tokio::time::sleep(REPORT_REFRESH_INTERVAL) => {
                     let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+                    let (sh, sdb) = storage_health_fn
+                        .as_ref()
+                        .map(|f| f())
+                        .unwrap_or((None, 0));
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -493,6 +516,8 @@ pub async fn start_gossip_agent(
                         instance_count: vm_count,
                         drain_status: false,
                         timestamp: now,
+                        storage_health: sh,
+                        storage_dirty_bytes: sdb,
                         cache_metrics: None,
                     };
                     report_cluster.update_report(report);
@@ -607,6 +632,8 @@ mod tests {
             instance_count: 2,
             drain_status: false,
             timestamp: 1000,
+            storage_health: None,
+            storage_dirty_bytes: 0,
             cache_metrics: None,
         };
         cluster.update_report(report.clone());
@@ -647,6 +674,8 @@ mod tests {
             instance_count: 3,
             drain_status: false,
             timestamp: 1000,
+            storage_health: None,
+            storage_dirty_bytes: 0,
             cache_metrics: None,
         };
         assert!((report.cpu_utilization() - 0.5).abs() < f64::EPSILON);
@@ -685,6 +714,8 @@ mod tests {
             instance_count: 1,
             drain_status: false,
             timestamp: 2000,
+            storage_health: None,
+            storage_dirty_bytes: 0,
             cache_metrics: Some(CacheMetricsGossip {
                 cache_hit_rate: 95.5,
                 dirty_bytes: 1_048_576,

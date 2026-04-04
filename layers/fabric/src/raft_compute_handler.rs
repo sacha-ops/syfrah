@@ -121,6 +121,8 @@ impl RaftComputeHandler {
                 instance_count: 0,
                 drain_status: false,
                 timestamp: now,
+                storage_health: None,
+                storage_dirty_bytes: 0,
                 cache_metrics: None,
             };
             debug!(
@@ -150,6 +152,8 @@ impl RaftComputeHandler {
                 instance_count: 0,
                 drain_status: false,
                 timestamp: now,
+                storage_health: None,
+                storage_dirty_bytes: 0,
                 cache_metrics: None,
             };
             debug!(

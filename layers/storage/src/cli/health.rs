@@ -326,6 +326,7 @@ mod tests {
                 dirty_bytes: 524_288,
             }],
             total_dirty_bytes: 524_288,
+            volume_health: vec![],
             cache_metrics: None,
             cache_alerts: vec![],
         };

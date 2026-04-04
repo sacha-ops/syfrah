@@ -1838,10 +1838,15 @@ pub async fn run_daemon(
 
                 let gossip_shutdown_rx = raft_shutdown_rx.clone();
                 tokio::spawn(async move {
+                    // TODO(#1209): Pass a StorageHealthFn once VolumeMgr is
+                    // shared via Arc<Mutex<>> between the reconciler and gossip
+                    // agent, so that storage_health/storage_dirty_bytes are
+                    // populated in gossip reports.
                     if let Err(e) = syfrah_controlplane::gossip::start_gossip_agent(
                         gossip_config,
                         gossip_cluster,
                         capacity_fn,
+                        None,
                         gossip_shutdown_rx,
                     )
                     .await
@@ -2625,11 +2630,13 @@ pub async fn run_daemon(
 
                                     let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
                                     tokio::spawn(async move {
+                                        // TODO(#1209): Pass StorageHealthFn — see above.
                                         if let Err(e) =
                                             syfrah_controlplane::gossip::start_gossip_agent(
                                                 gossip_config,
                                                 gossip_cluster,
                                                 capacity_fn,
+                                                None,
                                                 gossip_shutdown_rx,
                                             )
                                             .await
