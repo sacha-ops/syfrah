@@ -37,7 +37,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use syfrah_storage::volume_mgr::{CacheConfig, S3Config, VolumeMgr, VolumeMgrError};
+use syfrah_storage::volume_mgr::{
+    CacheConfig, S3Config, VolumeManifest, VolumeMgr, VolumeMgrError,
+};
 
 // ---------------------------------------------------------------------------
 // Desired-state types (read from Raft)
@@ -245,6 +247,70 @@ impl ChClientProvider for NoOpChClientProvider {
             "no CH client available for vm={vm_id} device={ch_device_id}"
         ))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot submission trait (Raft command submission)
+// ---------------------------------------------------------------------------
+
+/// Trait for submitting a `CreateSnapshot` command to the Raft state machine.
+///
+/// In production, the implementation serializes a `StateMachineCommand::CreateSnapshot`
+/// and proposes it through the Raft client. In tests, a mock records the call.
+#[async_trait::async_trait]
+pub trait SnapshotSubmitter: Send + Sync {
+    /// Submit a snapshot creation request. Returns the snapshot ID on success.
+    ///
+    /// `snapshot_id` — pre-generated unique ID for the snapshot.
+    /// `source_volume_id` — the volume being snapshotted.
+    /// `manifest` — SST files + WAL position captured from ZeroFS.
+    async fn submit_create_snapshot(
+        &self,
+        snapshot_id: &str,
+        source_volume_id: &str,
+        manifest: &VolumeManifest,
+    ) -> Result<String, String>;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot creation flow (ADR-006 §6)
+// ---------------------------------------------------------------------------
+
+/// Create a snapshot of a running volume.
+///
+/// Orchestrates the full snapshot creation flow:
+/// 1. Capture the current manifest from ZeroFS (SST files + WAL position)
+/// 2. Submit a `CreateSnapshot` Raft command with the manifest data
+/// 3. SST refcount increments happen atomically in the state machine
+///
+/// Returns the snapshot ID on success.
+pub async fn create_snapshot(
+    volume_mgr: &VolumeMgr,
+    submitter: &dyn SnapshotSubmitter,
+    snapshot_id: &str,
+    volume_id: &str,
+) -> Result<String, String> {
+    // Step 1: Capture manifest from ZeroFS.
+    let manifest = volume_mgr
+        .capture_manifest(volume_id)
+        .await
+        .map_err(|e| format!("failed to capture manifest for volume {volume_id}: {e}"))?;
+
+    info!(
+        volume_id,
+        snapshot_id,
+        sst_count = manifest.sst_files.len(),
+        wal_position = manifest.wal_position,
+        "captured volume manifest for snapshot"
+    );
+
+    // Step 2: Submit CreateSnapshot Raft command.
+    let result = submitter
+        .submit_create_snapshot(snapshot_id, volume_id, &manifest)
+        .await?;
+
+    info!(volume_id, snapshot_id, "snapshot created via Raft");
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,5 +1658,130 @@ mod tests {
             StorageReconciler::new("hv-1".into(), "test-pass".into()).with_disk_rate_limit(config);
         assert_eq!(r.disk_rate_limit.bw_size, 100 * 1024 * 1024);
         assert_eq!(r.disk_rate_limit.ops_size, 5_000);
+    }
+
+    // ── Snapshot creation tests (#1200) ────────────────────────────
+
+    /// Mock SnapshotSubmitter that records calls and returns success.
+    struct MockSnapshotSubmitter {
+        calls: Mutex<Vec<(String, String, VolumeManifest)>>,
+        fail_with: Mutex<Option<String>>,
+    }
+
+    impl MockSnapshotSubmitter {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_with: Mutex::new(None),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_with: Mutex::new(Some(msg.to_string())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn last_call(&self) -> Option<(String, String, VolumeManifest)> {
+            self.calls.lock().unwrap().last().cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotSubmitter for MockSnapshotSubmitter {
+        async fn submit_create_snapshot(
+            &self,
+            snapshot_id: &str,
+            source_volume_id: &str,
+            manifest: &VolumeManifest,
+        ) -> Result<String, String> {
+            if let Some(err) = self.fail_with.lock().unwrap().as_ref() {
+                return Err(err.clone());
+            }
+            self.calls.lock().unwrap().push((
+                snapshot_id.to_string(),
+                source_volume_id.to_string(),
+                manifest.clone(),
+            ));
+            Ok(snapshot_id.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_succeeds_with_manifest_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = VolumeMgr::new();
+        mgr = mgr.with_nbd_base(tmp.path().join("nbd"));
+        mgr.inject_fake_process("vol-snap", 1);
+
+        // Pre-write manifest file.
+        let manifest = VolumeManifest {
+            sst_files: vec!["sst-a.sst".into()],
+            wal_position: 42,
+        };
+        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        let submitter = MockSnapshotSubmitter::new();
+        let result = create_snapshot(&mgr, &submitter, "snap-01", "vol-snap").await;
+
+        assert!(result.is_ok(), "create_snapshot failed: {result:?}");
+        assert_eq!(result.unwrap(), "snap-01");
+        assert_eq!(submitter.call_count(), 1);
+
+        let (sid, vid, m) = submitter.last_call().unwrap();
+        assert_eq!(sid, "snap-01");
+        assert_eq!(vid, "vol-snap");
+        assert_eq!(m.sst_files, vec!["sst-a.sst"]);
+        assert_eq!(m.wal_position, 42);
+
+        mgr.stop_volume("vol-snap").await.ok();
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_fails_when_volume_not_running() {
+        let mgr = VolumeMgr::new();
+        let submitter = MockSnapshotSubmitter::new();
+        let result = create_snapshot(&mgr, &submitter, "snap-01", "nonexistent").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not running"));
+        assert_eq!(submitter.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_propagates_raft_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = VolumeMgr::new();
+        mgr = mgr.with_nbd_base(tmp.path().join("nbd"));
+        mgr.inject_fake_process("vol-snap", 1);
+
+        // Pre-write manifest file.
+        let manifest_path = tmp.path().join("vol-snap.manifest.json");
+        tokio::fs::write(
+            &manifest_path,
+            serde_json::to_string(&VolumeManifest {
+                sst_files: vec!["sst-x.sst".into()],
+                wal_position: 7,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let submitter = MockSnapshotSubmitter::failing("raft: not leader");
+        let result = create_snapshot(&mgr, &submitter, "snap-01", "vol-snap").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("raft: not leader"));
+
+        mgr.stop_volume("vol-snap").await.ok();
     }
 }
