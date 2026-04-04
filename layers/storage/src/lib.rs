@@ -10,7 +10,7 @@ pub use api::{
     send_storage_request, StorageHealthReport, StorageLayerHandler, StorageRequest,
     StorageResponse, StorageStatusReport, VolumeCacheStat,
 };
-pub use binary::{ensure_nbd_module, ensure_zerofs};
+pub use binary::ensure_zerofs;
 pub use cache::{
     cleanup_volume_cache, create_volume_cache, evaluate_alerts, validate_cache_disk,
     zerofs_cache_args, CacheAlert, CacheAlertThresholds, CacheConfig, CacheDiskInfo, CacheError,
