@@ -1575,6 +1575,20 @@ impl RedbStateMachine {
                         )
                     }
                 };
+                // Storage preflight: check if the hypervisor's zone has storage
+                // configured. Without storage, VMs on this hypervisor cannot pull
+                // images or manage volumes. Block enable with a helpful error.
+                if let Ok(Some(hv)) = hv_store.get(name) {
+                    let zone = &hv.zone;
+                    let storage = self.storage.read().unwrap();
+                    if !storage.storage_configs.contains_key(zone) {
+                        return StateMachineResponse::Error(format!(
+                            "cannot enable hypervisor {name} \u{2014} storage is not configured for zone {zone}.\n\
+                             VMs on this hypervisor would fail to pull images or manage volumes.\n\
+                             Run: syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
+                        ));
+                    }
+                }
                 match hv_store.update_state(name, syfrah_org::HypervisorState::Available) {
                     Ok(()) => StateMachineResponse::Ok,
                     Err(e) => StateMachineResponse::Error(e.to_string()),
@@ -3141,6 +3155,14 @@ mod tests {
         assert_eq!(hv.zone, "az1");
         assert_eq!(hv.fabric_ipv6, "fd00::1");
 
+        // Configure storage for zone az1 so enable succeeds.
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu".to_string(),
+            zone: "az1".to_string(),
+            config: Box::new(make_valid_storage_config()),
+        });
+        assert!(!matches!(resp, StateMachineResponse::Error(_)));
+
         // EnableHypervisor should update state to Available.
         let resp = sm.apply_command(&StateMachineCommand::EnableHypervisor {
             name: "hv1".to_string(),
@@ -3175,6 +3197,54 @@ mod tests {
             fabric_ipv6: "fd00::1".to_string(),
         });
         assert!(matches!(resp, StateMachineResponse::Error(_)));
+    }
+
+    #[test]
+    fn enable_hypervisor_blocked_without_storage_config() {
+        let (_dir, store) = make_org_store();
+        let hv_db = syfrah_state::LayerDb::open_at(&_dir.path().join("hv.redb")).unwrap();
+        let hv_store = std::sync::Arc::new(syfrah_org::HypervisorStore::new(hv_db));
+        let sm = RedbStateMachine::new(store).with_hypervisor_store(hv_store.clone());
+
+        // Register a hypervisor in zone fsn1.
+        let resp = sm.apply_command(&StateMachineCommand::RegisterHypervisor {
+            name: "hv-fsn".to_string(),
+            region: "eu".to_string(),
+            zone: "fsn1".to_string(),
+            fabric_ipv6: "fd00::1".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        // Attempt to enable without storage config for fsn1 — should fail.
+        let resp = sm.apply_command(&StateMachineCommand::EnableHypervisor {
+            name: "hv-fsn".to_string(),
+        });
+        match resp {
+            StateMachineResponse::Error(msg) => {
+                assert!(
+                    msg.contains("storage is not configured for zone fsn1"),
+                    "expected storage preflight error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("syfrah storage configure"),
+                    "error should suggest the fix command, got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got: {other:?}"),
+        }
+
+        // Now configure storage for fsn1 and retry — should succeed.
+        let resp = sm.apply_command(&StateMachineCommand::SetStorageConfig {
+            region: "eu".to_string(),
+            zone: "fsn1".to_string(),
+            config: Box::new(make_valid_storage_config()),
+        });
+        assert!(!matches!(resp, StateMachineResponse::Error(_)));
+
+        let resp = sm.apply_command(&StateMachineCommand::EnableHypervisor {
+            name: "hv-fsn".to_string(),
+        });
+        assert!(matches!(resp, StateMachineResponse::Ok));
     }
 
     #[tokio::test]

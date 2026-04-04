@@ -22,6 +22,7 @@ pub async fn run(
         peering_port,
         region,
         zone,
+        no_hypervisor: false,
     })
     .await
     .context("Failed to initialize mesh. If a mesh already exists, run: syfrah fabric leave")
