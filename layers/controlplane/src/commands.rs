@@ -426,6 +426,20 @@ pub enum StateMachineCommand {
         max_age_secs: u64,
     },
 
+    /// Commit a manifest pointer for a volume (ADR-006 §12b).
+    ///
+    /// Validates:
+    /// - `generation` matches the volume's current `placement_generation`
+    /// - `manifest_version` == last committed version + 1 (strict sequential)
+    /// - `published_by` matches the hypervisor the volume is attached to
+    CommitManifest {
+        volume_id: String,
+        generation: u64,
+        manifest_version: u64,
+        s3_key: String,
+        published_by: String,
+    },
+
     // -- Composite Transaction --
     /// Atomic batch of commands applied in a single Raft log entry.
     /// All sub-commands succeed or all fail. Used for placement transactions
@@ -478,6 +492,11 @@ impl std::fmt::Display for StateMachineCommand {
             Self::PurgeTombstones { max_age_secs, .. } => {
                 write!(f, "PurgeTombstones(ttl={max_age_secs}s)")
             }
+            Self::CommitManifest {
+                volume_id,
+                manifest_version,
+                ..
+            } => write!(f, "CommitManifest({volume_id}, v{manifest_version})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -788,6 +807,13 @@ mod tests {
                 max_volumes: 50,
                 max_total_gb: 10000,
                 max_snapshots: 200,
+            },
+            StateMachineCommand::CommitManifest {
+                volume_id: "vol-01".into(),
+                generation: 1,
+                manifest_version: 1,
+                s3_key: "manifests/vol-01/v1.json".into(),
+                published_by: "hv1".into(),
             },
         ];
 
