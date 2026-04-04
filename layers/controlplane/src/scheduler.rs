@@ -10,7 +10,7 @@
 //! If no gossip data is available (single-node, no gossip running),
 //! falls back to "place locally" (current behavior).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -246,6 +246,35 @@ impl Scheduler {
         excluded: &[String],
         existing_placements: &HashMap<String, u32>,
     ) -> Result<PlacementDecision, SchedulerError> {
+        self.schedule_from_store_with_storage(
+            vcpus,
+            memory_mb,
+            constraints,
+            hypervisor_store,
+            excluded,
+            existing_placements,
+            None,
+        )
+    }
+
+    /// Schedule a VM placement using Raft-replicated hypervisor records,
+    /// with an optional storage preflight check.
+    ///
+    /// When `configured_storage_zones` is provided, the scheduler verifies
+    /// that the target zone has storage (S3) configured before placing a VM
+    /// there. If storage is not configured, scheduling fails with a clear
+    /// error message that tells the operator exactly how to fix it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_from_store_with_storage(
+        &self,
+        vcpus: u32,
+        memory_mb: u64,
+        constraints: &PlacementConstraints,
+        hypervisor_store: &syfrah_org::HypervisorStore,
+        excluded: &[String],
+        existing_placements: &HashMap<String, u32>,
+        configured_storage_zones: Option<&HashSet<String>>,
+    ) -> Result<PlacementDecision, SchedulerError> {
         let hypervisors = match hypervisor_store.list() {
             Ok(hvs) => hvs,
             Err(e) => {
@@ -283,6 +312,56 @@ impl Scheduler {
                 constraints_summary: summary,
             });
         }
+
+        // Storage preflight: if configured_storage_zones is provided, check
+        // that every candidate zone has storage configured. If the user
+        // requested a specific zone and it has no storage, fail early with
+        // a helpful error. If no specific zone was requested, filter out
+        // candidates in unconfigured zones.
+        let filtered = if let Some(zones) = configured_storage_zones {
+            // If user requested a specific zone, check it directly.
+            if let Some(ref requested_zone) = constraints.zone {
+                if !zones.contains(requested_zone.as_str()) {
+                    return Err(SchedulerError {
+                        message: format!(
+                            "cannot create VM in zone {requested_zone} \u{2014} storage is not configured for this zone.\n\
+                             Run: syfrah storage config --zone {requested_zone} --s3-endpoint <url> --s3-bucket <bucket> --access-key <key> --secret-key <secret>"
+                        ),
+                        constraints_summary: format!("zone={requested_zone}, storage=unconfigured"),
+                    });
+                }
+                filtered
+            } else {
+                // No specific zone requested: filter out candidates in
+                // zones without storage, but keep going if some remain.
+                let storage_filtered: Vec<HypervisorCandidate> = filtered
+                    .into_iter()
+                    .filter(|c| {
+                        if zones.contains(c.zone.as_str()) {
+                            true
+                        } else {
+                            debug!(
+                                "scheduler: filter out '{}' \u{2014} storage not configured for zone {}",
+                                c.name, c.zone
+                            );
+                            false
+                        }
+                    })
+                    .collect();
+                if storage_filtered.is_empty() {
+                    return Err(SchedulerError {
+                        message:
+                            "cannot create VM \u{2014} no zone has storage configured.\n\
+                             Run: syfrah storage config --zone <zone> --s3-endpoint <url> --s3-bucket <bucket> --access-key <key> --secret-key <secret>"
+                                .to_string(),
+                        constraints_summary: "storage=unconfigured".to_string(),
+                    });
+                }
+                storage_filtered
+            }
+        } else {
+            filtered
+        };
 
         let mut scored: Vec<(HypervisorCandidate, f64)> = filtered
             .into_iter()
@@ -1010,5 +1089,209 @@ mod tests {
             .schedule(2, 4096, &constraints, &cluster, &[], &HashMap::new())
             .unwrap();
         assert_eq!(result.hypervisor_id, "hv-fsn");
+    }
+
+    // -- Storage preflight tests (issue #1296) --
+
+    fn make_hv_store() -> (tempfile::TempDir, syfrah_org::HypervisorStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = syfrah_state::LayerDb::open_at(&dir.path().join("hv.redb")).unwrap();
+        let store = syfrah_org::HypervisorStore::new(db);
+        (dir, store)
+    }
+
+    fn register_hypervisor(store: &syfrah_org::HypervisorStore, name: &str, zone: &str) {
+        let hv = syfrah_org::Hypervisor {
+            id: syfrah_org::HypervisorId(name.to_string()),
+            name: name.to_string(),
+            region: "eu".to_string(),
+            zone: zone.to_string(),
+            state: syfrah_org::HypervisorState::Available,
+            fabric_node_id: name.to_string(),
+            public_ip: String::new(),
+            fabric_ipv6: format!("fd00::{name}"),
+            hardware: syfrah_org::HardwareSpec {
+                cpu_model: String::new(),
+                cpu_cores_physical: 16,
+                cpu_threads_logical: 16,
+                memory_gb: 64,
+                local_disk_type: syfrah_org::DiskType::NVMe,
+                local_disk_gb: 500,
+                gpu: None,
+                network_bandwidth_gbps: 1,
+                architecture: syfrah_org::CpuArchitecture::X86_64,
+            },
+            capacity: syfrah_org::AllocatableCapacity {
+                allocatable_vcpus: 16,
+                allocatable_memory_mb: 65536,
+                ..Default::default()
+            },
+            labels: HashMap::new(),
+            taints: Vec::new(),
+            created_at: 0,
+        };
+        store.create(&hv).unwrap();
+    }
+
+    #[test]
+    fn storage_preflight_blocks_zone_without_config() {
+        let (_dir, hv_store) = make_hv_store();
+        register_hypervisor(&hv_store, "hv-1", "fsn1");
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("fsn1".to_string()),
+            ..Default::default()
+        };
+
+        // No zones have storage configured.
+        let storage_zones: HashSet<String> = HashSet::new();
+
+        let err = scheduler
+            .schedule_from_store_with_storage(
+                1,
+                1024,
+                &constraints,
+                &hv_store,
+                &[],
+                &HashMap::new(),
+                Some(&storage_zones),
+            )
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("storage is not configured"),
+            "expected storage preflight error, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("fsn1"),
+            "error should mention the zone, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("syfrah storage config"),
+            "error should suggest the fix command, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn storage_preflight_allows_zone_with_config() {
+        let (_dir, hv_store) = make_hv_store();
+        register_hypervisor(&hv_store, "hv-1", "fsn1");
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("fsn1".to_string()),
+            ..Default::default()
+        };
+
+        let mut storage_zones = HashSet::new();
+        storage_zones.insert("fsn1".to_string());
+
+        let result = scheduler
+            .schedule_from_store_with_storage(
+                1,
+                1024,
+                &constraints,
+                &hv_store,
+                &[],
+                &HashMap::new(),
+                Some(&storage_zones),
+            )
+            .unwrap();
+        assert_eq!(result.hypervisor_id, "hv-1");
+    }
+
+    #[test]
+    fn storage_preflight_filters_unconfigured_zones_when_no_zone_constraint() {
+        let (_dir, hv_store) = make_hv_store();
+        register_hypervisor(&hv_store, "hv-1", "fsn1");
+        register_hypervisor(&hv_store, "hv-2", "nbg1");
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        // No zone constraint — scheduler picks from all zones.
+        let constraints = PlacementConstraints::default();
+
+        // Only nbg1 has storage configured.
+        let mut storage_zones = HashSet::new();
+        storage_zones.insert("nbg1".to_string());
+
+        let result = scheduler
+            .schedule_from_store_with_storage(
+                1,
+                1024,
+                &constraints,
+                &hv_store,
+                &[],
+                &HashMap::new(),
+                Some(&storage_zones),
+            )
+            .unwrap();
+        // hv-1 (fsn1) should be filtered out — only hv-2 (nbg1) remains.
+        assert_eq!(result.hypervisor_id, "hv-2");
+    }
+
+    #[test]
+    fn storage_preflight_none_skips_check() {
+        let (_dir, hv_store) = make_hv_store();
+        register_hypervisor(&hv_store, "hv-1", "fsn1");
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints {
+            zone: Some("fsn1".to_string()),
+            ..Default::default()
+        };
+
+        // When configured_storage_zones is None, no check is done.
+        let result = scheduler
+            .schedule_from_store_with_storage(
+                1,
+                1024,
+                &constraints,
+                &hv_store,
+                &[],
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.hypervisor_id, "hv-1");
+    }
+
+    #[test]
+    fn storage_preflight_all_zones_unconfigured() {
+        let (_dir, hv_store) = make_hv_store();
+        register_hypervisor(&hv_store, "hv-1", "fsn1");
+        register_hypervisor(&hv_store, "hv-2", "nbg1");
+
+        let scheduler = Scheduler::new("other".to_string(), "::1".to_string());
+        let constraints = PlacementConstraints::default();
+
+        // No zones configured at all.
+        let storage_zones: HashSet<String> = HashSet::new();
+
+        let err = scheduler
+            .schedule_from_store_with_storage(
+                1,
+                1024,
+                &constraints,
+                &hv_store,
+                &[],
+                &HashMap::new(),
+                Some(&storage_zones),
+            )
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("no zone has storage configured"),
+            "expected clear error about no zones, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("syfrah storage config"),
+            "error should suggest the fix command, got: {}",
+            err.message
+        );
     }
 }

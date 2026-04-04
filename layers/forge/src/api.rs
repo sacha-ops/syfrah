@@ -58,6 +58,8 @@ pub struct ForgeState {
     /// The scheduler reads from this store (Raft-replicated) to pick a
     /// hypervisor in the requested zone.
     pub hypervisor_store: Option<Arc<syfrah_org::HypervisorStore>>,
+    /// Storage store for preflight checks (is S3 configured for the target zone?).
+    pub storage_store: Option<Arc<syfrah_org::StorageStore>>,
     /// Local node name for scheduler (to identify "this" hypervisor).
     pub local_node_name: String,
     /// Local fabric IPv6 for scheduler.
@@ -984,13 +986,21 @@ async fn create_instance_handler(
                 None,
             );
             let existing: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-            match scheduler.schedule_from_store(
+            // Build the set of zones with storage configured for preflight checks.
+            let storage_zones: Option<std::collections::HashSet<String>> =
+                state.storage_store.as_ref().and_then(|ss| {
+                    ss.list_storage_configs()
+                        .ok()
+                        .map(|cfgs| cfgs.into_iter().map(|(z, _)| z).collect())
+                });
+            match scheduler.schedule_from_store_with_storage(
                 req.vcpus,
                 req.memory_mb as u64,
                 &constraints,
                 hv_store,
                 &[],
                 &existing,
+                storage_zones.as_ref(),
             ) {
                 Ok(decision) => {
                     if !decision.is_local_fallback
@@ -2621,6 +2631,7 @@ mod tests {
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
             hypervisor_store: None,
+            storage_store: None,
             local_node_name: String::new(),
             local_fabric_ipv6: String::new(),
         })
@@ -2650,6 +2661,7 @@ mod tests {
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
             hypervisor_store: None,
+            storage_store: None,
             local_node_name: String::new(),
             local_fabric_ipv6: String::new(),
         });
@@ -2882,6 +2894,7 @@ mod tests {
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
             hypervisor_store: None,
+            storage_store: None,
             local_node_name: String::new(),
             local_fabric_ipv6: String::new(),
         });
@@ -2924,6 +2937,7 @@ mod tests {
             raft_client: Arc::new(tokio::sync::RwLock::new(None)),
             gossip_cluster: Arc::new(tokio::sync::RwLock::new(None)),
             hypervisor_store: None,
+            storage_store: None,
             local_node_name: String::new(),
             local_fabric_ipv6: String::new(),
         })

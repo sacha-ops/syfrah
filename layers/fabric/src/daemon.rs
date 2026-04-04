@@ -1682,7 +1682,7 @@ pub async fn run_daemon(
         info!("hypervisor layer initialised");
     }
 
-    // -- Storage layer integration ---------------------------------------------
+    // -- Storage layer integration (store opened first, then wired into compute handler below) ---------------------------------------------
     //
     // Register the StorageLayerHandler so CLI commands like `syfrah volume create`
     // and `syfrah storage configure` are routed through the daemon's control socket.
@@ -1726,6 +1726,21 @@ pub async fn run_daemon(
             None
         };
     info!("storage layer handler registered");
+
+    // Wire storage store into Raft compute handler for storage preflight checks
+    // (block VM creation if storage is not configured for the target zone).
+    if let Some(ref store) = shared_storage_store {
+        if let Some(ref handler) = raft_compute_handler_ref {
+            let handler: Arc<crate::raft_compute_handler::RaftComputeHandler> = Arc::clone(handler);
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                handler.set_storage_store(store).await;
+                info!(
+                    "compute: storage store wired into Raft compute handler for preflight checks"
+                );
+            });
+        }
+    }
 
     // Register the forge layer handler on the control socket so future
     // `syfrah forge` CLI commands can be routed through the daemon.
@@ -1947,6 +1962,7 @@ pub async fn run_daemon(
             raft_client: Arc::clone(&forge_raft_client),
             gossip_cluster: Arc::clone(&forge_gossip_cluster),
             hypervisor_store: shared_hypervisor_store.clone(),
+            storage_store: shared_storage_store.clone(),
             local_node_name: my_record.name.clone(),
             local_fabric_ipv6: my_record.mesh_ipv6.to_string(),
         });
