@@ -288,6 +288,13 @@ impl StorageLayerHandler {
                     None => format!("{org}/{project}/default"),
                 };
                 let volume_id = format!("vol-{}", short_id());
+                // Auto-assign volume to the local hypervisor so the storage
+                // reconciler starts ZeroFS immediately (single-node flow).
+                let hypervisor_id = if self.local_node_name.is_empty() {
+                    None
+                } else {
+                    Some(self.local_node_name.clone())
+                };
                 let cmd = StateMachineCommand::CreateVolume {
                     id: volume_id.clone(),
                     name: name.clone(),
@@ -296,6 +303,7 @@ impl StorageLayerHandler {
                     project_id: project,
                     env_id,
                     volume_type: syfrah_controlplane::commands::VolumeType::Data,
+                    hypervisor_id,
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {

@@ -643,6 +643,7 @@ impl RaftComputeHandler {
             project_id,
             env_id,
             volume_type: VolumeType::Root,
+            hypervisor_id: None,
         };
 
         match client.write(cmd).await {

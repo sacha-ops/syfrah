@@ -1910,6 +1910,7 @@ impl RedbStateMachine {
                 project_id,
                 env_id,
                 volume_type,
+                hypervisor_id,
             } => {
                 // Check quota before creating.
                 if let Err(e) = self.check_volume_quota(org_id, project_id, *size_gb) {
@@ -1933,6 +1934,12 @@ impl RedbStateMachine {
                         "volume with id '{id}' already exists"
                     ));
                 }
+                // When hypervisor_id is provided, auto-assign the volume so the
+                // storage reconciler starts ZeroFS immediately (single-node flow).
+                let (attached_hypervisor_id, placement_generation) = match hypervisor_id {
+                    Some(hv) => (Some(hv.clone()), 1),
+                    None => (None, 0),
+                };
                 let record = VolumeRecord {
                     id: id.clone(),
                     name: name.clone(),
@@ -1943,8 +1950,8 @@ impl RedbStateMachine {
                     volume_type: volume_type.clone(),
                     state: VolumeState::Available,
                     attached_vm_id: None,
-                    attached_hypervisor_id: None,
-                    placement_generation: 0,
+                    attached_hypervisor_id,
+                    placement_generation,
                     deletion_protection: false,
                     deleted_at: None,
                 };
@@ -3001,6 +3008,7 @@ mod tests {
             project_id: project.into(),
             env_id: env.into(),
             volume_type: VolumeType::Data,
+            hypervisor_id: None,
         })
     }
 
@@ -4342,6 +4350,7 @@ mod tests {
             project_id: "myapp".into(),
             env_id: "prod".into(),
             volume_type: VolumeType::Root,
+            hypervisor_id: None,
         });
         assert!(matches!(resp, StateMachineResponse::Created(_)));
 
@@ -4427,6 +4436,7 @@ mod tests {
             project_id: "myapp".into(),
             env_id: "prod".into(),
             volume_type: VolumeType::Root,
+            hypervisor_id: None,
         });
         assert!(matches!(resp, StateMachineResponse::Created(_)));
 

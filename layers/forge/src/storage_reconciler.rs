@@ -867,8 +867,13 @@ impl VolumeStateReader for RaftVolumeStateReader {
             .volumes
             .values()
             .filter(|vol| {
-                vol.state == syfrah_controlplane::VolumeState::Attached
-                    && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
+                // Include both Attached volumes (VM-bound) and Available volumes
+                // that have been assigned to this hypervisor (auto-start on create).
+                let assigned_here =
+                    vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id);
+                let startable_state = vol.state == syfrah_controlplane::VolumeState::Attached
+                    || vol.state == syfrah_controlplane::VolumeState::Available;
+                assigned_here && startable_state
             })
             .map(|vol| DesiredVolume {
                 id: vol.id.clone(),

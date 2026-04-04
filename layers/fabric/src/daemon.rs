@@ -1515,11 +1515,33 @@ pub async fn run_daemon(
     {
         let hypervisor_id = my_record.name.clone();
         let region = my_record.region.as_deref().unwrap_or("default").to_string();
-        let encryption_passphrase: String = mesh_secret
-            .encryption_key()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // Read encryption passphrase from /etc/syfrah/storage-key if it exists,
+        // otherwise derive from the mesh secret (single-node default).
+        let encryption_passphrase: String = match std::fs::read_to_string("/etc/syfrah/storage-key")
+        {
+            Ok(contents) => {
+                let trimmed = contents.trim().to_string();
+                if trimmed.is_empty() {
+                    warn!("/etc/syfrah/storage-key is empty, falling back to mesh secret");
+                    mesh_secret
+                        .encryption_key()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect()
+                } else {
+                    info!("using encryption passphrase from /etc/syfrah/storage-key");
+                    trimmed
+                }
+            }
+            Err(_) => {
+                debug!("/etc/syfrah/storage-key not found, deriving passphrase from mesh secret");
+                mesh_secret
+                    .encryption_key()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            }
+        };
         let reconciler = syfrah_forge::storage_reconciler::StorageReconciler::new(
             hypervisor_id,
             encryption_passphrase,

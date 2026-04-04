@@ -345,6 +345,9 @@ pub enum StateMachineCommand {
     // TODO: Replace String IDs with typed VolumeId/SnapshotId/VmId/HypervisorId
     // from syfrah-core once #1178 lands.
     /// Create a new volume. Raft validates quota and name uniqueness within env.
+    ///
+    /// When `hypervisor_id` is set, the volume is auto-assigned to that node so
+    /// the storage reconciler can start ZeroFS immediately (single-node flow).
     CreateVolume {
         id: String,
         name: String,
@@ -353,6 +356,12 @@ pub enum StateMachineCommand {
         project_id: String,
         env_id: String,
         volume_type: VolumeType,
+        /// Optional hypervisor to auto-assign the volume to on creation.
+        /// When set, `attached_hypervisor_id` and `placement_generation` are
+        /// initialized so the reconciler starts ZeroFS without a separate
+        /// VolumeAttach command.
+        #[serde(default)]
+        hypervisor_id: Option<String>,
     },
     /// Mark a volume for deletion (tombstone). Volume must be Available (not attached).
     /// With `cascade: true`, all snapshots referencing this volume are deleted first.
@@ -822,6 +831,7 @@ mod tests {
                 project_id: "myapp".into(),
                 env_id: "prod".into(),
                 volume_type: VolumeType::Data,
+                hypervisor_id: None,
             },
             StateMachineCommand::DeleteVolume {
                 volume_id: "vol-01".into(),
