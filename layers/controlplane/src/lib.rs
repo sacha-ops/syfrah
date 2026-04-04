@@ -20,7 +20,7 @@ pub use client::{RaftClient, RaftMetricsSnapshot};
 pub use commands::{StateMachineCommand, StateMachineResponse, StorageConfig};
 pub use gossip::{
     CacheMetricsGossip, GossipCluster, GossipConfig, GossipMetricsSnapshot, GossipNodeId,
-    HypervisorGossipReport, MemberState, StorageHealthFn,
+    HypervisorGossipReport, MemberState, S3HealthSnapshotFn, StorageHealthFn,
 };
 pub use idempotency::IdempotencyJournal;
 pub use log_storage::RedbLogStore;

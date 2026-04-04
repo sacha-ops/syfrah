@@ -117,6 +117,18 @@ pub struct HypervisorGossipReport {
     pub instance_count: u32,
     pub drain_status: bool,
     pub timestamp: u64,
+    /// S3 reachability from the latest health probe (None if probe not running).
+    #[serde(default)]
+    pub s3_reachable: Option<bool>,
+    /// S3 PUT latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_put_latency_ms: Option<u64>,
+    /// S3 GET latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_get_latency_ms: Option<u64>,
+    /// S3 degradation level string (Healthy, FsyncBlocking, EIO, Degraded, Error).
+    #[serde(default)]
+    pub s3_degradation_level: Option<String>,
     /// Worst volume health state on this hypervisor (ADR-006 §25).
     /// `None` when no volumes are running.
     /// TODO(#1209): Currently scaffolding — populated via `storage_health_fn`
@@ -352,6 +364,13 @@ pub struct GossipConfig {
     pub local_zone: String,
 }
 
+/// Callback that returns the latest S3 health snapshot for gossip reports.
+///
+/// Returns `(s3_reachable, put_latency_ms, get_latency_ms, degradation_level)`.
+/// When `None`, gossip reports carry `s3_reachable: None` etc.
+pub type S3HealthSnapshotFn =
+    Arc<dyn Fn() -> (bool, Option<u64>, Option<u64>, String) + Send + Sync>;
+
 /// Return type for the storage health closure: `(worst_health, total_dirty_bytes)`.
 ///
 /// `worst_health` is `None` when no volumes are running.
@@ -367,6 +386,7 @@ pub async fn start_gossip_agent(
     config: GossipConfig,
     cluster: GossipCluster,
     capacity_fn: Arc<dyn Fn() -> (u32, u64, u32, u64, u32) + Send + Sync>,
+    s3_health_fn: Option<S3HealthSnapshotFn>,
     storage_health_fn: Option<StorageHealthFn>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -401,6 +421,13 @@ pub async fn start_gossip_agent(
     // Publish initial local report.
     {
         let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+        let (s3r, s3p, s3g, s3d) = match &s3_health_fn {
+            Some(f) => {
+                let (r, p, g, d) = f();
+                (Some(r), p, g, Some(d))
+            }
+            None => (None, None, None, None),
+        };
         let (sh, sdb) = storage_health_fn.as_ref().map(|f| f()).unwrap_or((None, 0));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -419,6 +446,10 @@ pub async fn start_gossip_agent(
             instance_count: vm_count,
             drain_status: false,
             timestamp: now,
+            s3_reachable: s3r,
+            s3_put_latency_ms: s3p,
+            s3_get_latency_ms: s3g,
+            s3_degradation_level: s3d,
             storage_health: sh,
             storage_dirty_bytes: sdb,
             cache_metrics: None,
@@ -495,6 +526,13 @@ pub async fn start_gossip_agent(
                 _ = shutdown_rx.wait_for(|v| *v) => break,
                 _ = tokio::time::sleep(REPORT_REFRESH_INTERVAL) => {
                     let (alloc_v, alloc_m, used_v, used_m, vm_count) = capacity_fn();
+                    let (s3r, s3p, s3g, s3d) = match &s3_health_fn {
+                        Some(f) => {
+                            let (r, p, g, d) = f();
+                            (Some(r), p, g, Some(d))
+                        }
+                        None => (None, None, None, None),
+                    };
                     let (sh, sdb) = storage_health_fn
                         .as_ref()
                         .map(|f| f())
@@ -516,6 +554,10 @@ pub async fn start_gossip_agent(
                         instance_count: vm_count,
                         drain_status: false,
                         timestamp: now,
+                        s3_reachable: s3r,
+                        s3_put_latency_ms: s3p,
+                        s3_get_latency_ms: s3g,
+                        s3_degradation_level: s3d,
                         storage_health: sh,
                         storage_dirty_bytes: sdb,
                         cache_metrics: None,
@@ -632,6 +674,10 @@ mod tests {
             instance_count: 2,
             drain_status: false,
             timestamp: 1000,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
             storage_health: None,
             storage_dirty_bytes: 0,
             cache_metrics: None,
@@ -674,6 +720,10 @@ mod tests {
             instance_count: 3,
             drain_status: false,
             timestamp: 1000,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
             storage_health: None,
             storage_dirty_bytes: 0,
             cache_metrics: None,
@@ -714,6 +764,10 @@ mod tests {
             instance_count: 1,
             drain_status: false,
             timestamp: 2000,
+            s3_reachable: None,
+            s3_put_latency_ms: None,
+            s3_get_latency_ms: None,
+            s3_degradation_level: None,
             storage_health: None,
             storage_dirty_bytes: 0,
             cache_metrics: Some(CacheMetricsGossip {

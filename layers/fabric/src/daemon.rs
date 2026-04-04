@@ -1528,6 +1528,29 @@ pub async fn run_daemon(
         info!("GC worker started");
     }
 
+    // S3 health probe (ADR-006 §25) — periodic PUT+GET+DELETE probe
+    // against S3 to track reachability and latency. The handle is read
+    // by the gossip agent to populate S3 health fields in reports.
+    let s3_health_handle: Option<syfrah_storage::S3HealthHandle> = {
+        let s3_probe_shutdown_rx = storage_shutdown_rx.clone();
+        let s3_health_probe_config = syfrah_storage::S3HealthProbeConfig {
+            endpoint: std::env::var("S3_ENDPOINT").unwrap_or_default(),
+            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "syfrah".to_string()),
+            access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
+            secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
+            thresholds: syfrah_storage::S3HealthThresholds::default(),
+        };
+        if !s3_health_probe_config.endpoint.is_empty() {
+            let handle =
+                syfrah_storage::start_s3_health_probe(s3_health_probe_config, s3_probe_shutdown_rx);
+            info!("S3 health probe started");
+            Some(handle)
+        } else {
+            info!("S3 health probe skipped: S3_ENDPOINT not configured");
+            None
+        }
+    };
+
     // -- Forge HTTP API server -----------------------------------------------
     //
     // Migration: daemon.rs starts the Forge HTTP server alongside the control
@@ -1836,6 +1859,22 @@ pub async fn run_daemon(
                         (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
                     });
 
+                // Build the S3 health snapshot callback from the probe handle.
+                let s3_health_fn: Option<syfrah_controlplane::gossip::S3HealthSnapshotFn> =
+                    s3_health_handle.clone().map(|handle| {
+                        let f: syfrah_controlplane::gossip::S3HealthSnapshotFn =
+                            std::sync::Arc::new(move || {
+                                let snap = handle.snapshot();
+                                (
+                                    snap.s3_reachable,
+                                    snap.s3_put_latency_ms,
+                                    snap.s3_get_latency_ms,
+                                    snap.degradation_level.to_string(),
+                                )
+                            });
+                        f
+                    });
+
                 let gossip_shutdown_rx = raft_shutdown_rx.clone();
                 tokio::spawn(async move {
                     // TODO(#1209): Pass a StorageHealthFn once VolumeMgr is
@@ -1846,7 +1885,8 @@ pub async fn run_daemon(
                         gossip_config,
                         gossip_cluster,
                         capacity_fn,
-                        None,
+                        s3_health_fn,
+                        None, // storage_health_fn — TODO(#1209)
                         gossip_shutdown_rx,
                     )
                     .await
@@ -2628,6 +2668,23 @@ pub async fn run_daemon(
                                         (alloc_vcpus, alloc_memory, 0u32, 0u64, 0u32)
                                     });
 
+                                    // Build S3 health callback for auto-join gossip path.
+                                    let aj_s3_health_fn: Option<
+                                        syfrah_controlplane::gossip::S3HealthSnapshotFn,
+                                    > = s3_health_handle.clone().map(|handle| {
+                                        let f: syfrah_controlplane::gossip::S3HealthSnapshotFn =
+                                            std::sync::Arc::new(move || {
+                                                let snap = handle.snapshot();
+                                                (
+                                                    snap.s3_reachable,
+                                                    snap.s3_put_latency_ms,
+                                                    snap.s3_get_latency_ms,
+                                                    snap.degradation_level.to_string(),
+                                                )
+                                            });
+                                        f
+                                    });
+
                                     let gossip_shutdown_rx = aj_raft_shutdown_rx.clone();
                                     tokio::spawn(async move {
                                         // TODO(#1209): Pass StorageHealthFn — see above.
@@ -2636,7 +2693,8 @@ pub async fn run_daemon(
                                                 gossip_config,
                                                 gossip_cluster,
                                                 capacity_fn,
-                                                None,
+                                                aj_s3_health_fn,
+                                                None, // storage_health_fn — TODO(#1209)
                                                 gossip_shutdown_rx,
                                             )
                                             .await

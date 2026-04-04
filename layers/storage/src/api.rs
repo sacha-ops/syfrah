@@ -162,6 +162,18 @@ pub struct StorageStatusReport {
     pub volume_cache_stats: Vec<VolumeCacheStat>,
     /// Total dirty bytes across all volumes (placeholder).
     pub total_dirty_bytes: u64,
+    /// S3 PUT latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_put_latency_ms: Option<u64>,
+    /// S3 GET latency from the latest health probe (ms).
+    #[serde(default)]
+    pub s3_get_latency_ms: Option<u64>,
+    /// Current S3 degradation level (Healthy, FsyncBlocking, EIO, Degraded, Error).
+    #[serde(default)]
+    pub s3_degradation_level: Option<String>,
+    /// Duration of current S3 outage in seconds (0 if healthy).
+    #[serde(default)]
+    pub s3_outage_duration_secs: Option<u64>,
     /// Per-volume S3 health state (ADR-006 §25).
     pub volume_health: Vec<crate::volume_mgr::VolumeHealthReport>,
     /// Aggregated cache metrics for this node.
@@ -316,6 +328,10 @@ async fn handle_storage_request(req: StorageRequest) -> StorageResponse {
                 s3_endpoint: "(not configured)".into(),
                 volume_cache_stats: vec![],
                 total_dirty_bytes: 0,
+                s3_put_latency_ms: None,
+                s3_get_latency_ms: None,
+                s3_degradation_level: None,
+                s3_outage_duration_secs: None,
                 volume_health: vec![],
                 cache_metrics: Some(crate::cache::CacheMetrics::default()),
                 cache_alerts: vec![],

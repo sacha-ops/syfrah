@@ -3,6 +3,7 @@ pub mod binary;
 pub mod cache;
 pub mod cli;
 pub mod nbd;
+pub mod s3_health;
 pub mod volume_mgr;
 
 pub use api::{
@@ -15,6 +16,10 @@ pub use cache::{
     CacheMetrics, VolumeCacheDir,
 };
 pub use cli::{SnapshotCommand, StorageCommand, VolumeCommand};
+pub use s3_health::{
+    start_s3_health_probe, S3DegradationLevel, S3HealthHandle, S3HealthProbeConfig,
+    S3HealthSnapshot, S3HealthThresholds,
+};
 pub use volume_mgr::{
     S3Config, S3HealthConfig, VolumeHealth, VolumeHealthReport, VolumeHealthTracker, VolumeMgr,
     VolumeMgrError,
