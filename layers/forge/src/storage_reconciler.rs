@@ -1,6 +1,6 @@
 //! Storage reconciler — detects desired volumes in Raft state and
-//! initializes/stops ZeroFS processes via VolumeMgr, then attaches NBD
-//! devices to Cloud Hypervisor VMs via the CH add-disk API.
+//! initializes/stops ZeroFS processes via VolumeMgr, then shares 9P
+//! mount points with Cloud Hypervisor VMs via the CH add-fs (virtio-fs) API.
 //!
 //! ## How it works
 //!
@@ -14,7 +14,7 @@
 //!    - Pending detach            -> detach_volume (CH remove-device → flush → NBD disconnect)
 //! 4. Reaps crashed ZeroFS processes
 //! 5. For volumes with desired=AttachedTo and ZeroFS running but not yet
-//!    attached to CH: calls PUT /vm.add-disk with rate limiting defaults
+//!    attached to CH: calls PUT /vm.add-fs with virtiofs config
 //!
 //! ## Detach flow (#1195)
 //!
@@ -108,13 +108,13 @@ impl DiskRateLimitConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Trait for attaching disks to VMs via Cloud Hypervisor (mockable in tests)
+// Trait for attaching volumes to VMs via Cloud Hypervisor virtio-fs (mockable in tests)
 // ---------------------------------------------------------------------------
 
-/// Abstraction over the Cloud Hypervisor add-disk API.
+/// Abstraction over the Cloud Hypervisor add-fs (virtio-fs) API.
 ///
 /// In production, this is implemented by resolving the VM's API socket and
-/// calling `ChClient::add_disk`. In tests, a mock records calls.
+/// calling `ChClient::add_fs`. In tests, a mock records calls.
 #[async_trait::async_trait]
 pub trait VmDiskAttacher: Send + Sync {
     /// Attach a volume's filesystem to the specified VM via virtio-fs.
@@ -202,7 +202,7 @@ pub enum StorageReconcileAction {
     },
     /// Reap a crashed ZeroFS process.
     ReapCrashed { volume_id: String },
-    /// Attach an NBD device to a VM via Cloud Hypervisor.
+    /// Attach a volume to a VM via Cloud Hypervisor virtio-fs.
     AttachDisk { volume_id: String, vm_id: String },
 }
 
@@ -320,8 +320,8 @@ pub async fn create_snapshot(
 // ---------------------------------------------------------------------------
 
 /// The storage reconciler — runs a periodic loop converging local ZeroFS
-/// processes to match the desired Raft state, and attaching NBD devices
-/// to Cloud Hypervisor VMs when desired=AttachedTo.
+/// processes to match the desired Raft state, and sharing 9P mount points
+/// with Cloud Hypervisor VMs via virtio-fs when desired=AttachedTo.
 pub struct StorageReconciler {
     /// This hypervisor's ID (used to filter volumes from Raft).
     local_hypervisor_id: String,
@@ -662,7 +662,7 @@ impl StorageReconciler {
 
         // 7. Attach volumes to Cloud Hypervisor VMs.
         //    For volumes with desired=AttachedTo (vm_id set) and ZeroFS running
-        //    but not yet attached to CH, call add-disk with rate limiting.
+        //    but not yet attached to CH, call add-fs with virtiofs config.
         if let Some(attacher) = attacher {
             for (id, vol) in &desired_map {
                 if let Some(ref vm_id) = vol.vm_id {
@@ -704,7 +704,7 @@ impl StorageReconciler {
                         } else {
                             warn!(
                                 volume_id = %id,
-                                "storage reconciler: volume running but no NBD device found"
+                                "storage reconciler: volume running but no mount path found"
                             );
                         }
                     }
@@ -745,8 +745,8 @@ impl StorageReconciler {
 
     /// Run the periodic reconciliation loop.
     ///
-    /// When `attacher` is `Some`, each pass will attempt to attach NBD
-    /// devices to Cloud Hypervisor VMs via the `VmDiskAttacher` trait.
+    /// When `attacher` is `Some`, each pass will attempt to share volume
+    /// mount points with Cloud Hypervisor VMs via the `VmDiskAttacher` trait.
     /// Without an attacher the attach step is skipped (volumes still
     /// start/stop normally).
     pub async fn run_loop(
