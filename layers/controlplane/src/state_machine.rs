@@ -1880,6 +1880,15 @@ impl RedbStateMachine {
                 to_hypervisor,
                 new_vm_id,
             } => {
+                // Reject self-reschedule: moving a volume to the same hypervisor
+                // is a no-op that would needlessly bump the generation and fence
+                // the currently-healthy writer.
+                if from_hypervisor == to_hypervisor {
+                    return StateMachineResponse::Error(format!(
+                        "cannot reschedule volume '{}' to the same hypervisor '{}'",
+                        volume_id, from_hypervisor
+                    ));
+                }
                 let mut storage = self.storage.write().unwrap();
                 match storage.volumes.get_mut(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => {
@@ -2988,6 +2997,39 @@ mod tests {
             let vol = storage.volumes.get("vol-fence").unwrap();
             assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-dst"));
             assert_eq!(vol.placement_generation, 2);
+        }
+    }
+
+    #[test]
+    fn reschedule_volume_rejects_self_reschedule() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        create_volume(&sm, "vol-1", "pgdata", 100, "acme", "myapp", "prod");
+        sm.apply_command(&StateMachineCommand::VolumeAttach {
+            volume_id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            hypervisor_id: "hv-1".into(),
+        });
+
+        // Self-reschedule: from == to — must be rejected.
+        let resp = sm.apply_command(&StateMachineCommand::RescheduleVolume {
+            volume_id: "vol-1".into(),
+            from_hypervisor: "hv-1".into(),
+            to_hypervisor: "hv-1".into(),
+            new_vm_id: "vm-1".into(),
+        });
+        assert!(
+            matches!(resp, StateMachineResponse::Error(ref msg) if msg.contains("same hypervisor")),
+            "self-reschedule should be rejected, got: {resp:?}"
+        );
+
+        // Generation must NOT have been incremented.
+        {
+            let storage = sm.storage.read().unwrap();
+            let vol = storage.volumes.get("vol-1").unwrap();
+            assert_eq!(vol.placement_generation, 1);
+            assert_eq!(vol.attached_hypervisor_id.as_deref(), Some("hv-1"));
         }
     }
 
