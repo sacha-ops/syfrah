@@ -2382,11 +2382,16 @@ impl RedbStateMachine {
 
             // -- GC: acknowledge WAL segment deletion --
             StateMachineCommand::GcCompleteWalSegments { below_position } => {
-                let storage = self.storage.read().unwrap();
+                let mut storage = self.storage.write().unwrap();
+                let old = storage.min_wal_position;
+                if storage.min_wal_position.is_none_or(|p| *below_position > p) {
+                    storage.min_wal_position = Some(*below_position);
+                }
                 info!(
                     below_position,
-                    min_wal = ?storage.min_wal_position,
-                    "GC: WAL segments below position acknowledged"
+                    old_min_wal = ?old,
+                    new_min_wal = ?storage.min_wal_position,
+                    "GC: WAL min position advanced"
                 );
                 StateMachineResponse::Ok
             }

@@ -1498,6 +1498,11 @@ pub async fn run_daemon(
 
         // GC worker — two-phase SST/WAL/generation garbage collection.
         // Runs on all nodes but only performs work on the Raft leader.
+        //
+        // TODO(#1208): Wire up real S3 config from node configuration and
+        // replace NoOpGcStateReader/NoOpGcSubmitter with Raft-backed
+        // implementations. Currently a no-op stub — the NoOpGcStateReader
+        // always reports not-leader so no GC work is performed.
         let gc_shutdown_rx = storage_shutdown_rx.clone();
         tokio::spawn(async move {
             let gc_config = syfrah_forge::gc::GcConfig::default();

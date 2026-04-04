@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::storage_cleanup::{S3CleanupConfig, S3CleanupError};
+use crate::storage_cleanup::{s3_auth_header, S3CleanupConfig, S3CleanupError};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -117,17 +117,22 @@ pub trait GcCommandSubmitter: Send + Sync {
 // GC worker
 // ---------------------------------------------------------------------------
 
-/// Tracks when each SST was first seen in the pending list, so we can
-/// enforce the grace period.
+/// Tracks when each SST and orphaned generation was first seen, so we
+/// can enforce grace periods before deletion.
 struct GcWorkerState {
     /// Maps SST key -> instant when it was first observed in pending_gc_ssts.
     first_seen: HashMap<String, Instant>,
+    /// Maps "volume_id/gen-N" -> instant when the orphaned generation was
+    /// first observed. Used to enforce a grace period before deleting
+    /// orphaned generation objects.
+    orphaned_gen_first_seen: HashMap<String, Instant>,
 }
 
 impl GcWorkerState {
     fn new() -> Self {
         Self {
             first_seen: HashMap::new(),
+            orphaned_gen_first_seen: HashMap::new(),
         }
     }
 
@@ -167,7 +172,7 @@ async fn delete_s3_object(config: &S3CleanupConfig, key: &str) -> Result<(), S3C
         .delete(&delete_url)
         .header(
             "Authorization",
-            format!("AWS {}:{}", config.access_key, config.secret_key),
+            s3_auth_header(config, "DELETE", &config.bucket, key),
         )
         .send()
         .await
@@ -188,6 +193,10 @@ async fn delete_s3_object(config: &S3CleanupConfig, key: &str) -> Result<(), S3C
 }
 
 /// List S3 objects under a prefix.
+///
+/// TODO: Handle pagination via continuation tokens. Currently limited to
+/// 1000 keys per request — objects beyond that are silently skipped and
+/// will be picked up on subsequent GC cycles.
 async fn list_s3_objects(
     config: &S3CleanupConfig,
     prefix: &str,
@@ -202,7 +211,7 @@ async fn list_s3_objects(
         .get(&list_url)
         .header(
             "Authorization",
-            format!("AWS {}:{}", config.access_key, config.secret_key),
+            s3_auth_header(config, "GET", &config.bucket, ""),
         )
         .send()
         .await
@@ -330,11 +339,33 @@ async fn gc_wal_cycle(config: &S3CleanupConfig, min_wal_position: Option<u64>) -
 /// Volumes store data under `volumes/{id}/gen-{N}/`. When a volume's
 /// placement_generation advances (e.g., after migration), old `gen-N/`
 /// prefixes become orphaned and their objects can be deleted.
+///
+/// Orphaned generations are subject to the same grace period as SSTs to
+/// protect in-flight reads or compactions targeting the old generation.
+/// Volumes with active restores are skipped entirely.
 async fn gc_orphaned_generations(
     config: &S3CleanupConfig,
     volume_generations: &HashMap<String, u64>,
+    restores_in_progress: &[String],
+    grace_period: Duration,
+    worker_state: &mut GcWorkerState,
 ) {
+    let now = Instant::now();
+
     for (volume_id, current_gen) in volume_generations {
+        // Skip volumes with in-progress restores — the restore may be
+        // reading from the old generation.
+        if restores_in_progress
+            .iter()
+            .any(|r| r.contains(volume_id.as_str()))
+        {
+            debug!(
+                volume_id,
+                "GC: skipping orphaned generation cleanup — restore in progress"
+            );
+            continue;
+        }
+
         // List all objects under the volume prefix.
         let prefix = format!("volumes/{volume_id}/gen-");
         let keys = match list_s3_objects(config, &prefix).await {
@@ -368,6 +399,21 @@ async fn gc_orphaned_generations(
                 continue; // Current or future generation — keep.
             }
 
+            // Enforce grace period: track when we first saw this orphaned
+            // generation and only delete after the grace period has elapsed.
+            let tracking_key = format!("{volume_id}/gen-{gen}");
+            let first_seen = worker_state
+                .orphaned_gen_first_seen
+                .entry(tracking_key.clone())
+                .or_insert(now);
+            if now.duration_since(*first_seen) < grace_period {
+                debug!(
+                    volume_id,
+                    gen, tracking_key, "GC: orphaned generation within grace period, skipping"
+                );
+                continue;
+            }
+
             match delete_s3_object(config, key).await {
                 Ok(()) => {
                     debug!(
@@ -386,6 +432,20 @@ async fn gc_orphaned_generations(
             }
         }
     }
+
+    // Prune tracking entries for generations that are no longer orphaned
+    // (e.g., volume was deleted or generation rolled back).
+    worker_state.orphaned_gen_first_seen.retain(|key, _| {
+        // key format: "{volume_id}/gen-{N}"
+        if let Some((vid, gen_part)) = key.split_once("/gen-") {
+            if let Ok(gen) = gen_part.parse::<u64>() {
+                if let Some(current) = volume_generations.get(vid) {
+                    return gen < *current;
+                }
+            }
+        }
+        false
+    });
 }
 
 /// Run the GC worker loop.
@@ -462,7 +522,15 @@ pub async fn run_gc_loop(
                 // Phase 3: Orphaned generation cleanup.
                 let volume_gens = state_reader.volume_generations();
                 if !volume_gens.is_empty() {
-                    gc_orphaned_generations(&s3_config, &volume_gens).await;
+                    let restores = state_reader.restores_in_progress();
+                    gc_orphaned_generations(
+                        &s3_config,
+                        &volume_gens,
+                        &restores,
+                        gc_config.grace_period,
+                        &mut worker_state,
+                    )
+                    .await;
                 }
 
                 debug!("GC: cycle complete");

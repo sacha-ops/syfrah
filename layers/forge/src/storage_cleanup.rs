@@ -217,7 +217,12 @@ pub fn parse_s3_list_keys(xml: &str) -> Vec<String> {
 /// that MinIO and many S3-compatible stores accept for internal use.
 /// Production deployments should implement full AWS Signature V4 signing.
 /// See: <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html>
-fn s3_auth_header(config: &S3CleanupConfig, _method: &str, _bucket: &str, _key: &str) -> String {
+pub(crate) fn s3_auth_header(
+    config: &S3CleanupConfig,
+    _method: &str,
+    _bucket: &str,
+    _key: &str,
+) -> String {
     // Legacy AWS auth format — sufficient for internal S3-compatible endpoints
     // (MinIO, Garage, etc.) but NOT valid for AWS S3 proper.
     format!("AWS {}:{}", config.access_key, config.secret_key)
