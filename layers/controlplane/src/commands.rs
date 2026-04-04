@@ -362,6 +362,11 @@ pub enum StateMachineCommand {
         /// VolumeAttach command.
         #[serde(default)]
         hypervisor_id: Option<String>,
+        /// The zone where this volume's data will live. Determines which
+        /// zone-local S3 bucket is used for storage. Typically matches the
+        /// hypervisor's zone at creation time.
+        #[serde(default)]
+        zone: Option<String>,
     },
     /// Mark a volume for deletion (tombstone). Volume must be Available (not attached).
     /// With `cascade: true`, all snapshots referencing this volume are deleted first.
@@ -832,6 +837,7 @@ mod tests {
                 env_id: "prod".into(),
                 volume_type: VolumeType::Data,
                 hypervisor_id: None,
+                zone: None,
             },
             StateMachineCommand::DeleteVolume {
                 volume_id: "vol-01".into(),

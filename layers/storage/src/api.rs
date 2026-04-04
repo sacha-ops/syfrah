@@ -307,6 +307,7 @@ impl StorageLayerHandler {
                     env_id,
                     volume_type: syfrah_controlplane::commands::VolumeType::Data,
                     hypervisor_id,
+                    zone: None, // TODO(#1282): pass zone from request context
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {

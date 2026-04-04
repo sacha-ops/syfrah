@@ -644,6 +644,7 @@ impl RaftComputeHandler {
             env_id,
             volume_type: VolumeType::Root,
             hypervisor_id: None,
+            zone: None, // TODO(#1282): inherit zone from target hypervisor
         };
 
         match client.write(cmd).await {
