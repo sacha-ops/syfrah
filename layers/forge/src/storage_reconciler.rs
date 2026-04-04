@@ -604,6 +604,7 @@ impl StorageReconciler {
                         &cache,
                         &self.encryption_passphrase,
                         vol.placement_generation,
+                        f64::from(vol.size_gb),
                     )
                     .await
                 {
