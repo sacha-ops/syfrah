@@ -844,6 +844,8 @@ mod tests {
         assert!(!fenced, "newer local gen should not be fenced");
         assert!(mgr.is_running("vol-future"));
         mgr.stop_volume("vol-future").await.ok();
+    }
+
     // ── VolumeManifest tests (#1200) ───────────────────────────────
 
     #[test]
