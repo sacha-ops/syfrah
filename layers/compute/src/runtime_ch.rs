@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::ComputeError;
 use crate::phase::VmPhase;
@@ -154,7 +154,45 @@ impl ComputeRuntime for ChRuntime {
         let socket_path = runtime_dir_path.join("api.sock");
 
         // Step 4: map
-        let vm_config = map(&resolved, &socket_path);
+        let mut vm_config = map(&resolved, &socket_path);
+
+        // Step 4b: virtiofs shared directory for ZeroFS volume
+        //
+        // When a root volume mount path is provided, configure a virtiofs
+        // share so the guest can access the ZeroFS volume at `/data`.
+        // Cloud Hypervisor's `--fs` requires a vhost-user-fs backend
+        // (virtiofsd) running on the host. We set up the socket path and
+        // config; the virtiofsd process is spawned before CH starts.
+        if let Some(ref vol_path) = spec.volume_mount_path {
+            let virtiofs_sock = runtime_dir_path.join("virtiofs.sock");
+            info!(
+                vm_id = %id,
+                volume_path = %vol_path.display(),
+                socket = %virtiofs_sock.display(),
+                "starting virtiofsd and adding virtiofs share for ZeroFS volume"
+            );
+
+            // Spawn virtiofsd to serve the volume directory over a socket.
+            // virtiofsd must be running before CH starts to use the --fs flag.
+            if let Err(e) = start_virtiofsd(vol_path, &virtiofs_sock).await {
+                warn!(
+                    vm_id = %id,
+                    error = %e,
+                    "failed to start virtiofsd, volume will not be available inside VM"
+                );
+            } else {
+                vm_config["fs"] = serde_json::json!([{
+                    "tag": "data",
+                    "socket": virtiofs_sock.to_string_lossy(),
+                    "num_queues": 1,
+                    "queue_size": 1024,
+                }]);
+                // Cloud Hypervisor requires shared memory for virtiofs.
+                if let Some(mem) = vm_config.get_mut("memory") {
+                    mem["shared"] = serde_json::json!(true);
+                }
+            }
+        }
 
         // Step 5: preflight
         if let Err(e) = run_preflight(&resolved, &self.ch_binary, &socket_path) {
@@ -394,6 +432,68 @@ impl ComputeRuntime for ChRuntime {
     fn name(&self) -> &str {
         "cloud-hypervisor"
     }
+}
+
+// ---------------------------------------------------------------------------
+// virtiofsd helper
+// ---------------------------------------------------------------------------
+
+/// Start a `virtiofsd` process that serves a host directory over a vhost-user
+/// socket. Cloud Hypervisor's `--fs` flag connects to this socket to expose
+/// the directory as a virtiofs mount inside the guest.
+///
+/// The guest can then mount it with:
+/// ```text
+/// mount -t virtiofs data /data
+/// ```
+///
+/// The process is daemonized (detached) so it outlives this function call.
+/// It will be cleaned up when the VM is deleted (the runtime dir is removed).
+async fn start_virtiofsd(shared_dir: &Path, socket_path: &Path) -> Result<(), ComputeError> {
+    use tokio::process::Command;
+
+    // Try common virtiofsd locations.
+    let virtiofsd = if Path::new("/usr/libexec/virtiofsd").exists() {
+        "/usr/libexec/virtiofsd"
+    } else if Path::new("/usr/lib/virtiofsd").exists() {
+        "/usr/lib/virtiofsd"
+    } else if Path::new("/usr/local/bin/virtiofsd").exists() {
+        "/usr/local/bin/virtiofsd"
+    } else {
+        return Err(crate::error::ProcessError::SpawnFailed {
+            reason:
+                "virtiofsd binary not found (checked /usr/libexec/, /usr/lib/, /usr/local/bin/)"
+                    .to_string(),
+        }
+        .into());
+    };
+
+    let status = Command::new(virtiofsd)
+        .args([
+            &format!("--socket-path={}", socket_path.display()),
+            &format!("--shared-dir={}", shared_dir.display()),
+            "--sandbox=none",
+            "--cache=never",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| crate::error::ProcessError::SpawnFailed {
+            reason: format!("failed to start virtiofsd: {e}"),
+        })?;
+
+    debug!(
+        pid = status.id().unwrap_or(0),
+        socket = %socket_path.display(),
+        shared_dir = %shared_dir.display(),
+        "virtiofsd started"
+    );
+
+    // Give virtiofsd a moment to create the socket.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
