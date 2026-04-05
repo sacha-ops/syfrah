@@ -24,8 +24,9 @@ pub fn resource_def() -> ResourceDef {
                 .with_arg(OperationArg::optional("region", FieldDef::string("region", "Region label").with_default("default")))
                 .with_arg(OperationArg::optional("zone", FieldDef::string("zone", "Zone label").with_default("default")))
                 .with_arg(OperationArg::optional("port", FieldDef::integer("port", "WireGuard listen port").with_default("51820")))
+                .with_arg(OperationArg::optional("peering", FieldDef::flag("peering", "Start peering listener after init (accepts joins)")))
                 .with_output(OutputKind::Resource)
-                .with_example("syfrah hypervisor init --name my-cloud --region eu --zone fsn1")
+                .with_example("syfrah hypervisor init --name my-cloud --region eu --zone fsn1 --peering")
             )
         .action("join", "Join an existing cluster")
             .op(|op| op
@@ -126,8 +127,58 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .map(|h| h.to_lowercase())
         .unwrap_or_else(|| "node".to_string());
 
+    let peering = req
+        .fields
+        .get("peering")
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
     let db = open_db()?;
     let result = fabric::ops::init(&db, mesh_name, &node_name, region, zone, port)?;
+
+    // Print init result immediately
+    eprintln!();
+    eprintln!("  Mesh initialized");
+    eprintln!();
+    eprintln!("  name     {}", result.hypervisor.name);
+    eprintln!("  id       {}", result.hypervisor.id.as_str());
+    eprintln!("  mesh     {}", result.mesh.name);
+    eprintln!("  region   {} · {}", region, zone);
+    eprintln!("  address  {}", result.hypervisor.mesh_ipv6);
+    eprintln!("  pin      {}", result.pin);
+    eprintln!();
+
+    if peering {
+        let peering_port = port + 1;
+        eprintln!("  Peering active on port {peering_port}");
+        eprintln!("  Nodes can join with:");
+        eprintln!(
+            "    syfrah hypervisor join --target <this-ip>:{peering_port} --pin {}",
+            result.pin
+        );
+        eprintln!();
+        eprintln!("  Waiting for joins... (Ctrl+C to stop)");
+        eprintln!();
+
+        // Block here listening for joins
+        let accepted = fabric::ops::listen_for_peers(
+            &db,
+            &result.pin,
+            peering_port,
+            3600, // 1 hour timeout
+        )
+        .await?;
+
+        eprintln!("  {} node(s) joined.", accepted);
+    } else {
+        eprintln!("  To accept joins, run:");
+        eprintln!("    syfrah hypervisor init --name {} --peering", mesh_name);
+        eprintln!("  Or on another node:");
+        eprintln!(
+            "    syfrah hypervisor join --target <this-ip> --pin {}",
+            result.pin
+        );
+    }
 
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": result.hypervisor.name,
@@ -137,7 +188,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         "zone": zone,
         "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
         "state": "available",
-        "secret": result.secret_masked,
+        "pin": result.pin,
     })))
 }
 

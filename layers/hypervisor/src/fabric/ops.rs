@@ -17,6 +17,7 @@ pub struct InitResult {
     pub mesh: MeshIdentity,
     pub hypervisor: HypervisorIdentity,
     pub secret_masked: String,
+    pub pin: String,
 }
 
 /// Initialize a new mesh on this node.
@@ -68,11 +69,33 @@ pub fn init(
         &secret_str[secret_str.len() - 4..]
     );
 
+    // Derive a PIN from the secret for peering
+    let pin = secret.derive_pin();
+
     Ok(InitResult {
         mesh: mesh_id,
         hypervisor: hv,
         secret_masked,
+        pin,
     })
+}
+
+/// Start a peering listener to accept join requests.
+///
+/// Blocks until timeout or Ctrl+C. Returns number of accepted joins.
+pub async fn listen_for_peers(
+    db: &LayerDb,
+    pin: &str,
+    peering_port: u16,
+    timeout_secs: u64,
+) -> Result<usize, SyfrahError> {
+    let bind_addr = format!("0.0.0.0:{peering_port}")
+        .parse()
+        .map_err(|_| SyfrahError::internal("invalid bind address"))?;
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    super::peering_server::listen(db, pin, bind_addr, timeout, 0).await
 }
 
 /// Result of a successful fabric join.
