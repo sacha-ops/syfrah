@@ -7,7 +7,8 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Error types** — unified error model with codes, HTTP mapping, retry hints
 - **Validation** — shared input validators for names, CIDRs, ports, durations, IPs, MACs, URLs
 - **Transport** — Unix socket protocol between CLI and daemon (framing, router, client/server)
-- **Config** — `~/.syfrah/config.toml` parsing with defaults, validation, hot-reload support
+- **Config** — `~/.syfrah/config.toml` parsing with defaults, validation, env/CLI overrides
+- **Logging** — structured logging setup with file rotation, JSON/text modes, runtime reconfiguration
 
 ---
 
@@ -402,6 +403,61 @@ Warning: storage: both cache_memory_mb and cache_disk_gb are 0 — no caching at
 - **Schema version** — `config_version` field for future migrations
 - **File permissions** — saved as 0o600 (owner-only)
 - **Validated** — bad values caught at load time, not runtime
+
+---
+
+## Logging (`syfrah_core::logging`)
+
+Structured logging based on `tracing`. Consistent across daemon and CLI.
+
+### Setup
+
+```rust
+use syfrah_core::logging;
+use syfrah_core::config::LoggingConfig;
+
+// Daemon: init from config
+let config = LoggingConfig { level: "info".into(), format: "text".into(), ..Default::default() };
+let _guard = logging::init(&config);  // hold guard for program lifetime
+
+// CLI: minimal logging (warn level, stderr)
+let _guard = logging::init_cli();
+
+// Then use tracing macros everywhere
+tracing::info!("daemon started");
+tracing::warn!(zone = "fsn1", "peer unreachable");
+tracing::debug!(vpc_id = %id, "creating vpc");
+```
+
+### Modes
+
+| Mode | When | Output |
+|------|------|--------|
+| **text** | Human at terminal | `2026-04-05T15:33:27Z INFO syfrah_fabric::daemon: daemon started` |
+| **json** | Log aggregation | `{"timestamp":"...","level":"INFO","target":"...","message":"..."}` |
+| **file** | Background daemon | Writes to file + stderr simultaneously |
+
+### Config
+
+```toml
+[logging]
+level = "info"        # trace, debug, info, warn, error
+format = "text"       # text, json
+file = ""             # empty = stderr only, or path like "/var/log/syfrah.log"
+max_file_size_mb = 50
+max_files = 3
+```
+
+Override with env: `RUST_LOG=debug syfrah fabric start`
+Override with env: `SYFRAH_LOG_LEVEL=trace syfrah fabric start`
+
+### Properties
+
+- **RUST_LOG respected** — standard Rust convention takes precedence
+- **File + stderr** — when file is set, logs go to both
+- **Non-blocking writes** — file output is buffered async, never blocks daemon
+- **Guard pattern** — `LogGuard` must be held; dropping it flushes pending logs
+- **Structured fields** — `tracing::info!(zone = "fsn1", "message")` for machine-parseable context
 
 ---
 
