@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Generate a random ID with the given prefix.
+/// Format: `{prefix}-{12-hex-chars}` (e.g., `vpc-a1b2c3d4e5f6`)
+fn generate_id(prefix: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let hex: String = (0..12)
+        .map(|_| format!("{:x}", rng.gen::<u8>() % 16))
+        .collect();
+    format!("{prefix}-{hex}")
+}
+
 /// Lifecycle state for mutable network resources (SGs, NICs, NAT GWs, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceState {
@@ -28,6 +39,13 @@ impl fmt::Display for ResourceState {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SecurityGroupId(pub String);
 
+impl SecurityGroupId {
+    /// Create a new random security group ID.
+    pub fn generate() -> Self {
+        Self(generate_id("sg"))
+    }
+}
+
 impl fmt::Display for SecurityGroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -50,6 +68,13 @@ pub struct SecurityGroup {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NicId(pub String);
 
+impl NicId {
+    /// Create a new random NIC ID.
+    pub fn generate() -> Self {
+        Self(generate_id("nic"))
+    }
+}
+
 impl fmt::Display for NicId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -63,8 +88,8 @@ pub struct NetworkInterface {
     pub id: NicId,
     pub name: String,
     pub vm_id: Option<String>,
-    pub subnet_id: String,
-    pub vpc_id: String,
+    pub subnet_id: SubnetId,
+    pub vpc_id: VpcId,
     pub private_ip: String,
     pub mac: String,
     pub security_groups: Vec<SecurityGroupId>,
@@ -73,8 +98,15 @@ pub struct NetworkInterface {
 }
 
 /// Unique identifier for a VPC.
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct VpcId(pub String);
+
+impl VpcId {
+    /// Create a new random VPC ID.
+    pub fn generate() -> Self {
+        Self(generate_id("vpc"))
+    }
+}
 
 impl fmt::Display for VpcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -105,6 +137,13 @@ pub struct Vpc {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OrgId(pub String);
 
+impl OrgId {
+    /// Create a new random org ID.
+    pub fn generate() -> Self {
+        Self(generate_id("org"))
+    }
+}
+
 impl fmt::Display for OrgId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -115,6 +154,13 @@ impl fmt::Display for OrgId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub String);
 
+impl ProjectId {
+    /// Create a new random project ID.
+    pub fn generate() -> Self {
+        Self(generate_id("proj"))
+    }
+}
+
 impl fmt::Display for ProjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -124,6 +170,13 @@ impl fmt::Display for ProjectId {
 /// Unique identifier for an environment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EnvironmentId(pub String);
+
+impl EnvironmentId {
+    /// Create a new random environment ID.
+    pub fn generate() -> Self {
+        Self(generate_id("env"))
+    }
+}
 
 impl fmt::Display for EnvironmentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -151,7 +204,7 @@ pub struct Project {
 /// A record of a shared VPC being attached to a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpcAttachment {
-    pub vpc_name: String,
+    pub vpc_id: VpcId,
     pub project_id: ProjectId,
     pub attached_at: u64,
 }
@@ -159,6 +212,13 @@ pub struct VpcAttachment {
 /// Unique identifier for a subnet.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubnetId(pub String);
+
+impl SubnetId {
+    /// Create a new random subnet ID.
+    pub fn generate() -> Self {
+        Self(generate_id("sub"))
+    }
+}
 
 impl fmt::Display for SubnetId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -181,6 +241,13 @@ pub struct Subnet {
 /// Unique identifier for a VPC peering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeeringId(pub String);
+
+impl PeeringId {
+    /// Create a new random peering ID.
+    pub fn generate() -> Self {
+        Self(generate_id("peer"))
+    }
+}
 
 impl fmt::Display for PeeringId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -210,8 +277,8 @@ impl fmt::Display for PeeringStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpcPeering {
     pub id: PeeringId,
-    pub vpc_a: String,
-    pub vpc_b: String,
+    pub vpc_a: VpcId,
+    pub vpc_b: VpcId,
     pub status: PeeringStatus,
     pub created_at: u64,
 }
@@ -232,6 +299,13 @@ pub struct Environment {
 /// Unique identifier for a security group rule.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuleId(pub String);
+
+impl RuleId {
+    /// Create a new random rule ID.
+    pub fn generate() -> Self {
+        Self(generate_id("rule"))
+    }
+}
 
 impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -325,6 +399,13 @@ pub struct SecurityGroupRule {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteTableId(pub String);
 
+impl RouteTableId {
+    /// Create a new random route table ID.
+    pub fn generate() -> Self {
+        Self(generate_id("rtb"))
+    }
+}
+
 impl fmt::Display for RouteTableId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -346,6 +427,13 @@ pub struct RouteTable {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteId(pub String);
 
+impl RouteId {
+    /// Create a new random route ID.
+    pub fn generate() -> Self {
+        Self(generate_id("rt"))
+    }
+}
+
 impl fmt::Display for RouteId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -356,8 +444,8 @@ impl fmt::Display for RouteId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteTarget {
     Local,
-    NatGateway(String),
-    VpcPeering(String),
+    NatGateway(NatGatewayId),
+    VpcPeering(PeeringId),
     Blackhole,
 }
 
@@ -423,6 +511,13 @@ pub struct Route {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NatGatewayId(pub String);
 
+impl NatGatewayId {
+    /// Create a new random NAT Gateway ID.
+    pub fn generate() -> Self {
+        Self(generate_id("nat"))
+    }
+}
+
 impl fmt::Display for NatGatewayId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -468,11 +563,11 @@ impl fmt::Display for PlacementAction {
 /// in the VPC must update their forwarding tables accordingly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmPlacement {
-    pub vpc_id: String,
+    pub vpc_id: VpcId,
     pub vm_id: String,
     pub vm_mac: String,
     pub vm_ip: String,
-    pub subnet_id: String,
+    pub subnet_id: SubnetId,
     pub hypervisor_id: String,
     pub action: PlacementAction,
     pub created_at: u64,
