@@ -1,0 +1,196 @@
+use clap::ArgMatches;
+use std::collections::HashMap;
+use std::io::{self, Write};
+
+use super::cli_gen::{render_detail, render_table};
+use super::constraint::FieldMap;
+use super::operation::OutputKind;
+use super::registry::{OperationRequest, OperationResponse, ResourceRegistration, ScopeValues};
+use super::ResourceDef;
+
+/// Dispatch a parsed CLI invocation to the appropriate resource handler.
+///
+/// This function:
+/// 1. Extracts args from clap matches
+/// 2. Validates constraints
+/// 3. Calls the handler
+/// 4. Renders the output
+pub async fn dispatch(
+    reg: &ResourceRegistration,
+    op_name: &str,
+    matches: &ArgMatches,
+) -> anyhow::Result<()> {
+    let def = &reg.def;
+    let op = def
+        .operations
+        .iter()
+        .find(|o| o.name == op_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown operation: {op_name}"))?;
+
+    // ── Extract values from clap matches ──
+
+    let name = matches
+        .try_get_one::<String>("name")
+        .ok()
+        .flatten()
+        .cloned();
+    let json = matches
+        .try_get_one::<bool>("json")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false);
+    let yes = matches
+        .try_get_one::<bool>("yes")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false);
+
+    let scope = extract_scope(def, matches);
+    let fields = extract_fields(def, op, matches);
+
+    // ── Validate constraints ──
+
+    for constraint in &op.constraints {
+        constraint
+            .validate(&fields)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // ── Confirmation prompt ──
+
+    if op.confirmable && !yes {
+        let resource_name = name.as_deref().unwrap_or("this resource");
+        let prompt = format!(
+            "Delete {} '{}'? This cannot be undone. [y/N] ",
+            def.identity.kind, resource_name
+        );
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // ── Build request ──
+
+    let request = OperationRequest {
+        operation: op_name.to_string(),
+        name,
+        scope,
+        fields,
+    };
+
+    // ── Call handler ──
+
+    let response = (reg.handler)(request).await?;
+
+    // ── Render output ──
+
+    match (&op.output.kind, json) {
+        (_, true) => {
+            // JSON mode — always output raw JSON
+            match &response {
+                OperationResponse::Resource(v) => {
+                    println!("{}", serde_json::to_string_pretty(v)?);
+                }
+                OperationResponse::ResourceList(items) => {
+                    println!("{}", serde_json::to_string_pretty(items)?);
+                }
+                OperationResponse::Message(msg) => {
+                    println!("{}", serde_json::json!({"message": msg}));
+                }
+                OperationResponse::None => {}
+            }
+        }
+        (OutputKind::Resource, false) => {
+            if let OperationResponse::Resource(v) = &response {
+                render_detail(def, v);
+            }
+            if let Some(tpl) = op.output.success_message {
+                let name_val: String = match &response {
+                    OperationResponse::Resource(v) => extract_name(v).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let rendered = tpl
+                    .replace("{kind}", def.identity.kind)
+                    .replace("{name}", &name_val);
+                println!("{rendered}");
+            }
+        }
+        (OutputKind::ResourceList, false) => {
+            if let OperationResponse::ResourceList(items) = &response {
+                render_table(def, items);
+            }
+        }
+        (OutputKind::Message, false) => {
+            if let OperationResponse::Message(msg) = &response {
+                println!("{msg}");
+            } else if let Some(tpl) = op.output.success_message {
+                let rendered: String = tpl.replace("{kind}", def.identity.kind);
+                println!("{rendered}");
+            }
+        }
+        (OutputKind::None, false) => {}
+    }
+
+    Ok(())
+}
+
+fn extract_scope(def: &ResourceDef, matches: &ArgMatches) -> ScopeValues {
+    let mut scope = ScopeValues::default();
+    for parent in &def.scope.parents {
+        if let Some(val) = matches.get_one::<String>(parent.kind) {
+            scope.set(parent.kind, val.clone());
+        }
+    }
+    scope
+}
+
+fn extract_fields(
+    def: &ResourceDef,
+    op: &super::operation::OperationDef,
+    matches: &ArgMatches,
+) -> FieldMap {
+    let mut fields = HashMap::new();
+
+    // Schema fields
+    for field in &def.schema.fields {
+        if let Some(val) = matches.get_one::<String>(field.name) {
+            fields.insert(field.name.to_string(), val.clone());
+        }
+        // Boolean flags
+        if matches!(field.field_type, super::schema::FieldType::Flag)
+            && matches.get_flag(field.name)
+        {
+            fields.insert(field.name.to_string(), "true".to_string());
+        }
+    }
+
+    // Operation-specific args
+    for arg in &op.args {
+        if let super::operation::ArgSource::Custom(field) = &arg.source {
+            if let Some(val) = matches.get_one::<String>(arg.name) {
+                fields.insert(arg.name.to_string(), val.clone());
+            }
+            if matches!(field.field_type, super::schema::FieldType::Flag)
+                && matches.get_flag(arg.name)
+            {
+                fields.insert(arg.name.to_string(), "true".to_string());
+            }
+        }
+    }
+
+    fields
+}
+
+fn extract_name(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
