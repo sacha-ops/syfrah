@@ -92,6 +92,8 @@ export default defineConfig({
 								{ label: 'Peering Protocol', slug: 'layers/hypervisor/fabric/peering' },
 								{ label: 'Peering Server', slug: 'layers/hypervisor/fabric/peering-server' },
 								{ label: 'Peering Client', slug: 'layers/hypervisor/fabric/peering-client' },
+								{ label: 'Health Check', slug: 'layers/hypervisor/fabric/health' },
+								{ label: 'Peer Announce', slug: 'layers/hypervisor/fabric/announce' },
 							],
 						},
 					],

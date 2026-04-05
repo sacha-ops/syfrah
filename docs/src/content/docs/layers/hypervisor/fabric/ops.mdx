@@ -51,14 +51,21 @@ The target must be a running Syfrah hypervisor. You need the PIN displayed when 
 
 ## listen_for_peers
 
-`listen_for_peers` starts the TCP listener that accepts incoming `join` requests. This runs in the background as part of a running hypervisor. When a join request arrives:
+`listen_for_peers` starts the peering mode for this node. It spawns three background tasks and then runs until cancelled:
 
-1. The database is opened fresh per-request (to avoid holding a long-lived write lock)
-2. The PIN is validated
-3. The mesh secret and current peer list are sent to the joiner
-4. A `PeerAnnounce` is broadcast to all existing peers so they add the new node
+1. **Peering listener** — TCP server on `wg_port + 1` (default 51821) that accepts incoming `join` requests. For each request it opens a fresh DB connection, validates the PIN, sends the mesh secret and peer list to the joiner, and calls `broadcast_new_peer()` to notify existing peers.
+2. **Health check loop** — polls WireGuard handshake timestamps every 30 seconds and updates peer status (`Active` / `Unreachable`). See [Health Checks](/layers/hypervisor/fabric/health).
+3. **Announce listener** — TCP server on `wg_port + 2` (default 51822) that receives `PeerAnnounce` messages from other nodes and adds newly joined peers to this node's WireGuard config. See [Peer Announcement](/layers/hypervisor/fabric/announce).
 
-The per-request database open is intentional — it prevents one slow join from blocking other operations.
+**Port allocation summary:**
+
+| Purpose | Port |
+|---|---|
+| WireGuard data plane | 51820 (`wg_port`) |
+| Peering listener | 51821 (`wg_port + 1`) |
+| Announce listener | 51822 (`wg_port + 2`) |
+
+All three tasks run concurrently. The per-request database open on the peering listener is intentional — it prevents one slow join from blocking other operations.
 
 ## status
 
