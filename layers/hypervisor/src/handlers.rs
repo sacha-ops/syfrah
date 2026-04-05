@@ -139,7 +139,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
 
     // Create mesh + node identity
     let (mesh, secret) = fabric::mesh::create_mesh(mesh_name)?;
-    let node = fabric::mesh::create_node(&node_name, region, zone, port, None, &mesh.prefix)?;
+    let node = fabric::mesh::create_hypervisor(&node_name, region, zone, port, None, &mesh.prefix)?;
 
     // Persist state
     let db = open_db()?;
@@ -151,7 +151,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
 
     let state = fabric::state::FabricState {
         mesh: mesh.clone(),
-        node: node.clone(),
+        hypervisor: node.clone(),
         secret: secret.to_string(),
         peers: fabric::peer::PeerList::new(),
     };
@@ -178,12 +178,12 @@ async fn handle_status(_req: OperationRequest) -> anyhow::Result<OperationRespon
         .ok_or_else(|| anyhow::anyhow!("not initialized. Run 'syfrah hypervisor init' first."))?;
 
     Ok(OperationResponse::Resource(serde_json::json!({
-        "name": state.node.name,
-        "id": state.node.id.as_str(),
+        "name": state.hypervisor.name,
+        "id": state.hypervisor.id.as_str(),
         "mesh": state.mesh.name,
-        "region": state.node.region,
-        "zone": state.node.zone,
-        "mesh_ipv6": state.node.mesh_ipv6.to_string(),
+        "region": state.hypervisor.region,
+        "zone": state.hypervisor.zone,
+        "mesh_ipv6": state.hypervisor.mesh_ipv6.to_string(),
         "state": "initialized",
         "peers": state.peers.len(),
         "active_peers": state.peers.active_count(),
@@ -199,8 +199,8 @@ async fn handle_list(_req: OperationRequest) -> anyhow::Result<OperationResponse
 
     // For now, just list self + peers as "hypervisors"
     let mut items = vec![serde_json::json!({
-        "name": state.node.name,
-        "region": format!("{}/{}", state.node.region, state.node.zone),
+        "name": state.hypervisor.name,
+        "region": format!("{}/{}", state.hypervisor.region, state.hypervisor.zone),
         "state": "available",
         "cpu": "0/0",
         "memory": "0/0",
@@ -232,15 +232,15 @@ async fn handle_get(req: OperationRequest) -> anyhow::Result<OperationResponse> 
         .ok_or_else(|| anyhow::anyhow!("not initialized"))?;
 
     // Check if it's this node
-    if state.node.name == name {
+    if state.hypervisor.name == name {
         return Ok(OperationResponse::Resource(serde_json::json!({
-            "name": state.node.name,
-            "id": state.node.id.as_str(),
-            "region": state.node.region,
-            "zone": state.node.zone,
-            "mesh_ipv6": state.node.mesh_ipv6.to_string(),
+            "name": state.hypervisor.name,
+            "id": state.hypervisor.id.as_str(),
+            "region": state.hypervisor.region,
+            "zone": state.hypervisor.zone,
+            "mesh_ipv6": state.hypervisor.mesh_ipv6.to_string(),
             "state": "available",
-            "wg_port": state.node.wg_port,
+            "wg_port": state.hypervisor.wg_port,
         })));
     }
 

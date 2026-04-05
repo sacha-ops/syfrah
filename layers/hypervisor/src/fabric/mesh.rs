@@ -25,7 +25,7 @@ pub struct MeshIdentity {
 
 /// A node's identity within the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeIdentity {
+pub struct HypervisorIdentity {
     /// Unique hypervisor ID.
     pub id: syfrah_core::id::HypervisorId,
     /// Human-readable node name (usually hostname).
@@ -70,14 +70,14 @@ pub fn create_mesh(
 
 /// Create a new node identity (called by both init and join).
 /// Validates name, region, zone, and port.
-pub fn create_node(
+pub fn create_hypervisor(
     name: &str,
     region: &str,
     zone: &str,
     port: u16,
     endpoint: Option<String>,
     mesh_prefix: &Ipv6Addr,
-) -> Result<NodeIdentity, syfrah_core::error::SyfrahError> {
+) -> Result<HypervisorIdentity, syfrah_core::error::SyfrahError> {
     syfrah_core::validate::name(name)?;
     syfrah_core::validate::region(region)?;
     syfrah_core::validate::zone(zone)?;
@@ -90,7 +90,7 @@ pub fn create_node(
 
     let mesh_ipv6 = addressing::derive_node_address(mesh_prefix, &pub_bytes);
 
-    Ok(NodeIdentity {
+    Ok(HypervisorIdentity {
         id: syfrah_core::id::HypervisorId::generate(),
         name: name.to_string(),
         region: region.to_string(),
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn create_node_has_valid_identity() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let node = create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
 
         assert_eq!(node.name, "node-1");
         assert_eq!(node.region, "eu");
@@ -141,8 +141,8 @@ mod tests {
     #[test]
     fn create_node_unique_keys() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        let a = create_node("node-aaa", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
-        let b = create_node("node-bbb", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let a = create_hypervisor("node-aaa", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let b = create_hypervisor("node-bbb", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
         assert_ne!(a.wg_public_key, b.wg_public_key);
         assert_ne!(a.mesh_ipv6, b.mesh_ipv6);
     }
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn create_node_with_endpoint() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        let node = create_node(
+        let node = create_hypervisor(
             "node-1",
             "eu",
             "fsn1",
@@ -165,9 +165,9 @@ mod tests {
     #[test]
     fn node_identity_serde_roundtrip() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let node = create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
         let json = serde_json::to_string(&node).unwrap();
-        let back: NodeIdentity = serde_json::from_str(&json).unwrap();
+        let back: HypervisorIdentity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "node-1");
         assert!(json.contains(&node.wg_public_key));
     }
@@ -192,25 +192,25 @@ mod tests {
     #[test]
     fn create_node_rejects_empty_name() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        assert!(create_node("", "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
+        assert!(create_hypervisor("", "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
     }
 
     #[test]
     fn create_node_rejects_bad_region() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        assert!(create_node("node-1", "EU!", "fsn1", 51820, None, &mesh.prefix).is_err());
+        assert!(create_hypervisor("node-1", "EU!", "fsn1", 51820, None, &mesh.prefix).is_err());
     }
 
     #[test]
     fn create_node_rejects_bad_zone() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        assert!(create_node("node-1", "eu", "FSN 1", 51820, None, &mesh.prefix).is_err());
+        assert!(create_hypervisor("node-1", "eu", "FSN 1", 51820, None, &mesh.prefix).is_err());
     }
 
     #[test]
     fn create_node_rejects_port_zero() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        assert!(create_node("node-1", "eu", "fsn1", 0, None, &mesh.prefix).is_err());
+        assert!(create_hypervisor("node-1", "eu", "fsn1", 0, None, &mesh.prefix).is_err());
     }
 
     // ── #5: Private key persistence ──
@@ -218,12 +218,12 @@ mod tests {
     #[test]
     fn private_key_survives_serde() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
-        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let node = create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
         let original_private = node.wg_private_key.clone();
         assert!(!original_private.is_empty());
 
         let json = serde_json::to_string(&node).unwrap();
-        let back: NodeIdentity = serde_json::from_str(&json).unwrap();
+        let back: HypervisorIdentity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wg_private_key, original_private);
     }
 
@@ -231,7 +231,7 @@ mod tests {
     fn private_key_default_when_missing() {
         // Simulate receiving peer info without private key
         let json = r#"{"id":"hv-test","name":"n1","region":"eu","zone":"fsn1","wg_public_key":"abc","wg_port":51820,"mesh_ipv6":"fd01::1"}"#;
-        let node: NodeIdentity = serde_json::from_str(json).unwrap();
+        let node: HypervisorIdentity = serde_json::from_str(json).unwrap();
         assert_eq!(node.wg_private_key, ""); // defaults to empty
         assert_eq!(node.name, "n1");
     }
@@ -242,10 +242,10 @@ mod tests {
     fn create_node_long_name() {
         let (mesh, _) = create_mesh("test-mesh").unwrap();
         let long_name = "a".repeat(63); // max allowed
-        assert!(create_node(&long_name, "eu", "fsn1", 51820, None, &mesh.prefix).is_ok());
+        assert!(create_hypervisor(&long_name, "eu", "fsn1", 51820, None, &mesh.prefix).is_ok());
 
         let too_long = "a".repeat(64);
-        assert!(create_node(&too_long, "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
+        assert!(create_hypervisor(&too_long, "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use syfrah_state::LayerDb;
 
-use super::mesh::{MeshIdentity, NodeIdentity};
+use super::mesh::{HypervisorIdentity, MeshIdentity};
 use super::peer::PeerList;
 
 /// Complete fabric state for a node.
@@ -15,7 +15,7 @@ pub struct FabricState {
     /// Mesh identity (name, prefix).
     pub mesh: MeshIdentity,
     /// This node's identity.
-    pub node: NodeIdentity,
+    pub hypervisor: HypervisorIdentity,
     /// The mesh secret (encrypted at rest in future).
     pub secret: String,
     /// Known peers.
@@ -62,11 +62,12 @@ mod tests {
 
     fn make_state() -> FabricState {
         let (mesh_id, secret) = mesh::create_mesh("test-mesh").unwrap();
-        let node = mesh::create_node("node-1", "eu", "fsn1", 51820, None, &mesh_id.prefix).unwrap();
+        let node =
+            mesh::create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh_id.prefix).unwrap();
 
         FabricState {
             mesh: mesh_id,
-            node,
+            hypervisor: node,
             secret: secret.to_string(),
             peers: PeerList::new(),
         }
@@ -81,8 +82,8 @@ mod tests {
         let loaded = FabricState::load(&db).unwrap().unwrap();
 
         assert_eq!(loaded.mesh.name, "test-mesh");
-        assert_eq!(loaded.node.name, "node-1");
-        assert_eq!(loaded.node.region, "eu");
+        assert_eq!(loaded.hypervisor.name, "node-1");
+        assert_eq!(loaded.hypervisor.region, "eu");
     }
 
     #[test]
@@ -148,8 +149,11 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: FabricState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mesh.name, state.mesh.name);
-        assert_eq!(back.node.name, state.node.name);
-        assert_eq!(back.node.wg_public_key, state.node.wg_public_key);
+        assert_eq!(back.hypervisor.name, state.hypervisor.name);
+        assert_eq!(
+            back.hypervisor.wg_public_key,
+            state.hypervisor.wg_public_key
+        );
     }
 
     // ── #5: Private key persists through save/load ──
@@ -158,12 +162,12 @@ mod tests {
     fn private_key_persists() {
         let (_d, db) = temp_db();
         let state = make_state();
-        let original_key = state.node.wg_private_key.clone();
+        let original_key = state.hypervisor.wg_private_key.clone();
         assert!(!original_key.is_empty());
 
         state.save(&db).unwrap();
         let loaded = FabricState::load(&db).unwrap().unwrap();
-        assert_eq!(loaded.node.wg_private_key, original_key);
+        assert_eq!(loaded.hypervisor.wg_private_key, original_key);
     }
 
     // ── #4: Corruption handling ──
