@@ -43,3 +43,106 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use syfrah_core::api::{list_routes, openapi_spec};
+    use syfrah_hypervisor::handlers;
+
+    #[test]
+    fn api_routes_generated_from_resource_def() {
+        let reg = handlers::registration();
+        let routes = list_routes(&[reg], "/admin/v1");
+
+        // Should have routes for all operations
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        let ops: Vec<&str> = routes.iter().map(|r| r.operation.as_str()).collect();
+
+        assert!(ops.contains(&"init"), "missing init route: {ops:?}");
+        assert!(ops.contains(&"join"), "missing join route: {ops:?}");
+        assert!(ops.contains(&"status"), "missing status route: {ops:?}");
+        assert!(ops.contains(&"list"), "missing list route: {ops:?}");
+        assert!(ops.contains(&"get"), "missing get route: {ops:?}");
+        assert!(ops.contains(&"stop"), "missing stop route: {ops:?}");
+        assert!(ops.contains(&"leave"), "missing leave route: {ops:?}");
+        assert!(ops.contains(&"drain"), "missing drain route: {ops:?}");
+        assert!(ops.contains(&"enable"), "missing enable route: {ops:?}");
+
+        // Check REST methods
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.method == "GET" && r.path == "/admin/v1/hypervisor"),
+            "missing GET list"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.method == "GET" && r.path.contains("{id}")),
+            "missing GET by id"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.method == "POST" && r.path.contains("init")),
+            "missing POST init"
+        );
+
+        println!("\nGenerated API routes:");
+        for r in &routes {
+            println!("  {} {:<40} {}", r.method, r.path, r.operation);
+        }
+    }
+
+    #[test]
+    fn openapi_spec_generated() {
+        let reg = handlers::registration();
+        let spec = openapi_spec(&[reg], "/admin/v1");
+
+        assert_eq!(spec["openapi"], "3.0.0");
+        assert!(spec["paths"]["/admin/v1/hypervisor"].is_object());
+        assert!(spec["paths"]["/admin/v1/hypervisor/{id}"].is_object());
+        assert!(spec["paths"]["/admin/v1/hypervisor/init"].is_object());
+
+        println!("\nOpenAPI spec:");
+        println!("{}", serde_json::to_string_pretty(&spec).unwrap());
+    }
+
+    #[tokio::test]
+    async fn api_server_serves_hypervisor_routes() {
+        use axum::body::Body;
+        use http::Request;
+        use syfrah_core::api::ApiConfig;
+        use syfrah_core::api::ApiServer;
+        use tower::ServiceExt;
+
+        let server = ApiServer::new(ApiConfig::default(), vec![handlers::registration()], vec![]);
+
+        // GET /admin/v1/hypervisor → list (returns empty since no state)
+        let req = Request::builder()
+            .uri("/admin/v1/hypervisor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = server.admin_router().clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200, "list endpoint should work");
+
+        // POST /admin/v1/hypervisor/status → status
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/v1/hypervisor/status")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = server.admin_router().clone().oneshot(req).await.unwrap();
+        // May return 500 (no state) but should not 404
+        assert_ne!(resp.status(), 404, "status endpoint should exist");
+
+        // GET /health → always works
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = server.admin_router().clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+}

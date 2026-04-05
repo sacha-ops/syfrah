@@ -1131,11 +1131,14 @@ name = "syfrah"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "http",
  "serde_json",
  "syfrah-core",
  "syfrah-hypervisor",
  "tokio",
+ "tower",
 ]
 
 [[package]]

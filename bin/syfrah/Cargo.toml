@@ -17,3 +17,6 @@ clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+axum.workspace = true
+http = "1"
+tower.workspace = true
