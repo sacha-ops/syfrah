@@ -86,7 +86,6 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _req: JoinRequest = read_json(&mut stream).await.unwrap();
             let resp = JoinResponse::accepted(
-                "my-cloud",
                 "syf_sk_test",
                 "fd01::".parse().unwrap(),
                 vec![],
@@ -115,7 +114,6 @@ mod tests {
 
         let resp = join(&addr.to_string(), req).await.unwrap();
         assert!(resp.accepted);
-        assert_eq!(resp.mesh_name.as_deref(), Some("my-cloud"));
         assert!(resp.secret.is_some());
         assert!(resp.acceptor.is_some());
 

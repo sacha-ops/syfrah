@@ -41,7 +41,7 @@ pub struct JoinResponse {
     /// Reason for rejection (if not accepted).
     pub reason: Option<String>,
     /// Mesh name.
-    pub mesh_name: Option<String>,
+
     /// Mesh secret (only if accepted).
     pub secret: Option<String>,
     /// Mesh prefix (only if accepted).
@@ -75,7 +75,6 @@ pub struct PeerAnnounce {
 impl JoinResponse {
     /// Create an accepted response.
     pub fn accepted(
-        mesh_name: &str,
         secret: &str,
         prefix: Ipv6Addr,
         peers: Vec<PeerInfo>,
@@ -84,7 +83,7 @@ impl JoinResponse {
         Self {
             accepted: true,
             reason: None,
-            mesh_name: Some(mesh_name.to_string()),
+
             secret: Some(secret.to_string()),
             prefix: Some(prefix),
             peers,
@@ -97,7 +96,7 @@ impl JoinResponse {
         Self {
             accepted: false,
             reason: Some(reason.to_string()),
-            mesh_name: None,
+
             secret: None,
             prefix: None,
             peers: Vec::new(),
@@ -138,7 +137,6 @@ mod tests {
     #[test]
     fn join_response_accepted() {
         let resp = JoinResponse::accepted(
-            "my-cloud",
             "syf_sk_test",
             "fd01::".parse().unwrap(),
             vec![],
@@ -169,7 +167,6 @@ mod tests {
     #[test]
     fn join_response_serde() {
         let resp = JoinResponse::accepted(
-            "mesh",
             "secret",
             "fd01::".parse().unwrap(),
             vec![PeerInfo {

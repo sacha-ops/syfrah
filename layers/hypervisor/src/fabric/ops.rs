@@ -28,7 +28,7 @@ pub struct InitResult {
 /// 4. Persist state
 pub fn init(
     db: &LayerDb,
-    mesh_name: &str,
+
     node_name: &str,
     region: &str,
     zone: &str,
@@ -44,7 +44,7 @@ pub fn init(
     }
 
     // Create identities
-    let (mesh_id, secret) = mesh::create_mesh(mesh_name)?;
+    let (mesh_id, secret) = mesh::create_mesh();
     let hv = mesh::create_hypervisor(node_name, region, zone, port, None, &mesh_id.prefix)?;
 
     // Install and start WireGuard service
@@ -106,7 +106,6 @@ pub async fn listen_for_peers(
 
 /// Result of a successful fabric join.
 pub struct JoinResult {
-    pub mesh_name: String,
     pub hypervisor: HypervisorIdentity,
     pub peer_count: usize,
 }
@@ -155,9 +154,6 @@ pub async fn join(
     let response = super::peering_client::join(target, request).await?;
 
     // Extract mesh info from response
-    let mesh_name = response
-        .mesh_name
-        .ok_or_else(|| SyfrahError::internal("join response missing mesh_name"))?;
     let secret_str = response
         .secret
         .ok_or_else(|| SyfrahError::internal("join response missing secret"))?;
@@ -194,7 +190,6 @@ pub async fn join(
     // Build mesh identity
     let mesh_id = MeshIdentity {
         id: syfrah_core::id::MeshId::generate(),
-        name: mesh_name.clone(),
         prefix,
     };
 
@@ -253,7 +248,6 @@ pub async fn join(
         .map_err(|e| SyfrahError::internal(e.to_string()))?;
 
     Ok(JoinResult {
-        mesh_name,
         hypervisor: hv,
         peer_count,
     })
@@ -263,7 +257,7 @@ pub async fn join(
 pub struct StatusResult {
     pub hypervisor_name: String,
     pub hypervisor_id: String,
-    pub mesh_name: String,
+
     pub region: String,
     pub zone: String,
     pub mesh_ipv6: String,
@@ -310,7 +304,6 @@ pub fn status(db: &LayerDb) -> Result<StatusResult, SyfrahError> {
     Ok(StatusResult {
         hypervisor_name: state.hypervisor.name,
         hypervisor_id: state.hypervisor.id.to_string(),
-        mesh_name: state.mesh.name,
         region: state.hypervisor.region,
         zone: state.hypervisor.zone,
         mesh_ipv6: state.hypervisor.mesh_ipv6.to_string(),

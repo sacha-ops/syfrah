@@ -121,13 +121,7 @@ async fn handle_join(
         })
         .collect();
 
-    let resp = JoinResponse::accepted(
-        &state.mesh.name,
-        &state.secret,
-        state.mesh.prefix,
-        existing_peers,
-        self_info,
-    );
+    let resp = JoinResponse::accepted(&state.secret, state.mesh.prefix, existing_peers, self_info);
     write_json(stream, &resp).await?;
 
     // Derive the new peer's mesh IPv6

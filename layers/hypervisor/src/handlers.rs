@@ -20,7 +20,6 @@ pub fn resource_def() -> ResourceDef {
         // Lifecycle
         .action("init", "Initialize a new cluster")
             .op(|op| op
-                .with_arg(OperationArg::required("name", FieldDef::string("name", "Mesh name")))
                 .with_arg(OperationArg::optional("region", FieldDef::string("region", "Region label").with_default("default")))
                 .with_arg(OperationArg::optional("zone", FieldDef::string("zone", "Zone label").with_default("default")))
                 .with_arg(OperationArg::optional("port", FieldDef::integer("port", "WireGuard listen port").with_default("51820")))
@@ -107,10 +106,6 @@ pub fn registration() -> ResourceRegistration {
 // ═══════════════════════════════════════════════════
 
 async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse> {
-    let mesh_name = req
-        .fields
-        .get("name")
-        .ok_or_else(|| anyhow::anyhow!("missing required field: name"))?;
     let region = req
         .fields
         .get("region")
@@ -140,7 +135,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .unwrap_or(false);
 
     let db = open_db()?;
-    let result = fabric::ops::init(&db, mesh_name, &node_name, region, zone, port)?;
+    let result = fabric::ops::init(&db, &node_name, region, zone, port)?;
 
     // Print init result immediately
     eprintln!();
@@ -148,7 +143,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     eprintln!();
     eprintln!("  name     {}", result.hypervisor.name);
     eprintln!("  id       {}", result.hypervisor.id.as_str());
-    eprintln!("  mesh     {}", result.mesh.name);
+    eprintln!("  mesh     {}", result.mesh.id.to_string());
     eprintln!("  region   {} · {}", region, zone);
     eprintln!("  address  {}", result.hypervisor.mesh_ipv6);
     eprintln!("  pin      {}", result.pin);
@@ -177,7 +172,6 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         eprintln!("  {} node(s) joined.", accepted);
     } else {
         eprintln!("  To accept joins, run:");
-        eprintln!("    syfrah hypervisor init --name {} --peering", mesh_name);
         eprintln!("  Or on another node:");
         eprintln!(
             "    syfrah hypervisor join --target <this-ip> --pin {}",
@@ -188,7 +182,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": result.hypervisor.name,
         "id": result.hypervisor.id.as_str(),
-        "mesh": result.mesh.name,
+        "mesh_id": result.hypervisor.id.as_str(),
         "region": format!("{} · {}", region, zone),
         "zone": zone,
         "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
@@ -232,7 +226,7 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": result.hypervisor.name,
         "id": result.hypervisor.id.as_str(),
-        "mesh": result.mesh_name,
+        "mesh_id": result.hypervisor.id.as_str(),
         "region": format!("{} · {}", region, zone),
         "zone": zone,
         "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
@@ -285,7 +279,7 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": s.hypervisor_name,
         "id": s.hypervisor_id,
-        "mesh": s.mesh_name,
+        "mesh_id": s.hypervisor_id,
         "region": s.region,
         "zone": s.zone,
         "mesh_ipv6": s.mesh_ipv6,

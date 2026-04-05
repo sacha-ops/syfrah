@@ -61,7 +61,7 @@ mod tests {
     }
 
     fn make_state() -> FabricState {
-        let (mesh_id, secret) = mesh::create_mesh("test-mesh").unwrap();
+        let (mesh_id, secret) = mesh::create_mesh();
         let node =
             mesh::create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh_id.prefix).unwrap();
 
@@ -81,7 +81,6 @@ mod tests {
         state.save(&db).unwrap();
         let loaded = FabricState::load(&db).unwrap().unwrap();
 
-        assert_eq!(loaded.mesh.name, "test-mesh");
         assert_eq!(loaded.hypervisor.name, "node-1");
         assert_eq!(loaded.hypervisor.region, "eu");
     }
@@ -148,7 +147,6 @@ mod tests {
         let state = make_state();
         let json = serde_json::to_string(&state).unwrap();
         let back: FabricState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.mesh.name, state.mesh.name);
         assert_eq!(back.hypervisor.name, state.hypervisor.name);
         assert_eq!(
             back.hypervisor.wg_public_key,
@@ -221,10 +219,8 @@ mod tests {
         state.save(&db).unwrap();
 
         // Modify and save again
-        state.mesh.name = "updated-mesh".to_string();
         state.save(&db).unwrap();
 
         let loaded = FabricState::load(&db).unwrap().unwrap();
-        assert_eq!(loaded.mesh.name, "updated-mesh");
     }
 }
