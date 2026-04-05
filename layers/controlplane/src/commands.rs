@@ -279,6 +279,36 @@ pub enum StateMachineCommand {
         destination: String,
     },
 
+    // -- VM Lifecycle (Phase 1: async provisioning #1311) --
+    /// Write a VM creation intent to Raft. The CLI returns immediately
+    /// with phase=Pending. The daemon/forge reconciles in background.
+    CreateVmIntent {
+        name: String,
+        image: String,
+        vcpus: u32,
+        memory_mb: u32,
+        zone: Option<String>,
+        subnet: Option<String>,
+        env: Option<String>,
+        project: Option<String>,
+        org: Option<String>,
+        ssh_key_path: Option<String>,
+        disk_size_gb: u32,
+    },
+    /// Update the phase of an existing VM record in Raft.
+    /// Called by the daemon/forge as provisioning progresses.
+    UpdateVmPhase {
+        vm_id: String,
+        phase: String,
+        hypervisor_id: Option<String>,
+        ip: Option<String>,
+        error: Option<String>,
+    },
+    /// Write a VM deletion intent to Raft.
+    DeleteVmIntent {
+        vm_id: String,
+    },
+
     // -- VM Placement --
     PlaceVm {
         vm_id: String,
@@ -640,6 +670,11 @@ impl std::fmt::Display for StateMachineCommand {
             Self::GcCompleteWalSegments { below_position } => {
                 write!(f, "GcCompleteWalSegments(below={below_position})")
             }
+            Self::CreateVmIntent { name, .. } => write!(f, "CreateVmIntent({name})"),
+            Self::UpdateVmPhase { vm_id, phase, .. } => {
+                write!(f, "UpdateVmPhase({vm_id}, {phase})")
+            }
+            Self::DeleteVmIntent { vm_id } => write!(f, "DeleteVmIntent({vm_id})"),
             Self::Composite { commands } => write!(f, "Composite({})", commands.len()),
             _ => write!(f, "{:?}", std::mem::discriminant(self)),
         }
@@ -839,6 +874,29 @@ mod tests {
                 vpc: "v".into(),
                 table: None,
                 destination: "0.0.0.0/0".into(),
+            },
+            StateMachineCommand::CreateVmIntent {
+                name: "web-1".into(),
+                image: "alpine-3.20".into(),
+                vcpus: 2,
+                memory_mb: 2048,
+                zone: Some("eu-west-1".into()),
+                subnet: Some("frontend".into()),
+                env: None,
+                project: None,
+                org: None,
+                ssh_key_path: None,
+                disk_size_gb: 20,
+            },
+            StateMachineCommand::UpdateVmPhase {
+                vm_id: "web-1".into(),
+                phase: "Running".into(),
+                hypervisor_id: Some("hv1".into()),
+                ip: Some("10.0.0.2".into()),
+                error: None,
+            },
+            StateMachineCommand::DeleteVmIntent {
+                vm_id: "web-1".into(),
             },
             StateMachineCommand::PlaceVm {
                 vm_id: "vm1".into(),
