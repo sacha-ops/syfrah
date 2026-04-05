@@ -1,28 +1,12 @@
 [workspace]
 resolver = "2"
-members = [
-    "layers/api",
-    "layers/core",
-    "layers/state",
-    "layers/api",
-    "layers/fabric",
-    "layers/forge",
-    "layers/compute",
-    "layers/overlay",
-    "layers/storage",
-    "layers/org",
-    "layers/controlplane",
-    "bin/syfrah",
-]
-exclude = [
-    "tests/e2e/fake-ch",
-]
+members = []
 
 [workspace.package]
-version = "0.2.0"
+version = "2.0.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/sifrah/syfrah"
+repository = "https://github.com/sacha-ops/syfrah"
 keywords = ["cloud", "wireguard", "mesh", "control-plane", "infrastructure"]
 categories = ["network-programming", "command-line-utilities"]
 
@@ -34,3 +18,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
