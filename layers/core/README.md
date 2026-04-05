@@ -200,9 +200,45 @@ validate::vcpus(4)?;                // ok (1-256)
 let secs = validate::duration("2h")?;  // 7200
 ```
 
+```rust
+// IP addresses
+validate::ipv4("10.0.0.1")?;        // ok, returns [u8; 4]
+validate::ipv6("fd01::1")?;          // ok
+validate::ip_addr("10.0.0.1")?;      // ok (IPv4 or IPv6)
+
+// IPv6 CIDR
+validate::cidr_v6("fd00::/48")?;     // ok
+validate::cidr_any("10.0.0.0/8")?;   // ok — dispatches to v4 or v6
+
+// MAC addresses
+validate::mac_address("aa:bb:cc:dd:ee:ff")?;  // ok, returns [u8; 6]
+
+// Hostnames (RFC 1123)
+validate::hostname("my-server.example.com")?;  // ok
+
+// URLs
+validate::url("https://s3.example.com")?;      // ok
+
+// Endpoints (host:port, including IPv6)
+let (host, port) = validate::endpoint("10.0.0.1:8080")?;
+let (host, port) = validate::endpoint("[fd01::1]:7200")?;
+
+// Port ranges
+let (start, end) = validate::port_range("8080-8090")?;
+
+// Email
+validate::email("user@example.com")?;
+
+// Paths
+validate::path_exists("/tmp")?;
+validate::file_exists("/etc/hosts")?;
+```
+
 All validators return `SyfrahError` with actionable messages:
 ```
 Error: invalid CIDR '10.1.1.0/16': host bits must be zero. Did you mean 10.1.0.0/16?
+Error: invalid MAC address 'aa:bb': must be 6 hex pairs separated by colons
+Error: invalid endpoint 'noport': must be in format HOST:PORT or IP:PORT
 ```
 
 ---

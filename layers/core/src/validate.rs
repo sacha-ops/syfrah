@@ -303,6 +303,298 @@ pub fn duration(input: &str) -> Result<u64, SyfrahError> {
     Ok(seconds)
 }
 
+/// Validate an IPv4 address.
+pub fn ipv4(input: &str) -> Result<[u8; 4], SyfrahError> {
+    let octets: Vec<&str> = input.split('.').collect();
+    if octets.len() != 4 {
+        return Err(SyfrahError::validation(format!(
+            "invalid IPv4 address '{input}': must have 4 octets (e.g., 10.0.0.1)"
+        )));
+    }
+    let mut bytes = [0u8; 4];
+    for (i, octet) in octets.iter().enumerate() {
+        bytes[i] = octet.parse().map_err(|_| {
+            SyfrahError::validation(format!(
+                "invalid IPv4 address '{input}': octet '{octet}' is not a valid number (0-255)"
+            ))
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// Validate an IPv6 address (simplified — accepts standard and compressed forms).
+pub fn ipv6(input: &str) -> Result<(), SyfrahError> {
+    // Use Rust's built-in parser
+    input
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| {
+            SyfrahError::validation(format!(
+                "invalid IPv6 address '{input}': must be a valid IPv6 address (e.g., fd01::1, 2001:db8::1)"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Validate an IP address (IPv4 or IPv6).
+pub fn ip_addr(input: &str) -> Result<(), SyfrahError> {
+    input.parse::<std::net::IpAddr>().map_err(|_| {
+        SyfrahError::validation(format!(
+            "invalid IP address '{input}': must be a valid IPv4 or IPv6 address"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validate a CIDR block — IPv4 or IPv6.
+pub fn cidr_any(input: &str) -> Result<(), SyfrahError> {
+    if input.contains(':') {
+        cidr_v6(input)
+    } else {
+        cidr(input)
+    }
+}
+
+/// Validate an IPv6 CIDR block.
+///
+/// Rules:
+/// - Format: `<ipv6>/N`
+/// - Valid IPv6 address
+/// - Prefix length 0-128
+pub fn cidr_v6(input: &str) -> Result<(), SyfrahError> {
+    let parts: Vec<&str> = input.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(SyfrahError::validation(format!(
+            "invalid IPv6 CIDR '{input}': must be in format <ipv6>/N (e.g., fd00::/48)"
+        )));
+    }
+
+    // Validate IPv6 address
+    parts[0].parse::<std::net::Ipv6Addr>().map_err(|_| {
+        SyfrahError::validation(format!("invalid IPv6 CIDR '{input}': invalid IPv6 address"))
+    })?;
+
+    // Validate prefix length
+    let prefix: u8 = parts[1].parse().map_err(|_| {
+        SyfrahError::validation(format!(
+            "invalid IPv6 CIDR '{input}': prefix length must be a number (0-128)"
+        ))
+    })?;
+    if prefix > 128 {
+        return Err(SyfrahError::validation(format!(
+            "invalid IPv6 CIDR '{input}': prefix length must be 0-128, got {prefix}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate a MAC address (colon-separated, lowercase).
+///
+/// Format: `aa:bb:cc:dd:ee:ff`
+pub fn mac_address(input: &str) -> Result<[u8; 6], SyfrahError> {
+    let parts: Vec<&str> = input.split(':').collect();
+    if parts.len() != 6 {
+        return Err(SyfrahError::validation(format!(
+            "invalid MAC address '{input}': must be 6 hex pairs separated by colons (e.g., aa:bb:cc:dd:ee:ff)"
+        )));
+    }
+    let mut bytes = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        if part.len() != 2 {
+            return Err(SyfrahError::validation(format!(
+                "invalid MAC address '{input}': each octet must be exactly 2 hex digits"
+            )));
+        }
+        bytes[i] = u8::from_str_radix(part, 16).map_err(|_| {
+            SyfrahError::validation(format!(
+                "invalid MAC address '{input}': '{part}' is not valid hex"
+            ))
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// Validate a hostname (RFC 952 / RFC 1123).
+///
+/// Rules:
+/// - 1-253 characters total
+/// - Labels separated by dots, each 1-63 characters
+/// - Each label: alphanumeric + hyphens, starts with alphanumeric
+pub fn hostname(input: &str) -> Result<(), SyfrahError> {
+    if input.is_empty() {
+        return Err(SyfrahError::validation("hostname cannot be empty"));
+    }
+    if input.len() > 253 {
+        return Err(SyfrahError::validation(format!(
+            "invalid hostname '{input}': must be at most 253 characters"
+        )));
+    }
+    for label in input.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(SyfrahError::validation(format!(
+                "invalid hostname '{input}': each label must be 1-63 characters"
+            )));
+        }
+        if !label.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            return Err(SyfrahError::validation(format!(
+                "invalid hostname '{input}': label '{label}' must start with alphanumeric"
+            )));
+        }
+        if label.len() > 1 && !label.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+            return Err(SyfrahError::validation(format!(
+                "invalid hostname '{input}': label '{label}' must end with alphanumeric"
+            )));
+        }
+        for c in label.chars() {
+            if !c.is_ascii_alphanumeric() && c != '-' {
+                return Err(SyfrahError::validation(format!(
+                    "invalid hostname '{input}': character '{c}' not allowed in label '{label}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a URL/endpoint.
+///
+/// Must start with `http://` or `https://` and have a non-empty host.
+pub fn url(input: &str) -> Result<(), SyfrahError> {
+    if !input.starts_with("http://") && !input.starts_with("https://") {
+        return Err(SyfrahError::validation(format!(
+            "invalid URL '{input}': must start with http:// or https://"
+        )));
+    }
+    let after_scheme = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))
+        .unwrap_or("");
+    if after_scheme.is_empty() {
+        return Err(SyfrahError::validation(format!(
+            "invalid URL '{input}': missing host"
+        )));
+    }
+    // Extract host (before first / or end)
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or("");
+    if host_no_port.is_empty() {
+        return Err(SyfrahError::validation(format!(
+            "invalid URL '{input}': missing host"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a file path exists and is readable.
+pub fn path_exists(input: &str) -> Result<(), SyfrahError> {
+    let path = std::path::Path::new(input);
+    if !path.exists() {
+        return Err(SyfrahError::validation(format!(
+            "path '{input}' does not exist"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a file path exists and is a regular file.
+pub fn file_exists(input: &str) -> Result<(), SyfrahError> {
+    let path = std::path::Path::new(input);
+    if !path.exists() {
+        return Err(SyfrahError::validation(format!(
+            "file '{input}' does not exist"
+        )));
+    }
+    if !path.is_file() {
+        return Err(SyfrahError::validation(format!(
+            "'{input}' is not a regular file"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse and validate a port range (e.g., "8080-8090").
+/// Returns (start, end) inclusive.
+pub fn port_range(input: &str) -> Result<(u16, u16), SyfrahError> {
+    let parts: Vec<&str> = input.split('-').collect();
+    if parts.len() != 2 {
+        return Err(SyfrahError::validation(format!(
+            "invalid port range '{input}': must be in format START-END (e.g., 8080-8090)"
+        )));
+    }
+    let start = port_str(parts[0])?;
+    let end = port_str(parts[1])?;
+    if start > end {
+        return Err(SyfrahError::validation(format!(
+            "invalid port range '{input}': start ({start}) must be <= end ({end})"
+        )));
+    }
+    Ok((start, end))
+}
+
+/// Validate an email address (basic RFC 5321).
+pub fn email(input: &str) -> Result<(), SyfrahError> {
+    let parts: Vec<&str> = input.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return Err(SyfrahError::validation(format!(
+            "invalid email '{input}': must contain exactly one @"
+        )));
+    }
+    let local = parts[0];
+    let domain = parts[1];
+    if local.is_empty() || local.len() > 64 {
+        return Err(SyfrahError::validation(format!(
+            "invalid email '{input}': local part must be 1-64 characters"
+        )));
+    }
+    if domain.is_empty() || !domain.contains('.') {
+        return Err(SyfrahError::validation(format!(
+            "invalid email '{input}': domain must contain at least one dot"
+        )));
+    }
+    // Validate domain as hostname
+    hostname(domain)?;
+    Ok(())
+}
+
+/// Validate an endpoint string — either `IP:PORT` or `HOST:PORT`.
+pub fn endpoint(input: &str) -> Result<(&str, u16), SyfrahError> {
+    // Handle IPv6 [addr]:port
+    if input.starts_with('[') {
+        let close = input.find(']').ok_or_else(|| {
+            SyfrahError::validation(format!(
+                "invalid endpoint '{input}': missing closing ']' for IPv6 address"
+            ))
+        })?;
+        let addr = &input[1..close];
+        ipv6(addr)?;
+        let rest = &input[close + 1..];
+        if !rest.starts_with(':') {
+            return Err(SyfrahError::validation(format!(
+                "invalid endpoint '{input}': expected ':PORT' after IPv6 address"
+            )));
+        }
+        let p = port_str(&rest[1..])?;
+        return Ok((addr, p));
+    }
+
+    // IPv4 or hostname:port
+    let last_colon = input.rfind(':').ok_or_else(|| {
+        SyfrahError::validation(format!(
+            "invalid endpoint '{input}': must be in format HOST:PORT or IP:PORT"
+        ))
+    })?;
+    let host = &input[..last_colon];
+    let port_s = &input[last_colon + 1..];
+    let p = port_str(port_s)?;
+
+    // Validate host is either IP or hostname
+    if host.parse::<std::net::IpAddr>().is_err() {
+        hostname(host)?;
+    }
+
+    Ok((host, p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +858,216 @@ mod tests {
     #[test]
     fn duration_not_a_number() {
         assert!(duration("abcm").is_err());
+    }
+
+    // ── IPv4 validation ──
+
+    #[test]
+    fn ipv4_valid() {
+        assert_eq!(ipv4("10.0.0.1").unwrap(), [10, 0, 0, 1]);
+        assert_eq!(ipv4("192.168.1.100").unwrap(), [192, 168, 1, 100]);
+        assert_eq!(ipv4("0.0.0.0").unwrap(), [0, 0, 0, 0]);
+        assert_eq!(ipv4("255.255.255.255").unwrap(), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn ipv4_invalid() {
+        assert!(ipv4("10.0.0").is_err());
+        assert!(ipv4("10.0.0.999").is_err());
+        assert!(ipv4("abc").is_err());
+        assert!(ipv4("").is_err());
+    }
+
+    // ── IPv6 validation ──
+
+    #[test]
+    fn ipv6_valid() {
+        assert!(ipv6("::1").is_ok());
+        assert!(ipv6("fd01:2bf2:852d::1").is_ok());
+        assert!(ipv6("2001:db8::1").is_ok());
+        assert!(ipv6("fe80::1%eth0").is_err()); // scoped — not accepted by std parser
+    }
+
+    #[test]
+    fn ipv6_invalid() {
+        assert!(ipv6("not-ipv6").is_err());
+        assert!(ipv6("10.0.0.1").is_err());
+        assert!(ipv6("").is_err());
+    }
+
+    // ── IP address (any) ──
+
+    #[test]
+    fn ip_addr_valid() {
+        assert!(ip_addr("10.0.0.1").is_ok());
+        assert!(ip_addr("::1").is_ok());
+        assert!(ip_addr("2001:db8::1").is_ok());
+    }
+
+    #[test]
+    fn ip_addr_invalid() {
+        assert!(ip_addr("nope").is_err());
+    }
+
+    // ── IPv6 CIDR ──
+
+    #[test]
+    fn cidr_v6_valid() {
+        assert!(cidr_v6("fd00::/48").is_ok());
+        assert!(cidr_v6("2001:db8::/32").is_ok());
+        assert!(cidr_v6("::/0").is_ok());
+        assert!(cidr_v6("::1/128").is_ok());
+    }
+
+    #[test]
+    fn cidr_v6_invalid() {
+        assert!(cidr_v6("fd00::").is_err()); // no prefix
+        assert!(cidr_v6("fd00::/129").is_err()); // prefix > 128
+        assert!(cidr_v6("not-ipv6/48").is_err());
+    }
+
+    #[test]
+    fn cidr_any_dispatches() {
+        assert!(cidr_any("10.0.0.0/8").is_ok());
+        assert!(cidr_any("fd00::/48").is_ok());
+    }
+
+    // ── MAC address ──
+
+    #[test]
+    fn mac_valid() {
+        let bytes = mac_address("aa:bb:cc:dd:ee:ff").unwrap();
+        assert_eq!(bytes, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert!(mac_address("00:11:22:33:44:55").is_ok());
+    }
+
+    #[test]
+    fn mac_invalid() {
+        assert!(mac_address("aa:bb:cc:dd:ee").is_err()); // 5 parts
+        assert!(mac_address("aa:bb:cc:dd:ee:gg").is_err()); // bad hex
+        assert!(mac_address("aabb.ccdd.eeff").is_err()); // wrong format
+        assert!(mac_address("aa:bb:cc:dd:ee:fff").is_err()); // 3 chars
+    }
+
+    // ── Hostname ──
+
+    #[test]
+    fn hostname_valid() {
+        assert!(hostname("example.com").is_ok());
+        assert!(hostname("my-server").is_ok());
+        assert!(hostname("a.b.c.d").is_ok());
+        assert!(hostname("node-1").is_ok());
+        assert!(hostname("A").is_ok()); // single char, uppercase OK for hostname
+    }
+
+    #[test]
+    fn hostname_invalid() {
+        assert!(hostname("").is_err());
+        assert!(hostname("-start").is_err());
+        assert!(hostname("a.b..c").is_err()); // empty label
+        assert!(hostname(&"a".repeat(254)).is_err()); // too long
+    }
+
+    // ── URL ──
+
+    #[test]
+    fn url_valid() {
+        assert!(url("https://example.com").is_ok());
+        assert!(url("http://10.0.0.1:8080").is_ok());
+        assert!(url("https://s3.eu-west.amazonaws.com/bucket").is_ok());
+    }
+
+    #[test]
+    fn url_invalid() {
+        assert!(url("ftp://example.com").is_err()); // wrong scheme
+        assert!(url("https://").is_err()); // no host
+        assert!(url("example.com").is_err()); // no scheme
+    }
+
+    // ── Path ──
+
+    #[test]
+    fn path_exists_valid() {
+        // /tmp should always exist
+        assert!(path_exists("/tmp").is_ok());
+    }
+
+    #[test]
+    fn path_exists_invalid() {
+        assert!(path_exists("/nonexistent/path/xyz").is_err());
+    }
+
+    #[test]
+    fn file_exists_not_a_file() {
+        // /tmp exists but is a directory
+        assert!(file_exists("/tmp").is_err());
+    }
+
+    // ── Port range ──
+
+    #[test]
+    fn port_range_valid() {
+        assert_eq!(port_range("8080-8090").unwrap(), (8080, 8090));
+        assert_eq!(port_range("80-80").unwrap(), (80, 80)); // single port
+    }
+
+    #[test]
+    fn port_range_invalid() {
+        assert!(port_range("8090-8080").is_err()); // start > end
+        assert!(port_range("80").is_err()); // no dash
+        assert!(port_range("0-80").is_err()); // port 0
+    }
+
+    // ── Email ──
+
+    #[test]
+    fn email_valid() {
+        assert!(email("user@example.com").is_ok());
+        assert!(email("admin@sub.domain.org").is_ok());
+    }
+
+    #[test]
+    fn email_invalid() {
+        assert!(email("noat").is_err());
+        assert!(email("@domain.com").is_err()); // empty local
+        assert!(email("user@").is_err()); // empty domain
+        assert!(email("user@nodot").is_err()); // no dot in domain
+    }
+
+    // ── Endpoint ──
+
+    #[test]
+    fn endpoint_ipv4() {
+        let (host, p) = endpoint("10.0.0.1:8080").unwrap();
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(p, 8080);
+    }
+
+    #[test]
+    fn endpoint_hostname() {
+        let (host, p) = endpoint("example.com:443").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(p, 443);
+    }
+
+    #[test]
+    fn endpoint_ipv6() {
+        let (host, p) = endpoint("[::1]:8080").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(p, 8080);
+    }
+
+    #[test]
+    fn endpoint_ipv6_full() {
+        let (host, p) = endpoint("[fd01:2bf2:852d::1]:7200").unwrap();
+        assert_eq!(host, "fd01:2bf2:852d::1");
+        assert_eq!(p, 7200);
+    }
+
+    #[test]
+    fn endpoint_invalid() {
+        assert!(endpoint("noport").is_err());
+        assert!(endpoint("[::1]").is_err()); // missing :port
+        assert!(endpoint("10.0.0.1:0").is_err()); // port 0
     }
 }
