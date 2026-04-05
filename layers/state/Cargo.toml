@@ -1,0 +1,17 @@
+[package]
+name = "syfrah-state"
+description = "Embedded key-value persistence for Syfrah layers (redb)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+redb = "2"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
