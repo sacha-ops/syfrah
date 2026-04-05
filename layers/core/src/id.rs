@@ -1,10 +1,16 @@
-//! Typed resource IDs.
+//! Typed resource IDs backed by ULID.
 //!
 //! Every resource has a generated, immutable ID with a known prefix.
 //! IDs are the primary key everywhere — Raft, stores, API, logs.
 //! Names are for humans, IDs are for machines.
 //!
-//! Format: `{prefix}-{12-hex-chars}` (e.g., `vpc-a1b2c3d4e5f6`)
+//! Format: `{prefix}-{26-char-crockford-base32}` (e.g., `vpc-01J5A3K7G8MN2P4Q6R9S0T1V2W`)
+//!
+//! Properties:
+//! - **Sortable**: IDs sort chronologically (ULID encodes timestamp)
+//! - **Unique**: 80 bits of randomness per millisecond
+//! - **Parseable**: prefix tells you the resource type
+//! - **Validated**: `FromStr` / `TryFrom` reject malformed IDs
 //!
 //! # Usage
 //!
@@ -13,43 +19,50 @@
 //!
 //! let id = VpcId::generate();
 //! assert!(id.as_str().starts_with("vpc-"));
-//! assert_eq!(id.as_str().len(), 16); // "vpc-" + 12 hex
+//!
+//! // Parse with validation
+//! let parsed: VpcId = "vpc-01J5A3K7G8MN2P4Q6R9S0T1V2W".parse().unwrap();
+//!
+//! // Invalid prefix is rejected
+//! assert!("org-01J5A3K7G8MN2P4Q6R9S0T1V2W".parse::<VpcId>().is_err());
 //! ```
 
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
-/// Generate a random ID with the given prefix.
-fn generate_id(prefix: &str) -> String {
-    let mut rng = rand::thread_rng();
-    let hex: String = (0..12)
-        .map(|_| format!("{:x}", rng.gen_range(0..16)))
-        .collect();
-    format!("{prefix}-{hex}")
+/// Error returned when an ID string is invalid.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum IdError {
+    #[error("invalid {kind} ID: expected prefix '{expected_prefix}-', got '{input}'")]
+    WrongPrefix {
+        kind: &'static str,
+        expected_prefix: &'static str,
+        input: String,
+    },
+    #[error("invalid {kind} ID: missing ULID after prefix in '{input}'")]
+    MissingUlid { kind: &'static str, input: String },
+    #[error("invalid {kind} ID: bad ULID encoding in '{input}': {reason}")]
+    InvalidUlid {
+        kind: &'static str,
+        input: String,
+        reason: String,
+    },
 }
 
-/// Generate a deterministic ID from a prefix + seed (for migrations).
-pub fn deterministic_id(prefix: &str, seed: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    prefix.hash(&mut hasher);
-    seed.hash(&mut hasher);
-    let hash = hasher.finish();
-    format!("{prefix}-{hash:012x}")
+/// Generate a ULID string (26-char Crockford base32, uppercase).
+fn generate_ulid() -> String {
+    ulid::Ulid::new().to_string()
 }
 
-/// Define a typed ID newtype.
-///
-/// Each ID type gets:
-/// - `generate()` — create a new random ID
-/// - `from_string()` / `From<String>` / `From<&str>` — wrap an existing string
-/// - `as_str()` — borrow as `&str`
-/// - `prefix()` — the static prefix (e.g., "vpc")
-/// - `is_valid()` — check if a string looks like this ID type
-/// - `Serialize` / `Deserialize` as transparent strings
-/// - `Display`, `Hash`, `Eq`, `Ord`, `Clone`, `Debug`
+/// Extract the timestamp (milliseconds since epoch) from a ULID string.
+pub fn timestamp_from_ulid(ulid_str: &str) -> Option<u64> {
+    ulid::Ulid::from_string(ulid_str)
+        .ok()
+        .map(|u| u.timestamp_ms())
+}
+
+/// Macro to define a typed ID newtype backed by ULID.
 macro_rules! define_id {
     ($name:ident, $prefix:expr, $doc:expr) => {
         #[doc = $doc]
@@ -60,12 +73,12 @@ macro_rules! define_id {
         pub struct $name(pub String);
 
         impl $name {
-            /// Generate a new random ID.
+            /// Generate a new ID with embedded timestamp + 80 bits of randomness.
             pub fn generate() -> Self {
-                Self(generate_id($prefix))
+                Self(format!(concat!($prefix, "-{}"), generate_ulid()))
             }
 
-            /// Wrap an existing string as this ID type.
+            /// Wrap an existing string. No validation — use `parse()` or `try_from()` for validation.
             pub fn from_string(s: impl Into<String>) -> Self {
                 Self(s.into())
             }
@@ -75,20 +88,55 @@ macro_rules! define_id {
                 &self.0
             }
 
-            /// The prefix for this ID type (e.g., "vpc").
+            /// The prefix for this ID type.
             pub fn prefix() -> &'static str {
                 $prefix
             }
 
-            /// Check if a string looks like a valid ID of this type.
-            pub fn is_valid(s: &str) -> bool {
-                s.starts_with(concat!($prefix, "-")) && s.len() > concat!($prefix, "-").len()
+            /// Extract the ULID portion (after the prefix and dash).
+            pub fn ulid_part(&self) -> Option<&str> {
+                self.0.strip_prefix(concat!($prefix, "-"))
             }
 
-            /// Check if the given input looks like an ID (vs a human name).
-            /// Used for name-or-id resolution.
+            /// Extract the creation timestamp (ms since epoch) from the embedded ULID.
+            pub fn created_at_ms(&self) -> Option<u64> {
+                self.ulid_part().and_then(timestamp_from_ulid)
+            }
+
+            /// Check if a string is a valid ID of this type.
+            pub fn is_valid(s: &str) -> bool {
+                Self::validate(s).is_ok()
+            }
+
+            /// Check if the input looks like an ID of this type (starts with prefix-).
             pub fn looks_like_id(s: &str) -> bool {
                 s.starts_with(concat!($prefix, "-"))
+            }
+
+            /// Full validation.
+            fn validate(s: &str) -> Result<(), IdError> {
+                let prefix_dash = concat!($prefix, "-");
+                if !s.starts_with(prefix_dash) {
+                    return Err(IdError::WrongPrefix {
+                        kind: $prefix,
+                        expected_prefix: $prefix,
+                        input: s.to_string(),
+                    });
+                }
+                let ulid_part = &s[prefix_dash.len()..];
+                if ulid_part.is_empty() {
+                    return Err(IdError::MissingUlid {
+                        kind: $prefix,
+                        input: s.to_string(),
+                    });
+                }
+                // Validate ULID encoding
+                ulid::Ulid::from_string(ulid_part).map_err(|e| IdError::InvalidUlid {
+                    kind: $prefix,
+                    input: s.to_string(),
+                    reason: e.to_string(),
+                })?;
+                Ok(())
             }
         }
 
@@ -126,6 +174,15 @@ macro_rules! define_id {
         impl From<&str> for $name {
             fn from(s: &str) -> Self {
                 Self(s.to_string())
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::validate(s)?;
+                Ok(Self(s.to_string()))
             }
         }
 
@@ -180,8 +237,8 @@ mod tests {
     #[test]
     fn generate_correct_length() {
         let id = VpcId::generate();
-        // "vpc-" (4) + 12 hex chars = 16
-        assert_eq!(id.as_str().len(), 16, "got: {id}");
+        // "vpc-" (4) + 26 ULID chars = 30
+        assert_eq!(id.as_str().len(), 30, "got: {id}");
     }
 
     #[test]
@@ -192,27 +249,88 @@ mod tests {
     }
 
     #[test]
-    fn from_string() {
-        let id = VpcId::from_string("vpc-custom123456");
-        assert_eq!(id.as_str(), "vpc-custom123456");
+    fn generate_sortable_chronologically() {
+        let a = VpcId::generate();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = VpcId::generate();
+        // ULID encodes timestamp first → lexicographic order = chronological order
+        assert!(a.as_str() < b.as_str(), "expected {a} < {b}");
     }
 
     #[test]
-    fn from_str() {
-        let id: VpcId = "vpc-abc".into();
-        assert_eq!(id.as_str(), "vpc-abc");
+    fn created_at_ms_extracts_timestamp() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = VpcId::generate();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let ts = id.created_at_ms().unwrap();
+        assert!(
+            ts >= before && ts <= after,
+            "ts={ts} not in [{before}, {after}]"
+        );
     }
 
     #[test]
-    fn display() {
-        let id = VpcId::from_string("vpc-abc");
-        assert_eq!(format!("{id}"), "vpc-abc");
+    fn from_str_valid() {
+        let id = VpcId::generate();
+        let parsed: VpcId = id.as_str().parse().unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn from_str_wrong_prefix() {
+        let result = "org-01J5A3K7G8MN2P4Q6R9S0T1V2W".parse::<VpcId>();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            IdError::WrongPrefix {
+                expected_prefix, ..
+            } => {
+                assert_eq!(expected_prefix, "vpc");
+            }
+            other => panic!("expected WrongPrefix, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn from_str_missing_ulid() {
+        let result = "vpc-".parse::<VpcId>();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), IdError::MissingUlid { .. }));
+    }
+
+    #[test]
+    fn from_str_invalid_ulid() {
+        let result = "vpc-not_a_valid_ulid!!!!!!!".parse::<VpcId>();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), IdError::InvalidUlid { .. }));
+    }
+
+    #[test]
+    fn from_str_no_prefix() {
+        let result = "my-vpc".parse::<VpcId>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_validated_vs_from_unchecked() {
+        // parse() validates
+        assert!("garbage".parse::<VpcId>().is_err());
+        // From<&str> does not validate (for deserialization compat)
+        let id: VpcId = "garbage".into();
+        assert_eq!(id.as_str(), "garbage");
     }
 
     #[test]
     fn is_valid() {
-        assert!(VpcId::is_valid("vpc-abc123def456"));
-        assert!(!VpcId::is_valid("org-abc123"));
+        let id = VpcId::generate();
+        assert!(VpcId::is_valid(id.as_str()));
+        assert!(!VpcId::is_valid("org-01J5A3K7G8MN2P4Q6R9S0T1V2W"));
         assert!(!VpcId::is_valid("vpc-"));
         assert!(!VpcId::is_valid("vpc"));
         assert!(!VpcId::is_valid("my-vpc"));
@@ -220,34 +338,42 @@ mod tests {
 
     #[test]
     fn looks_like_id() {
-        assert!(VpcId::looks_like_id("vpc-abc123"));
+        assert!(VpcId::looks_like_id("vpc-anything"));
         assert!(!VpcId::looks_like_id("my-vpc"));
         assert!(!VpcId::looks_like_id("vpc"));
     }
 
     #[test]
     fn serde_roundtrip() {
-        let id = VpcId::from_string("vpc-abc123def456");
+        let id = VpcId::generate();
         let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, r#""vpc-abc123def456""#);
         let back: VpcId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+        // Serializes as plain string, not object
+        assert!(json.starts_with('"'));
+    }
+
+    #[test]
+    fn display() {
+        let id = VpcId::generate();
+        let s = format!("{id}");
+        assert!(s.starts_with("vpc-"));
     }
 
     #[test]
     fn eq_with_str() {
-        let id = VpcId::from_string("vpc-abc");
-        assert!(id == "vpc-abc");
-        assert!(id == *"vpc-abc");
-        let s = "vpc-abc".to_string();
+        let id = VpcId::from_string("vpc-test");
+        assert!(id == "vpc-test");
+        assert!(id == *"vpc-test");
+        let s = "vpc-test".to_string();
         assert!(id == s);
     }
 
     #[test]
     fn deref_to_str() {
-        let id = VpcId::from_string("vpc-abc");
-        assert!(id.starts_with("vpc-")); // uses Deref<Target=str>
-        assert_eq!(id.len(), 7);
+        let id = VpcId::generate();
+        assert!(id.starts_with("vpc-"));
+        assert!(id.len() == 30);
     }
 
     #[test]
@@ -256,26 +382,20 @@ mod tests {
         assert_eq!(OrgId::prefix(), "org");
         assert_eq!(HypervisorId::prefix(), "hv");
         assert_eq!(NodeId::prefix(), "node");
+        assert_eq!(MeshId::prefix(), "mesh");
     }
 
     #[test]
-    fn deterministic_id_is_stable() {
-        let a = deterministic_id("vpc", "my-vpc");
-        let b = deterministic_id("vpc", "my-vpc");
-        assert_eq!(a, b);
-        assert!(a.starts_with("vpc-"));
-    }
-
-    #[test]
-    fn deterministic_id_differs_by_seed() {
-        let a = deterministic_id("vpc", "vpc-a");
-        let b = deterministic_id("vpc", "vpc-b");
-        assert_ne!(a, b);
+    fn ulid_part_extracts_correctly() {
+        let id = VpcId::generate();
+        let ulid = id.ulid_part().unwrap();
+        assert_eq!(ulid.len(), 26);
+        // Verify it's valid ULID
+        assert!(ulid::Ulid::from_string(ulid).is_ok());
     }
 
     #[test]
     fn all_types_generate() {
-        // Verify every ID type compiles and generates
         let _ = OrgId::generate();
         let _ = ProjectId::generate();
         let _ = EnvId::generate();
@@ -314,9 +434,25 @@ mod tests {
     fn borrow_str_for_hashmap_lookup() {
         use std::collections::HashMap;
         let mut map: HashMap<VpcId, &str> = HashMap::new();
-        let id = VpcId::from_string("vpc-abc");
+        let id = VpcId::generate();
+        let key = id.as_str().to_string();
         map.insert(id, "test");
-        // Can lookup with &str thanks to Borrow<str>
-        assert!(map.contains_key("vpc-abc"));
+        assert!(map.contains_key(key.as_str()));
+    }
+
+    #[test]
+    fn ord_is_chronological() {
+        let mut ids: Vec<VpcId> = (0..5)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                VpcId::generate()
+            })
+            .collect();
+        let sorted = ids.clone();
+        ids.sort();
+        assert_eq!(
+            ids, sorted,
+            "ULID-based IDs should already be in chronological order"
+        );
     }
 }
