@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use syfrah_core::{EnvId, HypervisorId, OrgId, ProjectId, SnapshotId, VmId, VolumeId};
 
 // ---------------------------------------------------------------------------
 // Storage types (inline until syfrah-core #1178 lands proper typed IDs)
@@ -88,13 +89,15 @@ impl StorageConfig {
 }
 
 /// Scope for storage quotas — either per-org or per-project.
-// TODO: Replace with typed OrgId/ProjectId from syfrah-core once #1178 lands.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QuotaScope {
     /// Quota applies to an entire organisation.
-    Org { org_id: String },
+    Org { org_id: OrgId },
     /// Quota applies to a specific project within an organisation.
-    Project { org_id: String, project_id: String },
+    Project {
+        org_id: OrgId,
+        project_id: ProjectId,
+    },
 }
 
 impl std::fmt::Display for QuotaScope {
@@ -372,26 +375,24 @@ pub enum StateMachineCommand {
     },
 
     // -- Storage (ADR-006 §16) --
-    // TODO: Replace String IDs with typed VolumeId/SnapshotId/VmId/HypervisorId
-    // from syfrah-core once #1178 lands.
     /// Create a new volume. Raft validates quota and name uniqueness within env.
     ///
     /// When `hypervisor_id` is set, the volume is auto-assigned to that node so
     /// the storage reconciler can start ZeroFS immediately (single-node flow).
     CreateVolume {
-        id: String,
+        id: VolumeId,
         name: String,
         size_gb: u32,
-        org_id: String,
-        project_id: String,
-        env_id: String,
+        org_id: OrgId,
+        project_id: ProjectId,
+        env_id: EnvId,
         volume_type: VolumeType,
         /// Optional hypervisor to auto-assign the volume to on creation.
         /// When set, `attached_hypervisor_id` and `placement_generation` are
         /// initialized so the reconciler starts ZeroFS without a separate
         /// VolumeAttach command.
         #[serde(default)]
-        hypervisor_id: Option<String>,
+        hypervisor_id: Option<HypervisorId>,
         /// The zone where this volume's data will live. Determines which
         /// zone-local S3 bucket is used for storage. Typically matches the
         /// hypervisor's zone at creation time.
@@ -401,7 +402,7 @@ pub enum StateMachineCommand {
     /// Mark a volume for deletion (tombstone). Volume must be Available (not attached).
     /// With `cascade: true`, all snapshots referencing this volume are deleted first.
     DeleteVolume {
-        volume_id: String,
+        volume_id: VolumeId,
         /// If true, delete all snapshots derived from this volume before deleting.
         #[serde(default)]
         cascade: bool,
@@ -414,45 +415,45 @@ pub enum StateMachineCommand {
     /// single-writer invariant — the volume must be Available.
     /// Increments `placement_generation` for fencing.
     VolumeAttach {
-        volume_id: String,
-        vm_id: String,
-        hypervisor_id: String,
+        volume_id: VolumeId,
+        vm_id: VmId,
+        hypervisor_id: HypervisorId,
     },
     /// Detach a volume from its current VM. Volume must be Attached.
     VolumeDetach {
-        volume_id: String,
+        volume_id: VolumeId,
     },
     /// Resize a volume (grow only, no shrink in v1). Volume must be Available.
     ResizeVolume {
-        volume_id: String,
+        volume_id: VolumeId,
         new_size_gb: u32,
     },
     /// Record a crash-consistent snapshot. Increments SST refcounts.
     CreateSnapshot {
-        id: String,
-        source_volume_id: String,
+        id: SnapshotId,
+        source_volume_id: VolumeId,
         sst_files: Vec<String>,
         wal_position: u64,
     },
     /// Delete a snapshot. Decrements SST refcounts; GC reclaims unreachable SSTs.
     DeleteSnapshot {
-        snapshot_id: String,
+        snapshot_id: SnapshotId,
     },
     /// Restore a snapshot into a new volume with a fresh generation.
     RestoreSnapshot {
-        snapshot_id: String,
-        new_volume_id: String,
+        snapshot_id: SnapshotId,
+        new_volume_id: VolumeId,
         new_volume_name: String,
     },
     /// Mark a snapshot as having a restore in progress. While this flag
     /// is set, `DeleteSnapshot` will be rejected for this snapshot.
     MarkRestoreBegin {
-        snapshot_id: String,
+        snapshot_id: SnapshotId,
     },
     /// Clear the restore-in-progress flag for a snapshot. Called by the
     /// reconciler once the restored volume is fully materialized.
     MarkRestoreComplete {
-        snapshot_id: String,
+        snapshot_id: SnapshotId,
     },
     /// Set per-zone S3 storage configuration (replicated to all nodes).
     /// NOTE: The encryption_passphrase is NOT included — it is stored locally
@@ -494,11 +495,11 @@ pub enum StateMachineCommand {
     /// The volume remains in `Attached` state throughout — only the
     /// hypervisor assignment and generation change (zero-copy migration).
     RescheduleVolume {
-        volume_id: String,
-        from_hypervisor: String,
-        to_hypervisor: String,
+        volume_id: VolumeId,
+        from_hypervisor: HypervisorId,
+        to_hypervisor: HypervisorId,
         /// New VM ID on the target hypervisor (may differ if the VM was re-created).
-        new_vm_id: String,
+        new_vm_id: VmId,
     },
 
     /// Begin a cross-zone volume migration (S3-to-S3 copy).
@@ -511,15 +512,15 @@ pub enum StateMachineCommand {
     /// Security: validates that both zone configs exist and that the caller
     /// specifies the correct source zone for the volume's current region.
     MigrateVolumeToZone {
-        volume_id: String,
+        volume_id: VolumeId,
         /// Region key for the source zone's StorageConfig.
         source_zone: String,
         /// Region key for the target zone's StorageConfig.
         target_zone: String,
         /// Target hypervisor where the volume will be placed after migration.
-        target_hypervisor: String,
+        target_hypervisor: HypervisorId,
         /// Target VM ID (optional — may be re-attached later).
-        target_vm_id: Option<String>,
+        target_vm_id: Option<VmId>,
     },
 
     /// Mark a cross-zone migration as complete.
@@ -528,7 +529,7 @@ pub enum StateMachineCommand {
     /// zone, updates the hypervisor assignment, and clears migration metadata.
     /// Only succeeds if the volume is currently in `Migrating` state.
     CompleteMigration {
-        volume_id: String,
+        volume_id: VolumeId,
     },
 
     /// Roll back a failed cross-zone migration.
@@ -537,7 +538,7 @@ pub enum StateMachineCommand {
     /// on the source zone. Clears migration metadata. Only succeeds if the
     /// volume is currently in `Migrating` state.
     RollbackMigration {
-        volume_id: String,
+        volume_id: VolumeId,
         /// Reason for the rollback (logged for audit).
         reason: String,
     },
@@ -549,11 +550,11 @@ pub enum StateMachineCommand {
     /// - `manifest_version` == last committed version + 1 (strict sequential)
     /// - `published_by` matches the hypervisor the volume is attached to
     CommitManifest {
-        volume_id: String,
+        volume_id: VolumeId,
         generation: u64,
         manifest_version: u64,
         s3_key: String,
-        published_by: String,
+        published_by: HypervisorId,
     },
 
     // -- GC --

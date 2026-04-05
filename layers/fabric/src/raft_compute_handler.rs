@@ -805,14 +805,14 @@ impl RaftComputeHandler {
         };
 
         let cmd = StateMachineCommand::CreateVolume {
-            id: root_volume_id.clone(),
+            id: root_volume_id.clone().into(),
             name: root_volume_name,
             size_gb,
-            org_id,
-            project_id,
-            env_id,
+            org_id: org_id.into(),
+            project_id: project_id.into(),
+            env_id: env_id.into(),
             volume_type: VolumeType::Root,
-            hypervisor_id: Some(target_hypervisor.to_string()),
+            hypervisor_id: Some(target_hypervisor.to_string().into()),
             zone: None, // TODO(#1282): inherit zone from target hypervisor
         };
 
@@ -877,7 +877,7 @@ impl RaftComputeHandler {
                         .as_secs();
 
                     let cmd = StateMachineCommand::DeleteVolume {
-                        volume_id: vol_id.clone(),
+                        volume_id: vol_id.clone().into(),
                         cascade: true,
                         deleted_at: now,
                     };

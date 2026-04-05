@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -48,15 +49,46 @@ macro_rules! define_id {
             }
         }
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self(String::new())
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 self.0.fmt(f)
             }
         }
 
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0
+            }
+        }
+
+        impl Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
             }
         }
 

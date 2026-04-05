@@ -320,18 +320,19 @@ impl StorageLayerHandler {
                 let volume_id = format!("vol-{}", short_id());
                 // Auto-assign volume to the local hypervisor so the storage
                 // reconciler starts ZeroFS immediately (single-node flow).
-                let hypervisor_id = if self.local_node_name.is_empty() {
-                    None
-                } else {
-                    Some(self.local_node_name.clone())
-                };
+                let hypervisor_id: Option<syfrah_core::HypervisorId> =
+                    if self.local_node_name.is_empty() {
+                        None
+                    } else {
+                        Some(self.local_node_name.clone().into())
+                    };
                 let cmd = StateMachineCommand::CreateVolume {
-                    id: volume_id.clone(),
+                    id: volume_id.clone().into(),
                     name: name.clone(),
                     size_gb: size_gb as u32,
-                    org_id: org,
-                    project_id: project,
-                    env_id,
+                    org_id: org.into(),
+                    project_id: project.into(),
+                    env_id: env_id.into(),
                     volume_type: syfrah_controlplane::commands::VolumeType::Data,
                     hypervisor_id,
                     zone: None, // TODO(#1282): pass zone from request context
@@ -372,7 +373,7 @@ impl StorageLayerHandler {
                     .unwrap_or_default()
                     .as_secs();
                 let cmd = StateMachineCommand::DeleteVolume {
-                    volume_id,
+                    volume_id: volume_id.into(),
                     cascade,
                     deleted_at: now,
                 };
@@ -392,7 +393,7 @@ impl StorageLayerHandler {
                     Err(e) => return StorageResponse::Error(e),
                 };
                 let cmd = StateMachineCommand::ResizeVolume {
-                    volume_id: volume_id.clone(),
+                    volume_id: volume_id.clone().into(),
                     new_size_gb: size_gb as u32,
                 };
                 match self.submit_raft(cmd).await {
@@ -423,9 +424,9 @@ impl StorageLayerHandler {
                     Err(e) => return StorageResponse::Error(e),
                 };
                 let cmd = StateMachineCommand::VolumeAttach {
-                    volume_id: volume_id.clone(),
-                    vm_id: vm,
-                    hypervisor_id: self.local_node_name.clone(),
+                    volume_id: volume_id.clone().into(),
+                    vm_id: vm.into(),
+                    hypervisor_id: self.local_node_name.clone().into(),
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {
@@ -448,7 +449,7 @@ impl StorageLayerHandler {
                     Err(e) => return StorageResponse::Error(e),
                 };
                 let cmd = StateMachineCommand::VolumeDetach {
-                    volume_id: volume_id.clone(),
+                    volume_id: volume_id.clone().into(),
                 };
                 match self.submit_raft(cmd).await {
                     Ok(_) => {
@@ -515,8 +516,8 @@ impl StorageLayerHandler {
                 // The Raft command records the snapshot metadata; the actual
                 // data lives in the ZeroFS checkpoint on S3.
                 let cmd = StateMachineCommand::CreateSnapshot {
-                    id: snapshot_id.clone(),
-                    source_volume_id: volume_id,
+                    id: snapshot_id.clone().into(),
+                    source_volume_id: volume_id.into(),
                     sst_files: vec![],
                     wal_position: 0,
                 };
@@ -545,7 +546,9 @@ impl StorageLayerHandler {
                     Ok(id) => id,
                     Err(e) => return StorageResponse::Error(e),
                 };
-                let cmd = StateMachineCommand::DeleteSnapshot { snapshot_id };
+                let cmd = StateMachineCommand::DeleteSnapshot {
+                    snapshot_id: snapshot_id.into(),
+                };
                 match self.submit_raft(cmd).await {
                     Ok(_) => StorageResponse::Ok,
                     Err(e) => StorageResponse::Error(e),
@@ -555,8 +558,8 @@ impl StorageLayerHandler {
             StorageRequest::SnapshotRestore { snapshot, name } => {
                 let new_volume_id = format!("vol-{}", short_id());
                 let cmd = StateMachineCommand::RestoreSnapshot {
-                    snapshot_id: snapshot,
-                    new_volume_id: new_volume_id.clone(),
+                    snapshot_id: snapshot.into(),
+                    new_volume_id: new_volume_id.clone().into(),
                     new_volume_name: name.clone(),
                 };
                 match self.submit_raft(cmd).await {

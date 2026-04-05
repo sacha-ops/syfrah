@@ -974,13 +974,13 @@ impl VolumeStateReader for RaftVolumeStateReader {
                 assigned_here && startable_state
             })
             .map(|vol| DesiredVolume {
-                id: vol.id.clone(),
+                id: vol.id.0.clone(),
                 name: vol.name.clone(),
                 size_gb: vol.size_gb,
                 placement_generation: vol.placement_generation,
                 hypervisor_id: local_hypervisor_id.to_string(),
                 zone: vol.zone.clone().unwrap_or_default(),
-                vm_id: vol.attached_vm_id.clone(),
+                vm_id: vol.attached_vm_id.as_ref().map(|id| id.0.clone()),
             })
             .collect()
     }
@@ -1003,8 +1003,12 @@ impl VolumeStateReader for RaftVolumeStateReader {
                     && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
             })
             .map(|vol| DesiredDetach {
-                volume_id: vol.id.clone(),
-                vm_id: vol.attached_vm_id.clone().unwrap_or_default(),
+                volume_id: vol.id.0.clone(),
+                vm_id: vol
+                    .attached_vm_id
+                    .as_ref()
+                    .map(|id| id.0.clone())
+                    .unwrap_or_default(),
                 // CH device ID follows the naming convention used during attach.
                 ch_device_id: format!("_disk_{}", vol.id),
                 force: false,
@@ -1027,7 +1031,7 @@ impl VolumeStateReader for RaftVolumeStateReader {
                 vol.state == syfrah_controlplane::VolumeState::Deleted
                     && vol.attached_hypervisor_id.as_deref() == Some(local_hypervisor_id)
             })
-            .map(|vol| vol.id.clone())
+            .map(|vol| vol.id.0.clone())
             .collect()
     }
 
