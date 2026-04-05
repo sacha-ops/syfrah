@@ -51,7 +51,50 @@ pub async fn dispatch(
         .unwrap_or(false);
 
     let scope = extract_scope(def, matches);
-    let fields = extract_fields(def, op, matches);
+    let mut fields = extract_fields(def, op, matches);
+
+    // ── 1b. Interactive prompts for missing required args ──
+    //
+    // If stdin is a TTY and required args are missing, prompt interactively
+    // instead of returning an error. Non-TTY (pipe/script) still fails fast.
+
+    if crate::ui::prompt::is_interactive() && !json {
+        // Check operation-specific args
+        for arg in &op.args {
+            if arg.required && !fields.contains_key(arg.name) {
+                if let super::operation::ArgSource::Custom(ref field_def) = arg.source {
+                    if let Ok(Some(val)) = crate::ui::prompt::prompt_field(
+                        arg.name,
+                        arg.description,
+                        &field_def.field_type,
+                        field_def.default,
+                    ) {
+                        fields.insert(arg.name.to_string(), val);
+                    }
+                }
+            }
+        }
+
+        // Check schema fields that are required for create
+        if matches!(op.semantics, super::operation::OperationSemantics::Create) {
+            for field in &def.schema.fields {
+                if field.mutability != crate::resource::Mutability::ReadOnly
+                    && field.mutability != crate::resource::Mutability::Internal
+                    && field.default.is_none()
+                    && !fields.contains_key(field.name)
+                {
+                    if let Ok(Some(val)) = crate::ui::prompt::prompt_field(
+                        field.name,
+                        field.description,
+                        &field.field_type,
+                        field.default,
+                    ) {
+                        fields.insert(field.name.to_string(), val);
+                    }
+                }
+            }
+        }
+    }
 
     // ── 2. Validate constraints → ValidatedRequest ──
 

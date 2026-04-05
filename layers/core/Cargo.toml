@@ -19,6 +19,7 @@ console = "0.15"
 indicatif = "0.17"
 terminal_size = "0.4"
 unicode-width = "0.2"
+dialoguer = "0.11"
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

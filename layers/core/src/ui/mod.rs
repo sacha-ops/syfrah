@@ -11,12 +11,14 @@
 
 mod color;
 mod confirm;
+pub mod prompt;
 mod spinner;
 mod table;
 mod time_fmt;
 
 pub use color::*;
 pub use confirm::*;
+pub use prompt::*;
 pub use spinner::*;
 pub use table::*;
 pub use time_fmt::*;
