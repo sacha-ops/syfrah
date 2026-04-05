@@ -1534,7 +1534,7 @@ impl RedbStateMachine {
                             .unwrap_or_default()
                             .as_secs();
                         let hv = syfrah_org::Hypervisor {
-                            id: syfrah_org::HypervisorId(format!("hv-{name}")),
+                            id: syfrah_org::HypervisorId::generate(),
                             name: name.clone(),
                             region: region.clone(),
                             zone: zone.clone(),
