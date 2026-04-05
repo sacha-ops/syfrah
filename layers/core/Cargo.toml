@@ -36,6 +36,7 @@ toml = "0.8"
 async-trait = "0.1"
 dirs = "5"
 libc = "0.2"
+nix = { version = "0.29", features = ["process"] }
 
 [dev-dependencies]
 serde_json.workspace = true

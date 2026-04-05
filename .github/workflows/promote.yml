@@ -1,0 +1,88 @@
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Source tag to promote (e.g., v2.1.0-dev.47)'
+        required: true
+        type: string
+      target_channel:
+        description: 'Target channel'
+        required: true
+        type: choice
+        options:
+          - beta
+          - rc
+          - stable
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.source_tag }} → ${{ inputs.target_channel }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Calculate target version
+        id: version
+        run: |
+          SOURCE="${{ inputs.source_tag }}"
+          CHANNEL="${{ inputs.target_channel }}"
+
+          # Extract base version (strip v prefix and pre-release suffix)
+          BASE=$(echo "${SOURCE#v}" | sed 's/-.*//')
+
+          if [ "$CHANNEL" = "stable" ]; then
+            TARGET_TAG="v${BASE}"
+          else
+            # Count existing releases in target channel
+            N=$(git tag --list "v${BASE}-${CHANNEL}.*" | wc -l)
+            N=$((N + 1))
+            TARGET_TAG="v${BASE}-${CHANNEL}.${N}"
+          fi
+
+          # Check tag doesn't exist
+          if git rev-parse "$TARGET_TAG" >/dev/null 2>&1; then
+            echo "Tag $TARGET_TAG already exists!"
+            exit 1
+          fi
+
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Promoting $SOURCE → $TARGET_TAG"
+
+      - name: Download source artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          gh release download "${{ inputs.source_tag }}" -D artifacts/
+
+      - name: Create promoted release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET="${{ steps.version.outputs.target }}"
+          CHANNEL="${{ steps.version.outputs.channel }}"
+
+          # Create tag at the same commit as source
+          SOURCE_SHA=$(git rev-list -n 1 "${{ inputs.source_tag }}")
+          git tag "$TARGET" "$SOURCE_SHA"
+          git push origin "$TARGET"
+
+          # Determine if this is a pre-release or latest
+          PRERELEASE="--prerelease"
+          if [ "$CHANNEL" = "stable" ]; then
+            PRERELEASE="--latest"
+          fi
+
+          # Create release with same artifacts
+          gh release create "$TARGET" \
+            --title "$TARGET" \
+            $PRERELEASE \
+            --notes "Promoted from ${{ inputs.source_tag }} to $CHANNEL channel" \
+            artifacts/*

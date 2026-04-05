@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::error::SyfrahError;
@@ -234,6 +235,116 @@ impl Default for FeatureFlags {
     }
 }
 
+// ═══════════════════════════════════════════════════
+// 5. Version compatibility
+// ═══════════════════════════════════════════════════
+
+/// Check if two versions are compatible for cluster membership.
+///
+/// Rule: nodes must share the same major version.
+/// Minor/patch differences are allowed (rolling upgrades).
+pub fn is_compatible(a: &Version, b: &Version) -> bool {
+    a.major == b.major
+}
+
+/// Version compatibility result with details.
+#[derive(Debug, Clone)]
+pub enum Compatibility {
+    /// Fully compatible — same major.minor
+    Compatible,
+    /// Compatible but different minor — may have feature differences
+    MinorDifference { local: String, remote: String },
+    /// Incompatible — different major version
+    Incompatible { local: String, remote: String },
+}
+
+/// Check detailed compatibility between local and remote version.
+pub fn check_compatibility(local: &Version, remote: &Version) -> Compatibility {
+    if local.major != remote.major {
+        return Compatibility::Incompatible {
+            local: local.to_string(),
+            remote: remote.to_string(),
+        };
+    }
+    if local.minor != remote.minor {
+        return Compatibility::MinorDifference {
+            local: local.to_string(),
+            remote: remote.to_string(),
+        };
+    }
+    Compatibility::Compatible
+}
+
+// ═══════════════════════════════════════════════════
+// 4. Changelog between versions
+// ═══════════════════════════════════════════════════
+
+/// Version diff — what changed between two versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionDiff {
+    pub from: String,
+    pub to: String,
+    pub channel_change: Option<(String, String)>,
+    pub is_upgrade: bool,
+    pub is_downgrade: bool,
+    pub major_bump: bool,
+    pub minor_bump: bool,
+    pub patch_bump: bool,
+}
+
+impl VersionDiff {
+    pub fn between(from: &Version, to: &Version) -> Self {
+        let channel_change = if from.channel != to.channel {
+            Some((from.channel.to_string(), to.channel.to_string()))
+        } else {
+            None
+        };
+
+        Self {
+            from: from.to_string(),
+            to: to.to_string(),
+            channel_change,
+            is_upgrade: to > from,
+            is_downgrade: to < from,
+            major_bump: to.major > from.major,
+            minor_bump: to.major == from.major && to.minor > from.minor,
+            patch_bump: to.major == from.major && to.minor == from.minor && to.patch > from.patch,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 3. Rollback support
+// ═══════════════════════════════════════════════════
+
+/// Path to the backup binary (for rollback).
+pub fn backup_binary_path() -> PathBuf {
+    crate::process::syfrah_dir().join("syfrah.backup")
+}
+
+/// Create a backup of the current binary before update.
+pub fn backup_current_binary() -> Result<(), SyfrahError> {
+    let current = std::env::current_exe()
+        .map_err(|e| SyfrahError::internal(format!("failed to get current exe: {e}")))?;
+    let backup = backup_binary_path();
+    std::fs::copy(&current, &backup)
+        .map_err(|e| SyfrahError::internal(format!("failed to backup binary: {e}")))?;
+    Ok(())
+}
+
+/// Rollback to the backup binary.
+pub fn rollback() -> Result<(), SyfrahError> {
+    let backup = backup_binary_path();
+    if !backup.exists() {
+        return Err(SyfrahError::not_found("binary", "syfrah.backup"));
+    }
+    let current = std::env::current_exe()
+        .map_err(|e| SyfrahError::internal(format!("failed to get current exe: {e}")))?;
+    std::fs::copy(&backup, &current)
+        .map_err(|e| SyfrahError::internal(format!("rollback failed: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +530,100 @@ mod tests {
         let c = Channel::Beta;
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, "\"beta\"");
+    }
+
+    // ── #5: Compatibility ──
+
+    #[test]
+    fn compatible_same_major() {
+        let a = Version::parse("2.0.0").unwrap();
+        let b = Version::parse("2.5.3").unwrap();
+        assert!(is_compatible(&a, &b));
+    }
+
+    #[test]
+    fn incompatible_different_major() {
+        let a = Version::parse("2.0.0").unwrap();
+        let b = Version::parse("3.0.0").unwrap();
+        assert!(!is_compatible(&a, &b));
+    }
+
+    #[test]
+    fn check_compatibility_compatible() {
+        let a = Version::parse("2.1.0").unwrap();
+        let b = Version::parse("2.1.5").unwrap();
+        assert!(matches!(
+            check_compatibility(&a, &b),
+            Compatibility::Compatible
+        ));
+    }
+
+    #[test]
+    fn check_compatibility_minor_diff() {
+        let a = Version::parse("2.1.0").unwrap();
+        let b = Version::parse("2.3.0").unwrap();
+        assert!(matches!(
+            check_compatibility(&a, &b),
+            Compatibility::MinorDifference { .. }
+        ));
+    }
+
+    #[test]
+    fn check_compatibility_incompatible() {
+        let a = Version::parse("2.0.0").unwrap();
+        let b = Version::parse("3.0.0").unwrap();
+        assert!(matches!(
+            check_compatibility(&a, &b),
+            Compatibility::Incompatible { .. }
+        ));
+    }
+
+    // ── #4: Version diff ──
+
+    #[test]
+    fn version_diff_upgrade() {
+        let from = Version::parse("2.0.0").unwrap();
+        let to = Version::parse("2.1.0").unwrap();
+        let diff = VersionDiff::between(&from, &to);
+        assert!(diff.is_upgrade);
+        assert!(!diff.is_downgrade);
+        assert!(diff.minor_bump);
+        assert!(!diff.major_bump);
+    }
+
+    #[test]
+    fn version_diff_downgrade() {
+        let from = Version::parse("2.1.0").unwrap();
+        let to = Version::parse("2.0.0").unwrap();
+        let diff = VersionDiff::between(&from, &to);
+        assert!(diff.is_downgrade);
+        assert!(!diff.is_upgrade);
+    }
+
+    #[test]
+    fn version_diff_channel_change() {
+        let from = Version::parse("2.1.0-dev.47").unwrap();
+        let to = Version::parse("2.1.0-beta.1").unwrap();
+        let diff = VersionDiff::between(&from, &to);
+        assert!(diff.channel_change.is_some());
+        let (from_ch, to_ch) = diff.channel_change.unwrap();
+        assert_eq!(from_ch, "dev");
+        assert_eq!(to_ch, "beta");
+    }
+
+    #[test]
+    fn version_diff_major_bump() {
+        let from = Version::parse("2.5.0").unwrap();
+        let to = Version::parse("3.0.0").unwrap();
+        let diff = VersionDiff::between(&from, &to);
+        assert!(diff.major_bump);
+    }
+
+    // ── #3: Rollback ──
+
+    #[test]
+    fn backup_path() {
+        let p = backup_binary_path();
+        assert!(p.to_str().unwrap().contains("syfrah.backup"));
     }
 }
