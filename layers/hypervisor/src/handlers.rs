@@ -79,7 +79,7 @@ pub fn handler() -> HandlerFn {
                 "leave" => handle_leave().await,
                 "list" => handle_list().await,
                 "get" => handle_get(req).await,
-                "join" => Ok(OperationResponse::Message("join: needs peering TCP — not yet implemented".into())),
+                "join" => handle_join(req).await,
                 "drain" => Ok(OperationResponse::Message("drain: not yet implemented".into())),
                 "enable" => Ok(OperationResponse::Message("enable: not yet implemented".into())),
                 other => Ok(OperationResponse::Message(format!("unknown: {other}"))),
@@ -138,6 +138,50 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
         "state": "available",
         "secret": result.secret_masked,
+    })))
+}
+
+async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse> {
+    let target = req
+        .fields
+        .get("target")
+        .ok_or_else(|| anyhow::anyhow!("missing required field: target"))?
+        .clone();
+    let region = req
+        .fields
+        .get("region")
+        .map(|s| s.as_str())
+        .unwrap_or("default");
+    let zone = req
+        .fields
+        .get("zone")
+        .map(|s| s.as_str())
+        .unwrap_or("default");
+    let port: u16 = req
+        .fields
+        .get("port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(51820);
+    let pin = req.fields.get("pin").map(|s| s.as_str());
+
+    let node_name = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .map(|h| h.to_lowercase())
+        .unwrap_or_else(|| "node".to_string());
+
+    let db = open_db()?;
+    let result = fabric::ops::join(&db, &target, &node_name, region, zone, port, pin).await?;
+
+    Ok(OperationResponse::Resource(serde_json::json!({
+        "name": result.hypervisor.name,
+        "id": result.hypervisor.id.as_str(),
+        "mesh": result.mesh_name,
+        "region": format!("{} · {}", region, zone),
+        "zone": zone,
+        "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
+        "state": "available",
+        "peers": result.peer_count,
     })))
 }
 
