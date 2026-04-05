@@ -1,7 +1,7 @@
 //! Hypervisor resource definition + handlers.
 //!
-//! No daemon. Each command configures system services and exits.
-//! WireGuard runs in the kernel, not in a process.
+//! Handlers delegate to fabric::ops. No plumbing here — just
+//! translate OperationRequest → fabric call → OperationResponse.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,7 +31,6 @@ pub fn resource_def() -> ResourceDef {
             .op(|op| op
                 .with_arg(OperationArg::required("target", FieldDef::string("target", "IP or IP:port of an existing node")))
                 .with_arg(OperationArg::optional("pin", FieldDef::string("pin", "PIN for auto-accept")))
-                .with_arg(OperationArg::optional("name", FieldDef::string("name", "Node name (default: hostname)")))
                 .with_arg(OperationArg::optional("region", FieldDef::string("region", "Region label").with_default("default")))
                 .with_arg(OperationArg::optional("zone", FieldDef::string("zone", "Zone label").with_default("default")))
                 .with_arg(OperationArg::optional("port", FieldDef::integer("port", "WireGuard listen port").with_default("51820")))
@@ -40,18 +39,15 @@ pub fn resource_def() -> ResourceDef {
             )
         .action("status", "Show hypervisor status")
             .op(|op| op.with_output(OutputKind::Resource))
-        // CRUD
-        .list()
-            .op(|op| op.with_example("syfrah hypervisor list"))
-        .get()
-            .op(|op| op.with_example("syfrah hypervisor get HYPERVISOR-1"))
-        // Service management (orchestrates systemd, not a daemon)
         .action("start", "Start the WireGuard service")
         .action("stop", "Stop the WireGuard service")
         .action("leave", "Leave the cluster, uninstall WireGuard service")
             .op(|op| op.with_confirm())
-        .action("drain", "Evacuate all VMs before maintenance")
-            .op(|op| op.with_confirm())
+        // CRUD
+        .list().op(|op| op.with_example("syfrah hypervisor list"))
+        .get().op(|op| op.with_example("syfrah hypervisor get HYPERVISOR-1"))
+        // Future
+        .action("drain", "Evacuate all VMs before maintenance").op(|op| op.with_confirm())
         .action("enable", "Enable for VM scheduling")
         // Table
         .column("NAME", "name")
@@ -61,7 +57,6 @@ pub fn resource_def() -> ResourceDef {
         .column("MEMORY", "memory")
         .column("VMs", "vms")
         .empty_message("No hypervisors found. Initialize with: syfrah hypervisor init --name <mesh>")
-        // Detail
         .detail_section(None, vec![
             DetailField::new("Name", "name"),
             DetailField::new("ID", "id"),
@@ -73,29 +68,26 @@ pub fn resource_def() -> ResourceDef {
         .done()
 }
 
-/// Build the handler.
 pub fn handler() -> HandlerFn {
     Box::new(|req: OperationRequest| -> Pin<Box<dyn Future<Output = anyhow::Result<OperationResponse>> + Send>> {
         Box::pin(async move {
             match req.operation.as_str() {
                 "init" => handle_init(req).await,
-                "status" => handle_status(req).await,
-                "list" => handle_list(req).await,
+                "status" => handle_status().await,
+                "start" => handle_start().await,
+                "stop" => handle_stop().await,
+                "leave" => handle_leave().await,
+                "list" => handle_list().await,
                 "get" => handle_get(req).await,
-                "leave" => handle_leave(req).await,
-                // Stubs
-                "start" => handle_start(req).await,
-                "stop" => handle_stop(req).await,
-                "join" => Ok(OperationResponse::Message("join not yet implemented — needs peering TCP server on target".into())),
-                "drain" => Ok(OperationResponse::Message("drain not yet implemented".into())),
-                "enable" => Ok(OperationResponse::Message("enable not yet implemented".into())),
-                other => Ok(OperationResponse::Message(format!("unknown operation: {other}"))),
+                "join" => Ok(OperationResponse::Message("join: needs peering TCP — not yet implemented".into())),
+                "drain" => Ok(OperationResponse::Message("drain: not yet implemented".into())),
+                "enable" => Ok(OperationResponse::Message("enable: not yet implemented".into())),
+                other => Ok(OperationResponse::Message(format!("unknown: {other}"))),
             }
         })
     })
 }
 
-/// Build the ResourceRegistration.
 pub fn registration() -> ResourceRegistration {
     ResourceRegistration {
         def: resource_def(),
@@ -104,7 +96,7 @@ pub fn registration() -> ResourceRegistration {
 }
 
 // ═══════════════════════════════════════════════════
-// Handlers
+// Thin handlers — delegate to fabric::ops
 // ═══════════════════════════════════════════════════
 
 async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse> {
@@ -134,97 +126,65 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .map(|h| h.to_lowercase())
         .unwrap_or_else(|| "node".to_string());
 
-    // Check not already initialized
     let db = open_db()?;
-    if fabric::state::FabricState::exists(&db).map_err(|e| anyhow::anyhow!("{e}"))? {
-        anyhow::bail!("already initialized. Run 'syfrah hypervisor leave' first.");
-    }
-
-    // Create mesh + hypervisor identity
-    let (mesh, secret) = fabric::mesh::create_mesh(mesh_name)?;
-    let hv = fabric::mesh::create_hypervisor(&node_name, region, zone, port, None, &mesh.prefix)?;
-
-    // Install and start WireGuard as a systemd service
-    fabric::service::install(&hv.wg_private_key, port, &hv.mesh_ipv6, &[])?;
-    fabric::service::enable_and_start()?;
-
-    // Persist state
-    let state = fabric::state::FabricState {
-        mesh: mesh.clone(),
-        hypervisor: hv.clone(),
-        secret: secret.to_string(),
-        peers: fabric::peer::PeerList::new(),
-    };
-    state.save(&db).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_str = secret.to_string();
-    let secret_masked = format!(
-        "{}...{}",
-        &secret_str[..10],
-        &secret_str[secret_str.len() - 4..]
-    );
+    let result = fabric::ops::init(&db, mesh_name, &node_name, region, zone, port)?;
 
     Ok(OperationResponse::Resource(serde_json::json!({
-        "name": hv.name,
-        "id": hv.id.as_str(),
-        "mesh": mesh.name,
+        "name": result.hypervisor.name,
+        "id": result.hypervisor.id.as_str(),
+        "mesh": result.mesh.name,
         "region": format!("{} · {}", region, zone),
         "zone": zone,
-        "mesh_ipv6": hv.mesh_ipv6.to_string(),
-        "wg_port": port,
+        "mesh_ipv6": result.hypervisor.mesh_ipv6.to_string(),
         "state": "available",
-        "secret": secret_masked,
+        "secret": result.secret_masked,
     })))
 }
 
-async fn handle_status(_req: OperationRequest) -> anyhow::Result<OperationResponse> {
+async fn handle_status() -> anyhow::Result<OperationResponse> {
     let db = open_db()?;
-    let state = fabric::state::FabricState::load(&db)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .ok_or_else(|| anyhow::anyhow!("not initialized. Run 'syfrah hypervisor init' first."))?;
+    let s = fabric::ops::status(&db)?;
 
-    // Read live service + WireGuard status
-    let svc_active = fabric::service::is_active();
-    let svc_installed = fabric::service::is_installed();
-    let wg_up = fabric::wg::interface_exists();
-    let wg_info = if wg_up {
-        fabric::wg::get_status().ok()
-    } else {
-        None
-    };
-
-    let interface_state = if svc_active && wg_up {
-        "available"
-    } else if svc_installed {
-        "stopped"
-    } else {
-        "not installed"
-    };
-
-    let mut info = serde_json::json!({
-        "name": state.hypervisor.name,
-        "id": state.hypervisor.id.as_str(),
-        "mesh": state.mesh.name,
-        "region": state.hypervisor.region,
-        "zone": state.hypervisor.zone,
-        "mesh_ipv6": state.hypervisor.mesh_ipv6.to_string(),
-        "state": interface_state,
-        "peers": state.peers.len(),
-        "active_peers": state.peers.active_count(),
-        "wg_interface": wg_up,
-    });
-
-    if let Some(wg) = wg_info {
-        info["wg_port"] = serde_json::json!(wg.listen_port);
-        info["wg_peers"] = serde_json::json!(wg.peer_count);
-        info["rx_bytes"] = serde_json::json!(wg.rx_bytes);
-        info["tx_bytes"] = serde_json::json!(wg.tx_bytes);
-    }
-
-    Ok(OperationResponse::Resource(info))
+    Ok(OperationResponse::Resource(serde_json::json!({
+        "name": s.hypervisor_name,
+        "id": s.hypervisor_id,
+        "mesh": s.mesh_name,
+        "region": s.region,
+        "zone": s.zone,
+        "mesh_ipv6": s.mesh_ipv6,
+        "state": s.state,
+        "service": if s.service_active { "running" } else { "stopped" },
+        "wg_interface": s.wg_interface_up,
+        "peers": s.peer_count,
+        "wg_port": s.wg_port,
+        "rx_bytes": s.rx_bytes,
+        "tx_bytes": s.tx_bytes,
+    })))
 }
 
-async fn handle_list(_req: OperationRequest) -> anyhow::Result<OperationResponse> {
+async fn handle_start() -> anyhow::Result<OperationResponse> {
+    fabric::ops::start()?;
+    Ok(OperationResponse::Message(
+        "WireGuard service started.".into(),
+    ))
+}
+
+async fn handle_stop() -> anyhow::Result<OperationResponse> {
+    fabric::ops::stop()?;
+    Ok(OperationResponse::Message(
+        "WireGuard service stopped.".into(),
+    ))
+}
+
+async fn handle_leave() -> anyhow::Result<OperationResponse> {
+    let db = open_db()?;
+    fabric::ops::leave(&db)?;
+    Ok(OperationResponse::Message(
+        "left the cluster. WireGuard service uninstalled.".into(),
+    ))
+}
+
+async fn handle_list() -> anyhow::Result<OperationResponse> {
     let db = open_db()?;
     let state = match fabric::state::FabricState::load(&db).map_err(|e| anyhow::anyhow!("{e}"))? {
         Some(s) => s,
@@ -261,22 +221,19 @@ async fn handle_get(req: OperationRequest) -> anyhow::Result<OperationResponse> 
     let name = req
         .name
         .ok_or_else(|| anyhow::anyhow!("missing hypervisor name"))?;
-
     let db = open_db()?;
     let state = fabric::state::FabricState::load(&db)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .ok_or_else(|| anyhow::anyhow!("not initialized"))?;
 
     if state.hypervisor.name == name {
-        let wg_up = fabric::wg::interface_exists();
         return Ok(OperationResponse::Resource(serde_json::json!({
             "name": state.hypervisor.name,
             "id": state.hypervisor.id.as_str(),
             "region": state.hypervisor.region,
             "zone": state.hypervisor.zone,
             "mesh_ipv6": state.hypervisor.mesh_ipv6.to_string(),
-            "state": if wg_up { "available" } else { "down" },
-            "wg_port": state.hypervisor.wg_port,
+            "state": if fabric::wg::interface_exists() { "available" } else { "down" },
         })));
     }
 
@@ -291,52 +248,6 @@ async fn handle_get(req: OperationRequest) -> anyhow::Result<OperationResponse> 
     }
 
     anyhow::bail!("hypervisor '{name}' not found")
-}
-
-async fn handle_start(_req: OperationRequest) -> anyhow::Result<OperationResponse> {
-    if !fabric::service::is_installed() {
-        anyhow::bail!("not initialized. Run 'syfrah hypervisor init' first.");
-    }
-    if fabric::service::is_active() {
-        return Ok(OperationResponse::Message(
-            "WireGuard service already running.".into(),
-        ));
-    }
-    fabric::service::start()?;
-    Ok(OperationResponse::Message(
-        "WireGuard service started.".into(),
-    ))
-}
-
-async fn handle_stop(_req: OperationRequest) -> anyhow::Result<OperationResponse> {
-    if !fabric::service::is_active() {
-        return Ok(OperationResponse::Message(
-            "WireGuard service already stopped.".into(),
-        ));
-    }
-    fabric::service::stop()?;
-    Ok(OperationResponse::Message(
-        "WireGuard service stopped.".into(),
-    ))
-}
-
-async fn handle_leave(_req: OperationRequest) -> anyhow::Result<OperationResponse> {
-    let db = open_db()?;
-
-    // Uninstall systemd service + remove WireGuard config
-    fabric::service::uninstall()?;
-
-    // Also remove interface if wg-quick didn't
-    if fabric::wg::interface_exists() {
-        let _ = fabric::wg::destroy_interface();
-    }
-
-    // Delete state
-    fabric::state::FabricState::delete(&db).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    Ok(OperationResponse::Message(
-        "left the cluster. WireGuard service uninstalled.".into(),
-    ))
 }
 
 fn open_db() -> anyhow::Result<LayerDb> {

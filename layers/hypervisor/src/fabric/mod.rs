@@ -8,6 +8,7 @@
 //! - State persistence
 
 pub mod mesh;
+pub mod ops;
 pub mod peer;
 pub mod peering;
 pub mod service;
