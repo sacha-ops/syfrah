@@ -99,6 +99,7 @@ export default defineConfig({
 			{
 				label: 'API Reference',
 				items: [
+					{ label: 'REST API (Scalar)', link: '/syfrah/rest/' },
 					{ label: 'Rust API (rustdoc)', link: '/syfrah/api/syfrah_core/' },
 				],
 			},

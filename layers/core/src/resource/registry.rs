@@ -115,6 +115,11 @@ impl ResourceRegistry {
         self.resources.iter()
     }
 
+    /// Get all registrations as a slice.
+    pub fn as_slice(&self) -> &[ResourceRegistration] {
+        &self.resources
+    }
+
     /// Number of registered resources.
     pub fn len(&self) -> usize {
         self.resources.len()

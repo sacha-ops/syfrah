@@ -31,6 +31,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Generate OpenAPI spec
+        run: |
+          cargo run --bin syfrah-openapi --release > docs/public/openapi.json
+
       - name: Build Starlight site
         working-directory: docs
         run: |

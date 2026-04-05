@@ -1,5 +1,8 @@
 # build output
 dist/
+
+# generated at build time
+public/openapi.json
 # generated types
 .astro/
 
