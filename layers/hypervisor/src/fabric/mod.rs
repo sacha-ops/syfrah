@@ -9,8 +9,11 @@
 
 pub mod mesh;
 pub mod peer;
+pub mod peering;
 pub mod state;
+pub mod wg;
 
 pub use mesh::*;
 pub use peer::*;
+pub use peering::*;
 pub use state::*;
