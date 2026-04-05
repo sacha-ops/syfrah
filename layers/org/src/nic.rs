@@ -50,7 +50,7 @@ impl NicStore {
         let entries: Vec<(String, NetworkInterface)> = self.db.list(TABLE)?;
         Ok(entries
             .into_iter()
-            .filter(|(_, nic)| nic.subnet_id == subnet_id)
+            .filter(|(_, nic)| nic.subnet_id.0 == subnet_id)
             .map(|(_, nic)| nic)
             .collect())
     }

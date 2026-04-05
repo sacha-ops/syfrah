@@ -18,6 +18,8 @@ use openraft::{EntryPayload, OptionalSend};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use syfrah_core::{EnvId, HypervisorId, OrgId, ProjectId, SnapshotId, VmId, VolumeId};
+
 use crate::commands::{
     QuotaScope, StateMachineCommand, StateMachineResponse, StorageConfig, VolumeType,
 };
@@ -38,16 +40,16 @@ pub struct StorageQuota {
 /// Volume record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeRecord {
-    pub id: String,
+    pub id: VolumeId,
     pub name: String,
     pub size_gb: u32,
-    pub org_id: String,
-    pub project_id: String,
-    pub env_id: String,
+    pub org_id: OrgId,
+    pub project_id: ProjectId,
+    pub env_id: EnvId,
     pub volume_type: VolumeType,
     pub state: VolumeState,
-    pub attached_vm_id: Option<String>,
-    pub attached_hypervisor_id: Option<String>,
+    pub attached_vm_id: Option<VmId>,
+    pub attached_hypervisor_id: Option<HypervisorId>,
     pub placement_generation: u64,
     /// The zone where this volume's data lives (determines which S3 bucket to use).
     /// Matches the hypervisor's zone at creation time.
@@ -71,11 +73,11 @@ pub struct VolumeRecord {
     /// Hypervisor the volume was attached to before migration started.
     /// Used for rollback if the migration fails.
     #[serde(default)]
-    pub pre_migration_hypervisor: Option<String>,
+    pub pre_migration_hypervisor: Option<HypervisorId>,
     /// VM the volume was attached to before migration started.
     /// Used for rollback if the migration fails.
     #[serde(default)]
-    pub pre_migration_vm_id: Option<String>,
+    pub pre_migration_vm_id: Option<VmId>,
 }
 
 /// Volume lifecycle state.
@@ -96,6 +98,92 @@ pub enum VolumeState {
 /// Default tombstone retention period: 30 days in seconds.
 pub const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 3600;
 
+// ---------------------------------------------------------------------------
+// VM lifecycle phases (Phase 1: async provisioning #1311)
+// ---------------------------------------------------------------------------
+
+/// Phase of a VM in the Raft state machine.
+///
+/// Tracks the lifecycle of a VM from intent to running/failed/deleted.
+/// The CLI writes a `CreateVmIntent` which creates a record in `Pending`;
+/// the daemon/forge updates the phase as provisioning progresses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VmPhase {
+    /// Intent written, not yet scheduled.
+    Pending,
+    /// Scheduler picking a hypervisor.
+    Scheduling,
+    /// Volume + network being set up.
+    Creating,
+    /// Container/VM booting.
+    Starting,
+    /// Healthy and serving.
+    Running,
+    /// Graceful shutdown in progress.
+    Stopping,
+    /// Explicitly stopped by operator.
+    Stopped,
+    /// Something went wrong (see error field on VmRecord).
+    Failed,
+    /// Cleanup in progress.
+    Deleting,
+}
+
+impl std::fmt::Display for VmPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmPhase::Pending => write!(f, "Pending"),
+            VmPhase::Scheduling => write!(f, "Scheduling"),
+            VmPhase::Creating => write!(f, "Creating"),
+            VmPhase::Starting => write!(f, "Starting"),
+            VmPhase::Running => write!(f, "Running"),
+            VmPhase::Stopping => write!(f, "Stopping"),
+            VmPhase::Stopped => write!(f, "Stopped"),
+            VmPhase::Failed => write!(f, "Failed"),
+            VmPhase::Deleting => write!(f, "Deleting"),
+        }
+    }
+}
+
+impl VmPhase {
+    /// Parse a phase from a string (case-insensitive first letter, exact otherwise).
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s {
+            "Pending" => Some(VmPhase::Pending),
+            "Scheduling" => Some(VmPhase::Scheduling),
+            "Creating" => Some(VmPhase::Creating),
+            "Starting" => Some(VmPhase::Starting),
+            "Running" => Some(VmPhase::Running),
+            "Stopping" => Some(VmPhase::Stopping),
+            "Stopped" => Some(VmPhase::Stopped),
+            "Failed" => Some(VmPhase::Failed),
+            "Deleting" => Some(VmPhase::Deleting),
+            _ => None,
+        }
+    }
+}
+
+/// VM record tracked by the Raft state machine.
+///
+/// Created by `CreateVmIntent`, updated by `UpdateVmPhase`.
+/// Keyed by `id` (same as the VM name).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VmRecord {
+    pub id: String,
+    pub name: String,
+    pub phase: VmPhase,
+    pub image: String,
+    pub vcpus: u32,
+    pub memory_mb: u32,
+    pub zone: Option<String>,
+    pub subnet_id: Option<String>,
+    pub hypervisor_id: Option<String>,
+    pub ip: Option<String>,
+    pub error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Snapshot lifecycle state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SnapshotState {
@@ -108,14 +196,14 @@ pub enum SnapshotState {
 /// Snapshot record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRecord {
-    pub id: String,
-    pub source_volume_id: String,
+    pub id: SnapshotId,
+    pub source_volume_id: VolumeId,
     pub sst_files: Vec<String>,
     pub wal_position: u64,
     /// org_id inherited from the source volume at creation time.
-    pub org_id: String,
+    pub org_id: OrgId,
     /// project_id inherited from the source volume at creation time.
-    pub project_id: String,
+    pub project_id: ProjectId,
     /// Size in GB of the source volume at snapshot time.
     /// Used by RestoreSnapshot so the restored volume gets the correct size
     /// even if the source volume has been deleted or resized since.
@@ -123,7 +211,7 @@ pub struct SnapshotRecord {
     pub size_gb: u32,
     /// env_id inherited from the source volume at creation time.
     #[serde(default)]
-    pub env_id: String,
+    pub env_id: EnvId,
     /// volume_type inherited from the source volume at creation time.
     #[serde(default = "default_volume_type")]
     pub volume_type: VolumeType,
@@ -144,14 +232,14 @@ pub struct SstRefCounts(pub HashMap<String, u64>);
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StorageState {
     pub quotas: HashMap<String, StorageQuota>,
-    pub volumes: HashMap<String, VolumeRecord>,
-    pub snapshots: HashMap<String, SnapshotRecord>,
+    pub volumes: HashMap<VolumeId, VolumeRecord>,
+    pub snapshots: HashMap<SnapshotId, SnapshotRecord>,
     pub sst_refcounts: SstRefCounts,
     /// Storage configs keyed by zone (migrated from per-region in #1281).
     pub storage_configs: HashMap<String, StorageConfig>,
     /// Manifest pointers keyed by volume_id (ADR-006 §12b).
     #[serde(default)]
-    pub manifest_pointers: HashMap<String, ManifestPointerRecord>,
+    pub manifest_pointers: HashMap<VolumeId, ManifestPointerRecord>,
     /// SST files whose refcount has reached 0 and are awaiting garbage
     /// collection. We mark them here rather than deleting immediately so
     /// that the GC worker can remove the S3 objects asynchronously.
@@ -160,12 +248,16 @@ pub struct StorageState {
     /// Snapshot IDs that currently have an in-progress restore. A snapshot
     /// cannot be deleted while a restore is in progress.
     #[serde(default)]
-    pub restores_in_progress: Vec<String>,
+    pub restores_in_progress: Vec<SnapshotId>,
     /// Minimum WAL position across all snapshots. Used by the log compactor
     /// to determine how far back WAL segments must be retained. `None` when
     /// there are no snapshots.
     #[serde(default)]
     pub min_wal_position: Option<u64>,
+    /// VM records keyed by VM ID (Phase 1: async provisioning #1311).
+    /// Tracks the lifecycle phase of each VM from intent to running/deleted.
+    #[serde(default)]
+    pub vm_records: HashMap<String, VmRecord>,
 }
 
 /// Manifest pointer record tracked by the state machine (ADR-006 §12b).
@@ -174,7 +266,7 @@ pub struct StorageState {
 /// is strictly sequential: each commit must present `last_committed + 1`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestPointerRecord {
-    pub volume_id: String,
+    pub volume_id: VolumeId,
     /// Must match the volume's current `placement_generation`.
     pub generation: u64,
     /// Strictly sequential manifest version (starts at 1).
@@ -182,7 +274,7 @@ pub struct ManifestPointerRecord {
     /// S3 key where the manifest is stored.
     pub s3_key: String,
     /// Hypervisor that published this manifest.
-    pub published_by: String,
+    pub published_by: HypervisorId,
 }
 
 /// Error returned when a storage quota is exceeded.
@@ -547,14 +639,14 @@ impl RedbStateMachine {
             return;
         };
         let now = syfrah_org::StorageStore::now();
-        let existing = store.get_volume(&vol.id).ok().flatten();
+        let existing = store.get_volume(vol.id.as_str()).ok().flatten();
         let store_vol = syfrah_org::storage_store::Volume {
-            id: vol.id.clone(),
+            id: vol.id.0.clone(),
             name: vol.name.clone(),
             size_gb: vol.size_gb,
-            org_id: vol.org_id.clone(),
-            project_id: vol.project_id.clone(),
-            env_id: vol.env_id.clone(),
+            org_id: vol.org_id.0.clone(),
+            project_id: vol.project_id.0.clone(),
+            env_id: vol.env_id.0.clone(),
             volume_type: match vol.volume_type {
                 VolumeType::Root => syfrah_org::storage_store::VolumeType::Root,
                 VolumeType::Data => syfrah_org::storage_store::VolumeType::Data,
@@ -565,8 +657,8 @@ impl RedbStateMachine {
                 VolumeState::Migrating => syfrah_org::storage_store::VolumeState::Migrating,
                 VolumeState::Deleted => syfrah_org::storage_store::VolumeState::Deleted,
             },
-            attached_vm_id: vol.attached_vm_id.clone(),
-            attached_hypervisor_id: vol.attached_hypervisor_id.clone(),
+            attached_vm_id: vol.attached_vm_id.as_ref().map(|id| id.0.clone()),
+            attached_hypervisor_id: vol.attached_hypervisor_id.as_ref().map(|id| id.0.clone()),
             placement_generation: vol.placement_generation,
             created_at: existing.as_ref().map_or(now, |e| e.created_at),
             updated_at: now,
@@ -576,18 +668,18 @@ impl RedbStateMachine {
         let old_hv = existing
             .as_ref()
             .and_then(|e| e.attached_hypervisor_id.as_deref());
-        let new_hv = vol.attached_hypervisor_id.as_deref();
+        let new_hv = vol.attached_hypervisor_id.as_ref().map(|id| id.as_str());
         if old_hv != new_hv {
             // Remove from old hypervisor index.
             if let Some(hv_id) = old_hv {
-                if let Err(e) = store.remove_from_hypervisor_index(hv_id, &vol.id) {
+                if let Err(e) = store.remove_from_hypervisor_index(hv_id, vol.id.as_str()) {
                     warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
                         "failed to remove volume from old hypervisor index");
                 }
             }
             // Add to new hypervisor index.
             if let Some(hv_id) = new_hv {
-                if let Err(e) = store.add_to_hypervisor_index(hv_id, &vol.id) {
+                if let Err(e) = store.add_to_hypervisor_index(hv_id, vol.id.as_str()) {
                     warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
                         "failed to add volume to new hypervisor index");
                 }
@@ -670,20 +762,20 @@ impl RedbStateMachine {
     /// Returns `None` if no quota is set (meaning unlimited).
     fn effective_quota_from(
         storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> Option<StorageQuota> {
         // Check project-level first.
         let project_key = Self::quota_key(&QuotaScope::Project {
-            org_id: org_id.to_string(),
-            project_id: project_id.to_string(),
+            org_id: org_id.clone(),
+            project_id: project_id.clone(),
         });
         if let Some(q) = storage.quotas.get(&project_key) {
             return Some(q.clone());
         }
         // Fall back to org-level.
         let org_key = Self::quota_key(&QuotaScope::Org {
-            org_id: org_id.to_string(),
+            org_id: org_id.clone(),
         });
         storage.quotas.get(&org_key).cloned()
     }
@@ -691,21 +783,21 @@ impl RedbStateMachine {
     /// Determine which scope is effective for quota from an already-locked storage.
     fn effective_quota_scope_from(
         storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> QuotaScope {
         let project_key = Self::quota_key(&QuotaScope::Project {
-            org_id: org_id.to_string(),
-            project_id: project_id.to_string(),
+            org_id: org_id.clone(),
+            project_id: project_id.clone(),
         });
         if storage.quotas.contains_key(&project_key) {
             QuotaScope::Project {
-                org_id: org_id.to_string(),
-                project_id: project_id.to_string(),
+                org_id: org_id.clone(),
+                project_id: project_id.clone(),
             }
         } else {
             QuotaScope::Org {
-                org_id: org_id.to_string(),
+                org_id: org_id.clone(),
             }
         }
     }
@@ -722,8 +814,8 @@ impl RedbStateMachine {
     /// volume insert are effectively atomic.
     fn check_volume_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
         new_size_gb: u32,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
@@ -765,8 +857,8 @@ impl RedbStateMachine {
     /// Same as `check_volume_quota` — Raft serializes all applies.
     fn check_resize_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
         delta_gb: u32,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
@@ -791,8 +883,8 @@ impl RedbStateMachine {
     /// Check snapshot quota for a CreateSnapshot operation.
     fn check_snapshot_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
         let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
@@ -1336,15 +1428,15 @@ impl RedbStateMachine {
                     Err(e) => return StateMachineResponse::Error(e.to_string()),
                 };
                 // Parse the route target string.
-                use syfrah_org::types::RouteTarget;
+                use syfrah_org::types::{NatGatewayId, PeeringId, RouteTarget};
                 let route_target = if target.eq_ignore_ascii_case("local") {
                     RouteTarget::Local
                 } else if target.eq_ignore_ascii_case("blackhole") {
                     RouteTarget::Blackhole
                 } else if let Some(name) = target.strip_prefix("nat-gw:") {
-                    RouteTarget::NatGateway(name.to_string())
+                    RouteTarget::NatGateway(NatGatewayId(name.to_string()))
                 } else if let Some(name) = target.strip_prefix("peering:") {
-                    RouteTarget::VpcPeering(name.to_string())
+                    RouteTarget::VpcPeering(PeeringId(name.to_string()))
                 } else {
                     return StateMachineResponse::Error(format!(
                         "invalid route target: '{target}'"
@@ -1471,8 +1563,8 @@ impl RedbStateMachine {
                     id: syfrah_org::types::NicId(nic_id.clone()),
                     name: format!("{vm_id}-eth0"),
                     vm_id: Some(vm_id.clone()),
-                    subnet_id: subnet_id.clone(),
-                    vpc_id: vpc_id.clone(),
+                    subnet_id: syfrah_org::types::SubnetId(subnet_id.clone()),
+                    vpc_id: syfrah_org::types::VpcId(vpc_id.clone()),
                     private_ip: ip.clone(),
                     mac: mac.clone(),
                     security_groups: vec![],
@@ -1534,7 +1626,7 @@ impl RedbStateMachine {
                             .unwrap_or_default()
                             .as_secs();
                         let hv = syfrah_org::Hypervisor {
-                            id: syfrah_org::HypervisorId(format!("hv-{name}")),
+                            id: syfrah_org::HypervisorId::generate(),
                             name: name.clone(),
                             region: region.clone(),
                             zone: zone.clone(),
@@ -1724,6 +1816,99 @@ impl RedbStateMachine {
                 }
             }
 
+            // -- VM Lifecycle (Phase 1: async provisioning #1311) --
+            StateMachineCommand::CreateVmIntent {
+                name,
+                image,
+                vcpus,
+                memory_mb,
+                zone,
+                subnet,
+                env: _,
+                project: _,
+                org: _,
+                ssh_key_path: _,
+                disk_size_gb: _,
+            } => {
+                let mut storage = self.storage.write().unwrap();
+                if storage.vm_records.contains_key(name) {
+                    return StateMachineResponse::Error(format!("VM already exists: {name}"));
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let record = VmRecord {
+                    id: name.clone(),
+                    name: name.clone(),
+                    phase: VmPhase::Pending,
+                    image: image.clone(),
+                    vcpus: *vcpus,
+                    memory_mb: *memory_mb,
+                    zone: zone.clone(),
+                    subnet_id: subnet.clone(),
+                    hypervisor_id: None,
+                    ip: None,
+                    error: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                storage.vm_records.insert(name.clone(), record);
+                info!(vm_id = name, "created VM intent (Pending)");
+                StateMachineResponse::Created(name.clone())
+            }
+            StateMachineCommand::UpdateVmPhase {
+                vm_id,
+                phase,
+                hypervisor_id,
+                ip,
+                error,
+            } => {
+                let new_phase = match VmPhase::from_str_loose(phase) {
+                    Some(p) => p,
+                    None => {
+                        return StateMachineResponse::Error(format!("unknown VM phase: {phase}"))
+                    }
+                };
+                let mut storage = self.storage.write().unwrap();
+                match storage.vm_records.get_mut(vm_id) {
+                    Some(record) => {
+                        record.phase = new_phase;
+                        if let Some(hv) = hypervisor_id {
+                            record.hypervisor_id = Some(hv.clone());
+                        }
+                        if let Some(ip_val) = ip {
+                            record.ip = Some(ip_val.clone());
+                        }
+                        if let Some(err) = error {
+                            record.error = Some(err.clone());
+                        }
+                        record.updated_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        info!(vm_id = vm_id, phase = %record.phase, "updated VM phase");
+                        StateMachineResponse::Ok
+                    }
+                    None => StateMachineResponse::Error(format!("VM not found: {vm_id}")),
+                }
+            }
+            StateMachineCommand::DeleteVmIntent { vm_id } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.vm_records.get_mut(vm_id) {
+                    Some(record) => {
+                        record.phase = VmPhase::Deleting;
+                        record.updated_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        info!(vm_id = vm_id, "VM marked for deletion (Deleting)");
+                        StateMachineResponse::Ok
+                    }
+                    None => StateMachineResponse::Error(format!("VM not found: {vm_id}")),
+                }
+            }
+
             // -- VM Placement --
             StateMachineCommand::PlaceVm {
                 vm_id,
@@ -1752,11 +1937,11 @@ impl RedbStateMachine {
                     Err(_) => subnet_id.split('/').next().unwrap_or("unknown").to_string(),
                 };
                 let placement = syfrah_org::types::VmPlacement {
-                    vpc_id,
+                    vpc_id: syfrah_org::types::VpcId(vpc_id.clone()),
                     vm_id: vm_id.clone(),
                     vm_mac: mac.clone(),
                     vm_ip: ip.clone(),
-                    subnet_id: subnet_id.clone(),
+                    subnet_id: syfrah_org::types::SubnetId(subnet_id.clone()),
                     hypervisor_id: hypervisor_id.clone(),
                     action: syfrah_org::types::PlacementAction::Add,
                     created_at: now,
@@ -1766,11 +1951,11 @@ impl RedbStateMachine {
                     Ok(()) => {
                         // Emit placement event for incremental FDB update.
                         let _ = self.placement_tx.send(PlacementEvent::Added {
-                            vpc_id: placement.vpc_id,
+                            vpc_id: placement.vpc_id.0,
                             vm_id: placement.vm_id,
                             vm_mac: placement.vm_mac,
                             vm_ip: placement.vm_ip,
-                            subnet_id: placement.subnet_id,
+                            subnet_id: placement.subnet_id.0,
                             hypervisor_id: placement.hypervisor_id,
                         });
                         StateMachineResponse::Ok
@@ -1794,13 +1979,13 @@ impl RedbStateMachine {
                             if p.vm_id == *vm_id {
                                 // Capture info before removal for the event.
                                 let event = PlacementEvent::Removed {
-                                    vpc_id: p.vpc_id.clone(),
+                                    vpc_id: p.vpc_id.0.clone(),
                                     vm_id: p.vm_id.clone(),
                                     vm_mac: p.vm_mac.clone(),
                                     vm_ip: p.vm_ip.clone(),
                                     hypervisor_id: p.hypervisor_id.clone(),
                                 };
-                                let _ = placement_store.remove_placement(&p.vpc_id, vm_id);
+                                let _ = placement_store.remove_placement(&p.vpc_id.0, vm_id);
                                 let _ = self.placement_tx.send(event);
                                 return StateMachineResponse::Ok;
                             }
@@ -1854,13 +2039,13 @@ impl RedbStateMachine {
                         // node's reconciler stops ZeroFS and the target's starts it
                         // with the new gen prefix (zero-copy migration via S3).
                         let mut storage = self.storage.write().unwrap();
-                        let vol_ids: Vec<String> = storage
+                        let vol_ids: Vec<VolumeId> = storage
                             .volumes
                             .iter()
                             .filter(|(_, vol)| {
                                 vol.state == VolumeState::Attached
-                                    && vol.attached_vm_id.as_deref() == Some(vm_id)
-                                    && vol.attached_hypervisor_id.as_deref() == Some(from)
+                                    && vol.attached_vm_id.as_deref() == Some(vm_id.as_str())
+                                    && vol.attached_hypervisor_id.as_deref() == Some(from.as_str())
                             })
                             .map(|(id, _)| id.clone())
                             .collect();
@@ -1868,13 +2053,13 @@ impl RedbStateMachine {
                         for vol_id in &vol_ids {
                             if let Some(vol) = storage.volumes.get_mut(vol_id) {
                                 vol.placement_generation += 1;
-                                vol.attached_hypervisor_id = Some(to.clone());
+                                vol.attached_hypervisor_id = Some(HypervisorId::from(to.as_str()));
                                 let synced = vol.clone();
                                 // Release storage lock temporarily to sync to redb.
                                 drop(storage);
                                 self.sync_volume_to_store(&synced);
                                 info!(
-                                    volume_id = vol_id,
+                                    volume_id = %vol_id,
                                     from = from,
                                     to = to,
                                     generation = synced.placement_generation,
@@ -2002,7 +2187,7 @@ impl RedbStateMachine {
                 }
                 drop(storage);
                 for id in &purged {
-                    self.sync_volume_delete_from_store(id);
+                    self.sync_volume_delete_from_store(id.as_str());
                 }
                 if !purged.is_empty() {
                     info!(count = purged.len(), "purged expired volume tombstones");
@@ -2076,10 +2261,10 @@ impl RedbStateMachine {
                     self.sync_volume_to_store(vol);
                 }
                 info!(
-                    id,
-                    name, size_gb, org_id, project_id, env_id, "volume created"
+                    id = %id,
+                    name, size_gb, org_id = %org_id, project_id = %project_id, env_id = %env_id, "volume created"
                 );
-                StateMachineResponse::Created(id.clone())
+                StateMachineResponse::Created(id.0.clone())
             }
 
             StateMachineCommand::DeleteVolume {
@@ -2111,7 +2296,7 @@ impl RedbStateMachine {
                     ),
                     Some(_) => {
                         // Check for non-deleted snapshots referencing this volume.
-                        let snapshot_ids: Vec<String> = storage
+                        let snapshot_ids: Vec<SnapshotId> = storage
                             .snapshots
                             .iter()
                             .filter(|(_, s)| {
@@ -2146,7 +2331,7 @@ impl RedbStateMachine {
                             }
 
                             // Collect SST files first to avoid borrow conflicts.
-                            let snap_ssts: Vec<(String, Vec<String>)> = snapshot_ids
+                            let snap_ssts: Vec<(SnapshotId, Vec<String>)> = snapshot_ids
                                 .iter()
                                 .filter_map(|snap_id| {
                                     let snap = storage.snapshots.get(snap_id)?;
@@ -2178,7 +2363,7 @@ impl RedbStateMachine {
                                 if let Some(snap) = storage.snapshots.get_mut(snap_id) {
                                     snap.state = SnapshotState::Deleted;
                                 }
-                                info!(snapshot_id = %snap_id, volume_id, "snapshot cascade-deleted");
+                                info!(snapshot_id = %snap_id, %volume_id, "snapshot cascade-deleted");
                             }
                             // Recalculate minimum WAL retention (excluding soft-deleted).
                             storage.min_wal_position = storage
@@ -2204,7 +2389,7 @@ impl RedbStateMachine {
                             self.sync_volume_to_store(vol);
                         }
 
-                        info!(volume_id, "volume marked as deleted (tombstone)");
+                        info!(%volume_id, "volume marked as deleted (tombstone)");
                         StateMachineResponse::Ok
                     }
                     None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
@@ -2226,7 +2411,7 @@ impl RedbStateMachine {
                         let synced = vol.clone();
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, vm_id, hypervisor_id, "volume attached");
+                        info!(%volume_id, %vm_id, %hypervisor_id, "volume attached");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2255,7 +2440,7 @@ impl RedbStateMachine {
                         storage.manifest_pointers.remove(volume_id);
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, "volume detached (manifest pointer cleared)");
+                        info!(%volume_id, "volume detached (manifest pointer cleared)");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2285,7 +2470,7 @@ impl RedbStateMachine {
                 match storage.volumes.get_mut(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => {
                         // Validate the volume is currently on the source hypervisor.
-                        if vol.attached_hypervisor_id.as_deref() != Some(from_hypervisor) {
+                        if vol.attached_hypervisor_id.as_deref() != Some(from_hypervisor.as_str()) {
                             return StateMachineResponse::Error(format!(
                                 "volume '{}' is not on hypervisor '{}' (actual: {:?})",
                                 volume_id, from_hypervisor, vol.attached_hypervisor_id
@@ -2300,9 +2485,9 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         info!(
-                            volume_id,
-                            from = from_hypervisor,
-                            to = to_hypervisor,
+                            %volume_id,
+                            from = %from_hypervisor,
+                            to = %to_hypervisor,
                             generation = synced.placement_generation,
                             "volume rescheduled"
                         );
@@ -2363,10 +2548,10 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         info!(
-                            volume_id,
+                            %volume_id,
                             source_zone,
                             target_zone,
-                            target_hypervisor,
+                            target_hypervisor = %target_hypervisor,
                             generation = synced.placement_generation,
                             "volume migration started"
                         );
@@ -2392,7 +2577,7 @@ impl RedbStateMachine {
                         let synced = vol.clone();
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, "volume migration completed");
+                        info!(%volume_id, "volume migration completed");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2417,7 +2602,7 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         warn!(
-                            volume_id,
+                            %volume_id,
                             reason = reason.as_str(),
                             "volume migration rolled back"
                         );
@@ -2474,7 +2659,7 @@ impl RedbStateMachine {
                     let synced = vol.clone();
                     drop(storage);
                     self.sync_volume_to_store(&synced);
-                    info!(volume_id, new_size_gb, "volume resized");
+                    info!(%volume_id, new_size_gb, "volume resized");
                     StateMachineResponse::Ok
                 } else {
                     StateMachineResponse::Error(format!("volume not found: {volume_id}"))
@@ -2541,8 +2726,8 @@ impl RedbStateMachine {
                     None => *wal_position,
                 });
 
-                info!(id, source_volume_id, size_gb, "snapshot created");
-                StateMachineResponse::Created(id.clone())
+                info!(id = %id, source_volume_id = %source_volume_id, size_gb, "snapshot created");
+                StateMachineResponse::Created(id.0.clone())
             }
 
             StateMachineCommand::DeleteSnapshot { snapshot_id } => {
@@ -2587,7 +2772,7 @@ impl RedbStateMachine {
                     .filter(|s| s.state != SnapshotState::Deleted)
                     .map(|s| s.wal_position)
                     .min();
-                info!(snapshot_id, "snapshot deleted");
+                info!(%snapshot_id, "snapshot deleted");
                 StateMachineResponse::Ok
             }
 
@@ -2628,7 +2813,7 @@ impl RedbStateMachine {
 
                 // 3. published_by must match the assigned hypervisor.
                 let assigned_hv = vol.attached_hypervisor_id.as_deref().unwrap_or("");
-                if published_by != assigned_hv {
+                if published_by.as_str() != assigned_hv {
                     return StateMachineResponse::Error(format!(
                         "wrong publisher for volume '{volume_id}': \
                          expected '{assigned_hv}', got '{published_by}'"
@@ -2660,8 +2845,8 @@ impl RedbStateMachine {
                     },
                 );
                 info!(
-                    volume_id,
-                    generation, manifest_version, published_by, "manifest committed"
+                    %volume_id,
+                    generation, manifest_version, published_by = %published_by, "manifest committed"
                 );
                 StateMachineResponse::Ok
             }
@@ -2737,7 +2922,7 @@ impl RedbStateMachine {
                         generation: 0,
                         manifest_version: 1,
                         s3_key: format!("snapshots/{snapshot_id}/manifest.json"),
-                        published_by: format!("restore:{snapshot_id}"),
+                        published_by: HypervisorId::from(format!("restore:{snapshot_id}")),
                     },
                 );
 
@@ -2768,10 +2953,10 @@ impl RedbStateMachine {
                     self.sync_volume_to_store(vol);
                 }
                 info!(
-                    snapshot_id,
-                    new_volume_id, new_volume_name, size_gb, "snapshot restored"
+                    %snapshot_id,
+                    new_volume_id = %new_volume_id, new_volume_name, size_gb, "snapshot restored"
                 );
-                StateMachineResponse::Created(new_volume_id.clone())
+                StateMachineResponse::Created(new_volume_id.0.clone())
             }
 
             // -- Storage: MarkRestoreBegin / MarkRestoreComplete --
@@ -2785,14 +2970,14 @@ impl RedbStateMachine {
                 if !storage.restores_in_progress.contains(snapshot_id) {
                     storage.restores_in_progress.push(snapshot_id.clone());
                 }
-                info!(snapshot_id, "restore marked in-progress");
+                info!(%snapshot_id, "restore marked in-progress");
                 StateMachineResponse::Ok
             }
 
             StateMachineCommand::MarkRestoreComplete { snapshot_id } => {
                 let mut storage = self.storage.write().unwrap();
                 storage.restores_in_progress.retain(|id| id != snapshot_id);
-                info!(snapshot_id, "restore completed");
+                info!(%snapshot_id, "restore completed");
                 StateMachineResponse::Ok
             }
 
@@ -2985,11 +3170,11 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                     let mut emitted = 0usize;
                     for p in &placements {
                         let _ = self.placement_tx.send(PlacementEvent::Added {
-                            vpc_id: p.vpc_id.clone(),
+                            vpc_id: p.vpc_id.0.clone(),
                             vm_id: p.vm_id.clone(),
                             vm_mac: p.vm_mac.clone(),
                             vm_ip: p.vm_ip.clone(),
-                            subnet_id: p.subnet_id.clone(),
+                            subnet_id: p.subnet_id.0.clone(),
                             hypervisor_id: p.hypervisor_id.clone(),
                         });
                         emitted += 1;
@@ -3068,7 +3253,9 @@ mod tests {
         };
         let resp = sm.apply_command(&cmd);
         match resp {
-            StateMachineResponse::Created(id) => assert!(id.contains("testorg")),
+            StateMachineResponse::Created(id) => {
+                assert!(id.starts_with("org-"), "expected org- prefix, got: {id}")
+            }
             other => panic!("expected Created, got {other:?}"),
         }
         // Verify it was actually created.
@@ -3117,7 +3304,9 @@ mod tests {
             org: "acme".to_string(),
         });
         match resp {
-            StateMachineResponse::Created(id) => assert!(id.contains("backend")),
+            StateMachineResponse::Created(id) => {
+                assert!(id.starts_with("proj-"), "expected proj- prefix, got: {id}")
+            }
             other => panic!("expected Created, got {other:?}"),
         }
     }
@@ -3813,11 +4002,11 @@ mod tests {
 
         // Seed a VM placement for "vm-1" on "hv-src".
         let placement = syfrah_org::types::VmPlacement {
-            vpc_id: "vpc-1".to_string(),
+            vpc_id: syfrah_org::types::VpcId("vpc-1".to_string()),
             vm_id: "vm-1".to_string(),
             vm_mac: "02:00:00:00:00:01".to_string(),
             vm_ip: "10.0.0.1".to_string(),
-            subnet_id: "vpc-1/sub-1".to_string(),
+            subnet_id: syfrah_org::types::SubnetId("vpc-1/sub-1".to_string()),
             hypervisor_id: "hv-src".to_string(),
             action: syfrah_org::types::PlacementAction::Add,
             created_at: 1000,
@@ -5912,5 +6101,379 @@ mod tests {
         assert!(vol.migration_target_zone.is_none());
         assert!(vol.pre_migration_hypervisor.is_none());
         assert!(vol.pre_migration_vm_id.is_none());
+    }
+
+    // -- VM lifecycle tests (#1311) ------------------------------------------
+
+    #[test]
+    fn apply_create_vm_intent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: Some("eu-west-1".to_string()),
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Created(id) => assert_eq!(id, "web-1"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Verify record in storage.
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Pending);
+        assert_eq!(record.image, "alpine-3.20");
+        assert_eq!(record.vcpus, 2);
+        assert_eq!(record.memory_mb, 2048);
+        assert_eq!(record.zone, Some("eu-west-1".to_string()));
+    }
+
+    #[test]
+    fn apply_create_vm_intent_duplicate() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let _ = sm.apply_command(&cmd);
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Create intent first.
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let _ = sm.apply_command(&create);
+
+        // Update to Running with hypervisor and IP.
+        let update = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+        };
+        let resp = sm.apply_command(&update);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Running);
+        assert_eq!(record.hypervisor_id, Some("hv1".to_string()));
+        assert_eq!(record.ip, Some("10.0.0.5".to_string()));
+        assert!(record.error.is_none());
+    }
+
+    #[test]
+    fn apply_update_vm_phase_not_found() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "nonexistent".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase_invalid_phase() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "BogusPhase".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("unknown VM phase")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase_failed_with_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "Failed".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: Some("image not found".to_string()),
+        };
+        let resp = sm.apply_command(&cmd);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Failed);
+        assert_eq!(record.error, Some("image not found".to_string()));
+    }
+
+    #[test]
+    fn apply_delete_vm_intent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::DeleteVmIntent {
+            vm_id: "web-1".to_string(),
+        };
+        let resp = sm.apply_command(&cmd);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Deleting);
+    }
+
+    #[test]
+    fn apply_delete_vm_intent_not_found() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::DeleteVmIntent {
+            vm_id: "ghost".to_string(),
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_phase_display_roundtrip() {
+        let phases = [
+            VmPhase::Pending,
+            VmPhase::Scheduling,
+            VmPhase::Creating,
+            VmPhase::Starting,
+            VmPhase::Running,
+            VmPhase::Stopping,
+            VmPhase::Stopped,
+            VmPhase::Failed,
+            VmPhase::Deleting,
+        ];
+        for phase in &phases {
+            let s = phase.to_string();
+            let parsed = VmPhase::from_str_loose(&s).unwrap();
+            assert_eq!(*phase, parsed);
+        }
+    }
+
+    #[test]
+    fn vm_record_serde_roundtrip() {
+        let record = VmRecord {
+            id: "web-1".to_string(),
+            name: "web-1".to_string(),
+            phase: VmPhase::Running,
+            image: "alpine-3.20".to_string(),
+            vcpus: 4,
+            memory_mb: 4096,
+            zone: Some("eu-west-1".to_string()),
+            subnet_id: Some("frontend".to_string()),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+            created_at: 1700000000,
+            updated_at: 1700000100,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "web-1");
+        assert_eq!(back.phase, VmPhase::Running);
+        assert_eq!(back.vcpus, 4);
+        assert_eq!(back.hypervisor_id, Some("hv1".to_string()));
+    }
+
+    #[test]
+    fn vm_records_included_in_storage_state_serde() {
+        let mut state = StorageState::default();
+        state.vm_records.insert(
+            "test-vm".to_string(),
+            VmRecord {
+                id: "test-vm".to_string(),
+                name: "test-vm".to_string(),
+                phase: VmPhase::Pending,
+                image: "ubuntu".to_string(),
+                vcpus: 2,
+                memory_mb: 2048,
+                zone: None,
+                subnet_id: None,
+                hypervisor_id: None,
+                ip: None,
+                error: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        let back: StorageState = serde_json::from_str(&json).unwrap();
+        assert!(back.vm_records.contains_key("test-vm"));
+        assert_eq!(back.vm_records["test-vm"].phase, VmPhase::Pending);
+    }
+
+    #[test]
+    fn vm_phase_full_lifecycle() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create
+        let _ = sm.apply_command(&StateMachineCommand::CreateVmIntent {
+            name: "lifecycle-vm".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        });
+
+        // Scheduling
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Scheduling".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Scheduling
+        );
+
+        // Creating
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Creating".to_string(),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: None,
+            error: None,
+        });
+
+        // Starting
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Starting".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        });
+
+        // Running
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: None,
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Running
+        );
+
+        // Delete
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVmIntent {
+            vm_id: "lifecycle-vm".to_string(),
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Deleting
+        );
     }
 }

@@ -31,6 +31,29 @@ const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
 
+// Name → ID index tables for ID-keyed resources (org layer)
+const ORG_NAME_IDX: &str = "org_name_idx";
+const PROJECT_NAME_IDX: &str = "project_name_idx";
+const ENV_NAME_IDX: &str = "env_name_idx";
+
+// Name → ID index tables for networking resources
+const VPC_NAME_INDEX: &str = "idx_vpc_name";
+const SUBNET_NAME_INDEX: &str = "idx_subnet_name";
+const SG_NAME_INDEX: &str = "idx_sg_name";
+const NAT_GW_NAME_INDEX: &str = "idx_nat_gw_name";
+const ROUTE_TABLE_NAME_INDEX: &str = "idx_route_table_name";
+
+/// Generate a random ID with the given prefix.
+/// Format: `{prefix}-{12-hex-chars}` (e.g., `org-a1b2c3d4e5f6`)
+fn generate_id(prefix: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let hex: String = (0..12)
+        .map(|_| format!("{:x}", rng.gen::<u8>() % 16))
+        .collect();
+    format!("{prefix}-{hex}")
+}
+
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
     db: LayerDb,
@@ -64,15 +87,30 @@ impl OrgStore {
             SUBNET_ROUTE_ASSOC_TABLE,
             NAT_GATEWAYS_TABLE,
             VNI_COUNTER_TABLE,
+            ORG_NAME_IDX,
+            PROJECT_NAME_IDX,
+            ENV_NAME_IDX,
+            VPC_NAME_INDEX,
+            SUBNET_NAME_INDEX,
+            SG_NAME_INDEX,
+            NAT_GW_NAME_INDEX,
+            ROUTE_TABLE_NAME_INDEX,
         ]
     }
 
     // ── Org operations ───────────────────────────────────────────────
 
-    /// Create a new organization. Validates the name, checks for duplicates.
+    /// Create a new organization. Validates the name, generates a unique OrgId,
+    /// stores keyed by ID with a name→ID index for lookups.
     pub fn create(&self, name: &str) -> Result<Org> {
         validate_name(name, "org")?;
 
+        // Check name uniqueness via the name index
+        if self.db.exists(ORG_NAME_IDX, name)? {
+            return Err(OrgError::AlreadyExists(name.to_string()));
+        }
+
+        // Backward compat: also reject if a legacy name-keyed record exists
         if self.db.exists(TABLE, name)? {
             return Err(OrgError::AlreadyExists(name.to_string()));
         }
@@ -82,19 +120,57 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = OrgId(generate_id("org"));
         let org = Org {
-            id: OrgId(format!("org-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             created_at: now,
         };
 
-        self.db.set(TABLE, name, &org)?;
+        // Store keyed by ID
+        self.db.set(TABLE, &id.0, &org)?;
+        // Name → ID index
+        self.db.set(ORG_NAME_IDX, name, &id.0)?;
         Ok(org)
     }
 
-    /// Get an organization by name. Returns `None` if it doesn't exist.
+    /// Get an organization by its ID.
+    pub fn get_by_id(&self, id: &OrgId) -> Result<Option<Org>> {
+        Ok(self.db.get(TABLE, &id.0)?)
+    }
+
+    /// Get an organization by name. Uses name→ID index, with fallback
+    /// migration for legacy name-keyed records.
     pub fn get(&self, name: &str) -> Result<Option<Org>> {
-        Ok(self.db.get(TABLE, name)?)
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(ORG_NAME_IDX, name)? {
+            return Ok(self.db.get(TABLE, &id_str)?);
+        }
+
+        // Fallback: check for legacy name-keyed record and migrate it
+        if let Some(mut org) = self.db.get::<Org>(TABLE, name)? {
+            // Migrate: generate a real ID, re-key, build index
+            let new_id = OrgId(generate_id("org"));
+            org.id = new_id.clone();
+            self.db.set(TABLE, &new_id.0, &org)?;
+            self.db.set(ORG_NAME_IDX, name, &new_id.0)?;
+            self.db.delete(TABLE, name)?;
+            return Ok(Some(org));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve an org name to its OrgId.
+    pub fn resolve_org_id(&self, name: &str) -> Result<OrgId> {
+        if let Some(id_str) = self.db.get::<String>(ORG_NAME_IDX, name)? {
+            return Ok(OrgId(id_str));
+        }
+        // Try legacy migration via get()
+        if let Some(org) = self.get(name)? {
+            return Ok(org.id);
+        }
+        Err(OrgError::NotFound(name.to_string()))
     }
 
     /// List all organizations.
@@ -103,16 +179,14 @@ impl OrgStore {
         Ok(entries.into_iter().map(|(_, org)| org).collect())
     }
 
-    /// Delete an organization by name. Fails if it has projects.
+    /// Delete an organization by name. Fails if it has projects or VPCs.
     pub fn delete(&self, name: &str) -> Result<()> {
-        if !self.db.exists(TABLE, name)? {
-            return Err(OrgError::NotFound(name.to_string()));
-        }
+        let org = self
+            .get(name)?
+            .ok_or_else(|| OrgError::NotFound(name.to_string()))?;
 
         // Check for child VPCs (org-owned or project-owned).
-        // list_vpcs_by_org already includes project-scoped VPCs.
-        let org_id = OrgId(name.to_string());
-        let all_vpcs = self.list_vpcs_by_org(&org_id)?;
+        let all_vpcs = self.list_vpcs_by_org(&org.id)?;
         if !all_vpcs.is_empty() {
             return Err(OrgError::OrgHasVpcs {
                 org: name.to_string(),
@@ -126,28 +200,41 @@ impl OrgStore {
             return Err(OrgError::OrgHasProjects(name.to_string()));
         }
 
-        self.db.delete(TABLE, name)?;
+        self.db.delete(TABLE, &org.id.0)?;
+        self.db.delete(ORG_NAME_IDX, name)?;
         Ok(())
     }
 
     // ── Project operations ───────────────────────────────────────────
 
-    /// Build the redb key for a project: "org_name/project_name".
-    fn project_key(org: &str, project: &str) -> String {
+    /// Build the legacy redb key for a project: "org_name/project_name".
+    /// Used for backward-compatible index lookups.
+    fn project_name_key(org: &str, project: &str) -> String {
         format!("{}/{}", org, project)
     }
 
-    /// Create a new project within an organization.
+    /// Create a new project within an organization. Generates a unique
+    /// ProjectId, stores keyed by ID, and creates a name index entry.
     pub fn create_project(&self, org: &str, name: &str) -> Result<Project> {
         validate_name(name, "project")?;
 
-        // Verify org exists
-        if !self.db.exists(TABLE, org)? {
-            return Err(OrgError::NotFound(org.to_string()));
+        // Verify org exists (resolves via name index)
+        let org_obj = self
+            .get(org)?
+            .ok_or_else(|| OrgError::NotFound(org.to_string()))?;
+
+        let name_key = Self::project_name_key(org, name);
+
+        // Check name uniqueness via name index
+        if self.db.exists(PROJECT_NAME_IDX, &name_key)? {
+            return Err(OrgError::ProjectAlreadyExists {
+                org: org.to_string(),
+                project: name.to_string(),
+            });
         }
 
-        let key = Self::project_key(org, name);
-        if self.db.exists(PROJECTS_TABLE, &key)? {
+        // Backward compat: reject if legacy composite-keyed record exists
+        if self.db.exists(PROJECTS_TABLE, &name_key)? {
             return Err(OrgError::ProjectAlreadyExists {
                 org: org.to_string(),
                 project: name.to_string(),
@@ -159,44 +246,103 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = ProjectId(generate_id("proj"));
         let project = Project {
-            id: ProjectId(key.clone()),
+            id: id.clone(),
             name: name.to_string(),
-            org_id: OrgId(org.to_string()),
+            org_id: org_obj.id.clone(),
             created_at: now,
         };
 
-        self.db.set(PROJECTS_TABLE, &key, &project)?;
+        // Store keyed by project ID
+        self.db.set(PROJECTS_TABLE, &id.0, &project)?;
+        // Name index: "org_name/project_name" → project_id
+        self.db.set(PROJECT_NAME_IDX, &name_key, &id.0)?;
         Ok(project)
     }
 
-    /// Get a project by org and project name.
+    /// Get a project by its ID.
+    pub fn get_project_by_id(&self, id: &ProjectId) -> Result<Option<Project>> {
+        Ok(self.db.get(PROJECTS_TABLE, &id.0)?)
+    }
+
+    /// Get a project by org name and project name.
     pub fn get_project(&self, org: &str, name: &str) -> Result<Option<Project>> {
-        let key = Self::project_key(org, name);
-        Ok(self.db.get(PROJECTS_TABLE, &key)?)
+        let name_key = Self::project_name_key(org, name);
+
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(PROJECT_NAME_IDX, &name_key)? {
+            return Ok(self.db.get(PROJECTS_TABLE, &id_str)?);
+        }
+
+        // Fallback: legacy composite-keyed record, migrate
+        if let Some(mut project) = self.db.get::<Project>(PROJECTS_TABLE, &name_key)? {
+            let new_id = ProjectId(generate_id("proj"));
+            // Also fix the org_id if it's a bare name
+            if let Some(org_obj) = self.get(org)? {
+                project.org_id = org_obj.id.clone();
+            }
+            project.id = new_id.clone();
+            self.db.set(PROJECTS_TABLE, &new_id.0, &project)?;
+            self.db.set(PROJECT_NAME_IDX, &name_key, &new_id.0)?;
+            self.db.delete(PROJECTS_TABLE, &name_key)?;
+            return Ok(Some(project));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve an org/project name pair to its ProjectId.
+    pub fn resolve_project_id(&self, org: &str, project: &str) -> Result<ProjectId> {
+        let name_key = Self::project_name_key(org, project);
+        if let Some(id_str) = self.db.get::<String>(PROJECT_NAME_IDX, &name_key)? {
+            return Ok(ProjectId(id_str));
+        }
+        // Try legacy migration via get_project()
+        if let Some(p) = self.get_project(org, project)? {
+            return Ok(p.id);
+        }
+        Err(OrgError::ProjectNotFound {
+            org: org.to_string(),
+            project: project.to_string(),
+        })
     }
 
     /// List all projects in an organization.
     pub fn list_projects(&self, org: &str) -> Result<Vec<Project>> {
-        let all: Vec<(String, Project)> = self.db.list(PROJECTS_TABLE)?;
+        // Use the name index to find projects for this org
         let prefix = format!("{}/", org);
-        Ok(all
-            .into_iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(_, project)| project)
-            .collect())
+        let idx_entries: Vec<(String, String)> = self.db.list(PROJECT_NAME_IDX)?;
+        let mut projects = Vec::new();
+        for (key, id_str) in &idx_entries {
+            if key.starts_with(&prefix) {
+                if let Some(project) = self.db.get::<Project>(PROJECTS_TABLE, id_str)? {
+                    projects.push(project);
+                }
+            }
+        }
+
+        // Fallback: check for legacy composite-keyed entries not yet migrated
+        if projects.is_empty() {
+            let all: Vec<(String, Project)> = self.db.list(PROJECTS_TABLE)?;
+            for (key, project) in all {
+                if key.starts_with(&prefix) {
+                    projects.push(project);
+                }
+            }
+        }
+
+        Ok(projects)
     }
 
     /// Delete a project. Fails if it has any environments.
     pub fn delete_project(&self, org: &str, name: &str) -> Result<()> {
-        let key = Self::project_key(org, name);
-
-        if !self.db.exists(PROJECTS_TABLE, &key)? {
-            return Err(OrgError::ProjectNotFound {
+        let project = self
+            .get_project(org, name)?
+            .ok_or_else(|| OrgError::ProjectNotFound {
                 org: org.to_string(),
                 project: name.to_string(),
-            });
-        }
+            })?;
 
         // Check for child environments
         let envs = self.list_envs(org, name)?;
@@ -207,17 +353,21 @@ impl OrgStore {
             });
         }
 
-        self.db.delete(PROJECTS_TABLE, &key)?;
+        let name_key = Self::project_name_key(org, name);
+        self.db.delete(PROJECTS_TABLE, &project.id.0)?;
+        self.db.delete(PROJECT_NAME_IDX, &name_key)?;
         Ok(())
     }
 
-    // ── Environment operations ──────────────────────────────────────
+    // ── Environment operations ──────────────���───────────────────────
 
-    fn env_key(org: &str, project: &str, env: &str) -> String {
+    /// Build the name-index key for an environment: "org/project/env".
+    fn env_name_key(org: &str, project: &str, env: &str) -> String {
         format!("{org}/{project}/{env}")
     }
 
-    /// Create an environment within a project.
+    /// Create an environment within a project. Generates a unique EnvironmentId,
+    /// stores keyed by ID, and creates a name index entry.
     pub fn create_env(
         &self,
         org: &str,
@@ -229,17 +379,23 @@ impl OrgStore {
     ) -> Result<Environment> {
         validate_name(name, "environment")?;
 
-        // Verify project exists
-        let project_key = Self::project_key(org, project);
-        if !self.db.exists(PROJECTS_TABLE, &project_key)? {
-            return Err(OrgError::ProjectNotFound {
-                org: org.to_string(),
-                project: project.to_string(),
-            });
+        // Verify project exists (resolves via name index)
+        let project_obj =
+            self.get_project(org, project)?
+                .ok_or_else(|| OrgError::ProjectNotFound {
+                    org: org.to_string(),
+                    project: project.to_string(),
+                })?;
+
+        let name_key = Self::env_name_key(org, project, name);
+
+        // Check name uniqueness via name index
+        if self.db.exists(ENV_NAME_IDX, &name_key)? {
+            return Err(OrgError::EnvAlreadyExists(name.to_string()));
         }
 
-        let env_key = Self::env_key(org, project, name);
-        if self.db.exists(ENVIRONMENTS_TABLE, &env_key)? {
+        // Backward compat: reject if legacy composite-keyed record exists
+        if self.db.exists(ENVIRONMENTS_TABLE, &name_key)? {
             return Err(OrgError::EnvAlreadyExists(name.to_string()));
         }
 
@@ -249,10 +405,11 @@ impl OrgStore {
             .as_secs();
         let expires_at = ttl.map(|t| created_at + t);
 
+        let id = EnvironmentId(generate_id("env"));
         let env = Environment {
-            id: EnvironmentId(env_key.clone()),
+            id: id.clone(),
             name: name.to_string(),
-            project_id: ProjectId(project_key),
+            project_id: project_obj.id.clone(),
             ttl,
             deletion_protection,
             labels,
@@ -260,28 +417,73 @@ impl OrgStore {
             expires_at,
         };
 
-        self.db.set(ENVIRONMENTS_TABLE, &env_key, &env)?;
+        // Store keyed by env ID
+        self.db.set(ENVIRONMENTS_TABLE, &id.0, &env)?;
+        // Name index: "org/project/env" → env_id
+        self.db.set(ENV_NAME_IDX, &name_key, &id.0)?;
         Ok(env)
+    }
+
+    /// Get an environment by its ID.
+    pub fn get_env_by_id(&self, id: &EnvironmentId) -> Result<Option<Environment>> {
+        Ok(self.db.get(ENVIRONMENTS_TABLE, &id.0)?)
     }
 
     /// Get an environment by org, project, and name.
     pub fn get_env(&self, org: &str, project: &str, name: &str) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-        self.db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))
+        let name_key = Self::env_name_key(org, project, name);
+
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(ENV_NAME_IDX, &name_key)? {
+            return self
+                .db
+                .get::<Environment>(ENVIRONMENTS_TABLE, &id_str)?
+                .ok_or_else(|| OrgError::EnvNotFound(name.to_string()));
+        }
+
+        // Fallback: legacy composite-keyed record, migrate
+        if let Some(mut env) = self.db.get::<Environment>(ENVIRONMENTS_TABLE, &name_key)? {
+            let new_id = EnvironmentId(generate_id("env"));
+            // Fix the project_id if it's a legacy composite key
+            if let Some(proj) = self.get_project(org, project)? {
+                env.project_id = proj.id.clone();
+            }
+            env.id = new_id.clone();
+            self.db.set(ENVIRONMENTS_TABLE, &new_id.0, &env)?;
+            self.db.set(ENV_NAME_IDX, &name_key, &new_id.0)?;
+            self.db.delete(ENVIRONMENTS_TABLE, &name_key)?;
+            return Ok(env);
+        }
+
+        Err(OrgError::EnvNotFound(name.to_string()))
     }
 
     /// List environments for a given org and project.
     pub fn list_envs(&self, org: &str, project: &str) -> Result<Vec<Environment>> {
         let prefix = format!("{org}/{project}/");
-        Ok(self
-            .db
-            .list::<Environment>(ENVIRONMENTS_TABLE)?
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v)
-            .collect())
+
+        // Use the name index to find environments
+        let idx_entries: Vec<(String, String)> = self.db.list(ENV_NAME_IDX)?;
+        let mut envs = Vec::new();
+        for (key, id_str) in &idx_entries {
+            if key.starts_with(&prefix) {
+                if let Some(env) = self.db.get::<Environment>(ENVIRONMENTS_TABLE, id_str)? {
+                    envs.push(env);
+                }
+            }
+        }
+
+        // Fallback: legacy composite-keyed entries
+        if envs.is_empty() {
+            let all: Vec<(String, Environment)> = self.db.list(ENVIRONMENTS_TABLE)?;
+            for (key, env) in all {
+                if key.starts_with(&prefix) {
+                    envs.push(env);
+                }
+            }
+        }
+
+        Ok(envs)
     }
 
     /// Extend (or set) the TTL of an environment.
@@ -296,12 +498,7 @@ impl OrgStore {
         name: &str,
         ttl: u64,
     ) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-
-        let mut env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let mut env = self.get_env(org, project, name)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -310,7 +507,7 @@ impl OrgStore {
         env.ttl = Some(ttl);
         env.expires_at = Some(now + ttl);
 
-        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        self.db.set(ENVIRONMENTS_TABLE, &env.id.0, &env)?;
         Ok(env)
     }
 
@@ -322,56 +519,63 @@ impl OrgStore {
         name: &str,
         enabled: bool,
     ) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-
-        let mut env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let mut env = self.get_env(org, project, name)?;
 
         env.deletion_protection = enabled;
-        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        self.db.set(ENVIRONMENTS_TABLE, &env.id.0, &env)?;
         Ok(env)
     }
 
     /// Delete an environment. Fails if deletion protection is enabled.
     pub fn delete_env(&self, org: &str, project: &str, name: &str) -> Result<()> {
-        let key = Self::env_key(org, project, name);
-
-        let env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let env = self.get_env(org, project, name)?;
 
         if env.deletion_protection {
             return Err(OrgError::EnvProtected(name.to_string()));
         }
 
-        self.db.delete(ENVIRONMENTS_TABLE, &key)?;
+        let name_key = Self::env_name_key(org, project, name);
+        self.db.delete(ENVIRONMENTS_TABLE, &env.id.0)?;
+        self.db.delete(ENV_NAME_IDX, &name_key)?;
         Ok(())
     }
 
     // ── VPC operations ──────────────────────────────────────────────
 
-    /// Validate a CIDR string. Accepts patterns like "10.0.0.0/16", "10.1.0.0/24".
+    /// Resolve the org ID that owns a VPC owner.
+    fn resolve_owner_org_id(&self, owner: &VpcOwner) -> Result<OrgId> {
+        match owner {
+            VpcOwner::Org(org_id) => Ok(org_id.clone()),
+            VpcOwner::Project(proj_id) => {
+                if let Some(project) = self.get_project_by_id(proj_id)? {
+                    Ok(project.org_id)
+                } else {
+                    // Legacy fallback: project ID might be "org/project" format
+                    let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                    if let [org_name, _proj_name] = parts.as_slice() {
+                        self.resolve_org_id(org_name)
+                    } else {
+                        Err(OrgError::NotFound(proj_id.0.clone()))
+                    }
+                }
+            }
+        }
+    }
+
     /// Collect parsed CIDRs of all VPCs belonging to the same org as `owner`.
     fn existing_cidrs_for_org(&self, owner: &VpcOwner) -> Result<Vec<Ipv4Net>> {
-        let org_name = match owner {
-            VpcOwner::Org(org_id) => org_id.0.clone(),
-            VpcOwner::Project(proj_id) => proj_id
-                .0
-                .split('/')
-                .next()
-                .unwrap_or(&proj_id.0)
-                .to_string(),
-        };
-
+        let org_id = self.resolve_owner_org_id(owner)?;
         let all_vpcs = self.list_vpcs()?;
         Ok(all_vpcs
             .into_iter()
-            .filter(|v| match &v.owner {
-                VpcOwner::Org(oid) => oid.0 == org_name,
-                VpcOwner::Project(pid) => pid.0.starts_with(&format!("{org_name}/")),
+            .filter(|v| {
+                let vpc_org = match &v.owner {
+                    VpcOwner::Org(oid) => Some(oid.clone()),
+                    VpcOwner::Project(pid) => {
+                        self.get_project_by_id(pid).ok().flatten().map(|p| p.org_id)
+                    }
+                };
+                vpc_org.as_ref() == Some(&org_id)
             })
             .filter_map(|v| v.cidr.parse::<Ipv4Net>().ok())
             .collect())
@@ -385,6 +589,24 @@ impl OrgStore {
         Ok(self
             .db
             .atomic_next_counter(VNI_COUNTER_TABLE, VNI_COUNTER_KEY, VNI_START)?)
+    }
+
+    /// Derive the org scope string for a VPC name index key.
+    fn vpc_org_scope(owner: &VpcOwner) -> String {
+        match owner {
+            VpcOwner::Org(org_id) => org_id.0.clone(),
+            VpcOwner::Project(proj_id) => proj_id
+                .0
+                .split('/')
+                .next()
+                .unwrap_or(&proj_id.0)
+                .to_string(),
+        }
+    }
+
+    /// Build the VPC name index key: "{org_scope}/{vpc_name}".
+    fn vpc_name_key(owner: &VpcOwner, name: &str) -> String {
+        format!("{}/{name}", Self::vpc_org_scope(owner))
     }
 
     /// Create a VPC. Validates the name and CIDR (RFC 1918, prefix 8-28,
@@ -402,31 +624,39 @@ impl OrgStore {
         // Validate that the parent org (and project, if applicable) exist.
         match &owner {
             VpcOwner::Org(org_id) => {
-                if !self.db.exists(TABLE, &org_id.0)? {
-                    return Err(OrgError::NotFound(org_id.0.clone()));
+                // Try ID-keyed lookup first, then name-based fallback
+                if self.get_by_id(org_id)?.is_none() {
+                    // Maybe org_id.0 is actually a name (legacy callers)
+                    if self.get(&org_id.0)?.is_none() {
+                        return Err(OrgError::NotFound(org_id.0.clone()));
+                    }
                 }
             }
             VpcOwner::Project(proj_id) => {
-                // Project IDs are "org/project"
-                let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
-                let (org_name, project_name) = match parts.as_slice() {
-                    [org, proj] => (*org, *proj),
-                    _ => return Err(OrgError::NotFound(proj_id.0.clone())),
-                };
-                if !self.db.exists(TABLE, org_name)? {
-                    return Err(OrgError::NotFound(org_name.to_string()));
-                }
-                let project_key = Self::project_key(org_name, project_name);
-                if !self.db.exists(PROJECTS_TABLE, &project_key)? {
-                    return Err(OrgError::ProjectNotFound {
-                        org: org_name.to_string(),
-                        project: project_name.to_string(),
-                    });
+                // Try ID-keyed lookup first
+                if self.get_project_by_id(proj_id)?.is_none() {
+                    // Legacy fallback: project ID might be "org/project" format
+                    let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                    let (org_name, project_name) = match parts.as_slice() {
+                        [org, proj] => (*org, *proj),
+                        _ => return Err(OrgError::NotFound(proj_id.0.clone())),
+                    };
+                    if self.get(org_name)?.is_none() {
+                        return Err(OrgError::NotFound(org_name.to_string()));
+                    }
+                    if self.get_project(org_name, project_name)?.is_none() {
+                        return Err(OrgError::ProjectNotFound {
+                            org: org_name.to_string(),
+                            project: project_name.to_string(),
+                        });
+                    }
                 }
             }
         }
 
-        if self.db.exists(VPCS_TABLE, name)? {
+        // Check name uniqueness within the org via index.
+        let name_key = Self::vpc_name_key(&owner, name);
+        if self.db.exists(VPC_NAME_INDEX, &name_key)? {
             return Err(OrgError::VpcAlreadyExists(name.to_string()));
         }
 
@@ -447,8 +677,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = VpcId::generate();
         let vpc = Vpc {
-            id: VpcId(format!("vpc-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             cidr: cidr.to_string(),
             vni,
@@ -457,7 +688,10 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(VPCS_TABLE, name, &vpc)?;
+        // Primary table: keyed by ID.
+        self.db.set(VPCS_TABLE, &id.0, &vpc)?;
+        // Name index: org-scoped name → ID.
+        self.db.set(VPC_NAME_INDEX, &name_key, &id.0)?;
 
         // Auto-create the default security group for this VPC.
         self.create_default_sg(&vpc)?;
@@ -468,15 +702,22 @@ impl OrgStore {
         Ok(vpc)
     }
 
-    /// Get a VPC by name.
+    /// Get a VPC by name. Uses the name index to find the ID, then fetches.
     pub fn get_vpc(&self, name: &str) -> Result<Option<Vpc>> {
-        Ok(self.db.get(VPCS_TABLE, name)?)
+        // Scan the name index for any entry ending with "/{name}".
+        let entries: Vec<(String, String)> = self.db.list(VPC_NAME_INDEX)?;
+        let suffix = format!("/{name}");
+        for (key, vpc_id) in entries {
+            if key.ends_with(&suffix) {
+                return Ok(self.db.get(VPCS_TABLE, &vpc_id)?);
+            }
+        }
+        Ok(None)
     }
 
-    /// Get a VPC by its ID (e.g. "vpc-my-vpc").
+    /// Get a VPC by its ID.
     pub fn get_vpc_by_id(&self, vpc_id: &VpcId) -> Result<Option<Vpc>> {
-        let all = self.list_vpcs()?;
-        Ok(all.into_iter().find(|v| v.id == *vpc_id))
+        Ok(self.db.get(VPCS_TABLE, &vpc_id.0)?)
     }
 
     /// List all VPCs.
@@ -500,25 +741,31 @@ impl OrgStore {
     /// whose project belongs to the given org. Project IDs use the
     /// `{org_name}/{project_name}` convention.
     pub fn list_vpcs_by_org(&self, org_id: &OrgId) -> Result<Vec<Vpc>> {
-        let prefix = format!("{}/", org_id.0);
         let all = self.list_vpcs()?;
         Ok(all
             .into_iter()
             .filter(|vpc| match &vpc.owner {
                 VpcOwner::Org(oid) => oid == org_id,
-                VpcOwner::Project(pid) => pid.0.starts_with(&prefix),
+                VpcOwner::Project(pid) => {
+                    // Check if this project belongs to the given org
+                    self.get_project_by_id(pid)
+                        .ok()
+                        .flatten()
+                        .map(|p| p.org_id == *org_id)
+                        .unwrap_or(false)
+                }
             })
             .collect())
     }
 
     /// Delete a VPC by name. Fails if it has active peerings.
     pub fn delete_vpc(&self, name: &str) -> Result<()> {
-        if !self.db.exists(VPCS_TABLE, name)? {
-            return Err(OrgError::VpcNotFound(name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(name)?
+            .ok_or_else(|| OrgError::VpcNotFound(name.to_string()))?;
 
         // Check for active peerings
-        let peerings = self.list_peerings_by_vpc(name)?;
+        let peerings = self.list_peerings_by_vpc_id(&vpc.id)?;
         if !peerings.is_empty() {
             return Err(OrgError::VpcHasPeerings {
                 name: name.to_string(),
@@ -526,29 +773,32 @@ impl OrgStore {
             });
         }
 
-        self.db.delete(VPCS_TABLE, name)?;
+        // Remove from name index.
+        let name_key = Self::vpc_name_key(&vpc.owner, name);
+        let _ = self.db.delete(VPC_NAME_INDEX, &name_key);
+
+        self.db.delete(VPCS_TABLE, &vpc.id.0)?;
         Ok(())
     }
 
     // ── VPC attachment operations ────────────────────────────────────
 
-    /// Build a storage key for a VPC attachment.
-    fn attachment_key(vpc_name: &str, project_id: &str) -> String {
-        format!("{vpc_name}/{project_id}")
+    /// Build a storage key for a VPC attachment: "vpc_id/project_id".
+    fn attachment_key(vpc_id: &VpcId, project_id: &str) -> String {
+        format!("{}/{project_id}", vpc_id.0)
     }
 
     /// Attach a shared VPC to a project.
     pub fn attach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
         let vpc = self
-            .db
-            .get::<Vpc>(VPCS_TABLE, vpc_name)?
+            .get_vpc(vpc_name)?
             .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
         if !vpc.shared {
             return Err(OrgError::VpcNotShared(vpc_name.to_string()));
         }
 
-        let key = Self::attachment_key(vpc_name, project_id);
+        let key = Self::attachment_key(&vpc.id, project_id);
         if self.db.exists(VPC_ATTACHMENTS_TABLE, &key)? {
             return Err(OrgError::VpcAlreadyAttached {
                 vpc: vpc_name.to_string(),
@@ -562,7 +812,7 @@ impl OrgStore {
             .as_secs();
 
         let attachment = VpcAttachment {
-            vpc_name: vpc_name.to_string(),
+            vpc_id: vpc.id.clone(),
             project_id: ProjectId(project_id.to_string()),
             attached_at: now,
         };
@@ -573,11 +823,11 @@ impl OrgStore {
 
     /// Detach a shared VPC from a project.
     pub fn detach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
-        if !self.db.exists(VPCS_TABLE, vpc_name)? {
-            return Err(OrgError::VpcNotFound(vpc_name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
-        let key = Self::attachment_key(vpc_name, project_id);
+        let key = Self::attachment_key(&vpc.id, project_id);
         if !self.db.exists(VPC_ATTACHMENTS_TABLE, &key)? {
             return Err(OrgError::VpcNotAttached {
                 vpc: vpc_name.to_string(),
@@ -591,11 +841,11 @@ impl OrgStore {
 
     /// List all projects attached to a VPC.
     pub fn list_attachments(&self, vpc_name: &str) -> Result<Vec<ProjectId>> {
-        if !self.db.exists(VPCS_TABLE, vpc_name)? {
-            return Err(OrgError::VpcNotFound(vpc_name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
-        let prefix = format!("{vpc_name}/");
+        let prefix = format!("{}/", vpc.id.0);
         let all: Vec<(String, VpcAttachment)> = self.db.list(VPC_ATTACHMENTS_TABLE)?;
         Ok(all
             .into_iter()
@@ -606,9 +856,9 @@ impl OrgStore {
 
     // ── Subnet operations ──────────────────────────────────────────
 
-    /// Build the redb key for a subnet: "vpc_name/subnet_name".
-    fn subnet_key(vpc_name: &str, subnet_name: &str) -> String {
-        format!("{vpc_name}/{subnet_name}")
+    /// Build the name index key for a subnet: "vpc_id/subnet_name".
+    fn subnet_name_key(vpc_id: &VpcId, subnet_name: &str) -> String {
+        format!("{}/{subnet_name}", vpc_id.0)
     }
 
     /// Compute the gateway address (.1) from a subnet CIDR.
@@ -706,8 +956,7 @@ impl OrgStore {
 
         // Verify VPC exists
         let vpc = self
-            .db
-            .get::<Vpc>(VPCS_TABLE, vpc_name)?
+            .get_vpc(vpc_name)?
             .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
         // Verify environment exists
@@ -715,9 +964,9 @@ impl OrgStore {
             return Err(OrgError::EnvNotFound(env_id.0.clone()));
         }
 
-        // Check subnet name uniqueness within VPC
-        let key = Self::subnet_key(vpc_name, name);
-        if self.db.exists(SUBNETS_TABLE, &key)? {
+        // Check subnet name uniqueness within VPC via index
+        let name_key = Self::subnet_name_key(&vpc.id, name);
+        if self.db.exists(SUBNET_NAME_INDEX, &name_key)? {
             return Err(OrgError::SubnetAlreadyExists {
                 vpc: vpc_name.to_string(),
                 subnet: name.to_string(),
@@ -774,8 +1023,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = SubnetId::generate();
         let subnet = Subnet {
-            id: SubnetId(key.clone()),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc.id.clone(),
             env_id: env_id.clone(),
@@ -784,7 +1034,10 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SUBNETS_TABLE, &key, &subnet)?;
+        // Primary table: keyed by ID.
+        self.db.set(SUBNETS_TABLE, &id.0, &subnet)?;
+        // Name index: vpc-scoped name → ID.
+        self.db.set(SUBNET_NAME_INDEX, &name_key, &id.0)?;
 
         // Auto-add system route for this subnet's CIDR in the VPC's default route table.
         if let Ok(Some(default_rt)) = self.get_default_route_table(&vpc.id) {
@@ -796,27 +1049,45 @@ impl OrgStore {
 
     /// Get a subnet by VPC name and subnet name.
     pub fn get_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<Subnet> {
-        let key = Self::subnet_key(vpc_name, subnet_name);
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+        let name_key = Self::subnet_name_key(&vpc.id, subnet_name);
+        let subnet_id: String =
+            self.db
+                .get(SUBNET_NAME_INDEX, &name_key)?
+                .ok_or_else(|| OrgError::SubnetNotFound {
+                    vpc: vpc_name.to_string(),
+                    subnet: subnet_name.to_string(),
+                })?;
         self.db
-            .get::<Subnet>(SUBNETS_TABLE, &key)?
+            .get::<Subnet>(SUBNETS_TABLE, &subnet_id)?
             .ok_or_else(|| OrgError::SubnetNotFound {
                 vpc: vpc_name.to_string(),
                 subnet: subnet_name.to_string(),
             })
     }
 
-    /// Get a subnet by its SubnetId (the raw redb key, e.g., "vpc_name/subnet_name").
+    /// Get a subnet by its SubnetId.
     pub fn get_subnet_by_id(&self, subnet_id: &str) -> Result<Option<Subnet>> {
         Ok(self.db.get::<Subnet>(SUBNETS_TABLE, subnet_id)?)
     }
 
-    /// List all subnets in a VPC.
+    /// List all subnets in a VPC (by VPC name).
     pub fn list_subnets(&self, vpc_name: &str) -> Result<Vec<Subnet>> {
-        let prefix = format!("{vpc_name}/");
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        self.list_subnets_by_vpc_id(&vpc.id)
+    }
+
+    /// List all subnets in a VPC (by VPC ID).
+    pub fn list_subnets_by_vpc_id(&self, vpc_id: &VpcId) -> Result<Vec<Subnet>> {
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         Ok(all
             .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
+            .filter(|(_, s)| s.vpc_id == *vpc_id)
             .map(|(_, s)| s)
             .collect())
     }
@@ -838,10 +1109,13 @@ impl OrgStore {
     pub fn find_subnets_by_name(&self, subnet_name: &str) -> Result<Vec<(String, Subnet)>> {
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         let mut matches = Vec::new();
-        for (key, subnet) in all {
+        for (_key, subnet) in all {
             if subnet.name == subnet_name {
-                // key is "vpc_name/subnet_name"; extract vpc_name
-                let vpc_name = key.split('/').next().unwrap_or(&key).to_string();
+                // Resolve VPC name from VPC ID.
+                let vpc_name = match self.get_vpc_by_id(&subnet.vpc_id)? {
+                    Some(v) => v.name,
+                    None => subnet.vpc_id.0.clone(),
+                };
                 matches.push((vpc_name, subnet));
             }
         }
@@ -850,14 +1124,25 @@ impl OrgStore {
 
     /// Delete a subnet by VPC name and subnet name.
     pub fn delete_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<()> {
-        let key = Self::subnet_key(vpc_name, subnet_name);
-        let subnet: Subnet =
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+
+        let name_key = Self::subnet_name_key(&vpc.id, subnet_name);
+        let subnet_id_str: String =
             self.db
-                .get(SUBNETS_TABLE, &key)?
+                .get(SUBNET_NAME_INDEX, &name_key)?
                 .ok_or_else(|| OrgError::SubnetNotFound {
                     vpc: vpc_name.to_string(),
                     subnet: subnet_name.to_string(),
                 })?;
+
+        let subnet: Subnet = self.db.get(SUBNETS_TABLE, &subnet_id_str)?.ok_or_else(|| {
+            OrgError::SubnetNotFound {
+                vpc: vpc_name.to_string(),
+                subnet: subnet_name.to_string(),
+            }
+        })?;
 
         // Remove the system route for this subnet's CIDR from the default route table.
         if let Ok(Some(default_rt)) = self.get_default_route_table(&subnet.vpc_id) {
@@ -867,29 +1152,31 @@ impl OrgStore {
         // Remove any route table association for this subnet.
         let _ = self.disassociate_subnet_route_table(&subnet.id);
 
-        self.db.delete(SUBNETS_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(SUBNET_NAME_INDEX, &name_key);
+
+        self.db.delete(SUBNETS_TABLE, &subnet_id_str)?;
         Ok(())
     }
 
     // ── VPC Peering operations ──────────────────────────────────────
 
-    /// Normalize a peering key by sorting the two VPC names alphabetically.
+    /// Normalize a peering key by sorting the two VPC IDs alphabetically.
     /// This ensures "A/B" and "B/A" resolve to the same peering.
-    fn peering_key(vpc_a: &str, vpc_b: &str) -> (String, String, String) {
-        let (a, b) = if vpc_a <= vpc_b {
-            (vpc_a.to_string(), vpc_b.to_string())
+    fn peering_name_key(vpc_a_id: &VpcId, vpc_b_id: &VpcId) -> (String, VpcId, VpcId) {
+        let (a, b) = if vpc_a_id.0 <= vpc_b_id.0 {
+            (vpc_a_id.clone(), vpc_b_id.clone())
         } else {
-            (vpc_b.to_string(), vpc_a.to_string())
+            (vpc_b_id.clone(), vpc_a_id.clone())
         };
-        let key = format!("{a}/{b}");
+        let key = format!("{}/{}", a.0, b.0);
         (key, a, b)
     }
 
-    /// Create a peering between two VPCs.
+    /// Create a peering between two VPCs (by name).
     ///
     /// Both VPCs must exist, self-peering is rejected, and duplicate
-    /// peerings are rejected. The key is normalized so that order of
-    /// vpc_a/vpc_b does not matter.
+    /// peerings are rejected.
     pub fn create_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<VpcPeering> {
         // Reject self-peering
         if vpc_a == vpc_b {
@@ -897,18 +1184,25 @@ impl OrgStore {
         }
 
         // Verify both VPCs exist
-        if !self.db.exists(VPCS_TABLE, vpc_a)? {
-            return Err(OrgError::VpcNotFound(vpc_a.to_string()));
-        }
-        if !self.db.exists(VPCS_TABLE, vpc_b)? {
-            return Err(OrgError::VpcNotFound(vpc_b.to_string()));
-        }
+        let vpc_a_obj = self
+            .get_vpc(vpc_a)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a.to_string()))?;
+        let vpc_b_obj = self
+            .get_vpc(vpc_b)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b.to_string()))?;
 
-        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
+        let (name_key, a_id, b_id) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
 
-        // Reject duplicate
-        if self.db.exists(PEERINGS_TABLE, &key)? {
-            return Err(OrgError::PeeringAlreadyExists { vpc_a: a, vpc_b: b });
+        // Check for duplicate via name-key scan.
+        let existing = self.list_peerings()?;
+        for p in &existing {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                return Err(OrgError::PeeringAlreadyExists {
+                    vpc_a: vpc_a.to_string(),
+                    vpc_b: vpc_b.to_string(),
+                });
+            }
         }
 
         let now = SystemTime::now()
@@ -916,28 +1210,45 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = PeeringId::generate();
         let peering = VpcPeering {
-            id: PeeringId(format!("peer-{key}")),
-            vpc_a: a,
-            vpc_b: b,
+            id: id.clone(),
+            vpc_a: a_id,
+            vpc_b: b_id,
             status: PeeringStatus::Active,
             created_at: now,
         };
 
-        self.db.set(PEERINGS_TABLE, &key, &peering)?;
+        // Primary table: keyed by peering ID.
+        self.db.set(PEERINGS_TABLE, &id.0, &peering)?;
         Ok(peering)
     }
 
-    /// Delete (remove) a peering between two VPCs.
+    /// Delete (remove) a peering between two VPCs (by name).
     pub fn delete_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<()> {
-        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
+        let vpc_a_obj = self
+            .get_vpc(vpc_a)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a.to_string()))?;
+        let vpc_b_obj = self
+            .get_vpc(vpc_b)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b.to_string()))?;
 
-        if !self.db.exists(PEERINGS_TABLE, &key)? {
-            return Err(OrgError::PeeringNotFound { vpc_a: a, vpc_b: b });
+        let (name_key, _, _) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
+
+        // Find matching peering.
+        let all = self.list_peerings()?;
+        for p in &all {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                self.db.delete(PEERINGS_TABLE, &p.id.0)?;
+                return Ok(());
+            }
         }
 
-        self.db.delete(PEERINGS_TABLE, &key)?;
-        Ok(())
+        Err(OrgError::PeeringNotFound {
+            vpc_a: vpc_a.to_string(),
+            vpc_b: vpc_b.to_string(),
+        })
     }
 
     /// List all peerings.
@@ -946,12 +1257,21 @@ impl OrgStore {
         Ok(entries.into_iter().map(|(_, p)| p).collect())
     }
 
-    /// List peerings that involve a specific VPC.
+    /// List peerings that involve a specific VPC (by name).
     pub fn list_peerings_by_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        self.list_peerings_by_vpc_id(&vpc.id)
+    }
+
+    /// List peerings that involve a specific VPC (by ID).
+    pub fn list_peerings_by_vpc_id(&self, vpc_id: &VpcId) -> Result<Vec<VpcPeering>> {
         let all = self.list_peerings()?;
         Ok(all
             .into_iter()
-            .filter(|p| p.vpc_a == vpc_name || p.vpc_b == vpc_name)
+            .filter(|p| p.vpc_a == *vpc_id || p.vpc_b == *vpc_id)
             .collect())
     }
 
@@ -960,22 +1280,42 @@ impl OrgStore {
         self.list_peerings_by_vpc(vpc_name)
     }
 
-    /// Resolve a VPC name from its stored string. Since peerings now store
-    /// VPC names directly, this is an identity function.
-    pub fn resolve_vpc_name(&self, vpc_name: &str) -> String {
-        vpc_name.to_string()
+    /// Resolve a VPC name from its ID. Returns the name if found, otherwise the
+    /// raw ID string.
+    pub fn resolve_vpc_name(&self, vpc_id_str: &str) -> String {
+        let vpc_id = VpcId(vpc_id_str.to_string());
+        match self.get_vpc_by_id(&vpc_id) {
+            Ok(Some(v)) => v.name,
+            _ => vpc_id_str.to_string(),
+        }
     }
 
-    /// Get a specific peering between two VPCs, if it exists.
+    /// Get a specific peering between two VPCs (by name), if it exists.
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
-        let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
-        Ok(self.db.get(PEERINGS_TABLE, &key)?)
+        let vpc_a_obj = match self.get_vpc(vpc_a)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let vpc_b_obj = match self.get_vpc(vpc_b)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let (name_key, _, _) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
+        let all = self.list_peerings()?;
+        for p in all {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
     }
 
     // ── Security Group operations ──────────────────────────────────
 
-    /// Build the redb key for a security group: "vpc_id/sg_name".
-    fn sg_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a security group: "vpc_id/sg_name".
+    fn sg_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{}", vpc_id.0, name)
     }
 
@@ -988,8 +1328,8 @@ impl OrgStore {
     ) -> Result<SecurityGroup> {
         validate_name(name, "security group")?;
 
-        let key = Self::sg_key(vpc_id, name);
-        if self.db.exists(SECURITY_GROUPS_TABLE, &key)? {
+        let name_key = Self::sg_name_key(vpc_id, name);
+        if self.db.exists(SG_NAME_INDEX, &name_key)? {
             return Err(OrgError::SgAlreadyExists(name.to_string()));
         }
 
@@ -998,8 +1338,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = SecurityGroupId::generate();
         let sg = SecurityGroup {
-            id: SecurityGroupId(format!("sg-{}", name)),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             description: description.map(|s| s.to_string()),
@@ -1008,22 +1349,24 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        // Primary table: keyed by ID.
+        self.db.set(SECURITY_GROUPS_TABLE, &id.0, &sg)?;
+        // Name index: vpc-scoped name → ID.
+        self.db.set(SG_NAME_INDEX, &name_key, &id.0)?;
         Ok(sg)
     }
 
     /// Create the default security group for a VPC. Called automatically
     /// during VPC creation. The default SG cannot be deleted.
     pub fn create_default_sg(&self, vpc: &Vpc) -> Result<SecurityGroup> {
-        let key = Self::sg_key(&vpc.id, "default");
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let id = SecurityGroupId::generate();
         let sg = SecurityGroup {
-            id: SecurityGroupId(format!("sg-default-{}", vpc.name)),
+            id: id.clone(),
             name: "default".to_string(),
             vpc_id: vpc.id.clone(),
             description: Some(format!("Default security group for VPC {}", vpc.name)),
@@ -1032,14 +1375,22 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        // Primary table: keyed by ID.
+        self.db.set(SECURITY_GROUPS_TABLE, &id.0, &sg)?;
+        // Name index.
+        let name_key = Self::sg_name_key(&vpc.id, "default");
+        self.db.set(SG_NAME_INDEX, &name_key, &id.0)?;
         Ok(sg)
     }
 
     /// Get a security group by VPC ID and name.
     pub fn get_sg(&self, vpc_id: &VpcId, name: &str) -> Result<Option<SecurityGroup>> {
-        let key = Self::sg_key(vpc_id, name);
-        Ok(self.db.get(SECURITY_GROUPS_TABLE, &key)?)
+        let name_key = Self::sg_name_key(vpc_id, name);
+        let sg_id: Option<String> = self.db.get(SG_NAME_INDEX, &name_key)?;
+        match sg_id {
+            Some(id) => Ok(self.db.get(SECURITY_GROUPS_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// List all security groups.
@@ -1050,29 +1401,30 @@ impl OrgStore {
 
     /// List security groups belonging to a specific VPC.
     pub fn list_sgs_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<SecurityGroup>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, sg)| sg)
-            .collect())
+        let all = self.list_sgs()?;
+        Ok(all.into_iter().filter(|sg| sg.vpc_id == *vpc_id).collect())
     }
 
     /// Delete a security group. Fails if the SG is the default for its VPC.
     pub fn delete_sg(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::sg_key(vpc_id, name);
+        let name_key = Self::sg_name_key(vpc_id, name);
+        let sg_id_str: String = self
+            .db
+            .get(SG_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
 
         let sg: SecurityGroup = self
             .db
-            .get(SECURITY_GROUPS_TABLE, &key)?
+            .get(SECURITY_GROUPS_TABLE, &sg_id_str)?
             .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
 
         if sg.is_default {
             return Err(OrgError::SgIsDefault(name.to_string()));
         }
 
-        self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(SG_NAME_INDEX, &name_key);
+        self.db.delete(SECURITY_GROUPS_TABLE, &sg_id_str)?;
         Ok(())
     }
 
@@ -1151,8 +1503,8 @@ impl OrgStore {
 
     // ── Route Table operations ──────────────────────────────────────
 
-    /// Build the redb key for a route table: "vpc_id/table_name".
-    fn route_table_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a route table: "vpc_id/table_name".
+    fn route_table_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{}", vpc_id.0, name)
     }
 
@@ -1164,15 +1516,14 @@ impl OrgStore {
     /// Create the default route table for a VPC. Called automatically
     /// during VPC creation.
     pub fn create_default_route_table(&self, vpc: &Vpc) -> Result<RouteTable> {
-        let key = Self::route_table_key(&vpc.id, "default");
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteTableId::generate();
         let table = RouteTable {
-            id: RouteTableId(format!("rtb-default-{}", vpc.name)),
+            id: id.clone(),
             name: "default".to_string(),
             vpc_id: vpc.id.clone(),
             is_default: true,
@@ -1180,7 +1531,11 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+        // Primary table: keyed by ID.
+        self.db.set(ROUTE_TABLES_TABLE, &id.0, &table)?;
+        // Name index.
+        let name_key = Self::route_table_name_key(&vpc.id, "default");
+        self.db.set(ROUTE_TABLE_NAME_INDEX, &name_key, &id.0)?;
 
         // Add the VPC CIDR local route as a system route.
         self.add_system_route(&table, &vpc.cidr)?;
@@ -1192,8 +1547,8 @@ impl OrgStore {
     pub fn create_route_table(&self, name: &str, vpc_id: &VpcId) -> Result<RouteTable> {
         validate_name(name, "route table")?;
 
-        let key = Self::route_table_key(vpc_id, name);
-        if self.db.exists(ROUTE_TABLES_TABLE, &key)? {
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        if self.db.exists(ROUTE_TABLE_NAME_INDEX, &name_key)? {
             return Err(OrgError::RouteTableAlreadyExists(name.to_string()));
         }
 
@@ -1202,8 +1557,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteTableId::generate();
         let table = RouteTable {
-            id: RouteTableId(format!("rtb-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             is_default: false,
@@ -1211,14 +1567,21 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+        // Primary table: keyed by ID.
+        self.db.set(ROUTE_TABLES_TABLE, &id.0, &table)?;
+        // Name index.
+        self.db.set(ROUTE_TABLE_NAME_INDEX, &name_key, &id.0)?;
         Ok(table)
     }
 
     /// Get a route table by VPC ID and name.
     pub fn get_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<Option<RouteTable>> {
-        let key = Self::route_table_key(vpc_id, name);
-        Ok(self.db.get(ROUTE_TABLES_TABLE, &key)?)
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        let table_id: Option<String> = self.db.get(ROUTE_TABLE_NAME_INDEX, &name_key)?;
+        match table_id {
+            Some(id) => Ok(self.db.get(ROUTE_TABLES_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// Get the default route table for a VPC.
@@ -1234,22 +1597,21 @@ impl OrgStore {
 
     /// List route tables belonging to a specific VPC.
     pub fn list_route_tables_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<RouteTable>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, RouteTable)> = self.db.list(ROUTE_TABLES_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, t)| t)
-            .collect())
+        let all = self.list_route_tables()?;
+        Ok(all.into_iter().filter(|t| t.vpc_id == *vpc_id).collect())
     }
 
     /// Delete a route table. Fails if it is the default table or has associated subnets.
     pub fn delete_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::route_table_key(vpc_id, name);
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        let table_id_str: String = self
+            .db
+            .get(ROUTE_TABLE_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::RouteTableNotFound(name.to_string()))?;
 
         let table: RouteTable = self
             .db
-            .get(ROUTE_TABLES_TABLE, &key)?
+            .get(ROUTE_TABLES_TABLE, &table_id_str)?
             .ok_or_else(|| OrgError::RouteTableNotFound(name.to_string()))?;
 
         if table.is_default {
@@ -1272,7 +1634,9 @@ impl OrgStore {
             self.db.delete(ROUTES_TABLE, &rkey)?;
         }
 
-        self.db.delete(ROUTE_TABLES_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(ROUTE_TABLE_NAME_INDEX, &name_key);
+        self.db.delete(ROUTE_TABLES_TABLE, &table_id_str)?;
         Ok(())
     }
 
@@ -1323,12 +1687,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!(
-                "rt-sys-{}-{}",
-                table.name,
-                destination.replace('/', "_")
-            )),
+            id: id.clone(),
             route_table_id: table.id.clone(),
             destination: destination.to_string(),
             target: RouteTarget::Local,
@@ -1361,19 +1722,14 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
-        let status = match &target {
-            RouteTarget::Blackhole => RouteStatus::Active,
-            RouteTarget::Local => RouteStatus::Active,
-            _ => RouteStatus::Active,
-        };
-
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!("rt-{}", destination.replace('/', "_"))),
+            id: id.clone(),
             route_table_id: table_id.clone(),
             destination: destination.to_string(),
             target,
             origin: RouteOrigin::User,
-            status,
+            status: RouteStatus::Active,
             priority: priority.unwrap_or(100),
             created_at: now,
         };
@@ -1396,8 +1752,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!("rt-prop-{}", destination.replace('/', "_"))),
+            id: id.clone(),
             route_table_id: table_id.clone(),
             destination: destination.to_string(),
             target,
@@ -1528,8 +1885,8 @@ impl OrgStore {
 
     // ── NAT Gateway operations ─────────────────────────────────────
 
-    /// Key format for NAT gateway entries: "vpc_id/name".
-    fn nat_gw_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a NAT gateway: "vpc_id/name".
+    fn nat_gw_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{name}", vpc_id.0)
     }
 
@@ -1543,8 +1900,8 @@ impl OrgStore {
     ) -> Result<NatGateway> {
         validate_name(name, "nat-gw")?;
 
-        let key = Self::nat_gw_key(vpc_id, name);
-        if self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        if self.db.exists(NAT_GW_NAME_INDEX, &name_key)? {
             return Err(OrgError::NatGwAlreadyExists(name.to_string()));
         }
 
@@ -1553,8 +1910,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = NatGatewayId::generate();
         let gw = NatGateway {
-            id: NatGatewayId(format!("nat-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             subnet_id: subnet_id.clone(),
@@ -1563,14 +1921,21 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        // Primary table: keyed by ID.
+        self.db.set(NAT_GATEWAYS_TABLE, &id.0, &gw)?;
+        // Name index.
+        self.db.set(NAT_GW_NAME_INDEX, &name_key, &id.0)?;
         Ok(gw)
     }
 
     /// Get a NAT Gateway by VPC ID and name.
     pub fn get_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<Option<NatGateway>> {
-        let key = Self::nat_gw_key(vpc_id, name);
-        Ok(self.db.get(NAT_GATEWAYS_TABLE, &key)?)
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id: Option<String> = self.db.get(NAT_GW_NAME_INDEX, &name_key)?;
+        match gw_id {
+            Some(id) => Ok(self.db.get(NAT_GATEWAYS_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// Get a NAT Gateway by name alone (scans all VPCs). Returns error if ambiguous.
@@ -1594,13 +1959,8 @@ impl OrgStore {
 
     /// List NAT Gateways belonging to a specific VPC.
     pub fn list_nat_gws_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<NatGateway>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, NatGateway)> = self.db.list(NAT_GATEWAYS_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, g)| g)
-            .collect())
+        let all = self.list_nat_gws()?;
+        Ok(all.into_iter().filter(|g| g.vpc_id == *vpc_id).collect())
     }
 
     /// List NAT Gateways by VPC name (CLI convenience wrapper).
@@ -1623,36 +1983,48 @@ impl OrgStore {
         name: &str,
         state: ResourceState,
     ) -> Result<NatGateway> {
-        let key = Self::nat_gw_key(vpc_id, name);
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id_str: String = self
+            .db
+            .get(NAT_GW_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
         let mut gw: NatGateway = self
             .db
-            .get(NAT_GATEWAYS_TABLE, &key)?
+            .get(NAT_GATEWAYS_TABLE, &gw_id_str)?
             .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
         gw.state = state;
-        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        self.db.set(NAT_GATEWAYS_TABLE, &gw_id_str, &gw)?;
         Ok(gw)
     }
 
     /// Delete a NAT Gateway record from the store.
     pub fn delete_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::nat_gw_key(vpc_id, name);
-        if !self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
-            return Err(OrgError::NatGwNotFound(name.to_string()));
-        }
-        self.db.delete(NAT_GATEWAYS_TABLE, &key)?;
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id_str: String = self
+            .db
+            .get(NAT_GW_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
+        // Remove from name index.
+        let _ = self.db.delete(NAT_GW_NAME_INDEX, &name_key);
+        self.db.delete(NAT_GATEWAYS_TABLE, &gw_id_str)?;
         Ok(())
     }
 
-    /// Check if any routes in the VPC reference the given NAT Gateway name.
+    /// Check if any routes in the VPC reference the given NAT Gateway ID.
     pub fn routes_referencing_nat_gw(
         &self,
         vpc_id: &VpcId,
         nat_gw_name: &str,
     ) -> Result<Vec<Route>> {
+        // Resolve nat gw name to ID.
+        let gw = match self.get_nat_gw(vpc_id, nat_gw_name)? {
+            Some(g) => g,
+            None => return Ok(Vec::new()),
+        };
         let routes = self.list_routes_by_vpc(vpc_id)?;
         Ok(routes
             .into_iter()
-            .filter(|r| matches!(&r.target, RouteTarget::NatGateway(n) if n == nat_gw_name))
+            .filter(|r| matches!(&r.target, RouteTarget::NatGateway(id) if *id == gw.id))
             .collect())
     }
 
@@ -1696,7 +2068,7 @@ impl OrgStore {
         let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
         Ok(entries
             .into_iter()
-            .filter(|(_, nic)| nic.vpc_id == vpc_id && nic.state != ResourceState::Deleted)
+            .filter(|(_, nic)| nic.vpc_id.0 == vpc_id && nic.state != ResourceState::Deleted)
             .map(|(_, nic)| nic)
             .collect())
     }
@@ -1720,23 +2092,21 @@ impl OrgStore {
         }
     }
 
-    /// Attach a security group to a NIC. Validates VPC match.
-    pub fn attach_sg_to_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
-        let sg: SecurityGroup = self
-            .db
-            .get(SECURITY_GROUPS_TABLE, sg_key)?
-            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+    /// Attach a security group to a NIC. `sg_ref` can be an SG ID (e.g. "sg-abc123")
+    /// or a name index key ("vpc_id/sg_name") for backward compatibility.
+    pub fn attach_sg_to_nic(&self, sg_ref: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg = self.resolve_sg_ref(sg_ref)?;
 
         let mut nic: NetworkInterface = self
             .db
             .get(NICS_TABLE, nic_id)?
             .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
 
-        if sg.vpc_id.0 != nic.vpc_id {
+        if sg.vpc_id != nic.vpc_id {
             return Err(OrgError::SgVpcMismatch {
                 sg: sg.name.clone(),
                 sg_vpc: sg.vpc_id.0.clone(),
-                nic_vpc: nic.vpc_id.clone(),
+                nic_vpc: nic.vpc_id.0.clone(),
             });
         }
 
@@ -1752,12 +2122,9 @@ impl OrgStore {
         Ok(nic)
     }
 
-    /// Detach a security group from a NIC.
-    pub fn detach_sg_from_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
-        let sg: SecurityGroup = self
-            .db
-            .get(SECURITY_GROUPS_TABLE, sg_key)?
-            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+    /// Detach a security group from a NIC. `sg_ref` can be an SG ID or name index key.
+    pub fn detach_sg_from_nic(&self, sg_ref: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg = self.resolve_sg_ref(sg_ref)?;
 
         let mut nic: NetworkInterface = self
             .db
@@ -1780,6 +2147,27 @@ impl OrgStore {
         nic.security_groups.retain(|id| id != &sg.id);
         self.db.set(NICS_TABLE, nic_id, &nic)?;
         Ok(nic)
+    }
+
+    /// Resolve an SG reference: try as direct ID first, then as name index key.
+    fn resolve_sg_ref(&self, sg_ref: &str) -> Result<SecurityGroup> {
+        // Try direct ID lookup first.
+        if let Some(sg) = self
+            .db
+            .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, sg_ref)?
+        {
+            return Ok(sg);
+        }
+        // Try as name index key ("vpc_id/sg_name").
+        if let Some(sg_id) = self.db.get::<String>(SG_NAME_INDEX, sg_ref)? {
+            if let Some(sg) = self
+                .db
+                .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, &sg_id)?
+            {
+                return Ok(sg);
+            }
+        }
+        Err(OrgError::SgNotFound(sg_ref.to_string()))
     }
 
     /// List security groups attached to a NIC.
@@ -1819,6 +2207,21 @@ mod tests {
         store.create_project("acme", "backend").unwrap();
     }
 
+    /// Helper: create an org and return its VpcOwner::Org.
+    fn org_owner(store: &OrgStore, name: &str) -> VpcOwner {
+        let org = store.get(name).unwrap().expect("org must exist");
+        VpcOwner::Org(org.id)
+    }
+
+    /// Helper: create an org+project and return its VpcOwner::Project.
+    fn project_owner(store: &OrgStore, org: &str, project: &str) -> VpcOwner {
+        let proj = store
+            .get_project(org, project)
+            .unwrap()
+            .expect("project must exist");
+        VpcOwner::Project(proj.id)
+    }
+
     // ── Org tests ───────────────────────────────────────────────────
 
     #[test]
@@ -1826,7 +2229,11 @@ mod tests {
         let (_dir, store) = temp_store();
         let org = store.create("acme").unwrap();
         assert_eq!(org.name, "acme");
-        assert_eq!(org.id.0, "org-acme");
+        assert!(
+            org.id.0.starts_with("org-"),
+            "ID should have org- prefix, got: {}",
+            org.id.0
+        );
         assert!(org.created_at > 0);
     }
 
@@ -1877,12 +2284,7 @@ mod tests {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
         store
-            .create_vpc(
-                "shared-net",
-                "10.0.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
+            .create_vpc("shared-net", "10.0.0.0/16", org_owner(&store, "acme"), true)
             .unwrap();
         let err = store.delete("acme").unwrap_err();
         assert!(matches!(err, OrgError::OrgHasVpcs { count: 1, .. }));
@@ -1897,7 +2299,7 @@ mod tests {
             .create_vpc(
                 "proj-net",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -1934,11 +2336,16 @@ mod tests {
     #[test]
     fn create_project_succeeds_with_valid_org() {
         let (_dir, store) = temp_store();
-        store.create("acme").unwrap();
+        let org = store.create("acme").unwrap();
 
         let project = store.create_project("acme", "backend").unwrap();
         assert_eq!(project.name, "backend");
-        assert_eq!(project.org_id, OrgId("acme".to_string()));
+        assert_eq!(project.org_id, org.id);
+        assert!(
+            project.id.0.starts_with("proj-"),
+            "ID should have proj- prefix, got: {}",
+            project.id.0
+        );
 
         let fetched = store.get_project("acme", "backend").unwrap();
         assert!(fetched.is_some());
@@ -1989,12 +2396,19 @@ mod tests {
         let (_dir, store) = temp_store();
         setup_org_and_project(&store);
 
+        let project = store.get_project("acme", "backend").unwrap().unwrap();
+
         let env = store
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap();
 
         assert_eq!(env.name, "staging");
-        assert_eq!(env.project_id.0, "acme/backend");
+        assert_eq!(env.project_id, project.id);
+        assert!(
+            env.id.0.starts_with("env-"),
+            "ID should have env- prefix, got: {}",
+            env.id.0
+        );
         assert!(env.created_at > 0);
         assert_eq!(env.ttl, None);
         assert!(!env.deletion_protection);
@@ -2174,13 +2588,16 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
         assert_eq!(vpc.name, "default");
-        assert_eq!(vpc.id.0, "vpc-default");
+        assert!(
+            vpc.id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(vpc.cidr, "10.1.0.0/16");
         assert_eq!(vpc.vni, 100);
         assert!(!vpc.shared);
@@ -2199,7 +2616,7 @@ mod tests {
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2207,7 +2624,7 @@ mod tests {
             .create_vpc(
                 "vpc-two",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2227,7 +2644,7 @@ mod tests {
                 .create_vpc(
                     &format!("vpc-{i}"),
                     &format!("10.{i}.0.0/16"),
-                    VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                    project_owner(&store, "acme", "backend"),
                     false,
                 )
                 .unwrap();
@@ -2245,7 +2662,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2254,7 +2671,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap_err();
@@ -2269,7 +2686,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2295,23 +2712,18 @@ mod tests {
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
         store
-            .create_vpc(
-                "vpc-two",
-                "10.2.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
+            .create_vpc("vpc-two", "10.2.0.0/16", org_owner(&store, "acme"), true)
             .unwrap();
         store
             .create_vpc(
                 "vpc-three",
                 "10.3.0.0/16",
-                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                project_owner(&store, "acme", "frontend"),
                 false,
             )
             .unwrap();
@@ -2326,13 +2738,13 @@ mod tests {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
         store.create_project("acme", "frontend").unwrap();
-        let pid = ProjectId("acme/backend".to_string());
+        let backend_proj = store.get_project("acme", "backend").unwrap().unwrap();
 
         store
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(pid.clone()),
+                VpcOwner::Project(backend_proj.id.clone()),
                 false,
             )
             .unwrap();
@@ -2340,7 +2752,7 @@ mod tests {
             .create_vpc(
                 "vpc-two",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                project_owner(&store, "acme", "frontend"),
                 false,
             )
             .unwrap();
@@ -2348,12 +2760,12 @@ mod tests {
             .create_vpc(
                 "vpc-shared",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
 
-        let by_project = store.list_vpcs_by_project(&pid).unwrap();
+        let by_project = store.list_vpcs_by_project(&backend_proj.id).unwrap();
         assert_eq!(by_project.len(), 1);
         assert_eq!(by_project[0].name, "vpc-one");
     }
@@ -2363,13 +2775,13 @@ mod tests {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let oid = OrgId("acme".to_string());
+        let org = store.get("acme").unwrap().unwrap();
 
         store
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2377,12 +2789,12 @@ mod tests {
             .create_vpc(
                 "vpc-shared",
                 "10.100.0.0/16",
-                VpcOwner::Org(oid.clone()),
+                VpcOwner::Org(org.id.clone()),
                 true,
             )
             .unwrap();
 
-        let by_org = store.list_vpcs_by_org(&oid).unwrap();
+        let by_org = store.list_vpcs_by_org(&org.id).unwrap();
         assert_eq!(by_org.len(), 2);
         let names: Vec<&str> = by_org.iter().map(|v| v.name.as_str()).collect();
         assert!(
@@ -2433,24 +2845,16 @@ mod tests {
     #[test]
     fn non_private_cidr_rejected() {
         let (_dir, store) = temp_store();
+        // Dummy owner — CIDR validation happens before owner validation
+        let dummy = VpcOwner::Org(OrgId("dummy".to_string()));
 
         let err = store
-            .create_vpc(
-                "pub-vpc",
-                "8.8.8.0/24",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("pub-vpc", "8.8.8.0/24", dummy.clone(), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
 
         let err = store
-            .create_vpc(
-                "pub-vpc",
-                "1.0.0.0/8",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("pub-vpc", "1.0.0.0/8", dummy, false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
@@ -2458,26 +2862,18 @@ mod tests {
     #[test]
     fn extreme_prefix_rejected() {
         let (_dir, store) = temp_store();
+        // Dummy owner — CIDR validation happens before owner validation
+        let dummy = VpcOwner::Org(OrgId("dummy".to_string()));
 
         // Too small (< 8)
         let err = store
-            .create_vpc(
-                "huge-vpc",
-                "10.0.0.0/7",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("huge-vpc", "10.0.0.0/7", dummy.clone(), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
 
         // Too large (> 28)
         let err = store
-            .create_vpc(
-                "tiny-vpc",
-                "10.0.0.0/29",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("tiny-vpc", "10.0.0.0/29", dummy, false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
@@ -2488,21 +2884,11 @@ mod tests {
         store.create("acme").unwrap();
 
         store
-            .create_vpc(
-                "vpc-one",
-                "10.1.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("vpc-one", "10.1.0.0/16", org_owner(&store, "acme"), false)
             .unwrap();
 
         let err = store
-            .create_vpc(
-                "vpc-two",
-                "10.1.0.0/24",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("vpc-two", "10.1.0.0/24", org_owner(&store, "acme"), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::CidrOverlap { .. }));
     }
@@ -2543,18 +2929,13 @@ mod tests {
             .create_vpc(
                 "proj-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
         let err = store
-            .create_vpc(
-                "org-vpc",
-                "10.1.5.0/24",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("org-vpc", "10.1.5.0/24", org_owner(&store, "acme"), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::CidrOverlap { .. }));
     }
@@ -2591,6 +2972,7 @@ mod tests {
     fn create_vpc_fails_when_project_not_found() {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
+        // Use a legacy-style "org/project" ID to test project-not-found path
         let err = store
             .create_vpc(
                 "my-vpc",
@@ -2614,7 +2996,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2633,7 +3015,7 @@ mod tests {
             .create_vpc(
                 "private-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2652,7 +3034,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2670,7 +3052,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2689,7 +3071,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2712,7 +3094,7 @@ mod tests {
                 .create_vpc(
                     "shared-vpc",
                     "10.100.0.0/16",
-                    VpcOwner::Org(OrgId("acme".to_string())),
+                    org_owner(&store, "acme"),
                     true,
                 )
                 .unwrap();
@@ -2737,7 +3119,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2755,21 +3137,18 @@ mod tests {
     fn setup_for_subnet(store: &OrgStore) -> (String, EnvironmentId) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
         store
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(store, "acme", "backend"),
                 false,
             )
             .unwrap();
-        (
-            "default".to_string(),
-            EnvironmentId("acme/backend/production".to_string()),
-        )
+        ("default".to_string(), env.id)
     }
 
     #[test]
@@ -2784,7 +3163,10 @@ mod tests {
         assert_eq!(subnet.name, "frontend");
         assert_eq!(subnet.cidr, "10.1.1.0/24");
         assert_eq!(subnet.gateway, "10.1.1.1");
-        assert_eq!(subnet.vpc_id.0, "vpc-default");
+        assert!(
+            subnet.vpc_id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(subnet.env_id, env_id);
         assert!(subnet.created_at > 0);
     }
@@ -2917,7 +3299,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2946,7 +3328,8 @@ mod tests {
     #[test]
     fn get_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.get_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.get_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
@@ -2972,10 +3355,10 @@ mod tests {
         let (vpc_name, env_id) = setup_for_subnet(&store);
 
         // Create second env
-        store
+        let staging = store
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap();
-        let staging_env = EnvironmentId("acme/backend/staging".to_string());
+        let staging_env = staging.id;
 
         store
             .create_subnet(&vpc_name, &env_id, "prod-sub", Some("10.1.1.0/24"))
@@ -3011,7 +3394,8 @@ mod tests {
     #[test]
     fn delete_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.delete_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.delete_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
@@ -3038,7 +3422,7 @@ mod tests {
     fn setup_for_peering(store: &OrgStore) -> (String, String) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(store, "acme", "backend");
         store
             .create_vpc("vpc-alpha", "10.1.0.0/16", owner.clone(), false)
             .unwrap();
@@ -3053,9 +3437,13 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         let peering = store.create_peering(&a, &b).unwrap();
-        assert_eq!(peering.vpc_a, "vpc-alpha");
-        assert_eq!(peering.vpc_b, "vpc-beta");
+        // vpc_a/vpc_b are sorted by ID, so check both IDs are present
+        let ids = [peering.vpc_a.clone(), peering.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
         assert_eq!(peering.status, PeeringStatus::Active);
         assert!(peering.created_at > 0);
     }
@@ -3065,11 +3453,14 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         // Create with reversed order
         let peering = store.create_peering(&b, &a).unwrap();
-        // Key is normalized alphabetically
-        assert_eq!(peering.vpc_a, "vpc-alpha");
-        assert_eq!(peering.vpc_b, "vpc-beta");
+        // Both IDs should be present regardless of order
+        let ids = [peering.vpc_a.clone(), peering.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
     }
 
     #[test]
@@ -3138,7 +3529,7 @@ mod tests {
         let (a, b) = setup_for_peering(&store);
 
         // Add a third VPC
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(&store, "acme", "backend");
         store
             .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
             .unwrap();
@@ -3155,7 +3546,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(&store, "acme", "backend");
         store
             .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
             .unwrap();
@@ -3196,13 +3587,16 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         store.create_peering(&a, &b).unwrap();
 
         let peering = store.get_peering(&a, &b).unwrap();
         assert!(peering.is_some());
         let p = peering.unwrap();
-        assert_eq!(p.vpc_a, "vpc-alpha");
-        assert_eq!(p.vpc_b, "vpc-beta");
+        let ids = [p.vpc_a.clone(), p.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
     }
 
     #[test]
@@ -3234,7 +3628,7 @@ mod tests {
     fn setup_vpc_for_sg(store: &OrgStore) -> VpcId {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(store, "acme", "backend");
         let vpc = store
             .create_vpc("myvpc", "10.1.0.0/16", owner, false)
             .unwrap();
@@ -3327,7 +3721,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3348,7 +3742,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3370,7 +3764,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3389,7 +3783,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3409,7 +3803,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3426,7 +3820,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3446,7 +3840,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3471,7 +3865,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3489,7 +3883,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3512,17 +3906,17 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
         // Create an environment for the subnet.
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3544,16 +3938,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3575,16 +3969,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         let subnet = store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3616,16 +4010,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         let subnet = store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3647,7 +4041,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3657,7 +4051,7 @@ mod tests {
             .add_propagated_route(
                 &rt.id,
                 "10.2.0.0/16",
-                RouteTarget::VpcPeering("peering-123".to_string()),
+                RouteTarget::VpcPeering(PeeringId("peering-123".to_string())),
             )
             .unwrap();
 
@@ -3670,20 +4064,19 @@ mod tests {
     fn setup_vpc_and_subnet(store: &OrgStore) -> (Vpc, Subnet) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
         let vpc = store
             .create_vpc(
                 "test-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(store, "acme", "backend"),
                 false,
             )
             .unwrap();
-        let env_id = EnvironmentId("acme/backend/production".to_string());
         let subnet = store
-            .create_subnet("test-vpc", &env_id, "frontend", Some("10.1.1.0/24"))
+            .create_subnet("test-vpc", &env.id, "frontend", Some("10.1.1.0/24"))
             .unwrap();
         (vpc, subnet)
     }
@@ -3801,7 +4194,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let (vpc, subnet) = setup_vpc_and_subnet(&store);
 
-        store
+        let gw = store
             .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
             .unwrap();
 
@@ -3810,7 +4203,7 @@ mod tests {
             .add_route(
                 &rt.id,
                 "0.0.0.0/0",
-                RouteTarget::NatGateway("gw1".to_string()),
+                RouteTarget::NatGateway(gw.id.clone()),
                 None,
             )
             .unwrap();

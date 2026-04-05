@@ -879,8 +879,8 @@ impl VmManager {
                         if let Err(te) = ns
                             .teardown(
                                 &vm_id_str,
-                                &nr.placement.vpc_id,
-                                &nr.placement.subnet_id,
+                                &nr.placement.vpc_id.0,
+                                &nr.placement.subnet_id.0,
                                 &nr.subnet_cidr,
                                 &nr.ip,
                                 &nr.tap_name,
@@ -949,8 +949,8 @@ impl VmManager {
         // Extract network metadata from setup result for runtime state.
         let (vm_ip, vm_subnet, vm_vpc, net_info) = if let Some(ref nr) = network_result {
             let info = NetworkInfo {
-                vpc_id: nr.placement.vpc_id.clone(),
-                subnet_id: nr.placement.subnet_id.clone(),
+                vpc_id: nr.placement.vpc_id.0.clone(),
+                subnet_id: nr.placement.subnet_id.0.clone(),
                 subnet_cidr: nr.subnet_cidr.clone(),
                 ip: nr.ip.clone(),
                 mac: nr.mac.clone(),
@@ -965,7 +965,7 @@ impl VmManager {
                         .map(|s| s.name.clone())
                         .unwrap_or_default(),
                 ),
-                Some(nr.placement.vpc_id.clone()),
+                Some(nr.placement.vpc_id.0.clone()),
                 Some(info),
             )
         } else {
@@ -974,6 +974,7 @@ impl VmManager {
 
         let mut state = crate::runtime::VmRuntimeState {
             vm_id: spec.id.clone(),
+            name: Some(spec.name.clone()),
             pid: handle.pid,
             socket_path: handle.runtime_dir.join("api.sock"),
             cgroup_path: None,
@@ -1048,7 +1049,7 @@ impl VmManager {
                     Arc::clone(backend),
                     local_node.clone(),
                 );
-                if let Err(e) = ns.mark_assigned(&nr.placement.subnet_id, &nr.ip, &vm_id_str) {
+                if let Err(e) = ns.mark_assigned(&nr.placement.subnet_id.0, &nr.ip, &vm_id_str) {
                     warn!(
                         vm_id = %vm_id_str,
                         error = %e,
@@ -1468,9 +1469,38 @@ impl VmManager {
 
     /// Get the external status of a single VM.
     pub async fn info(&self, id: &str) -> Result<VmStatus, ComputeError> {
-        let vm_arc = self.get_vm(id).await?;
-        let guard = vm_arc.lock().await;
-        Ok(guard.to_status(now_unix()))
+        // Try direct ID lookup first, then fall back to name-based search.
+        match self.get_vm(id).await {
+            Ok(vm_arc) => {
+                let guard = vm_arc.lock().await;
+                Ok(guard.to_status(now_unix()))
+            }
+            Err(_) => {
+                // Fall back to name-based lookup.
+                let resolved_id = self.resolve_name_to_id(id).await?;
+                let vm_arc = self.get_vm(&resolved_id).await?;
+                let guard = vm_arc.lock().await;
+                Ok(guard.to_status(now_unix()))
+            }
+        }
+    }
+
+    /// Resolve a human-friendly name to a VmId string.
+    ///
+    /// Scans all VMs for a matching `name` field. Returns the VM's actual ID
+    /// string if found. This enables `vm get web-1` to work when the VM is
+    /// keyed by a generated ID like `vm-a1b2c3d4e5f6`.
+    pub async fn resolve_name_to_id(&self, name: &str) -> Result<String, ComputeError> {
+        let map = self.vms.read().await;
+        for (id, vm_arc) in map.iter() {
+            let guard = vm_arc.lock().await;
+            if guard.name.as_deref() == Some(name) {
+                return Ok(id.clone());
+            }
+        }
+        Err(ComputeError::VmNotFound {
+            id: name.to_string(),
+        })
     }
 
     /// List the status of all tracked VMs.
@@ -1523,6 +1553,7 @@ impl VmManager {
                 let id = handle.id.clone();
                 let state = VmRuntimeState {
                     vm_id: VmId(id.clone()),
+                    name: None, // Recovered containers get name populated later
                     pid: handle.pid,
                     socket_path: PathBuf::new(),
                     cgroup_path: None,
@@ -1887,6 +1918,7 @@ mod tests {
     async fn inject_fake_vm(mgr: &VmManager, vm_id: &str, phase: crate::phase::VmPhase) {
         let state = VmRuntimeState {
             vm_id: VmId(vm_id.to_string()),
+            name: Some(vm_id.to_string()),
             pid: 1,
             socket_path: PathBuf::from(format!("/tmp/ch-{vm_id}.sock")),
             cgroup_path: None,

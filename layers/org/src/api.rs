@@ -19,7 +19,7 @@ use crate::store::OrgStore;
 use crate::types::{
     Direction, Environment, EnvironmentId, NatGateway, NetworkInterface, Org, OrgId, PeeringStatus,
     PortRange, Project, ProjectId, Protocol, ResourceState, Route, RouteTable, RouteTarget, RuleId,
-    RuleSource, SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
+    RuleSource, SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcId, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +254,15 @@ pub enum OrgRequest {
         project: Option<String>,
         org: Option<String>,
     },
+
+    // -- Generic name → ID resolution --
+    /// Resolve a human-readable resource name to its ID.
+    /// If `scope` is provided, it constrains the lookup (e.g., org name for VPCs).
+    Resolve {
+        resource_type: syfrah_core::resolve::ResourceType,
+        name: String,
+        scope: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -291,6 +300,8 @@ pub enum OrgResponse {
     RouteListResp(Vec<Route>),
     /// Resolved subnet info for VM placement (None = no subnet context).
     SubnetResolved(Option<ResolvedSubnet>),
+    /// Result of a generic name → ID resolution.
+    Resolved(syfrah_core::resolve::ResolveResult),
     Ok,
     Error(String),
 }
@@ -312,6 +323,7 @@ pub struct ResolvedSubnet {
 pub struct OrgLayerHandler {
     store: Arc<OrgStore>,
     sg_rule_store: Option<Arc<SgRuleStore>>,
+    hv_store: Option<Arc<crate::hypervisor::HypervisorStore>>,
 }
 
 impl OrgLayerHandler {
@@ -319,11 +331,17 @@ impl OrgLayerHandler {
         Self {
             store,
             sg_rule_store: None,
+            hv_store: None,
         }
     }
 
     pub fn with_sg_rule_store(mut self, sg_rule_store: Arc<SgRuleStore>) -> Self {
         self.sg_rule_store = Some(sg_rule_store);
+        self
+    }
+
+    pub fn with_hv_store(mut self, hv_store: Arc<crate::hypervisor::HypervisorStore>) -> Self {
+        self.hv_store = Some(hv_store);
         self
     }
 }
@@ -339,7 +357,12 @@ impl LayerHandler for OrgLayerHandler {
             }
         };
 
-        let resp = handle_org_request(&self.store, self.sg_rule_store.as_deref(), req);
+        let resp = handle_org_request(
+            &self.store,
+            self.sg_rule_store.as_deref(),
+            self.hv_store.as_deref(),
+            req,
+        );
         serde_json::to_vec(&resp).unwrap_or_default()
     }
 }
@@ -350,6 +373,7 @@ const DEFAULT_SHARED_CIDR: &str = "10.100.0.0/16";
 fn handle_org_request(
     store: &OrgStore,
     sg_rule_store: Option<&SgRuleStore>,
+    hv_store: Option<&crate::hypervisor::HypervisorStore>,
     req: OrgRequest,
 ) -> OrgResponse {
     match req {
@@ -524,12 +548,14 @@ fn handle_org_request(
             };
             match result {
                 Ok(peerings) => {
-                    // Resolve VPC names in the peering list for display
+                    // Resolve VPC IDs to names for display.
                     let enriched: Vec<VpcPeering> = peerings
                         .into_iter()
                         .map(|mut p| {
-                            p.vpc_a = store.resolve_vpc_name(&p.vpc_a);
-                            p.vpc_b = store.resolve_vpc_name(&p.vpc_b);
+                            let a_name = store.resolve_vpc_name(&p.vpc_a.0);
+                            let b_name = store.resolve_vpc_name(&p.vpc_b.0);
+                            p.vpc_a = VpcId(a_name);
+                            p.vpc_b = VpcId(b_name);
                             p
                         })
                         .collect();
@@ -998,7 +1024,7 @@ fn handle_org_request(
                             let _ = store.add_route(
                                 &default_rt.id,
                                 "0.0.0.0/0",
-                                RouteTarget::NatGateway(name.clone()),
+                                RouteTarget::NatGateway(active_gw.id.clone()),
                                 Some(100),
                             );
                         }
@@ -1324,6 +1350,318 @@ fn handle_org_request(
                 },
             }
         }
+
+        // -- Generic name → ID resolution --
+        OrgRequest::Resolve {
+            resource_type,
+            name,
+            scope,
+        } => {
+            use syfrah_core::resolve::{looks_like_id, ResolveMatch, ResolveResult, ResourceType};
+
+            // If input already looks like an ID, pass through
+            if looks_like_id(&name, &resource_type) {
+                return OrgResponse::Resolved(ResolveResult::Id(name));
+            }
+
+            match resource_type {
+                ResourceType::Org => match store.resolve_org_id(&name) {
+                    Ok(id) => OrgResponse::Resolved(ResolveResult::Id(id.0)),
+                    Err(_) => OrgResponse::Resolved(ResolveResult::NotFound {
+                        resource_type: "org".into(),
+                        name,
+                    }),
+                },
+                ResourceType::Project => {
+                    // scope = org name
+                    let Some(org) = scope else {
+                        return OrgResponse::Error(
+                            "project resolution requires --org scope".into(),
+                        );
+                    };
+                    match store.resolve_project_id(&org, &name) {
+                        Ok(id) => OrgResponse::Resolved(ResolveResult::Id(id.0)),
+                        Err(_) => OrgResponse::Resolved(ResolveResult::NotFound {
+                            resource_type: "project".into(),
+                            name,
+                        }),
+                    }
+                }
+                ResourceType::Vpc => {
+                    // Try direct name lookup first
+                    match store.get_vpc(&name) {
+                        Ok(Some(vpc)) => OrgResponse::Resolved(ResolveResult::Id(vpc.id.0)),
+                        Ok(None) => {
+                            // If scope (org) is provided, scan VPCs by org
+                            if let Some(org_name) = scope {
+                                if let Ok(org_id) = store.resolve_org_id(&org_name) {
+                                    if let Ok(vpcs) = store.list_vpcs_by_org(&org_id) {
+                                        let matches: Vec<_> =
+                                            vpcs.iter().filter(|v| v.name == name).collect();
+                                        return match matches.len() {
+                                            0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                                resource_type: "vpc".into(),
+                                                name,
+                                            }),
+                                            1 => OrgResponse::Resolved(ResolveResult::Id(
+                                                matches[0].id.0.clone(),
+                                            )),
+                                            _ => OrgResponse::Resolved(ResolveResult::Ambiguous(
+                                                matches
+                                                    .iter()
+                                                    .map(|v| ResolveMatch {
+                                                        id: v.id.0.clone(),
+                                                        context: format!("org: {org_name}"),
+                                                    })
+                                                    .collect(),
+                                            )),
+                                        };
+                                    }
+                                }
+                            }
+                            // Check all VPCs for ambiguity
+                            if let Ok(all_vpcs) = store.list_vpcs() {
+                                let matches: Vec<_> =
+                                    all_vpcs.iter().filter(|v| v.name == name).collect();
+                                match matches.len() {
+                                    0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                        resource_type: "vpc".into(),
+                                        name,
+                                    }),
+                                    1 => OrgResponse::Resolved(ResolveResult::Id(
+                                        matches[0].id.0.clone(),
+                                    )),
+                                    _ => {
+                                        let resolve_matches: Vec<_> = matches
+                                            .iter()
+                                            .map(|v| {
+                                                let ctx = match &v.owner {
+                                                    VpcOwner::Org(oid) => {
+                                                        format!("org: {}", oid.0)
+                                                    }
+                                                    VpcOwner::Project(pid) => {
+                                                        format!("project: {}", pid.0)
+                                                    }
+                                                };
+                                                ResolveMatch {
+                                                    id: v.id.0.clone(),
+                                                    context: ctx,
+                                                }
+                                            })
+                                            .collect();
+                                        OrgResponse::Resolved(ResolveResult::Ambiguous(
+                                            resolve_matches,
+                                        ))
+                                    }
+                                }
+                            } else {
+                                OrgResponse::Resolved(ResolveResult::NotFound {
+                                    resource_type: "vpc".into(),
+                                    name,
+                                })
+                            }
+                        }
+                        Err(e) => OrgResponse::Error(e.to_string()),
+                    }
+                }
+                ResourceType::Subnet => {
+                    // scope = vpc name
+                    if let Some(vpc_name) = scope {
+                        match store.get_subnet(&vpc_name, &name) {
+                            Ok(subnet) => OrgResponse::Resolved(ResolveResult::Id(subnet.id.0)),
+                            Err(_) => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "subnet".into(),
+                                name,
+                            }),
+                        }
+                    } else {
+                        // Scan all VPCs for a subnet with this name
+                        let mut found = Vec::new();
+                        if let Ok(vpcs) = store.list_vpcs() {
+                            for vpc in &vpcs {
+                                if let Ok(subnets) = store.list_subnets(&vpc.name) {
+                                    for s in &subnets {
+                                        if s.name == name {
+                                            found.push(ResolveMatch {
+                                                id: s.id.0.clone(),
+                                                context: format!("vpc: {}", vpc.name),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match found.len() {
+                            0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "subnet".into(),
+                                name,
+                            }),
+                            1 => OrgResponse::Resolved(ResolveResult::Id(
+                                found.into_iter().next().unwrap().id,
+                            )),
+                            _ => OrgResponse::Resolved(ResolveResult::Ambiguous(found)),
+                        }
+                    }
+                }
+                ResourceType::Sg => {
+                    // scope = vpc name (resolved to VpcId)
+                    if let Some(vpc_name) = scope {
+                        match store.get_vpc(&vpc_name) {
+                            Ok(Some(vpc)) => match store.get_sg(&vpc.id, &name) {
+                                Ok(Some(sg)) => OrgResponse::Resolved(ResolveResult::Id(sg.id.0)),
+                                _ => OrgResponse::Resolved(ResolveResult::NotFound {
+                                    resource_type: "sg".into(),
+                                    name,
+                                }),
+                            },
+                            _ => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "sg".into(),
+                                name,
+                            }),
+                        }
+                    } else {
+                        // Scan all SGs
+                        let mut found = Vec::new();
+                        if let Ok(all_sgs) = store.list_sgs() {
+                            for sg in &all_sgs {
+                                if sg.name == name {
+                                    found.push(ResolveMatch {
+                                        id: sg.id.0.clone(),
+                                        context: format!("vpc: {}", sg.vpc_id.0),
+                                    });
+                                }
+                            }
+                        }
+                        match found.len() {
+                            0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "sg".into(),
+                                name,
+                            }),
+                            1 => OrgResponse::Resolved(ResolveResult::Id(
+                                found.into_iter().next().unwrap().id,
+                            )),
+                            _ => OrgResponse::Resolved(ResolveResult::Ambiguous(found)),
+                        }
+                    }
+                }
+                ResourceType::Hypervisor => {
+                    if let Some(hvs) = hv_store {
+                        match hvs.get(&name) {
+                            Ok(Some(hv)) => OrgResponse::Resolved(ResolveResult::Id(hv.id.0)),
+                            _ => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "hypervisor".into(),
+                                name,
+                            }),
+                        }
+                    } else {
+                        OrgResponse::Error("hypervisor store not available for resolution".into())
+                    }
+                }
+                ResourceType::NatGw => {
+                    if let Ok(all_nats) = store.list_nat_gws() {
+                        let matches: Vec<_> = all_nats.iter().filter(|n| n.name == name).collect();
+                        match matches.len() {
+                            0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "nat-gw".into(),
+                                name,
+                            }),
+                            1 => OrgResponse::Resolved(ResolveResult::Id(matches[0].id.0.clone())),
+                            _ => OrgResponse::Resolved(ResolveResult::Ambiguous(
+                                matches
+                                    .iter()
+                                    .map(|n| ResolveMatch {
+                                        id: n.id.0.clone(),
+                                        context: format!("vpc: {}", n.vpc_id.0),
+                                    })
+                                    .collect(),
+                            )),
+                        }
+                    } else {
+                        OrgResponse::Resolved(ResolveResult::NotFound {
+                            resource_type: "nat-gw".into(),
+                            name,
+                        })
+                    }
+                }
+                ResourceType::RouteTable => {
+                    if let Ok(all_tables) = store.list_route_tables() {
+                        let matches: Vec<_> =
+                            all_tables.iter().filter(|t| t.name == name).collect();
+                        match matches.len() {
+                            0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                resource_type: "route-table".into(),
+                                name,
+                            }),
+                            1 => OrgResponse::Resolved(ResolveResult::Id(matches[0].id.0.clone())),
+                            _ => OrgResponse::Resolved(ResolveResult::Ambiguous(
+                                matches
+                                    .iter()
+                                    .map(|t| ResolveMatch {
+                                        id: t.id.0.clone(),
+                                        context: format!("vpc: {}", t.vpc_id.0),
+                                    })
+                                    .collect(),
+                            )),
+                        }
+                    } else {
+                        OrgResponse::Resolved(ResolveResult::NotFound {
+                            resource_type: "route-table".into(),
+                            name,
+                        })
+                    }
+                }
+                // Env: scope = "org/project" (e.g., "acme/backend")
+                ResourceType::Env => {
+                    let Some(scope_str) = scope else {
+                        return OrgResponse::Error(
+                            "env resolution requires scope in 'org/project' format".into(),
+                        );
+                    };
+                    let parts: Vec<&str> = scope_str.splitn(2, '/').collect();
+                    if parts.len() != 2 {
+                        return OrgResponse::Error(
+                            "env resolution scope must be 'org/project'".into(),
+                        );
+                    }
+                    let (org_name, project_name) = (parts[0], parts[1]);
+                    match store.list_envs(org_name, project_name) {
+                        Ok(envs) => {
+                            let matches: Vec<&Environment> =
+                                envs.iter().filter(|e| e.name == name).collect();
+                            match matches.len() {
+                                0 => OrgResponse::Resolved(ResolveResult::NotFound {
+                                    resource_type: "env".into(),
+                                    name,
+                                }),
+                                1 => OrgResponse::Resolved(ResolveResult::Id(
+                                    matches[0].id.0.clone(),
+                                )),
+                                _ => OrgResponse::Resolved(ResolveResult::Ambiguous(
+                                    matches
+                                        .iter()
+                                        .map(|e| ResolveMatch {
+                                            id: e.id.0.clone(),
+                                            context: format!("project: {org_name}/{project_name}"),
+                                        })
+                                        .collect(),
+                                )),
+                            }
+                        }
+                        Err(_) => OrgResponse::Resolved(ResolveResult::NotFound {
+                            resource_type: "env".into(),
+                            name,
+                        }),
+                    }
+                }
+                // VM and Volume/Snapshot are handled by compute/storage layers
+                ResourceType::Vm | ResourceType::Volume | ResourceType::Snapshot => {
+                    OrgResponse::Error(format!(
+                        "{} resolution is handled by its own layer, not the org layer",
+                        resource_type.label()
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -1350,6 +1688,72 @@ pub async fn send_org_request(
         }
         LayerResponse::UnknownLayer(name) => Err(format!("unknown layer: {name}").into()),
         other => Err(format!("unexpected response variant: {other:?}").into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side name → ID resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a resource name to its ID via the daemon control socket.
+///
+/// If the input already looks like an ID (starts with the resource prefix),
+/// it is returned as-is without contacting the daemon.
+///
+/// On ambiguity, returns an error describing all matches and how to
+/// disambiguate.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::path::Path;
+/// # use syfrah_core::resolve::ResourceType;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let sock = Path::new("/root/.syfrah/control.sock");
+/// let vpc_id = syfrah_org::resolve_name(sock, ResourceType::Vpc, "my-vpc", None).await?;
+/// // vpc_id is now e.g. "vpc-a1b2c3d4e5f6"
+/// # Ok(())
+/// # }
+/// ```
+pub async fn resolve_name(
+    socket_path: &Path,
+    resource_type: syfrah_core::resolve::ResourceType,
+    name: &str,
+    scope: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use syfrah_core::resolve::{looks_like_id, ResolveResult};
+
+    // Fast path: if it already looks like an ID, skip the socket call.
+    if looks_like_id(name, &resource_type) {
+        return Ok(name.to_string());
+    }
+
+    let req = OrgRequest::Resolve {
+        resource_type: resource_type.clone(),
+        name: name.to_string(),
+        scope: scope.map(String::from),
+    };
+    let resp = send_org_request(socket_path, &req).await?;
+
+    match resp {
+        OrgResponse::Resolved(ResolveResult::Id(id)) => Ok(id),
+        OrgResponse::Resolved(ResolveResult::NotFound {
+            resource_type: rt,
+            name: n,
+        }) => Err(format!("{rt} '{n}' not found").into()),
+        OrgResponse::Resolved(ResolveResult::Ambiguous(matches)) => {
+            let mut msg = format!("multiple {}s named '{name}':\n", resource_type.label());
+            for m in &matches {
+                msg.push_str(&format!("  {} ({})\n", m.id, m.context));
+            }
+            msg.push_str(&format!(
+                "Use the appropriate scope flag to disambiguate, or pass the {} ID directly.",
+                resource_type.label()
+            ));
+            Err(msg.into())
+        }
+        OrgResponse::Error(e) => Err(e.into()),
+        other => Err(format!("unexpected resolve response: {other:?}").into()),
     }
 }
 
@@ -1490,8 +1894,9 @@ fn detect_public_ip() -> String {
 }
 
 /// Parse a port range string like "443" or "8000-9000".
-/// Parse a route target string like "local", "blackhole", "nat-gw:foo", "peering:bar".
+/// Parse a route target string like "local", "blackhole", "nat-gw:<id>", "peering:<id>".
 fn parse_route_target(s: &str) -> std::result::Result<RouteTarget, String> {
+    use crate::types::{NatGatewayId, PeeringId};
     let s = s.trim();
     if s.eq_ignore_ascii_case("local") {
         Ok(RouteTarget::Local)
@@ -1499,17 +1904,17 @@ fn parse_route_target(s: &str) -> std::result::Result<RouteTarget, String> {
         Ok(RouteTarget::Blackhole)
     } else if let Some(name) = s.strip_prefix("nat-gw:") {
         if name.is_empty() {
-            return Err("nat-gw target requires a name".to_string());
+            return Err("nat-gw target requires a name or ID".to_string());
         }
-        Ok(RouteTarget::NatGateway(name.to_string()))
+        Ok(RouteTarget::NatGateway(NatGatewayId(name.to_string())))
     } else if let Some(name) = s.strip_prefix("peering:") {
         if name.is_empty() {
-            return Err("peering target requires a name".to_string());
+            return Err("peering target requires a name or ID".to_string());
         }
-        Ok(RouteTarget::VpcPeering(name.to_string()))
+        Ok(RouteTarget::VpcPeering(PeeringId(name.to_string())))
     } else {
         Err(format!(
-            "invalid route target: '{s}'. Valid: local, blackhole, nat-gw:<name>, peering:<name>"
+            "invalid route target: '{s}'. Valid: local, blackhole, nat-gw:<id>, peering:<id>"
         ))
     }
 }
@@ -1521,13 +1926,13 @@ fn validate_route_target(
 ) -> std::result::Result<(), String> {
     match target {
         RouteTarget::Local | RouteTarget::Blackhole => Ok(()),
-        RouteTarget::VpcPeering(name) => {
+        RouteTarget::VpcPeering(peer_id) => {
             // Check if peering exists and is active.
             match store.list_peerings() {
                 Ok(peerings) => {
-                    let found = peerings
-                        .iter()
-                        .find(|p| p.vpc_a == *name || p.vpc_b == *name || p.id.0 == *name);
+                    let found = peerings.iter().find(|p| {
+                        p.id == *peer_id || p.vpc_a.0 == peer_id.0 || p.vpc_b.0 == peer_id.0
+                    });
                     match found {
                         Some(p) => {
                             if p.status == crate::types::PeeringStatus::Active {
@@ -1535,30 +1940,30 @@ fn validate_route_target(
                             } else {
                                 Err(format!(
                                     "target resource '{}' is not active (current state: {})",
-                                    name, p.status
+                                    peer_id, p.status
                                 ))
                             }
                         }
-                        None => Err(format!("target resource '{name}' not found")),
+                        None => Err(format!("target resource '{peer_id}' not found")),
                     }
                 }
                 Err(e) => Err(e.to_string()),
             }
         }
-        RouteTarget::NatGateway(name) => {
+        RouteTarget::NatGateway(nat_id) => {
             // Check if NAT GW exists and is Active.
-            match store.get_nat_gw_by_name(name) {
+            match store.get_nat_gw_by_name(&nat_id.0) {
                 Ok(Some(gw)) => {
                     if gw.state == ResourceState::Active {
                         Ok(())
                     } else {
                         Err(format!(
                             "nat-gw '{}' is not active (current state: {})",
-                            name, gw.state
+                            nat_id, gw.state
                         ))
                     }
                 }
-                Ok(None) => Err(format!("nat-gw '{name}' not found")),
+                Ok(None) => Err(format!("nat-gw '{}' not found", nat_id)),
                 Err(e) => Err(e.to_string()),
             }
         }

@@ -116,6 +116,8 @@ impl std::error::Error for SchedulerError {}
 /// Merges gossip report data with persistent store data.
 #[derive(Debug, Clone)]
 pub struct HypervisorCandidate {
+    /// Unique hypervisor ID (from HypervisorStore or gossip report).
+    pub id: String,
     pub name: String,
     pub region: String,
     pub zone: String,
@@ -137,6 +139,7 @@ impl HypervisorCandidate {
     /// consistent) so the scheduler sees all hypervisors in the cluster.
     pub fn from_hypervisor(hv: &syfrah_org::Hypervisor) -> Self {
         Self {
+            id: hv.id.0.clone(),
             name: hv.name.clone(),
             region: hv.region.clone(),
             zone: hv.zone.clone(),
@@ -168,6 +171,7 @@ impl HypervisorCandidate {
     /// Build from a gossip report.
     pub fn from_gossip_report(report: &HypervisorGossipReport, fabric_ipv6: String) -> Self {
         Self {
+            id: report.hypervisor_id.clone(),
             name: report.node_name.clone(),
             region: report.region.clone(),
             zone: report.zone.clone(),
@@ -904,6 +908,7 @@ mod tests {
     #[test]
     fn hypervisor_candidate_utilization() {
         let c = HypervisorCandidate {
+            id: "hv-id-001".to_string(),
             name: "hv".to_string(),
             region: "eu".to_string(),
             zone: "az-1".to_string(),

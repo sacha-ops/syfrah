@@ -11,7 +11,7 @@ use crate::sg_rules::SgRuleStore;
 use crate::store::OrgStore;
 use crate::types::{
     Direction, NetworkInterface, NicId, PlacementAction, PortRange, Protocol, ResourceState,
-    RuleId, RuleSource, SecurityGroupId, SecurityGroupRule, VmPlacement,
+    RuleId, RuleSource, SecurityGroupId, SecurityGroupRule, SubnetId, VmPlacement, VpcId,
 };
 
 fn temp_store() -> (tempfile::TempDir, OrgStore) {
@@ -143,11 +143,11 @@ fn org_project_env_lifecycle() {
 
 fn make_placement(vpc: &str, vm: &str, node: &str, subnet: &str) -> VmPlacement {
     VmPlacement {
-        vpc_id: vpc.to_string(),
+        vpc_id: VpcId(vpc.to_string()),
         vm_id: vm.to_string(),
         vm_mac: format!("02:00:0a:00:01:{:02x}", vm.len()),
         vm_ip: format!("10.0.1.{}", vm.len()),
-        subnet_id: subnet.to_string(),
+        subnet_id: SubnetId(subnet.to_string()),
         hypervisor_id: node.to_string(),
         action: PlacementAction::Add,
         created_at: 1700000000,
@@ -203,7 +203,7 @@ fn list_by_vpc() {
 
     let vpc1 = store.list_by_vpc("vpc-1").unwrap();
     assert_eq!(vpc1.len(), 2, "expected 2 placements in vpc-1");
-    assert!(vpc1.iter().all(|p| p.vpc_id == "vpc-1"));
+    assert!(vpc1.iter().all(|p| p.vpc_id.0 == "vpc-1"));
 
     let vpc2 = store.list_by_vpc("vpc-2").unwrap();
     assert_eq!(vpc2.len(), 1, "expected 1 placement in vpc-2");
@@ -411,8 +411,8 @@ fn make_nic(id: &str, vm_id: Option<&str>, subnet: &str, vpc: &str) -> NetworkIn
         id: NicId(id.to_string()),
         name: format!("nic-{id}"),
         vm_id: vm_id.map(|s| s.to_string()),
-        subnet_id: subnet.to_string(),
-        vpc_id: vpc.to_string(),
+        subnet_id: SubnetId(subnet.to_string()),
+        vpc_id: VpcId(vpc.to_string()),
         private_ip: "10.0.1.10".to_string(),
         mac: "02:00:0a:00:01:0a".to_string(),
         security_groups: vec![],

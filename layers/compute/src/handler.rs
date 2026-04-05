@@ -105,6 +105,7 @@ pub struct ErrorResponse {
 #[derive(Debug, Serialize)]
 pub struct VmResponse {
     pub id: String,
+    pub name: String,
     pub phase: String,
     pub vcpus: u32,
     pub memory_mb: u32,
@@ -157,6 +158,7 @@ pub struct GetStatusResponse {
 fn vm_status_to_response(s: &VmStatus) -> VmResponse {
     VmResponse {
         id: s.vm_id.0.clone(),
+        name: s.name.clone(),
         phase: format!("{:?}", s.phase),
         vcpus: s.vcpus,
         memory_mb: s.memory_mb,
@@ -244,8 +246,11 @@ async fn create_vm(
     State(mgr): State<SharedManager>,
     Json(body): Json<CreateVmRequest>,
 ) -> impl IntoResponse {
+    let vm_id = VmId::generate();
+    let root_volume_id = Some(format!("vol-root-{}", &vm_id.0));
     let spec = VmSpec {
-        id: VmId(body.name.clone()),
+        id: vm_id,
+        name: body.name.clone(),
         vcpus: body.vcpus,
         memory_mb: body.memory_mb,
         image: body.image,
@@ -271,7 +276,7 @@ async fn create_vm(
         security_groups: vec![],
         pre_allocated_ip: None,
         pre_allocated_mac: None,
-        root_volume_id: None,
+        root_volume_id,
     };
 
     match mgr.create_vm(spec).await {
@@ -345,7 +350,8 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(id): Path<String>) -> im
             Err(_) => (
                 StatusCode::OK,
                 Json(VmResponse {
-                    id,
+                    id: id.clone(),
+                    name: id,
                     phase: "Stopped".to_string(),
                     vcpus: 0,
                     memory_mb: 0,
@@ -682,6 +688,7 @@ mod tests {
     fn vm_status_to_response_maps_all_fields() {
         let status = VmStatus {
             vm_id: VmId("test-vm".to_string()),
+            name: "test-vm".to_string(),
             phase: crate::phase::VmPhase::Running,
             vcpus: 4,
             memory_mb: 8192,
@@ -714,6 +721,7 @@ mod tests {
     fn vm_status_to_response_omits_none_fields() {
         let status = VmStatus {
             vm_id: VmId("test-vm".to_string()),
+            name: "test-vm".to_string(),
             phase: crate::phase::VmPhase::Pending,
             vcpus: 1,
             memory_mb: 512,
