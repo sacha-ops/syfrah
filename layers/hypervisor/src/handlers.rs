@@ -47,6 +47,11 @@ pub fn resource_def() -> ResourceDef {
         // CRUD
         .list().op(|op| op.with_example("syfrah hypervisor list"))
         .get().op(|op| op.with_example("syfrah hypervisor get HYPERVISOR-1"))
+        .action("peering", "Start peering listener to accept new nodes")
+            .op(|op| op
+                .with_arg(OperationArg::optional("timeout", FieldDef::integer("timeout", "Listener timeout in seconds").with_default("3600")))
+                .with_example("syfrah hypervisor peering")
+            )
         // Future
         .action("drain", "Evacuate all VMs before maintenance").op(|op| op.with_confirm())
         .action("enable", "Enable for VM scheduling")
@@ -81,6 +86,7 @@ pub fn handler() -> HandlerFn {
                 "list" => handle_list().await,
                 "get" => handle_get(req).await,
                 "join" => handle_join(req).await,
+                "peering" => handle_peering(req).await,
                 "drain" => Ok(OperationResponse::Message("drain: not yet implemented".into())),
                 "enable" => Ok(OperationResponse::Message("enable: not yet implemented".into())),
                 other => Ok(OperationResponse::Message(format!("unknown: {other}"))),
@@ -160,9 +166,8 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         eprintln!("  Waiting for joins... (Ctrl+C to stop)");
         eprintln!();
 
-        // Block here listening for joins
+        // Block here listening for joins (DB opened per-request, no lock held)
         let accepted = fabric::ops::listen_for_peers(
-            &db,
             &result.pin,
             peering_port,
             3600, // 1 hour timeout
@@ -234,6 +239,43 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
         "state": "available",
         "peers": result.peer_count,
     })))
+}
+
+async fn handle_peering(req: OperationRequest) -> anyhow::Result<OperationResponse> {
+    let timeout_secs: u64 = req
+        .fields
+        .get("timeout")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+
+    let db = open_db()?;
+    let state = fabric::state::FabricState::load(&db)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("not initialized. Run 'syfrah hypervisor init' first."))?;
+
+    // Derive PIN from secret
+    let secret: syfrah_core::crypto::MeshSecret = state.secret.parse()?;
+    let pin = secret.derive_pin();
+    let peering_port = state.hypervisor.wg_port + 1;
+
+    // Drop DB before starting listener (release lock!)
+    drop(db);
+
+    eprintln!();
+    eprintln!("  Peering active on port {peering_port}");
+    eprintln!("  PIN: {pin}");
+    eprintln!();
+    eprintln!("  Nodes can join with:");
+    eprintln!("    syfrah hypervisor join --target <this-ip>:{peering_port} --pin {pin}");
+    eprintln!();
+    eprintln!("  Waiting for joins... (Ctrl+C to stop)");
+    eprintln!();
+
+    let accepted = fabric::ops::listen_for_peers(&pin, peering_port, timeout_secs).await?;
+
+    Ok(OperationResponse::Message(format!(
+        "{accepted} node(s) joined."
+    )))
 }
 
 async fn handle_status() -> anyhow::Result<OperationResponse> {

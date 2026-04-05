@@ -1,12 +1,11 @@
 //! Peering TCP server — accepts join requests from new nodes.
 //!
-//! One-shot: listens, accepts one connection, processes the join, exits.
-//! Or can run in a loop for multiple joins with a timeout.
+//! Opens the DB per-request (no long-lived lock).
 
-use base64::Engine as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -18,13 +17,9 @@ use super::peering::{JoinRequest, JoinResponse, PeerInfo};
 use super::service;
 use super::state::FabricState;
 
-/// Start a peering listener that accepts join requests.
-///
-/// - `pin`: required PIN for auto-accept
-/// - `timeout`: how long to listen before giving up
-/// - `max_joins`: max number of joins to accept (0 = unlimited until timeout)
+/// Start a peering listener. Opens the DB per-request to avoid holding the lock.
 pub async fn listen(
-    db: &LayerDb,
+    db_opener: impl Fn() -> Result<LayerDb, SyfrahError>,
     pin: &str,
     bind_addr: SocketAddr,
     timeout: Duration,
@@ -45,16 +40,28 @@ pub async fn listen(
             Ok(Ok((mut stream, peer_addr))) => {
                 tracing::info!(peer = %peer_addr, "incoming join request");
 
-                match handle_join(&mut stream, db, pin).await {
+                // Open DB fresh for each request — no long-lived lock
+                let db = match db_opener() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to open DB for join");
+                        continue;
+                    }
+                };
+
+                match handle_join(&mut stream, &db, pin).await {
                     Ok(peer_name) => {
                         tracing::info!(peer = %peer_addr, name = %peer_name, "join accepted");
                         accepted += 1;
+                        // DB is dropped here — lock released
+                        drop(db);
                         if max_joins > 0 && accepted >= max_joins {
                             break;
                         }
                     }
                     Err(e) => {
                         tracing::warn!(peer = %peer_addr, error = %e, "join rejected");
+                        drop(db);
                     }
                 }
             }
@@ -62,7 +69,6 @@ pub async fn listen(
                 tracing::warn!(error = %e, "accept error");
             }
             Err(_) => {
-                // Timeout
                 tracing::info!("peering listener timeout");
                 break;
             }
@@ -78,22 +84,18 @@ async fn handle_join(
     db: &LayerDb,
     expected_pin: &str,
 ) -> Result<String, SyfrahError> {
-    // Read request (length-prefixed JSON)
     let req = read_json::<JoinRequest>(stream).await?;
 
-    // Validate PIN
     if !super::peering::validate_pin(expected_pin, req.pin.as_deref()) {
         let resp = JoinResponse::rejected("invalid PIN");
         write_json(stream, &resp).await?;
         return Err(SyfrahError::permission_denied("invalid PIN"));
     }
 
-    // Load current state
     let mut state = FabricState::load(db)
         .map_err(|e| SyfrahError::internal(e.to_string()))?
         .ok_or_else(|| SyfrahError::precondition("not initialized"))?;
 
-    // Build peer list for response (existing peers + self)
     let self_info = PeerInfo {
         name: state.hypervisor.name.clone(),
         region: state.hypervisor.region.clone(),
@@ -119,7 +121,6 @@ async fn handle_join(
         })
         .collect();
 
-    // Send response with mesh secret + peer list
     let resp = JoinResponse::accepted(
         &state.mesh.name,
         &state.secret,
@@ -135,16 +136,18 @@ async fn handle_join(
         .unwrap_or_default();
     let peer_ipv6 = syfrah_core::addressing::derive_node_address(&state.mesh.prefix, &pub_bytes);
 
-    // Add the new peer to our state
+    // Add peer + save + update WG — all in one shot, then DB is released
     let new_peer = Peer::new(
         req.name.clone(),
         req.region,
         req.zone,
-        req.wg_public_key.clone(),
+        req.wg_public_key,
         req.endpoint,
         peer_ipv6,
     );
     let _ = state.peers.add(new_peer);
+
+    // Bug 3 fix: save immediately, don't defer
     state
         .save(db)
         .map_err(|e| SyfrahError::internal(e.to_string()))?;
@@ -226,9 +229,6 @@ pub async fn write_json<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Peering server requires network — tested in integration tests.
-    // Unit tests cover the JSON framing.
 
     #[tokio::test]
     async fn json_roundtrip_over_tcp() {

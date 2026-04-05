@@ -82,9 +82,8 @@ pub fn init(
 
 /// Start a peering listener to accept join requests.
 ///
-/// Blocks until timeout or Ctrl+C. Returns number of accepted joins.
+/// Blocks until timeout or Ctrl+C. Opens DB per-request (no long-lived lock).
 pub async fn listen_for_peers(
-    db: &LayerDb,
     pin: &str,
     peering_port: u16,
     timeout_secs: u64,
@@ -95,7 +94,14 @@ pub async fn listen_for_peers(
 
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    super::peering_server::listen(db, pin, bind_addr, timeout, 0).await
+    // Pass a closure that opens a fresh DB each time — no long lock
+    let db_opener = || {
+        let dir = syfrah_core::process::syfrah_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        syfrah_state::LayerDb::open("hypervisor").map_err(|e| SyfrahError::internal(e.to_string()))
+    };
+
+    super::peering_server::listen(db_opener, pin, bind_addr, timeout, 0).await
 }
 
 /// Result of a successful fabric join.
