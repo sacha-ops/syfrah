@@ -19,7 +19,7 @@ use crate::store::OrgStore;
 use crate::types::{
     Direction, Environment, EnvironmentId, NatGateway, NetworkInterface, Org, OrgId, PeeringStatus,
     PortRange, Project, ProjectId, Protocol, ResourceState, Route, RouteTable, RouteTarget, RuleId,
-    RuleSource, SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcOwner, VpcPeering,
+    RuleSource, SecurityGroup, SecurityGroupRule, Subnet, Vpc, VpcId, VpcOwner, VpcPeering,
 };
 
 // ---------------------------------------------------------------------------
@@ -548,12 +548,14 @@ fn handle_org_request(
             };
             match result {
                 Ok(peerings) => {
-                    // Resolve VPC names in the peering list for display
+                    // Resolve VPC IDs to names for display.
                     let enriched: Vec<VpcPeering> = peerings
                         .into_iter()
                         .map(|mut p| {
-                            p.vpc_a = store.resolve_vpc_name(&p.vpc_a);
-                            p.vpc_b = store.resolve_vpc_name(&p.vpc_b);
+                            let a_name = store.resolve_vpc_name(&p.vpc_a.0);
+                            let b_name = store.resolve_vpc_name(&p.vpc_b.0);
+                            p.vpc_a = VpcId(a_name);
+                            p.vpc_b = VpcId(b_name);
                             p
                         })
                         .collect();
@@ -1022,7 +1024,7 @@ fn handle_org_request(
                             let _ = store.add_route(
                                 &default_rt.id,
                                 "0.0.0.0/0",
-                                RouteTarget::NatGateway(name.clone()),
+                                RouteTarget::NatGateway(active_gw.id.clone()),
                                 Some(100),
                             );
                         }
@@ -1892,8 +1894,9 @@ fn detect_public_ip() -> String {
 }
 
 /// Parse a port range string like "443" or "8000-9000".
-/// Parse a route target string like "local", "blackhole", "nat-gw:foo", "peering:bar".
+/// Parse a route target string like "local", "blackhole", "nat-gw:<id>", "peering:<id>".
 fn parse_route_target(s: &str) -> std::result::Result<RouteTarget, String> {
+    use crate::types::{NatGatewayId, PeeringId};
     let s = s.trim();
     if s.eq_ignore_ascii_case("local") {
         Ok(RouteTarget::Local)
@@ -1901,17 +1904,17 @@ fn parse_route_target(s: &str) -> std::result::Result<RouteTarget, String> {
         Ok(RouteTarget::Blackhole)
     } else if let Some(name) = s.strip_prefix("nat-gw:") {
         if name.is_empty() {
-            return Err("nat-gw target requires a name".to_string());
+            return Err("nat-gw target requires a name or ID".to_string());
         }
-        Ok(RouteTarget::NatGateway(name.to_string()))
+        Ok(RouteTarget::NatGateway(NatGatewayId(name.to_string())))
     } else if let Some(name) = s.strip_prefix("peering:") {
         if name.is_empty() {
-            return Err("peering target requires a name".to_string());
+            return Err("peering target requires a name or ID".to_string());
         }
-        Ok(RouteTarget::VpcPeering(name.to_string()))
+        Ok(RouteTarget::VpcPeering(PeeringId(name.to_string())))
     } else {
         Err(format!(
-            "invalid route target: '{s}'. Valid: local, blackhole, nat-gw:<name>, peering:<name>"
+            "invalid route target: '{s}'. Valid: local, blackhole, nat-gw:<id>, peering:<id>"
         ))
     }
 }
@@ -1923,13 +1926,13 @@ fn validate_route_target(
 ) -> std::result::Result<(), String> {
     match target {
         RouteTarget::Local | RouteTarget::Blackhole => Ok(()),
-        RouteTarget::VpcPeering(name) => {
+        RouteTarget::VpcPeering(peer_id) => {
             // Check if peering exists and is active.
             match store.list_peerings() {
                 Ok(peerings) => {
-                    let found = peerings
-                        .iter()
-                        .find(|p| p.vpc_a == *name || p.vpc_b == *name || p.id.0 == *name);
+                    let found = peerings.iter().find(|p| {
+                        p.id == *peer_id || p.vpc_a.0 == peer_id.0 || p.vpc_b.0 == peer_id.0
+                    });
                     match found {
                         Some(p) => {
                             if p.status == crate::types::PeeringStatus::Active {
@@ -1937,30 +1940,30 @@ fn validate_route_target(
                             } else {
                                 Err(format!(
                                     "target resource '{}' is not active (current state: {})",
-                                    name, p.status
+                                    peer_id, p.status
                                 ))
                             }
                         }
-                        None => Err(format!("target resource '{name}' not found")),
+                        None => Err(format!("target resource '{peer_id}' not found")),
                     }
                 }
                 Err(e) => Err(e.to_string()),
             }
         }
-        RouteTarget::NatGateway(name) => {
+        RouteTarget::NatGateway(nat_id) => {
             // Check if NAT GW exists and is Active.
-            match store.get_nat_gw_by_name(name) {
+            match store.get_nat_gw_by_name(&nat_id.0) {
                 Ok(Some(gw)) => {
                     if gw.state == ResourceState::Active {
                         Ok(())
                     } else {
                         Err(format!(
                             "nat-gw '{}' is not active (current state: {})",
-                            name, gw.state
+                            nat_id, gw.state
                         ))
                     }
                 }
-                Ok(None) => Err(format!("nat-gw '{name}' not found")),
+                Ok(None) => Err(format!("nat-gw '{}' not found", nat_id)),
                 Err(e) => Err(e.to_string()),
             }
         }

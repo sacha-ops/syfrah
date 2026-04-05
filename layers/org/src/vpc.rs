@@ -667,8 +667,8 @@ impl VpcStore {
 
         let peering = VpcPeering {
             id: PeeringId(key.clone()),
-            vpc_a: norm_a,
-            vpc_b: norm_b,
+            vpc_a: VpcId(norm_a),
+            vpc_b: VpcId(norm_b),
             status: PeeringStatus::Active,
             created_at: now,
         };
@@ -691,7 +691,7 @@ impl VpcStore {
         Ok(all
             .into_iter()
             .filter(|(_, p)| {
-                (p.vpc_a == *id_str || p.vpc_b == *id_str) && p.status == PeeringStatus::Active
+                (p.vpc_a.0 == *id_str || p.vpc_b.0 == *id_str) && p.status == PeeringStatus::Active
             })
             .map(|(_, p)| p)
             .collect())
@@ -1059,8 +1059,8 @@ mod tests {
     fn make_peering(vpc_a: &VpcId, vpc_b: &VpcId) -> VpcPeering {
         VpcPeering {
             id: PeeringId(format!("peer-{}-{}", vpc_a, vpc_b)),
-            vpc_a: vpc_a.0.clone(),
-            vpc_b: vpc_b.0.clone(),
+            vpc_a: vpc_a.clone(),
+            vpc_b: vpc_b.clone(),
             status: PeeringStatus::Active,
             created_at: 1000,
         }
@@ -1754,7 +1754,7 @@ mod tests {
             "spoke-a must have exactly 1 peering"
         );
         assert!(
-            spoke_a_peerings[0].vpc_a == hub.id.0 || spoke_a_peerings[0].vpc_b == hub.id.0,
+            spoke_a_peerings[0].vpc_a == hub.id || spoke_a_peerings[0].vpc_b == hub.id,
             "spoke-a's peering must be with hub"
         );
 
@@ -1766,7 +1766,7 @@ mod tests {
             "spoke-b must have exactly 1 peering"
         );
         assert!(
-            spoke_b_peerings[0].vpc_a == hub.id.0 || spoke_b_peerings[0].vpc_b == hub.id.0,
+            spoke_b_peerings[0].vpc_a == hub.id || spoke_b_peerings[0].vpc_b == hub.id,
             "spoke-b's peering must be with hub"
         );
     }
@@ -1792,26 +1792,26 @@ mod tests {
         // imply spoke-a <-> spoke-b.
         let spoke_a_peerings = store.list_active_peerings_for_vpc(&spoke_a.id).unwrap();
         for p in &spoke_a_peerings {
-            let peer_vpc = if p.vpc_a == spoke_a.id.0 {
+            let peer_vpc = if p.vpc_a == spoke_a.id {
                 &p.vpc_b
             } else {
                 &p.vpc_a
             };
             assert_ne!(
-                *peer_vpc, spoke_b.id.0,
+                *peer_vpc, spoke_b.id,
                 "spoke-a must NOT be peered with spoke-b (no transitive peering)"
             );
         }
 
         let spoke_b_peerings = store.list_active_peerings_for_vpc(&spoke_b.id).unwrap();
         for p in &spoke_b_peerings {
-            let peer_vpc = if p.vpc_a == spoke_b.id.0 {
+            let peer_vpc = if p.vpc_a == spoke_b.id {
                 &p.vpc_b
             } else {
                 &p.vpc_a
             };
             assert_ne!(
-                *peer_vpc, spoke_a.id.0,
+                *peer_vpc, spoke_a.id,
                 "spoke-b must NOT be peered with spoke-a (no transitive peering)"
             );
         }
@@ -1834,10 +1834,10 @@ mod tests {
 
         // Collect the VPC IDs that the hub is peered with
         let hub_peerings = store.list_active_peerings_for_vpc(&hub.id).unwrap();
-        let hub_peers: Vec<String> = hub_peerings
+        let hub_peers: Vec<VpcId> = hub_peerings
             .iter()
             .map(|p| {
-                if p.vpc_a == hub.id.0 {
+                if p.vpc_a == hub.id {
                     p.vpc_b.clone()
                 } else {
                     p.vpc_a.clone()
@@ -1846,11 +1846,11 @@ mod tests {
             .collect();
 
         assert!(
-            hub_peers.contains(&spoke_a.id.0),
+            hub_peers.contains(&spoke_a.id),
             "hub must be peered with spoke-a"
         );
         assert!(
-            hub_peers.contains(&spoke_b.id.0),
+            hub_peers.contains(&spoke_b.id),
             "hub must be peered with spoke-b"
         );
         assert_eq!(hub_peers.len(), 2, "hub must be peered with exactly 2 VPCs");
@@ -1879,13 +1879,13 @@ mod tests {
             1,
             "hub must have 1 peering after removing spoke-a"
         );
-        let remaining_peer = if hub_peerings[0].vpc_a == hub.id.0 {
+        let remaining_peer = if hub_peerings[0].vpc_a == hub.id {
             &hub_peerings[0].vpc_b
         } else {
             &hub_peerings[0].vpc_a
         };
         assert_eq!(
-            *remaining_peer, spoke_b.id.0,
+            *remaining_peer, spoke_b.id,
             "remaining peering must be with spoke-b"
         );
 

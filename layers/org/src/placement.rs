@@ -38,7 +38,7 @@ impl PlacementStore {
     /// Add a VM placement record. Overwrites any existing entry for the same
     /// vpc_id/vm_id pair.
     pub fn add_placement(&self, placement: &VmPlacement) -> Result<()> {
-        let k = Self::key(&placement.vpc_id, &placement.vm_id);
+        let k = Self::key(&placement.vpc_id.0, &placement.vm_id);
         self.db.set(TABLE, &k, placement)?;
         Ok(())
     }
