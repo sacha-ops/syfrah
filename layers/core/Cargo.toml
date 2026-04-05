@@ -19,6 +19,11 @@ console = "0.15"
 indicatif = "0.17"
 terminal_size = "0.4"
 unicode-width = "0.2"
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http = "1"
 clap = { workspace = true, features = ["derive", "env"] }
 rand = "0.8"
 ulid = "1.2"

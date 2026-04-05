@@ -10,6 +10,7 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Config** — `~/.syfrah/config.toml` parsing with defaults, validation, env/CLI overrides
 - **Logging** — structured logging setup with file rotation, JSON/text modes, runtime reconfiguration
 - **UI** — terminal output system: tables, spinners, progress bars, colors, responsive layout
+- **API** — auto-generated REST routes from ResourceDef, error responses, server config
 
 ---
 
@@ -591,6 +592,94 @@ time_fmt::bytes(1_073_741_824)   // "1.0 GiB"
 | Pipe | (stdout not TTY) | TSV | hidden | no | no |
 | JSON | `--json` | JSON array | JSON events | no | no |
 | Quiet | `--quiet` | TSV | hidden | no | no |
+
+---
+
+## API (`syfrah_core::api`)
+
+Auto-generates REST routes from the same ResourceDef that generates CLI commands. Layers export pure handlers — zero HTTP code in layers.
+
+### How it works
+
+```
+ResourceDef "hypervisor" with CRUD + action "drain"
+    │
+    ├── CLI:  syfrah hypervisor list         (auto-generated)
+    │         syfrah hypervisor drain hv-01
+    │
+    └── API:  GET    /admin/v1/hypervisor    (auto-generated)
+              POST   /admin/v1/hypervisor
+              GET    /admin/v1/hypervisor/{id}
+              DELETE /admin/v1/hypervisor/{id}
+              POST   /admin/v1/hypervisor/drain
+```
+
+Same handler, same validation, same error codes. Two surfaces.
+
+### Server setup
+
+```rust
+use syfrah_core::api::{ApiServer, ApiConfig};
+
+let config = ApiConfig {
+    admin_addr: "127.0.0.1:8443".parse().unwrap(),
+    public_addr: Some("0.0.0.0:443".parse().unwrap()),
+    admin_prefix: "/admin/v1".to_string(),
+    public_prefix: "/v1".to_string(),
+};
+
+let server = ApiServer::new(config, admin_resources, public_resources);
+server.run_admin().await?;
+```
+
+### Error responses
+
+SyfrahError automatically maps to HTTP:
+
+```json
+HTTP 404
+{
+  "code": "RESOURCE_NOT_FOUND",
+  "message": "vpc 'web' not found",
+  "suggestion": "List available VPCs with: syfrah vpc list"
+}
+```
+
+| ErrorCode | HTTP Status |
+|-----------|-------------|
+| ResourceNotFound | 404 |
+| ResourceAlreadyExists | 409 |
+| ValidationError | 400 |
+| PermissionDenied | 403 |
+| RateLimited | 429 |
+| InternalError | 500 |
+| Timeout | 504 |
+
+### Route listing
+
+```rust
+use syfrah_core::api::list_routes;
+
+let routes = list_routes(&registrations, "/admin/v1");
+// [{ method: "GET", path: "/admin/v1/hypervisor", operation: "list", ... }]
+```
+
+### Endpoints
+
+- `GET /health` — health check with version
+- `GET /admin/v1/{resource}` — list
+- `POST /admin/v1/{resource}` — create
+- `GET /admin/v1/{resource}/{id}` — get
+- `DELETE /admin/v1/{resource}/{id}` — delete
+- `PATCH /admin/v1/{resource}/{id}` — update
+- `POST /admin/v1/{resource}/{action}` — custom action
+
+### Two APIs
+
+| API | Prefix | Port | Auth | Purpose |
+|-----|--------|------|------|---------|
+| **Admin** | `/admin/v1` | 8443 | mTLS / admin key | Platform ops (fabric, hypervisors, storage) |
+| **Public** | `/v1` | 443 | API key (tenant) | Tenant workloads (VMs, VPCs, volumes) |
 
 ---
 
