@@ -15,9 +15,11 @@ tokio.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 rand = "0.8"
 ulid = "1.2"
+toml = "0.8"
 async-trait = "0.1"
 dirs = "5"
 libc = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"

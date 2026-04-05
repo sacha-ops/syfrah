@@ -7,6 +7,7 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Error types** — unified error model with codes, HTTP mapping, retry hints
 - **Validation** — shared input validators for names, CIDRs, ports, durations, IPs, MACs, URLs
 - **Transport** — Unix socket protocol between CLI and daemon (framing, router, client/server)
+- **Config** — `~/.syfrah/config.toml` parsing with defaults, validation, hot-reload support
 
 ---
 
@@ -324,6 +325,46 @@ loop {
 - **Restrictive socket permissions** — 0o600, owner-only.
 - **Error responses are structured** — `SyfrahError` with code, message, suggestion.
 - **No streaming** — one request, one response, close. Keeps it simple.
+
+---
+
+## Config (`syfrah_core::config`)
+
+Configuration from `~/.syfrah/config.toml`. Optional — every setting has a sensible default.
+
+```rust
+use syfrah_core::config::Config;
+
+// Load (returns defaults if file doesn't exist)
+let config = Config::load()?;
+
+// Or parse directly
+let config = Config::parse("[daemon]\nhealth_check_interval_secs = 120")?;
+
+// Access
+config.daemon.health_check_interval_secs  // 120
+config.wireguard.interface_name            // "syfrah0"
+config.logging.level                       // "info"
+```
+
+### Sections
+
+| Section | Settings |
+|---------|----------|
+| `[daemon]` | health_check_interval, reconcile_interval, persist_interval, unreachable_timeout, max_concurrent_requests |
+| `[wireguard]` | interface_name, keepalive_interval, listen_port |
+| `[peering]` | join_timeout, exchange_timeout, max_concurrent_connections, max_pending_joins |
+| `[storage]` | cache_memory_mb, cache_disk_gb |
+| `[logging]` | level, format (text/json), file, max_file_size_mb, max_files |
+
+### Properties
+
+- **Optional file** — missing file = all defaults
+- **Partial config** — only override what you need, rest defaults
+- **Unknown keys ignored** — forward-compatible
+- **Invalid TOML = hard error** — daemon refuses to start with suggestion
+- **Generate default**: `Config::generate_default()` → commented TOML template
+- **Save/reload**: `config.save(&path)?`, `Config::load_from(&path)?`
 
 ---
 
