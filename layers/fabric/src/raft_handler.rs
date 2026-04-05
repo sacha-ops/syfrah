@@ -360,11 +360,22 @@ impl LayerHandler for RaftOrgHandler {
                     Some(v) => v.clone(),
                     None => format!("{org}-{project}-default"),
                 };
-                let env_id = format!("{org}/{project}/{env}");
+                // Resolve environment name to its ID via the name index.
+                // Environments are stored by generated ID (e.g. "env-a1b2c3d4"),
+                // not by composite key ("org/project/env").
+                let resolved_env = match self.org_store.get_env(org, project, env) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let resp = OrgResponse::Error(format!(
+                            "environment not found: {org}/{project}/{env}: {e}"
+                        ));
+                        return serde_json::to_vec(&resp).unwrap_or_default();
+                    }
+                };
                 let cmd = StateMachineCommand::CreateSubnet {
                     name: name.clone(),
                     vpc: vpc_name,
-                    env_id,
+                    env_id: resolved_env.id.0,
                     cidr: cidr.clone(),
                 };
                 return submit_raft_command(client, &req, cmd, &self.org_store).await;
