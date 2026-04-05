@@ -11,9 +11,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 rand = "0.8"
 ulid = "1.2"
+async-trait = "0.1"
+dirs = "5"
+libc = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

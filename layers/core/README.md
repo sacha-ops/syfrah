@@ -5,7 +5,8 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Resource framework** — declarative CLI generation from resource definitions
 - **Typed IDs** — ULID-backed, sortable, validated resource identifiers
 - **Error types** — unified error model with codes, HTTP mapping, retry hints
-- **Validation** — shared input validators for names, CIDRs, ports, durations
+- **Validation** — shared input validators for names, CIDRs, ports, durations, IPs, MACs, URLs
+- **Transport** — Unix socket protocol between CLI and daemon (framing, router, client/server)
 
 ---
 
@@ -240,6 +241,89 @@ Error: invalid CIDR '10.1.1.0/16': host bits must be zero. Did you mean 10.1.0.0
 Error: invalid MAC address 'aa:bb': must be 6 hex pairs separated by colons
 Error: invalid endpoint 'noport': must be in format HOST:PORT or IP:PORT
 ```
+
+---
+
+## Transport (`syfrah_core::transport`)
+
+Unix domain socket protocol between CLI and daemon. Generic, resource-kind-based routing — adding a new resource doesn't require changing the protocol.
+
+### Protocol
+
+```text
+CLI                              Daemon
+ │                                 │
+ │── [4 bytes len][JSON Request] ─→│
+ │                                 │── Router dispatches by kind
+ │←─ [4 bytes len][JSON Response] ─│
+ │                                 │
+ └── close ────────────────────────┘
+```
+
+### Request / Response
+
+```rust
+use syfrah_core::transport::{Request, Response};
+
+// CLI builds a request
+let req = Request::resource("vpc", "create", Some("my-vpc".into()), fields)
+    .with_scope("org", "acme");
+
+// Daemon returns a response
+let resp = Response::ok(serde_json::json!({"name": "my-vpc", "cidr": "10.0.0.0/16"}));
+let resp = Response::err(SyfrahError::not_found("vpc", "web"));
+let resp = Response::ok_message("vpc 'my-vpc' deleted.");
+let resp = Response::ok_empty();
+```
+
+### Client (CLI side)
+
+```rust
+use syfrah_core::transport::{send_request, socket_path};
+
+let resp = send_request(&socket_path(), &req).await?;
+// If daemon is not running → SyfrahError::daemon_unreachable()
+```
+
+### Server (daemon side)
+
+```rust
+use syfrah_core::transport::{Router, RequestHandler, Request, Response, bind_listener};
+
+struct VpcHandler;
+
+#[async_trait::async_trait]
+impl RequestHandler for VpcHandler {
+    async fn handle(&self, req: Request, caller_uid: Option<u32>) -> Response {
+        match req.operation.as_str() {
+            "create" => Response::ok(serde_json::json!({"name": req.name})),
+            "list" => Response::ok(serde_json::json!([])),
+            _ => Response::err(SyfrahError::not_implemented(&req.operation)),
+        }
+    }
+}
+
+let mut router = Router::new();
+router.register("vpc", VpcHandler);
+router.register("fabric", FabricHandler);
+
+// Accept loop
+let listener = bind_listener(&socket_path())?;
+loop {
+    let (stream, _) = listener.accept().await?;
+    let req: Request = read_message(&mut stream).await?;
+    let resp = router.dispatch(req, caller_uid).await;
+    write_message(&mut stream, &resp).await?;
+}
+```
+
+### Design choices
+
+- **Generic routing by string kind** — not an enum per layer. Adding a resource = registering a handler, no protocol changes.
+- **Length-prefixed JSON** — simple, debuggable, max 1 MB.
+- **Restrictive socket permissions** — 0o600, owner-only.
+- **Error responses are structured** — `SyfrahError` with code, message, suggestion.
+- **No streaming** — one request, one response, close. Keeps it simple.
 
 ---
 
