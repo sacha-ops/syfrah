@@ -180,7 +180,8 @@ enum FabricCommand {
     Join {
         /// IP or IP:port of an existing node (default port: 51821)
         target: String,
-        #[arg(long)]
+        /// Node name [default: hostname]
+        #[arg(long, alias = "name")]
         node_name: Option<String>,
         #[arg(long, default_value = "51820")]
         port: u16,

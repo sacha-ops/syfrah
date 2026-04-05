@@ -8,6 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::api::{send_storage_request, StorageRequest, StorageResponse};
+use syfrah_org::hypervisor_handler::{
+    send_hypervisor_request, HypervisorRequest, HypervisorResponse,
+};
+use syfrah_org::HypervisorState;
 
 /// Path where the encryption passphrase is stored locally (never replicated).
 const STORAGE_KEY_PATH: &str = "/etc/syfrah/storage-key";
@@ -94,6 +98,12 @@ pub async fn run_configure(params: &ConfigureParams<'_>) -> anyhow::Result<()> {
             if encryption_passphrase.is_some() {
                 println!("Encryption passphrase saved to {STORAGE_KEY_PATH}.");
             }
+
+            // Auto-enable hypervisors in this zone that are in NotReady state.
+            // Now that storage is configured, the EnableHypervisor command will
+            // pass the storage preflight check in the state machine.
+            auto_enable_hypervisors(&control_socket_path(), &zone).await;
+
             Ok(())
         }
         StorageResponse::Error(msg) => anyhow::bail!("{msg}"),
@@ -133,6 +143,46 @@ pub async fn run_configure_cache(
         }
         StorageResponse::Error(msg) => anyhow::bail!("{msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// After storage is configured for a zone, find any hypervisors in that zone
+/// that are still in `NotReady` state and automatically enable them.
+async fn auto_enable_hypervisors(socket_path: &Path, zone: &str) {
+    // List hypervisors in the zone.
+    let list_req = HypervisorRequest::List {
+        region: None,
+        zone: Some(zone.to_string()),
+    };
+    let list_resp = match send_hypervisor_request(socket_path, &list_req).await {
+        Ok(r) => r,
+        Err(_) => return, // Daemon unreachable; skip auto-enable silently.
+    };
+
+    let hypervisors = match list_resp {
+        HypervisorResponse::HypervisorList(list) => list,
+        _ => return,
+    };
+
+    for hv in &hypervisors {
+        if hv.state != HypervisorState::NotReady {
+            continue;
+        }
+        let enable_req = HypervisorRequest::Enable {
+            name: hv.name.clone(),
+        };
+        match send_hypervisor_request(socket_path, &enable_req).await {
+            Ok(HypervisorResponse::Ok) => {
+                println!(
+                    "\u{2713} Hypervisor {} enabled (zone {zone} now has storage configured)",
+                    hv.name
+                );
+            }
+            Ok(HypervisorResponse::Error(e)) => {
+                eprintln!("  Warning: could not enable hypervisor {}: {e}", hv.name);
+            }
+            _ => {}
+        }
     }
 }
 

@@ -220,6 +220,11 @@ pub fn setup_init(config: &DaemonConfig) -> anyhow::Result<DaemonReady> {
     println!("  \u{26a0} Peering is not active. New nodes cannot join yet.");
     println!("    To accept nodes with a PIN:  syfrah fabric peering start --pin <PIN>");
     println!("    To approve manually:         syfrah fabric peering start");
+    println!();
+    println!("  Next step: configure storage for this zone:");
+    println!(
+        "  syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
+    );
 
     let my_record = build_record(
         &config.node_name,
@@ -498,6 +503,11 @@ async fn finalize_join(
     println!();
     ui::warn("The mesh secret is stored in ~/.syfrah/state.json");
     println!("    Keep this file safe \u{2014} it grants full mesh access.");
+    println!();
+    println!("  Next step: configure storage for this zone:");
+    println!(
+        "  syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
+    );
 
     let my_record = build_record(
         &config.node_name,
@@ -845,7 +855,7 @@ async fn auto_bootstrap_raft(node_name: &str) -> anyhow::Result<()> {
 /// Called after the Raft client is injected into the hypervisor handler.
 /// Skips gracefully if:
 /// - The operator passed `--no-hypervisor`
-/// - KVM is not available on this node
+/// - No compute runtime is available (no KVM, crun, or runsc)
 /// - The hypervisor is already registered and enabled
 async fn auto_register_and_enable_hypervisor(
     raft_client: syfrah_controlplane::RaftClient,
@@ -862,9 +872,9 @@ async fn auto_register_and_enable_hypervisor(
         return;
     }
 
-    // Check KVM capability.
-    if !syfrah_org::discovery::kvm_available() {
-        info!("hypervisor: auto-registration skipped (no KVM on this node)");
+    // Check for any compute capability (KVM for VMs, or crun/runsc for containers).
+    if !syfrah_org::discovery::compute_capable() {
+        info!("hypervisor: auto-registration skipped (no KVM, crun, or runsc on this node)");
         return;
     }
 

@@ -20,6 +20,39 @@ pub fn kvm_available() -> bool {
     Path::new("/dev/kvm").exists()
 }
 
+/// Check if a container runtime (crun or runsc) is available on this node.
+///
+/// Mirrors the resolution logic in `syfrah_compute::runtime_container` but
+/// avoids a cross-layer dependency: checks `/usr/local/bin`, `/usr/bin`, and
+/// `$PATH` via `which`.
+pub fn container_runtime_available() -> bool {
+    fn resolve(name: &str) -> bool {
+        if Path::new(&format!("/usr/local/bin/{name}")).exists() {
+            return true;
+        }
+        if Path::new(&format!("/usr/bin/{name}")).exists() {
+            return true;
+        }
+        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout);
+                let p = std::path::PathBuf::from(path_str.trim());
+                if p.exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    resolve("crun") || resolve("runsc")
+}
+
+/// Check if this node can run any compute workload (VMs via KVM or containers
+/// via crun/runsc).
+pub fn compute_capable() -> bool {
+    kvm_available() || container_runtime_available()
+}
+
 /// Check if the operator opted out of automatic hypervisor registration
 /// via `--no-hypervisor`. The sentinel file is `~/.syfrah/no_hypervisor`.
 pub fn no_hypervisor_opted_out() -> bool {
@@ -280,8 +313,8 @@ pub fn discover_hypervisor(
         return None;
     }
 
-    if !kvm_available() {
-        info!("hypervisor: /dev/kvm not found, node is mesh-only");
+    if !compute_capable() {
+        info!("hypervisor: no compute runtime found (no KVM, crun, or runsc), node is mesh-only");
         return None;
     }
 
