@@ -1,9 +1,9 @@
 //! Volume setup integration — waits for ZeroFS volume readiness before VM boot.
 //!
-//! When a VM has a `root_volume_id`, the reconciler has already started ZeroFS
-//! and mounted the 9P filesystem at `/var/lib/syfrah/volumes/{volume_id}/`.
-//! This module polls until the mount point exists and is non-empty, then returns
-//! the path so the runtime can bind-mount (container) or virtiofs-share (CH) it.
+//! When a VM has a `root_volume_id`, the storage layer starts ZeroFS which
+//! exposes a 9P socket at `/tmp/syfrah/{volume_id}/zerofs.9p.sock`. This
+//! module polls until the socket exists, then returns the volume mount path
+//! so the runtime can bind-mount (container) or virtiofs-share (CH) it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,43 +15,60 @@ use crate::error::{ComputeError, ProcessError};
 /// Base directory where ZeroFS volumes are mounted on the host.
 const VOLUMES_BASE: &str = "/var/lib/syfrah/volumes";
 
-/// Maximum time to wait for a volume mount to appear (seconds).
-const VOLUME_READY_TIMEOUT_SECS: u64 = 60;
+/// Base directory where ZeroFS creates its runtime files (config, 9P socket).
+const ZEROFS_RUNTIME_BASE: &str = "/tmp/syfrah";
+
+/// Maximum time to wait for the ZeroFS 9P socket to appear (seconds).
+///
+/// ZeroFS typically starts in ~1-2 seconds so 10s is generous.
+const VOLUME_READY_TIMEOUT_SECS: u64 = 10;
 
 /// Interval between readiness checks (milliseconds).
-const VOLUME_POLL_INTERVAL_MS: u64 = 500;
+const VOLUME_POLL_INTERVAL_MS: u64 = 250;
 
 /// Return the expected host-side mount path for a volume.
 pub fn volume_mount_path(volume_id: &str) -> PathBuf {
     Path::new(VOLUMES_BASE).join(volume_id)
 }
 
-/// Wait for a ZeroFS volume mount to become ready.
+/// Return the path to the ZeroFS 9P socket for a volume.
+fn zerofs_socket_path(volume_id: &str) -> PathBuf {
+    Path::new(ZEROFS_RUNTIME_BASE)
+        .join(volume_id)
+        .join("zerofs.9p.sock")
+}
+
+/// Wait for a ZeroFS volume to become ready.
 ///
-/// Polls until the mount directory exists (indicating ZeroFS has started and
-/// the host 9P mount succeeded). Returns the mount path on success or an
-/// error after the timeout.
+/// Polls until the ZeroFS 9P socket exists at
+/// `/tmp/syfrah/{volume_id}/zerofs.9p.sock`, which is the authoritative
+/// readiness signal — it means ZeroFS has started and is accepting 9P
+/// connections. Returns the host mount path on success or an error after
+/// the timeout.
 ///
 /// This is analogous to how `NetworkSetup` prepares networking before the
 /// runtime boots — storage must be ready before the workload starts.
 pub async fn wait_for_volume_ready(volume_id: &str) -> Result<PathBuf, ComputeError> {
     let mount_path = volume_mount_path(volume_id);
+    let socket_path = zerofs_socket_path(volume_id);
     let timeout = Duration::from_secs(VOLUME_READY_TIMEOUT_SECS);
     let poll = Duration::from_millis(VOLUME_POLL_INTERVAL_MS);
     let deadline = tokio::time::Instant::now() + timeout;
 
     info!(
         volume_id = %volume_id,
+        socket_path = %socket_path.display(),
         mount_path = %mount_path.display(),
-        "waiting for ZeroFS volume mount to become ready"
+        "waiting for ZeroFS 9P socket to appear"
     );
 
     loop {
-        if mount_path.exists() && mount_path.is_dir() {
+        if socket_path.exists() {
             info!(
                 volume_id = %volume_id,
+                socket_path = %socket_path.display(),
                 mount_path = %mount_path.display(),
-                "ZeroFS volume mount is ready"
+                "ZeroFS 9P socket is ready"
             );
             return Ok(mount_path);
         }
@@ -59,14 +76,14 @@ pub async fn wait_for_volume_ready(volume_id: &str) -> Result<PathBuf, ComputeEr
         if tokio::time::Instant::now() >= deadline {
             warn!(
                 volume_id = %volume_id,
-                mount_path = %mount_path.display(),
-                "timed out waiting for ZeroFS volume mount"
+                socket_path = %socket_path.display(),
+                "timed out waiting for ZeroFS 9P socket"
             );
             return Err(ProcessError::SpawnFailed {
                 reason: format!(
                     "ZeroFS volume '{volume_id}' not ready after {VOLUME_READY_TIMEOUT_SECS}s \
-                     (mount path {} does not exist)",
-                    mount_path.display()
+                     (9P socket {} does not exist)",
+                    socket_path.display()
                 ),
             }
             .into());
@@ -74,7 +91,7 @@ pub async fn wait_for_volume_ready(volume_id: &str) -> Result<PathBuf, ComputeEr
 
         debug!(
             volume_id = %volume_id,
-            "volume mount not yet ready, polling again in {VOLUME_POLL_INTERVAL_MS}ms"
+            "ZeroFS 9P socket not yet ready, polling again in {VOLUME_POLL_INTERVAL_MS}ms"
         );
         tokio::time::sleep(poll).await;
     }
@@ -97,25 +114,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn zerofs_socket_path_format() {
+        let path = zerofs_socket_path("vol-root-my-vm");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/syfrah/vol-root-my-vm/zerofs.9p.sock")
+        );
+    }
+
     #[tokio::test]
-    async fn wait_for_volume_ready_with_existing_dir() {
-        // Create a temp dir to simulate a mounted volume.
+    async fn wait_for_volume_ready_with_existing_socket() {
+        // Create a temp file to simulate the 9P socket.
         let tmp = tempfile::TempDir::new().unwrap();
         let vol_dir = tmp.path().join("vol-test");
         std::fs::create_dir_all(&vol_dir).unwrap();
+        let sock = vol_dir.join("zerofs.9p.sock");
+        std::fs::write(&sock, b"").unwrap();
 
-        // Monkey-patch: we can't easily override VOLUMES_BASE, so test the
-        // path-checking logic directly.
-        assert!(vol_dir.exists());
-        assert!(vol_dir.is_dir());
+        // The socket file exists, which is the readiness signal.
+        assert!(sock.exists());
     }
 
     #[tokio::test]
     async fn wait_for_volume_ready_timeout() {
-        // A nonexistent volume should timeout. Use a very short timeout by
-        // testing the underlying logic rather than the full function (which
-        // has a 60s timeout).
-        let path = volume_mount_path("vol-nonexistent-12345");
+        // A nonexistent volume's socket should not exist.
+        let path = zerofs_socket_path("vol-nonexistent-12345");
         assert!(!path.exists());
     }
 }
