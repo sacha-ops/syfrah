@@ -330,41 +330,78 @@ loop {
 
 ## Config (`syfrah_core::config`)
 
-Configuration from `~/.syfrah/config.toml`. Optional — every setting has a sensible default.
+Configuration from `~/.syfrah/config.toml` with env var and CLI overrides. All durations are human-readable (`"60s"`, `"5m"`, `"2h"`).
+
+### Priority (highest wins)
+
+```
+CLI flags  →  env vars (SYFRAH_*)  →  config.toml  →  defaults
+```
+
+### Usage
 
 ```rust
 use syfrah_core::config::Config;
 
-// Load (returns defaults if file doesn't exist)
-let config = Config::load()?;
+let config = Config::load()?;  // file → env → validate
 
-// Or parse directly
-let config = Config::parse("[daemon]\nhealth_check_interval_secs = 120")?;
+config.daemon.health_check_interval  // "60s"
+config.wireguard.interface_name      // "syfrah0"
+config.logging.level                 // "info"
 
-// Access
-config.daemon.health_check_interval_secs  // 120
-config.wireguard.interface_name            // "syfrah0"
-config.logging.level                       // "info"
+// Parse duration to seconds
+Config::duration_secs("5m")?  // 300
 ```
 
-### Sections
+### Env var overrides
 
-| Section | Settings |
-|---------|----------|
-| `[daemon]` | health_check_interval, reconcile_interval, persist_interval, unreachable_timeout, max_concurrent_requests |
-| `[wireguard]` | interface_name, keepalive_interval, listen_port |
-| `[peering]` | join_timeout, exchange_timeout, max_concurrent_connections, max_pending_joins |
-| `[storage]` | cache_memory_mb, cache_disk_gb |
-| `[logging]` | level, format (text/json), file, max_file_size_mb, max_files |
+```bash
+SYFRAH_LOG_LEVEL=debug syfrah fabric start     # overrides logging.level
+SYFRAH_WG_PORT=9999 syfrah fabric start        # overrides wireguard.listen_port
+```
+
+| Env var | Config field |
+|---------|-------------|
+| `SYFRAH_LOG_LEVEL` | `logging.level` |
+| `SYFRAH_LOG_FORMAT` | `logging.format` |
+| `SYFRAH_LOG_FILE` | `logging.file` |
+| `SYFRAH_WG_INTERFACE` | `wireguard.interface_name` |
+| `SYFRAH_WG_PORT` | `wireguard.listen_port` |
+| `SYFRAH_HEALTH_INTERVAL` | `daemon.health_check_interval` |
+| `SYFRAH_CACHE_MEMORY_MB` | `storage.cache_memory_mb` |
+
+### CLI overrides
+
+```rust
+let mut overrides = HashMap::new();
+overrides.insert("logging.level".into(), "debug".into());
+config.apply_overrides(&overrides);
+```
+
+### Validation
+
+All values are validated after loading. Invalid values = hard error before daemon starts:
+
+```
+Error: logging.level 'banana' is invalid. Must be one of: trace, debug, info, warn, error
+Error: daemon.health_check_interval 'nope' is invalid (use e.g., 60s, 1m, 5m)
+Error: wireguard.listen_port cannot be 0
+```
+
+Cross-field warnings (non-fatal):
+```
+Warning: storage: both cache_memory_mb and cache_disk_gb are 0 — no caching at all
+```
 
 ### Properties
 
-- **Optional file** — missing file = all defaults
-- **Partial config** — only override what you need, rest defaults
+- **Optional file** — missing = all defaults
+- **Partial config** — override only what you need
 - **Unknown keys ignored** — forward-compatible
-- **Invalid TOML = hard error** — daemon refuses to start with suggestion
-- **Generate default**: `Config::generate_default()` → commented TOML template
-- **Save/reload**: `config.save(&path)?`, `Config::load_from(&path)?`
+- **Human durations** — `"60s"`, `"5m"`, `"2h"`, `"7d"` everywhere
+- **Schema version** — `config_version` field for future migrations
+- **File permissions** — saved as 0o600 (owner-only)
+- **Validated** — bad values caught at load time, not runtime
 
 ---
 
