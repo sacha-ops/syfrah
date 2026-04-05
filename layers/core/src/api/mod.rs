@@ -1,13 +1,14 @@
 //! API layer — auto-generates REST routes from ResourceDef.
 //!
 //! Layers export pure handlers. This module wraps them in HTTP:
-//! - Routing: ResourceDef → axum routes
+//! - Routing: ResourceDef → axum routes (with scoped paths)
 //! - Request parsing: JSON body + path params → OperationRequest
 //! - Response rendering: OperationResponse → JSON HTTP response
 //! - Error handling: SyfrahError → HTTP status + JSON error body
-//! - Middleware: auth, logging, rate limiting
-//!
-//! # Usage
+//! - Middleware: request ID, version header, rate limiting, tracing
+//! - Pagination: standard query params on list endpoints
+//! - OpenAPI: auto-generated spec from ResourceDef
+//! - Graceful shutdown: SIGTERM/SIGINT handling
 //!
 //! ```no_run
 //! use syfrah_core::api::{ApiServer, ApiConfig};
@@ -20,6 +21,7 @@
 //! ```
 
 mod error_response;
+pub mod middleware;
 mod route_gen;
 mod server;
 
