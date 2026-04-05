@@ -31,10 +31,17 @@ const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
 
-// Name → ID index tables for ID-keyed resources
+// Name → ID index tables for ID-keyed resources (org layer)
 const ORG_NAME_IDX: &str = "org_name_idx";
 const PROJECT_NAME_IDX: &str = "project_name_idx";
 const ENV_NAME_IDX: &str = "env_name_idx";
+
+// Name → ID index tables for networking resources
+const VPC_NAME_INDEX: &str = "idx_vpc_name";
+const SUBNET_NAME_INDEX: &str = "idx_subnet_name";
+const SG_NAME_INDEX: &str = "idx_sg_name";
+const NAT_GW_NAME_INDEX: &str = "idx_nat_gw_name";
+const ROUTE_TABLE_NAME_INDEX: &str = "idx_route_table_name";
 
 /// Generate a random ID with the given prefix.
 /// Format: `{prefix}-{12-hex-chars}` (e.g., `org-a1b2c3d4e5f6`)
@@ -83,6 +90,11 @@ impl OrgStore {
             ORG_NAME_IDX,
             PROJECT_NAME_IDX,
             ENV_NAME_IDX,
+            VPC_NAME_INDEX,
+            SUBNET_NAME_INDEX,
+            SG_NAME_INDEX,
+            NAT_GW_NAME_INDEX,
+            ROUTE_TABLE_NAME_INDEX,
         ]
     }
 
@@ -579,6 +591,24 @@ impl OrgStore {
             .atomic_next_counter(VNI_COUNTER_TABLE, VNI_COUNTER_KEY, VNI_START)?)
     }
 
+    /// Derive the org scope string for a VPC name index key.
+    fn vpc_org_scope(owner: &VpcOwner) -> String {
+        match owner {
+            VpcOwner::Org(org_id) => org_id.0.clone(),
+            VpcOwner::Project(proj_id) => proj_id
+                .0
+                .split('/')
+                .next()
+                .unwrap_or(&proj_id.0)
+                .to_string(),
+        }
+    }
+
+    /// Build the VPC name index key: "{org_scope}/{vpc_name}".
+    fn vpc_name_key(owner: &VpcOwner, name: &str) -> String {
+        format!("{}/{name}", Self::vpc_org_scope(owner))
+    }
+
     /// Create a VPC. Validates the name and CIDR (RFC 1918, prefix 8-28,
     /// no host bits), checks for overlap with existing VPCs in the same org,
     /// allocates a VNI, and persists.
@@ -624,7 +654,9 @@ impl OrgStore {
             }
         }
 
-        if self.db.exists(VPCS_TABLE, name)? {
+        // Check name uniqueness within the org via index.
+        let name_key = Self::vpc_name_key(&owner, name);
+        if self.db.exists(VPC_NAME_INDEX, &name_key)? {
             return Err(OrgError::VpcAlreadyExists(name.to_string()));
         }
 
@@ -645,8 +677,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = VpcId::generate();
         let vpc = Vpc {
-            id: VpcId(format!("vpc-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             cidr: cidr.to_string(),
             vni,
@@ -655,7 +688,10 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(VPCS_TABLE, name, &vpc)?;
+        // Primary table: keyed by ID.
+        self.db.set(VPCS_TABLE, &id.0, &vpc)?;
+        // Name index: org-scoped name → ID.
+        self.db.set(VPC_NAME_INDEX, &name_key, &id.0)?;
 
         // Auto-create the default security group for this VPC.
         self.create_default_sg(&vpc)?;
@@ -666,15 +702,22 @@ impl OrgStore {
         Ok(vpc)
     }
 
-    /// Get a VPC by name.
+    /// Get a VPC by name. Uses the name index to find the ID, then fetches.
     pub fn get_vpc(&self, name: &str) -> Result<Option<Vpc>> {
-        Ok(self.db.get(VPCS_TABLE, name)?)
+        // Scan the name index for any entry ending with "/{name}".
+        let entries: Vec<(String, String)> = self.db.list(VPC_NAME_INDEX)?;
+        let suffix = format!("/{name}");
+        for (key, vpc_id) in entries {
+            if key.ends_with(&suffix) {
+                return Ok(self.db.get(VPCS_TABLE, &vpc_id)?);
+            }
+        }
+        Ok(None)
     }
 
-    /// Get a VPC by its ID (e.g. "vpc-my-vpc").
+    /// Get a VPC by its ID.
     pub fn get_vpc_by_id(&self, vpc_id: &VpcId) -> Result<Option<Vpc>> {
-        let all = self.list_vpcs()?;
-        Ok(all.into_iter().find(|v| v.id == *vpc_id))
+        Ok(self.db.get(VPCS_TABLE, &vpc_id.0)?)
     }
 
     /// List all VPCs.
@@ -717,12 +760,12 @@ impl OrgStore {
 
     /// Delete a VPC by name. Fails if it has active peerings.
     pub fn delete_vpc(&self, name: &str) -> Result<()> {
-        if !self.db.exists(VPCS_TABLE, name)? {
-            return Err(OrgError::VpcNotFound(name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(name)?
+            .ok_or_else(|| OrgError::VpcNotFound(name.to_string()))?;
 
         // Check for active peerings
-        let peerings = self.list_peerings_by_vpc(name)?;
+        let peerings = self.list_peerings_by_vpc_id(&vpc.id)?;
         if !peerings.is_empty() {
             return Err(OrgError::VpcHasPeerings {
                 name: name.to_string(),
@@ -730,29 +773,32 @@ impl OrgStore {
             });
         }
 
-        self.db.delete(VPCS_TABLE, name)?;
+        // Remove from name index.
+        let name_key = Self::vpc_name_key(&vpc.owner, name);
+        let _ = self.db.delete(VPC_NAME_INDEX, &name_key);
+
+        self.db.delete(VPCS_TABLE, &vpc.id.0)?;
         Ok(())
     }
 
     // ── VPC attachment operations ────────────────────────────────────
 
-    /// Build a storage key for a VPC attachment.
-    fn attachment_key(vpc_name: &str, project_id: &str) -> String {
-        format!("{vpc_name}/{project_id}")
+    /// Build a storage key for a VPC attachment: "vpc_id/project_id".
+    fn attachment_key(vpc_id: &VpcId, project_id: &str) -> String {
+        format!("{}/{project_id}", vpc_id.0)
     }
 
     /// Attach a shared VPC to a project.
     pub fn attach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
         let vpc = self
-            .db
-            .get::<Vpc>(VPCS_TABLE, vpc_name)?
+            .get_vpc(vpc_name)?
             .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
         if !vpc.shared {
             return Err(OrgError::VpcNotShared(vpc_name.to_string()));
         }
 
-        let key = Self::attachment_key(vpc_name, project_id);
+        let key = Self::attachment_key(&vpc.id, project_id);
         if self.db.exists(VPC_ATTACHMENTS_TABLE, &key)? {
             return Err(OrgError::VpcAlreadyAttached {
                 vpc: vpc_name.to_string(),
@@ -766,7 +812,7 @@ impl OrgStore {
             .as_secs();
 
         let attachment = VpcAttachment {
-            vpc_name: vpc_name.to_string(),
+            vpc_id: vpc.id.clone(),
             project_id: ProjectId(project_id.to_string()),
             attached_at: now,
         };
@@ -777,11 +823,11 @@ impl OrgStore {
 
     /// Detach a shared VPC from a project.
     pub fn detach_vpc(&self, vpc_name: &str, project_id: &str) -> Result<()> {
-        if !self.db.exists(VPCS_TABLE, vpc_name)? {
-            return Err(OrgError::VpcNotFound(vpc_name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
-        let key = Self::attachment_key(vpc_name, project_id);
+        let key = Self::attachment_key(&vpc.id, project_id);
         if !self.db.exists(VPC_ATTACHMENTS_TABLE, &key)? {
             return Err(OrgError::VpcNotAttached {
                 vpc: vpc_name.to_string(),
@@ -795,11 +841,11 @@ impl OrgStore {
 
     /// List all projects attached to a VPC.
     pub fn list_attachments(&self, vpc_name: &str) -> Result<Vec<ProjectId>> {
-        if !self.db.exists(VPCS_TABLE, vpc_name)? {
-            return Err(OrgError::VpcNotFound(vpc_name.to_string()));
-        }
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
-        let prefix = format!("{vpc_name}/");
+        let prefix = format!("{}/", vpc.id.0);
         let all: Vec<(String, VpcAttachment)> = self.db.list(VPC_ATTACHMENTS_TABLE)?;
         Ok(all
             .into_iter()
@@ -810,9 +856,9 @@ impl OrgStore {
 
     // ── Subnet operations ──────────────────────────────────────────
 
-    /// Build the redb key for a subnet: "vpc_name/subnet_name".
-    fn subnet_key(vpc_name: &str, subnet_name: &str) -> String {
-        format!("{vpc_name}/{subnet_name}")
+    /// Build the name index key for a subnet: "vpc_id/subnet_name".
+    fn subnet_name_key(vpc_id: &VpcId, subnet_name: &str) -> String {
+        format!("{}/{subnet_name}", vpc_id.0)
     }
 
     /// Compute the gateway address (.1) from a subnet CIDR.
@@ -910,8 +956,7 @@ impl OrgStore {
 
         // Verify VPC exists
         let vpc = self
-            .db
-            .get::<Vpc>(VPCS_TABLE, vpc_name)?
+            .get_vpc(vpc_name)?
             .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
 
         // Verify environment exists
@@ -919,9 +964,9 @@ impl OrgStore {
             return Err(OrgError::EnvNotFound(env_id.0.clone()));
         }
 
-        // Check subnet name uniqueness within VPC
-        let key = Self::subnet_key(vpc_name, name);
-        if self.db.exists(SUBNETS_TABLE, &key)? {
+        // Check subnet name uniqueness within VPC via index
+        let name_key = Self::subnet_name_key(&vpc.id, name);
+        if self.db.exists(SUBNET_NAME_INDEX, &name_key)? {
             return Err(OrgError::SubnetAlreadyExists {
                 vpc: vpc_name.to_string(),
                 subnet: name.to_string(),
@@ -978,8 +1023,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = SubnetId::generate();
         let subnet = Subnet {
-            id: SubnetId(key.clone()),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc.id.clone(),
             env_id: env_id.clone(),
@@ -988,7 +1034,10 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SUBNETS_TABLE, &key, &subnet)?;
+        // Primary table: keyed by ID.
+        self.db.set(SUBNETS_TABLE, &id.0, &subnet)?;
+        // Name index: vpc-scoped name → ID.
+        self.db.set(SUBNET_NAME_INDEX, &name_key, &id.0)?;
 
         // Auto-add system route for this subnet's CIDR in the VPC's default route table.
         if let Ok(Some(default_rt)) = self.get_default_route_table(&vpc.id) {
@@ -1000,27 +1049,45 @@ impl OrgStore {
 
     /// Get a subnet by VPC name and subnet name.
     pub fn get_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<Subnet> {
-        let key = Self::subnet_key(vpc_name, subnet_name);
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+        let name_key = Self::subnet_name_key(&vpc.id, subnet_name);
+        let subnet_id: String =
+            self.db
+                .get(SUBNET_NAME_INDEX, &name_key)?
+                .ok_or_else(|| OrgError::SubnetNotFound {
+                    vpc: vpc_name.to_string(),
+                    subnet: subnet_name.to_string(),
+                })?;
         self.db
-            .get::<Subnet>(SUBNETS_TABLE, &key)?
+            .get::<Subnet>(SUBNETS_TABLE, &subnet_id)?
             .ok_or_else(|| OrgError::SubnetNotFound {
                 vpc: vpc_name.to_string(),
                 subnet: subnet_name.to_string(),
             })
     }
 
-    /// Get a subnet by its SubnetId (the raw redb key, e.g., "vpc_name/subnet_name").
+    /// Get a subnet by its SubnetId.
     pub fn get_subnet_by_id(&self, subnet_id: &str) -> Result<Option<Subnet>> {
         Ok(self.db.get::<Subnet>(SUBNETS_TABLE, subnet_id)?)
     }
 
-    /// List all subnets in a VPC.
+    /// List all subnets in a VPC (by VPC name).
     pub fn list_subnets(&self, vpc_name: &str) -> Result<Vec<Subnet>> {
-        let prefix = format!("{vpc_name}/");
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        self.list_subnets_by_vpc_id(&vpc.id)
+    }
+
+    /// List all subnets in a VPC (by VPC ID).
+    pub fn list_subnets_by_vpc_id(&self, vpc_id: &VpcId) -> Result<Vec<Subnet>> {
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         Ok(all
             .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
+            .filter(|(_, s)| s.vpc_id == *vpc_id)
             .map(|(_, s)| s)
             .collect())
     }
@@ -1042,10 +1109,13 @@ impl OrgStore {
     pub fn find_subnets_by_name(&self, subnet_name: &str) -> Result<Vec<(String, Subnet)>> {
         let all: Vec<(String, Subnet)> = self.db.list(SUBNETS_TABLE)?;
         let mut matches = Vec::new();
-        for (key, subnet) in all {
+        for (_key, subnet) in all {
             if subnet.name == subnet_name {
-                // key is "vpc_name/subnet_name"; extract vpc_name
-                let vpc_name = key.split('/').next().unwrap_or(&key).to_string();
+                // Resolve VPC name from VPC ID.
+                let vpc_name = match self.get_vpc_by_id(&subnet.vpc_id)? {
+                    Some(v) => v.name,
+                    None => subnet.vpc_id.0.clone(),
+                };
                 matches.push((vpc_name, subnet));
             }
         }
@@ -1054,14 +1124,25 @@ impl OrgStore {
 
     /// Delete a subnet by VPC name and subnet name.
     pub fn delete_subnet(&self, vpc_name: &str, subnet_name: &str) -> Result<()> {
-        let key = Self::subnet_key(vpc_name, subnet_name);
-        let subnet: Subnet =
+        let vpc = self
+            .get_vpc(vpc_name)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_name.to_string()))?;
+
+        let name_key = Self::subnet_name_key(&vpc.id, subnet_name);
+        let subnet_id_str: String =
             self.db
-                .get(SUBNETS_TABLE, &key)?
+                .get(SUBNET_NAME_INDEX, &name_key)?
                 .ok_or_else(|| OrgError::SubnetNotFound {
                     vpc: vpc_name.to_string(),
                     subnet: subnet_name.to_string(),
                 })?;
+
+        let subnet: Subnet = self.db.get(SUBNETS_TABLE, &subnet_id_str)?.ok_or_else(|| {
+            OrgError::SubnetNotFound {
+                vpc: vpc_name.to_string(),
+                subnet: subnet_name.to_string(),
+            }
+        })?;
 
         // Remove the system route for this subnet's CIDR from the default route table.
         if let Ok(Some(default_rt)) = self.get_default_route_table(&subnet.vpc_id) {
@@ -1071,29 +1152,31 @@ impl OrgStore {
         // Remove any route table association for this subnet.
         let _ = self.disassociate_subnet_route_table(&subnet.id);
 
-        self.db.delete(SUBNETS_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(SUBNET_NAME_INDEX, &name_key);
+
+        self.db.delete(SUBNETS_TABLE, &subnet_id_str)?;
         Ok(())
     }
 
     // ── VPC Peering operations ──────────────────────────────────────
 
-    /// Normalize a peering key by sorting the two VPC names alphabetically.
+    /// Normalize a peering key by sorting the two VPC IDs alphabetically.
     /// This ensures "A/B" and "B/A" resolve to the same peering.
-    fn peering_key(vpc_a: &str, vpc_b: &str) -> (String, String, String) {
-        let (a, b) = if vpc_a <= vpc_b {
-            (vpc_a.to_string(), vpc_b.to_string())
+    fn peering_name_key(vpc_a_id: &VpcId, vpc_b_id: &VpcId) -> (String, VpcId, VpcId) {
+        let (a, b) = if vpc_a_id.0 <= vpc_b_id.0 {
+            (vpc_a_id.clone(), vpc_b_id.clone())
         } else {
-            (vpc_b.to_string(), vpc_a.to_string())
+            (vpc_b_id.clone(), vpc_a_id.clone())
         };
-        let key = format!("{a}/{b}");
+        let key = format!("{}/{}", a.0, b.0);
         (key, a, b)
     }
 
-    /// Create a peering between two VPCs.
+    /// Create a peering between two VPCs (by name).
     ///
     /// Both VPCs must exist, self-peering is rejected, and duplicate
-    /// peerings are rejected. The key is normalized so that order of
-    /// vpc_a/vpc_b does not matter.
+    /// peerings are rejected.
     pub fn create_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<VpcPeering> {
         // Reject self-peering
         if vpc_a == vpc_b {
@@ -1101,18 +1184,25 @@ impl OrgStore {
         }
 
         // Verify both VPCs exist
-        if !self.db.exists(VPCS_TABLE, vpc_a)? {
-            return Err(OrgError::VpcNotFound(vpc_a.to_string()));
-        }
-        if !self.db.exists(VPCS_TABLE, vpc_b)? {
-            return Err(OrgError::VpcNotFound(vpc_b.to_string()));
-        }
+        let vpc_a_obj = self
+            .get_vpc(vpc_a)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a.to_string()))?;
+        let vpc_b_obj = self
+            .get_vpc(vpc_b)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b.to_string()))?;
 
-        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
+        let (name_key, a_id, b_id) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
 
-        // Reject duplicate
-        if self.db.exists(PEERINGS_TABLE, &key)? {
-            return Err(OrgError::PeeringAlreadyExists { vpc_a: a, vpc_b: b });
+        // Check for duplicate via name-key scan.
+        let existing = self.list_peerings()?;
+        for p in &existing {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                return Err(OrgError::PeeringAlreadyExists {
+                    vpc_a: vpc_a.to_string(),
+                    vpc_b: vpc_b.to_string(),
+                });
+            }
         }
 
         let now = SystemTime::now()
@@ -1120,28 +1210,45 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = PeeringId::generate();
         let peering = VpcPeering {
-            id: PeeringId(format!("peer-{key}")),
-            vpc_a: a,
-            vpc_b: b,
+            id: id.clone(),
+            vpc_a: a_id,
+            vpc_b: b_id,
             status: PeeringStatus::Active,
             created_at: now,
         };
 
-        self.db.set(PEERINGS_TABLE, &key, &peering)?;
+        // Primary table: keyed by peering ID.
+        self.db.set(PEERINGS_TABLE, &id.0, &peering)?;
         Ok(peering)
     }
 
-    /// Delete (remove) a peering between two VPCs.
+    /// Delete (remove) a peering between two VPCs (by name).
     pub fn delete_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<()> {
-        let (key, a, b) = Self::peering_key(vpc_a, vpc_b);
+        let vpc_a_obj = self
+            .get_vpc(vpc_a)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_a.to_string()))?;
+        let vpc_b_obj = self
+            .get_vpc(vpc_b)?
+            .ok_or_else(|| OrgError::VpcNotFound(vpc_b.to_string()))?;
 
-        if !self.db.exists(PEERINGS_TABLE, &key)? {
-            return Err(OrgError::PeeringNotFound { vpc_a: a, vpc_b: b });
+        let (name_key, _, _) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
+
+        // Find matching peering.
+        let all = self.list_peerings()?;
+        for p in &all {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                self.db.delete(PEERINGS_TABLE, &p.id.0)?;
+                return Ok(());
+            }
         }
 
-        self.db.delete(PEERINGS_TABLE, &key)?;
-        Ok(())
+        Err(OrgError::PeeringNotFound {
+            vpc_a: vpc_a.to_string(),
+            vpc_b: vpc_b.to_string(),
+        })
     }
 
     /// List all peerings.
@@ -1150,12 +1257,21 @@ impl OrgStore {
         Ok(entries.into_iter().map(|(_, p)| p).collect())
     }
 
-    /// List peerings that involve a specific VPC.
+    /// List peerings that involve a specific VPC (by name).
     pub fn list_peerings_by_vpc(&self, vpc_name: &str) -> Result<Vec<VpcPeering>> {
+        let vpc = match self.get_vpc(vpc_name)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        self.list_peerings_by_vpc_id(&vpc.id)
+    }
+
+    /// List peerings that involve a specific VPC (by ID).
+    pub fn list_peerings_by_vpc_id(&self, vpc_id: &VpcId) -> Result<Vec<VpcPeering>> {
         let all = self.list_peerings()?;
         Ok(all
             .into_iter()
-            .filter(|p| p.vpc_a == vpc_name || p.vpc_b == vpc_name)
+            .filter(|p| p.vpc_a == *vpc_id || p.vpc_b == *vpc_id)
             .collect())
     }
 
@@ -1164,22 +1280,42 @@ impl OrgStore {
         self.list_peerings_by_vpc(vpc_name)
     }
 
-    /// Resolve a VPC name from its stored string. Since peerings now store
-    /// VPC names directly, this is an identity function.
-    pub fn resolve_vpc_name(&self, vpc_name: &str) -> String {
-        vpc_name.to_string()
+    /// Resolve a VPC name from its ID. Returns the name if found, otherwise the
+    /// raw ID string.
+    pub fn resolve_vpc_name(&self, vpc_id_str: &str) -> String {
+        let vpc_id = VpcId(vpc_id_str.to_string());
+        match self.get_vpc_by_id(&vpc_id) {
+            Ok(Some(v)) => v.name,
+            _ => vpc_id_str.to_string(),
+        }
     }
 
-    /// Get a specific peering between two VPCs, if it exists.
+    /// Get a specific peering between two VPCs (by name), if it exists.
     pub fn get_peering(&self, vpc_a: &str, vpc_b: &str) -> Result<Option<VpcPeering>> {
-        let (key, _, _) = Self::peering_key(vpc_a, vpc_b);
-        Ok(self.db.get(PEERINGS_TABLE, &key)?)
+        let vpc_a_obj = match self.get_vpc(vpc_a)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let vpc_b_obj = match self.get_vpc(vpc_b)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let (name_key, _, _) = Self::peering_name_key(&vpc_a_obj.id, &vpc_b_obj.id);
+        let all = self.list_peerings()?;
+        for p in all {
+            let (ek, _, _) = Self::peering_name_key(&p.vpc_a, &p.vpc_b);
+            if ek == name_key {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
     }
 
     // ── Security Group operations ──────────────────────────────────
 
-    /// Build the redb key for a security group: "vpc_id/sg_name".
-    fn sg_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a security group: "vpc_id/sg_name".
+    fn sg_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{}", vpc_id.0, name)
     }
 
@@ -1192,8 +1328,8 @@ impl OrgStore {
     ) -> Result<SecurityGroup> {
         validate_name(name, "security group")?;
 
-        let key = Self::sg_key(vpc_id, name);
-        if self.db.exists(SECURITY_GROUPS_TABLE, &key)? {
+        let name_key = Self::sg_name_key(vpc_id, name);
+        if self.db.exists(SG_NAME_INDEX, &name_key)? {
             return Err(OrgError::SgAlreadyExists(name.to_string()));
         }
 
@@ -1202,8 +1338,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = SecurityGroupId::generate();
         let sg = SecurityGroup {
-            id: SecurityGroupId(format!("sg-{}", name)),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             description: description.map(|s| s.to_string()),
@@ -1212,22 +1349,24 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        // Primary table: keyed by ID.
+        self.db.set(SECURITY_GROUPS_TABLE, &id.0, &sg)?;
+        // Name index: vpc-scoped name → ID.
+        self.db.set(SG_NAME_INDEX, &name_key, &id.0)?;
         Ok(sg)
     }
 
     /// Create the default security group for a VPC. Called automatically
     /// during VPC creation. The default SG cannot be deleted.
     pub fn create_default_sg(&self, vpc: &Vpc) -> Result<SecurityGroup> {
-        let key = Self::sg_key(&vpc.id, "default");
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let id = SecurityGroupId::generate();
         let sg = SecurityGroup {
-            id: SecurityGroupId(format!("sg-default-{}", vpc.name)),
+            id: id.clone(),
             name: "default".to_string(),
             vpc_id: vpc.id.clone(),
             description: Some(format!("Default security group for VPC {}", vpc.name)),
@@ -1236,14 +1375,22 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(SECURITY_GROUPS_TABLE, &key, &sg)?;
+        // Primary table: keyed by ID.
+        self.db.set(SECURITY_GROUPS_TABLE, &id.0, &sg)?;
+        // Name index.
+        let name_key = Self::sg_name_key(&vpc.id, "default");
+        self.db.set(SG_NAME_INDEX, &name_key, &id.0)?;
         Ok(sg)
     }
 
     /// Get a security group by VPC ID and name.
     pub fn get_sg(&self, vpc_id: &VpcId, name: &str) -> Result<Option<SecurityGroup>> {
-        let key = Self::sg_key(vpc_id, name);
-        Ok(self.db.get(SECURITY_GROUPS_TABLE, &key)?)
+        let name_key = Self::sg_name_key(vpc_id, name);
+        let sg_id: Option<String> = self.db.get(SG_NAME_INDEX, &name_key)?;
+        match sg_id {
+            Some(id) => Ok(self.db.get(SECURITY_GROUPS_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// List all security groups.
@@ -1254,29 +1401,30 @@ impl OrgStore {
 
     /// List security groups belonging to a specific VPC.
     pub fn list_sgs_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<SecurityGroup>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, SecurityGroup)> = self.db.list(SECURITY_GROUPS_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, sg)| sg)
-            .collect())
+        let all = self.list_sgs()?;
+        Ok(all.into_iter().filter(|sg| sg.vpc_id == *vpc_id).collect())
     }
 
     /// Delete a security group. Fails if the SG is the default for its VPC.
     pub fn delete_sg(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::sg_key(vpc_id, name);
+        let name_key = Self::sg_name_key(vpc_id, name);
+        let sg_id_str: String = self
+            .db
+            .get(SG_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
 
         let sg: SecurityGroup = self
             .db
-            .get(SECURITY_GROUPS_TABLE, &key)?
+            .get(SECURITY_GROUPS_TABLE, &sg_id_str)?
             .ok_or_else(|| OrgError::SgNotFound(name.to_string()))?;
 
         if sg.is_default {
             return Err(OrgError::SgIsDefault(name.to_string()));
         }
 
-        self.db.delete(SECURITY_GROUPS_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(SG_NAME_INDEX, &name_key);
+        self.db.delete(SECURITY_GROUPS_TABLE, &sg_id_str)?;
         Ok(())
     }
 
@@ -1355,8 +1503,8 @@ impl OrgStore {
 
     // ── Route Table operations ──────────────────────────────────────
 
-    /// Build the redb key for a route table: "vpc_id/table_name".
-    fn route_table_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a route table: "vpc_id/table_name".
+    fn route_table_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{}", vpc_id.0, name)
     }
 
@@ -1368,15 +1516,14 @@ impl OrgStore {
     /// Create the default route table for a VPC. Called automatically
     /// during VPC creation.
     pub fn create_default_route_table(&self, vpc: &Vpc) -> Result<RouteTable> {
-        let key = Self::route_table_key(&vpc.id, "default");
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteTableId::generate();
         let table = RouteTable {
-            id: RouteTableId(format!("rtb-default-{}", vpc.name)),
+            id: id.clone(),
             name: "default".to_string(),
             vpc_id: vpc.id.clone(),
             is_default: true,
@@ -1384,7 +1531,11 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+        // Primary table: keyed by ID.
+        self.db.set(ROUTE_TABLES_TABLE, &id.0, &table)?;
+        // Name index.
+        let name_key = Self::route_table_name_key(&vpc.id, "default");
+        self.db.set(ROUTE_TABLE_NAME_INDEX, &name_key, &id.0)?;
 
         // Add the VPC CIDR local route as a system route.
         self.add_system_route(&table, &vpc.cidr)?;
@@ -1396,8 +1547,8 @@ impl OrgStore {
     pub fn create_route_table(&self, name: &str, vpc_id: &VpcId) -> Result<RouteTable> {
         validate_name(name, "route table")?;
 
-        let key = Self::route_table_key(vpc_id, name);
-        if self.db.exists(ROUTE_TABLES_TABLE, &key)? {
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        if self.db.exists(ROUTE_TABLE_NAME_INDEX, &name_key)? {
             return Err(OrgError::RouteTableAlreadyExists(name.to_string()));
         }
 
@@ -1406,8 +1557,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteTableId::generate();
         let table = RouteTable {
-            id: RouteTableId(format!("rtb-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             is_default: false,
@@ -1415,14 +1567,21 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(ROUTE_TABLES_TABLE, &key, &table)?;
+        // Primary table: keyed by ID.
+        self.db.set(ROUTE_TABLES_TABLE, &id.0, &table)?;
+        // Name index.
+        self.db.set(ROUTE_TABLE_NAME_INDEX, &name_key, &id.0)?;
         Ok(table)
     }
 
     /// Get a route table by VPC ID and name.
     pub fn get_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<Option<RouteTable>> {
-        let key = Self::route_table_key(vpc_id, name);
-        Ok(self.db.get(ROUTE_TABLES_TABLE, &key)?)
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        let table_id: Option<String> = self.db.get(ROUTE_TABLE_NAME_INDEX, &name_key)?;
+        match table_id {
+            Some(id) => Ok(self.db.get(ROUTE_TABLES_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// Get the default route table for a VPC.
@@ -1438,22 +1597,21 @@ impl OrgStore {
 
     /// List route tables belonging to a specific VPC.
     pub fn list_route_tables_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<RouteTable>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, RouteTable)> = self.db.list(ROUTE_TABLES_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, t)| t)
-            .collect())
+        let all = self.list_route_tables()?;
+        Ok(all.into_iter().filter(|t| t.vpc_id == *vpc_id).collect())
     }
 
     /// Delete a route table. Fails if it is the default table or has associated subnets.
     pub fn delete_route_table(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::route_table_key(vpc_id, name);
+        let name_key = Self::route_table_name_key(vpc_id, name);
+        let table_id_str: String = self
+            .db
+            .get(ROUTE_TABLE_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::RouteTableNotFound(name.to_string()))?;
 
         let table: RouteTable = self
             .db
-            .get(ROUTE_TABLES_TABLE, &key)?
+            .get(ROUTE_TABLES_TABLE, &table_id_str)?
             .ok_or_else(|| OrgError::RouteTableNotFound(name.to_string()))?;
 
         if table.is_default {
@@ -1476,7 +1634,9 @@ impl OrgStore {
             self.db.delete(ROUTES_TABLE, &rkey)?;
         }
 
-        self.db.delete(ROUTE_TABLES_TABLE, &key)?;
+        // Remove from name index.
+        let _ = self.db.delete(ROUTE_TABLE_NAME_INDEX, &name_key);
+        self.db.delete(ROUTE_TABLES_TABLE, &table_id_str)?;
         Ok(())
     }
 
@@ -1527,12 +1687,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!(
-                "rt-sys-{}-{}",
-                table.name,
-                destination.replace('/', "_")
-            )),
+            id: id.clone(),
             route_table_id: table.id.clone(),
             destination: destination.to_string(),
             target: RouteTarget::Local,
@@ -1565,19 +1722,14 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
-        let status = match &target {
-            RouteTarget::Blackhole => RouteStatus::Active,
-            RouteTarget::Local => RouteStatus::Active,
-            _ => RouteStatus::Active,
-        };
-
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!("rt-{}", destination.replace('/', "_"))),
+            id: id.clone(),
             route_table_id: table_id.clone(),
             destination: destination.to_string(),
             target,
             origin: RouteOrigin::User,
-            status,
+            status: RouteStatus::Active,
             priority: priority.unwrap_or(100),
             created_at: now,
         };
@@ -1600,8 +1752,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = RouteId::generate();
         let route = Route {
-            id: RouteId(format!("rt-prop-{}", destination.replace('/', "_"))),
+            id: id.clone(),
             route_table_id: table_id.clone(),
             destination: destination.to_string(),
             target,
@@ -1732,8 +1885,8 @@ impl OrgStore {
 
     // ── NAT Gateway operations ─────────────────────────────────────
 
-    /// Key format for NAT gateway entries: "vpc_id/name".
-    fn nat_gw_key(vpc_id: &VpcId, name: &str) -> String {
+    /// Build the name index key for a NAT gateway: "vpc_id/name".
+    fn nat_gw_name_key(vpc_id: &VpcId, name: &str) -> String {
         format!("{}/{name}", vpc_id.0)
     }
 
@@ -1747,8 +1900,8 @@ impl OrgStore {
     ) -> Result<NatGateway> {
         validate_name(name, "nat-gw")?;
 
-        let key = Self::nat_gw_key(vpc_id, name);
-        if self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        if self.db.exists(NAT_GW_NAME_INDEX, &name_key)? {
             return Err(OrgError::NatGwAlreadyExists(name.to_string()));
         }
 
@@ -1757,8 +1910,9 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = NatGatewayId::generate();
         let gw = NatGateway {
-            id: NatGatewayId(format!("nat-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             vpc_id: vpc_id.clone(),
             subnet_id: subnet_id.clone(),
@@ -1767,14 +1921,21 @@ impl OrgStore {
             created_at: now,
         };
 
-        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        // Primary table: keyed by ID.
+        self.db.set(NAT_GATEWAYS_TABLE, &id.0, &gw)?;
+        // Name index.
+        self.db.set(NAT_GW_NAME_INDEX, &name_key, &id.0)?;
         Ok(gw)
     }
 
     /// Get a NAT Gateway by VPC ID and name.
     pub fn get_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<Option<NatGateway>> {
-        let key = Self::nat_gw_key(vpc_id, name);
-        Ok(self.db.get(NAT_GATEWAYS_TABLE, &key)?)
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id: Option<String> = self.db.get(NAT_GW_NAME_INDEX, &name_key)?;
+        match gw_id {
+            Some(id) => Ok(self.db.get(NAT_GATEWAYS_TABLE, &id)?),
+            None => Ok(None),
+        }
     }
 
     /// Get a NAT Gateway by name alone (scans all VPCs). Returns error if ambiguous.
@@ -1798,13 +1959,8 @@ impl OrgStore {
 
     /// List NAT Gateways belonging to a specific VPC.
     pub fn list_nat_gws_by_vpc(&self, vpc_id: &VpcId) -> Result<Vec<NatGateway>> {
-        let prefix = format!("{}/", vpc_id.0);
-        let all: Vec<(String, NatGateway)> = self.db.list(NAT_GATEWAYS_TABLE)?;
-        Ok(all
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, g)| g)
-            .collect())
+        let all = self.list_nat_gws()?;
+        Ok(all.into_iter().filter(|g| g.vpc_id == *vpc_id).collect())
     }
 
     /// List NAT Gateways by VPC name (CLI convenience wrapper).
@@ -1827,36 +1983,48 @@ impl OrgStore {
         name: &str,
         state: ResourceState,
     ) -> Result<NatGateway> {
-        let key = Self::nat_gw_key(vpc_id, name);
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id_str: String = self
+            .db
+            .get(NAT_GW_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
         let mut gw: NatGateway = self
             .db
-            .get(NAT_GATEWAYS_TABLE, &key)?
+            .get(NAT_GATEWAYS_TABLE, &gw_id_str)?
             .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
         gw.state = state;
-        self.db.set(NAT_GATEWAYS_TABLE, &key, &gw)?;
+        self.db.set(NAT_GATEWAYS_TABLE, &gw_id_str, &gw)?;
         Ok(gw)
     }
 
     /// Delete a NAT Gateway record from the store.
     pub fn delete_nat_gw(&self, vpc_id: &VpcId, name: &str) -> Result<()> {
-        let key = Self::nat_gw_key(vpc_id, name);
-        if !self.db.exists(NAT_GATEWAYS_TABLE, &key)? {
-            return Err(OrgError::NatGwNotFound(name.to_string()));
-        }
-        self.db.delete(NAT_GATEWAYS_TABLE, &key)?;
+        let name_key = Self::nat_gw_name_key(vpc_id, name);
+        let gw_id_str: String = self
+            .db
+            .get(NAT_GW_NAME_INDEX, &name_key)?
+            .ok_or_else(|| OrgError::NatGwNotFound(name.to_string()))?;
+        // Remove from name index.
+        let _ = self.db.delete(NAT_GW_NAME_INDEX, &name_key);
+        self.db.delete(NAT_GATEWAYS_TABLE, &gw_id_str)?;
         Ok(())
     }
 
-    /// Check if any routes in the VPC reference the given NAT Gateway name.
+    /// Check if any routes in the VPC reference the given NAT Gateway ID.
     pub fn routes_referencing_nat_gw(
         &self,
         vpc_id: &VpcId,
         nat_gw_name: &str,
     ) -> Result<Vec<Route>> {
+        // Resolve nat gw name to ID.
+        let gw = match self.get_nat_gw(vpc_id, nat_gw_name)? {
+            Some(g) => g,
+            None => return Ok(Vec::new()),
+        };
         let routes = self.list_routes_by_vpc(vpc_id)?;
         Ok(routes
             .into_iter()
-            .filter(|r| matches!(&r.target, RouteTarget::NatGateway(n) if n == nat_gw_name))
+            .filter(|r| matches!(&r.target, RouteTarget::NatGateway(id) if *id == gw.id))
             .collect())
     }
 
@@ -1900,7 +2068,7 @@ impl OrgStore {
         let entries: Vec<(String, NetworkInterface)> = self.db.list(NICS_TABLE)?;
         Ok(entries
             .into_iter()
-            .filter(|(_, nic)| nic.vpc_id == vpc_id && nic.state != ResourceState::Deleted)
+            .filter(|(_, nic)| nic.vpc_id.0 == vpc_id && nic.state != ResourceState::Deleted)
             .map(|(_, nic)| nic)
             .collect())
     }
@@ -1924,23 +2092,21 @@ impl OrgStore {
         }
     }
 
-    /// Attach a security group to a NIC. Validates VPC match.
-    pub fn attach_sg_to_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
-        let sg: SecurityGroup = self
-            .db
-            .get(SECURITY_GROUPS_TABLE, sg_key)?
-            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+    /// Attach a security group to a NIC. `sg_ref` can be an SG ID (e.g. "sg-abc123")
+    /// or a name index key ("vpc_id/sg_name") for backward compatibility.
+    pub fn attach_sg_to_nic(&self, sg_ref: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg = self.resolve_sg_ref(sg_ref)?;
 
         let mut nic: NetworkInterface = self
             .db
             .get(NICS_TABLE, nic_id)?
             .ok_or_else(|| OrgError::NicNotFound(nic_id.to_string()))?;
 
-        if sg.vpc_id.0 != nic.vpc_id {
+        if sg.vpc_id != nic.vpc_id {
             return Err(OrgError::SgVpcMismatch {
                 sg: sg.name.clone(),
                 sg_vpc: sg.vpc_id.0.clone(),
-                nic_vpc: nic.vpc_id.clone(),
+                nic_vpc: nic.vpc_id.0.clone(),
             });
         }
 
@@ -1956,12 +2122,9 @@ impl OrgStore {
         Ok(nic)
     }
 
-    /// Detach a security group from a NIC.
-    pub fn detach_sg_from_nic(&self, sg_key: &str, nic_id: &str) -> Result<NetworkInterface> {
-        let sg: SecurityGroup = self
-            .db
-            .get(SECURITY_GROUPS_TABLE, sg_key)?
-            .ok_or_else(|| OrgError::SgNotFound(sg_key.to_string()))?;
+    /// Detach a security group from a NIC. `sg_ref` can be an SG ID or name index key.
+    pub fn detach_sg_from_nic(&self, sg_ref: &str, nic_id: &str) -> Result<NetworkInterface> {
+        let sg = self.resolve_sg_ref(sg_ref)?;
 
         let mut nic: NetworkInterface = self
             .db
@@ -1984,6 +2147,27 @@ impl OrgStore {
         nic.security_groups.retain(|id| id != &sg.id);
         self.db.set(NICS_TABLE, nic_id, &nic)?;
         Ok(nic)
+    }
+
+    /// Resolve an SG reference: try as direct ID first, then as name index key.
+    fn resolve_sg_ref(&self, sg_ref: &str) -> Result<SecurityGroup> {
+        // Try direct ID lookup first.
+        if let Some(sg) = self
+            .db
+            .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, sg_ref)?
+        {
+            return Ok(sg);
+        }
+        // Try as name index key ("vpc_id/sg_name").
+        if let Some(sg_id) = self.db.get::<String>(SG_NAME_INDEX, sg_ref)? {
+            if let Some(sg) = self
+                .db
+                .get::<SecurityGroup>(SECURITY_GROUPS_TABLE, &sg_id)?
+            {
+                return Ok(sg);
+            }
+        }
+        Err(OrgError::SgNotFound(sg_ref.to_string()))
     }
 
     /// List security groups attached to a NIC.
@@ -2410,7 +2594,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(vpc.name, "default");
-        assert_eq!(vpc.id.0, "vpc-default");
+        assert!(
+            vpc.id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(vpc.cidr, "10.1.0.0/16");
         assert_eq!(vpc.vni, 100);
         assert!(!vpc.shared);
@@ -2976,7 +3163,10 @@ mod tests {
         assert_eq!(subnet.name, "frontend");
         assert_eq!(subnet.cidr, "10.1.1.0/24");
         assert_eq!(subnet.gateway, "10.1.1.1");
-        assert_eq!(subnet.vpc_id.0, "vpc-default");
+        assert!(
+            subnet.vpc_id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(subnet.env_id, env_id);
         assert!(subnet.created_at > 0);
     }
@@ -3138,7 +3328,8 @@ mod tests {
     #[test]
     fn get_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.get_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.get_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
@@ -3203,7 +3394,8 @@ mod tests {
     #[test]
     fn delete_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.delete_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.delete_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
@@ -3245,9 +3437,13 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         let peering = store.create_peering(&a, &b).unwrap();
-        assert_eq!(peering.vpc_a, "vpc-alpha");
-        assert_eq!(peering.vpc_b, "vpc-beta");
+        // vpc_a/vpc_b are sorted by ID, so check both IDs are present
+        let ids = [peering.vpc_a.clone(), peering.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
         assert_eq!(peering.status, PeeringStatus::Active);
         assert!(peering.created_at > 0);
     }
@@ -3257,11 +3453,14 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         // Create with reversed order
         let peering = store.create_peering(&b, &a).unwrap();
-        // Key is normalized alphabetically
-        assert_eq!(peering.vpc_a, "vpc-alpha");
-        assert_eq!(peering.vpc_b, "vpc-beta");
+        // Both IDs should be present regardless of order
+        let ids = [peering.vpc_a.clone(), peering.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
     }
 
     #[test]
@@ -3388,13 +3587,16 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
+        let vpc_a = store.get_vpc(&a).unwrap().unwrap();
+        let vpc_b = store.get_vpc(&b).unwrap().unwrap();
         store.create_peering(&a, &b).unwrap();
 
         let peering = store.get_peering(&a, &b).unwrap();
         assert!(peering.is_some());
         let p = peering.unwrap();
-        assert_eq!(p.vpc_a, "vpc-alpha");
-        assert_eq!(p.vpc_b, "vpc-beta");
+        let ids = [p.vpc_a.clone(), p.vpc_b.clone()];
+        assert!(ids.contains(&vpc_a.id));
+        assert!(ids.contains(&vpc_b.id));
     }
 
     #[test]
@@ -3849,7 +4051,7 @@ mod tests {
             .add_propagated_route(
                 &rt.id,
                 "10.2.0.0/16",
-                RouteTarget::VpcPeering("peering-123".to_string()),
+                RouteTarget::VpcPeering(PeeringId("peering-123".to_string())),
             )
             .unwrap();
 
@@ -3992,7 +4194,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let (vpc, subnet) = setup_vpc_and_subnet(&store);
 
-        store
+        let gw = store
             .create_nat_gw("gw1", &vpc.id, &subnet.id, "1.2.3.4")
             .unwrap();
 
@@ -4001,7 +4203,7 @@ mod tests {
             .add_route(
                 &rt.id,
                 "0.0.0.0/0",
-                RouteTarget::NatGateway("gw1".to_string()),
+                RouteTarget::NatGateway(gw.id.clone()),
                 None,
             )
             .unwrap();

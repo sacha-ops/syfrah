@@ -1428,15 +1428,15 @@ impl RedbStateMachine {
                     Err(e) => return StateMachineResponse::Error(e.to_string()),
                 };
                 // Parse the route target string.
-                use syfrah_org::types::RouteTarget;
+                use syfrah_org::types::{NatGatewayId, PeeringId, RouteTarget};
                 let route_target = if target.eq_ignore_ascii_case("local") {
                     RouteTarget::Local
                 } else if target.eq_ignore_ascii_case("blackhole") {
                     RouteTarget::Blackhole
                 } else if let Some(name) = target.strip_prefix("nat-gw:") {
-                    RouteTarget::NatGateway(name.to_string())
+                    RouteTarget::NatGateway(NatGatewayId(name.to_string()))
                 } else if let Some(name) = target.strip_prefix("peering:") {
-                    RouteTarget::VpcPeering(name.to_string())
+                    RouteTarget::VpcPeering(PeeringId(name.to_string()))
                 } else {
                     return StateMachineResponse::Error(format!(
                         "invalid route target: '{target}'"
@@ -1563,8 +1563,8 @@ impl RedbStateMachine {
                     id: syfrah_org::types::NicId(nic_id.clone()),
                     name: format!("{vm_id}-eth0"),
                     vm_id: Some(vm_id.clone()),
-                    subnet_id: subnet_id.clone(),
-                    vpc_id: vpc_id.clone(),
+                    subnet_id: syfrah_org::types::SubnetId(subnet_id.clone()),
+                    vpc_id: syfrah_org::types::VpcId(vpc_id.clone()),
                     private_ip: ip.clone(),
                     mac: mac.clone(),
                     security_groups: vec![],
@@ -1937,11 +1937,11 @@ impl RedbStateMachine {
                     Err(_) => subnet_id.split('/').next().unwrap_or("unknown").to_string(),
                 };
                 let placement = syfrah_org::types::VmPlacement {
-                    vpc_id,
+                    vpc_id: syfrah_org::types::VpcId(vpc_id.clone()),
                     vm_id: vm_id.clone(),
                     vm_mac: mac.clone(),
                     vm_ip: ip.clone(),
-                    subnet_id: subnet_id.clone(),
+                    subnet_id: syfrah_org::types::SubnetId(subnet_id.clone()),
                     hypervisor_id: hypervisor_id.clone(),
                     action: syfrah_org::types::PlacementAction::Add,
                     created_at: now,
@@ -1951,11 +1951,11 @@ impl RedbStateMachine {
                     Ok(()) => {
                         // Emit placement event for incremental FDB update.
                         let _ = self.placement_tx.send(PlacementEvent::Added {
-                            vpc_id: placement.vpc_id,
+                            vpc_id: placement.vpc_id.0,
                             vm_id: placement.vm_id,
                             vm_mac: placement.vm_mac,
                             vm_ip: placement.vm_ip,
-                            subnet_id: placement.subnet_id,
+                            subnet_id: placement.subnet_id.0,
                             hypervisor_id: placement.hypervisor_id,
                         });
                         StateMachineResponse::Ok
@@ -1979,13 +1979,13 @@ impl RedbStateMachine {
                             if p.vm_id == *vm_id {
                                 // Capture info before removal for the event.
                                 let event = PlacementEvent::Removed {
-                                    vpc_id: p.vpc_id.clone(),
+                                    vpc_id: p.vpc_id.0.clone(),
                                     vm_id: p.vm_id.clone(),
                                     vm_mac: p.vm_mac.clone(),
                                     vm_ip: p.vm_ip.clone(),
                                     hypervisor_id: p.hypervisor_id.clone(),
                                 };
-                                let _ = placement_store.remove_placement(&p.vpc_id, vm_id);
+                                let _ = placement_store.remove_placement(&p.vpc_id.0, vm_id);
                                 let _ = self.placement_tx.send(event);
                                 return StateMachineResponse::Ok;
                             }
@@ -3170,11 +3170,11 @@ impl RaftStateMachine<SyfrahRaftConfig> for Arc<RedbStateMachine> {
                     let mut emitted = 0usize;
                     for p in &placements {
                         let _ = self.placement_tx.send(PlacementEvent::Added {
-                            vpc_id: p.vpc_id.clone(),
+                            vpc_id: p.vpc_id.0.clone(),
                             vm_id: p.vm_id.clone(),
                             vm_mac: p.vm_mac.clone(),
                             vm_ip: p.vm_ip.clone(),
-                            subnet_id: p.subnet_id.clone(),
+                            subnet_id: p.subnet_id.0.clone(),
                             hypervisor_id: p.hypervisor_id.clone(),
                         });
                         emitted += 1;
@@ -4002,11 +4002,11 @@ mod tests {
 
         // Seed a VM placement for "vm-1" on "hv-src".
         let placement = syfrah_org::types::VmPlacement {
-            vpc_id: "vpc-1".to_string(),
+            vpc_id: syfrah_org::types::VpcId("vpc-1".to_string()),
             vm_id: "vm-1".to_string(),
             vm_mac: "02:00:00:00:00:01".to_string(),
             vm_ip: "10.0.0.1".to_string(),
-            subnet_id: "vpc-1/sub-1".to_string(),
+            subnet_id: syfrah_org::types::SubnetId("vpc-1/sub-1".to_string()),
             hypervisor_id: "hv-src".to_string(),
             action: syfrah_org::types::PlacementAction::Add,
             created_at: 1000,

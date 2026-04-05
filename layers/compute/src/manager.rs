@@ -879,8 +879,8 @@ impl VmManager {
                         if let Err(te) = ns
                             .teardown(
                                 &vm_id_str,
-                                &nr.placement.vpc_id,
-                                &nr.placement.subnet_id,
+                                &nr.placement.vpc_id.0,
+                                &nr.placement.subnet_id.0,
                                 &nr.subnet_cidr,
                                 &nr.ip,
                                 &nr.tap_name,
@@ -949,8 +949,8 @@ impl VmManager {
         // Extract network metadata from setup result for runtime state.
         let (vm_ip, vm_subnet, vm_vpc, net_info) = if let Some(ref nr) = network_result {
             let info = NetworkInfo {
-                vpc_id: nr.placement.vpc_id.clone(),
-                subnet_id: nr.placement.subnet_id.clone(),
+                vpc_id: nr.placement.vpc_id.0.clone(),
+                subnet_id: nr.placement.subnet_id.0.clone(),
                 subnet_cidr: nr.subnet_cidr.clone(),
                 ip: nr.ip.clone(),
                 mac: nr.mac.clone(),
@@ -965,7 +965,7 @@ impl VmManager {
                         .map(|s| s.name.clone())
                         .unwrap_or_default(),
                 ),
-                Some(nr.placement.vpc_id.clone()),
+                Some(nr.placement.vpc_id.0.clone()),
                 Some(info),
             )
         } else {
@@ -1049,7 +1049,7 @@ impl VmManager {
                     Arc::clone(backend),
                     local_node.clone(),
                 );
-                if let Err(e) = ns.mark_assigned(&nr.placement.subnet_id, &nr.ip, &vm_id_str) {
+                if let Err(e) = ns.mark_assigned(&nr.placement.subnet_id.0, &nr.ip, &vm_id_str) {
                     warn!(
                         vm_id = %vm_id_str,
                         error = %e,

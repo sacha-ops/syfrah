@@ -1336,6 +1336,14 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Startup state migration (name-keyed → ID-keyed) -----------------------
+    //
+    // Batch-migrate legacy records before accepting requests. Runs locally
+    // against redb (not through Raft) and is idempotent.
+    if let Some(ref org_store) = shared_org_store {
+        crate::migration::run_startup_migration(org_store, shared_hypervisor_store.as_deref());
+    }
+
     // -- Shared IPAM + placement stores ----------------------------------------
     //
     // Opened once and shared between the state machine (Raft) and the compute
@@ -2432,11 +2440,11 @@ pub async fn run_daemon(
                         let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
                             .iter()
                             .map(|p| syfrah_overlay::VmPlacement {
-                                vpc_id: p.vpc_id.clone(),
+                                vpc_id: p.vpc_id.0.clone(),
                                 vm_id: p.vm_id.clone(),
                                 vm_mac: p.vm_mac.clone(),
                                 vm_ip: p.vm_ip.clone(),
-                                subnet_id: p.subnet_id.clone(),
+                                subnet_id: p.subnet_id.0.clone(),
                                 hypervisor_id: p.hypervisor_id.clone(),
                                 action: syfrah_overlay::PlacementAction::Add,
                                 placement_generation: p.placement_generation,
@@ -2594,11 +2602,11 @@ pub async fn run_daemon(
                                                     }
                                                     let peer_placement =
                                                         syfrah_overlay::VmPlacement {
-                                                            vpc_id: p.vpc_id.clone(),
+                                                            vpc_id: p.vpc_id.0.clone(),
                                                             vm_id: p.vm_id.clone(),
                                                             vm_mac: p.vm_mac.clone(),
                                                             vm_ip: p.vm_ip.clone(),
-                                                            subnet_id: p.subnet_id.clone(),
+                                                            subnet_id: p.subnet_id.0.clone(),
                                                             hypervisor_id: p.hypervisor_id.clone(),
                                                             action:
                                                                 syfrah_overlay::PlacementAction::Add,
@@ -2656,11 +2664,11 @@ pub async fn run_daemon(
                                             > = placements
                                                 .iter()
                                                 .map(|p| syfrah_overlay::VmPlacement {
-                                                    vpc_id: p.vpc_id.clone(),
+                                                    vpc_id: p.vpc_id.0.clone(),
                                                     vm_id: p.vm_id.clone(),
                                                     vm_mac: p.vm_mac.clone(),
                                                     vm_ip: p.vm_ip.clone(),
-                                                    subnet_id: p.subnet_id.clone(),
+                                                    subnet_id: p.subnet_id.0.clone(),
                                                     hypervisor_id: p.hypervisor_id.clone(),
                                                     action: syfrah_overlay::PlacementAction::Add,
                                                     placement_generation: p.placement_generation,
@@ -3300,11 +3308,11 @@ pub async fn run_daemon(
                                             > = placements
                                                 .iter()
                                                 .map(|p| syfrah_overlay::VmPlacement {
-                                                    vpc_id: p.vpc_id.clone(),
+                                                    vpc_id: p.vpc_id.0.clone(),
                                                     vm_id: p.vm_id.clone(),
                                                     vm_mac: p.vm_mac.clone(),
                                                     vm_ip: p.vm_ip.clone(),
-                                                    subnet_id: p.subnet_id.clone(),
+                                                    subnet_id: p.subnet_id.0.clone(),
                                                     hypervisor_id: p.hypervisor_id.clone(),
                                                     action: syfrah_overlay::PlacementAction::Add,
                                                     placement_generation: p.placement_generation,
@@ -3434,11 +3442,11 @@ pub async fn run_daemon(
                                                                     continue;
                                                                 }
                                                                 let remote = syfrah_overlay::VmPlacement {
-                                                                    vpc_id: peer.vpc_id.clone(),
+                                                                    vpc_id: peer.vpc_id.0.clone(),
                                                                     vm_id: peer.vm_id.clone(),
                                                                     vm_mac: peer.vm_mac.clone(),
                                                                     vm_ip: peer.vm_ip.clone(),
-                                                                    subnet_id: peer.subnet_id.clone(),
+                                                                    subnet_id: peer.subnet_id.0.clone(),
                                                                     hypervisor_id: peer.hypervisor_id.clone(),
                                                                     action: syfrah_overlay::PlacementAction::Add,
                                                                     placement_generation: peer.placement_generation,
@@ -3491,11 +3499,11 @@ pub async fn run_daemon(
                                                             let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
                                                                 .iter()
                                                                 .map(|p| syfrah_overlay::VmPlacement {
-                                                                    vpc_id: p.vpc_id.clone(),
+                                                                    vpc_id: p.vpc_id.0.clone(),
                                                                     vm_id: p.vm_id.clone(),
                                                                     vm_mac: p.vm_mac.clone(),
                                                                     vm_ip: p.vm_ip.clone(),
-                                                                    subnet_id: p.subnet_id.clone(),
+                                                                    subnet_id: p.subnet_id.0.clone(),
                                                                     hypervisor_id: p.hypervisor_id.clone(),
                                                                     action: syfrah_overlay::PlacementAction::Add,
                                                                     placement_generation: p.placement_generation,
@@ -4352,10 +4360,10 @@ pub async fn run_daemon(
                     Ok(placements) => {
                         let mut seen_vpcs = std::collections::HashSet::new();
                         for p in &placements {
-                            if seen_vpcs.insert(p.vpc_id.clone()) {
+                            if seen_vpcs.insert(p.vpc_id.0.clone()) {
                                 expected_bridges.push(syfrah_overlay::ExpectedBridge {
-                                    name: syfrah_overlay::naming::bridge_name(&p.vpc_id),
-                                    vpc_id: p.vpc_id.clone(),
+                                    name: syfrah_overlay::naming::bridge_name(&p.vpc_id.0),
+                                    vpc_id: p.vpc_id.0.clone(),
                                 });
                             }
                         }
@@ -4381,11 +4389,11 @@ pub async fn run_daemon(
                     continue;
                 }
                 // Resolve VPC names to VPC records to get the IDs for bridge naming.
-                let vpc_a = match org_store.get_vpc(&peering.vpc_a) {
+                let vpc_a = match org_store.get_vpc_by_id(&peering.vpc_a) {
                     Ok(Some(v)) => v,
                     _ => continue,
                 };
-                let vpc_b = match org_store.get_vpc(&peering.vpc_b) {
+                let vpc_b = match org_store.get_vpc_by_id(&peering.vpc_b) {
                     Ok(Some(v)) => v,
                     _ => continue,
                 };
@@ -4531,11 +4539,11 @@ pub async fn run_daemon(
                         let overlay_placements: Vec<syfrah_overlay::VmPlacement> = placements
                             .iter()
                             .map(|p| syfrah_overlay::VmPlacement {
-                                vpc_id: p.vpc_id.clone(),
+                                vpc_id: p.vpc_id.0.clone(),
                                 vm_id: p.vm_id.clone(),
                                 vm_mac: p.vm_mac.clone(),
                                 vm_ip: p.vm_ip.clone(),
-                                subnet_id: p.subnet_id.clone(),
+                                subnet_id: p.subnet_id.0.clone(),
                                 hypervisor_id: p.hypervisor_id.clone(),
                                 action: syfrah_overlay::PlacementAction::Add,
                                 placement_generation: p.placement_generation,

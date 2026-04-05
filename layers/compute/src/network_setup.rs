@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use syfrah_org::ipam::IpamStore;
 use syfrah_org::store::OrgStore;
 use syfrah_org::types::{
-    NetworkInterface, NicId, PlacementAction, ResourceState, SecurityGroupId, Subnet, VmPlacement,
-    Vpc,
+    NetworkInterface, NicId, PlacementAction, ResourceState, SecurityGroupId, Subnet, SubnetId,
+    VmPlacement, Vpc, VpcId,
 };
 use syfrah_org::PlacementStore;
 use syfrah_org::SgRuleStore;
@@ -424,11 +424,11 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             .as_secs();
 
         let placement = VmPlacement {
-            vpc_id: vpc_id.to_string(),
+            vpc_id: VpcId(vpc_id.to_string()),
             vm_id: vm_id.to_string(),
             vm_mac: mac.to_string(),
             vm_ip: ip.to_string(),
-            subnet_id: subnet_id.to_string(),
+            subnet_id: SubnetId(subnet_id.to_string()),
             hypervisor_id: self.local_node.clone(),
             action: PlacementAction::Add,
             created_at: now,
@@ -468,8 +468,8 @@ impl<B: NetworkBackend + ?Sized> NetworkSetup<B> {
             id: NicId(nic_id.clone()),
             name: format!("eth0-{vm_id}"),
             vm_id: Some(vm_id.to_string()),
-            subnet_id: subnet_id.to_string(),
-            vpc_id: vpc_id.to_string(),
+            subnet_id: SubnetId(subnet_id.to_string()),
+            vpc_id: VpcId(vpc_id.to_string()),
             private_ip: ip.to_string(),
             mac: mac.to_string(),
             security_groups: sg_ids,
@@ -837,7 +837,7 @@ mod tests {
         // Verify allocation exists in IPAM
         let alloc = h
             .ipam_store
-            .get_allocation(&result.placement.subnet_id, &result.ip)
+            .get_allocation(&result.placement.subnet_id.0, &result.ip)
             .unwrap();
         assert!(alloc.is_some(), "allocation must exist in IPAM");
     }
@@ -890,7 +890,7 @@ mod tests {
         // Verify placement was stored
         let stored = h
             .placement_store
-            .get_placement(&result.placement.vpc_id, "web-1")
+            .get_placement(&result.placement.vpc_id.0, "web-1")
             .unwrap();
         assert!(stored.is_some(), "placement must be stored");
         let p = stored.unwrap();
@@ -959,13 +959,13 @@ mod tests {
         let result = ns.setup("web-1", SUBNET_NAME, false).await.unwrap();
 
         // Mark as assigned (happens after successful boot)
-        ns.mark_assigned(&result.placement.subnet_id, &result.ip, "web-1")
+        ns.mark_assigned(&result.placement.subnet_id.0, &result.ip, "web-1")
             .unwrap();
 
         // Verify state changed to Assigned
         let alloc = h
             .ipam_store
-            .get_allocation(&result.placement.subnet_id, &result.ip)
+            .get_allocation(&result.placement.subnet_id.0, &result.ip)
             .unwrap()
             .unwrap();
         assert_eq!(alloc.state, syfrah_org::AllocationState::Assigned);
@@ -983,8 +983,8 @@ mod tests {
         // Teardown
         ns.teardown(
             "web-1",
-            &result.placement.vpc_id,
-            &result.placement.subnet_id,
+            &result.placement.vpc_id.0,
+            &result.placement.subnet_id.0,
             &result.subnet_cidr,
             &result.ip,
             &result.tap_name,
@@ -1000,7 +1000,7 @@ mod tests {
         // Verify IP released from IPAM
         let alloc = h
             .ipam_store
-            .get_allocation(&result.placement.subnet_id, &result.ip)
+            .get_allocation(&result.placement.subnet_id.0, &result.ip)
             .unwrap();
         assert!(
             alloc.is_none(),
