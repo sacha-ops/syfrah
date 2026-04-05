@@ -159,8 +159,9 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
 
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": node.name,
-        "id": mesh.id.as_str(),
+        "id": node.id.as_str(),
         "mesh": mesh.name,
+        "mesh_id": mesh.id.as_str(),
         "region": format!("{} · {}", region, zone),
         "zone": zone,
         "mesh_ipv6": node.mesh_ipv6.to_string(),
@@ -178,6 +179,7 @@ async fn handle_status(_req: OperationRequest) -> anyhow::Result<OperationRespon
 
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": state.node.name,
+        "id": state.node.id.as_str(),
         "mesh": state.mesh.name,
         "region": state.node.region,
         "zone": state.node.zone,
@@ -233,7 +235,7 @@ async fn handle_get(req: OperationRequest) -> anyhow::Result<OperationResponse> 
     if state.node.name == name {
         return Ok(OperationResponse::Resource(serde_json::json!({
             "name": state.node.name,
-            "id": state.mesh.id.as_str(),
+            "id": state.node.id.as_str(),
             "region": state.node.region,
             "zone": state.node.zone,
             "mesh_ipv6": state.node.mesh_ipv6.to_string(),

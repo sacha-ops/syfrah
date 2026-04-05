@@ -26,6 +26,8 @@ pub struct MeshIdentity {
 /// A node's identity within the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
+    /// Unique hypervisor ID.
+    pub id: syfrah_core::id::HypervisorId,
     /// Human-readable node name (usually hostname).
     pub name: String,
     /// Region label.
@@ -89,6 +91,7 @@ pub fn create_node(
     let mesh_ipv6 = addressing::derive_node_address(mesh_prefix, &pub_bytes);
 
     Ok(NodeIdentity {
+        id: syfrah_core::id::HypervisorId::generate(),
         name: name.to_string(),
         region: region.to_string(),
         zone: zone.to_string(),
@@ -227,7 +230,7 @@ mod tests {
     #[test]
     fn private_key_default_when_missing() {
         // Simulate receiving peer info without private key
-        let json = r#"{"name":"n1","region":"eu","zone":"fsn1","wg_public_key":"abc","wg_port":51820,"mesh_ipv6":"fd01::1"}"#;
+        let json = r#"{"id":"hv-test","name":"n1","region":"eu","zone":"fsn1","wg_public_key":"abc","wg_port":51820,"mesh_ipv6":"fd01::1"}"#;
         let node: NodeIdentity = serde_json::from_str(json).unwrap();
         assert_eq!(node.wg_private_key, ""); // defaults to empty
         assert_eq!(node.name, "n1");

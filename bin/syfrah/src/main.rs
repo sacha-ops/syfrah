@@ -55,7 +55,7 @@ mod tests {
         let routes = list_routes(&[reg], "/admin/v1");
 
         // Should have routes for all operations
-        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        let _paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
         let ops: Vec<&str> = routes.iter().map(|r| r.operation.as_str()).collect();
 
         assert!(ops.contains(&"init"), "missing init route: {ops:?}");
