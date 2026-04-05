@@ -13,6 +13,85 @@ const UNIT_PATH: &str = "/etc/systemd/system/syfrah-wg.service";
 const WG_CONF_DIR: &str = "/etc/wireguard";
 const WG_CONF_FILE: &str = "/etc/wireguard/syfrah0.conf";
 
+/// Ensure WireGuard tools are installed. Installs automatically if missing.
+///
+/// Detects the package manager and installs `wireguard-tools`:
+/// - apt (Debian/Ubuntu)
+/// - dnf (Fedora/RHEL)
+/// - yum (CentOS/older RHEL)
+/// - pacman (Arch)
+/// - apk (Alpine)
+/// - zypper (openSUSE)
+pub fn ensure_wireguard() -> Result<(), SyfrahError> {
+    if wg_quick_available() {
+        return Ok(());
+    }
+
+    eprintln!("  Installing wireguard-tools...");
+
+    let (cmd, args): (&str, &[&str]) = if which("apt-get") {
+        ("apt-get", &["install", "-y", "-qq", "wireguard-tools"])
+    } else if which("dnf") {
+        ("dnf", &["install", "-y", "-q", "wireguard-tools"])
+    } else if which("yum") {
+        ("yum", &["install", "-y", "-q", "wireguard-tools"])
+    } else if which("pacman") {
+        ("pacman", &["-S", "--noconfirm", "--quiet", "wireguard-tools"])
+    } else if which("apk") {
+        ("apk", &["add", "--quiet", "wireguard-tools"])
+    } else if which("zypper") {
+        ("zypper", &["install", "-y", "--quiet", "wireguard-tools"])
+    } else {
+        return Err(SyfrahError::precondition(
+            "wireguard-tools not found and no supported package manager detected. \
+             Install wireguard-tools manually.",
+        ));
+    };
+
+    // Update package index first for apt
+    if cmd == "apt-get" {
+        let _ = Command::new("apt-get")
+            .args(["update", "-qq"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| SyfrahError::internal(format!("{cmd} failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SyfrahError::internal(format!(
+            "failed to install wireguard-tools: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Verify it's now available
+    if !wg_quick_available() {
+        return Err(SyfrahError::internal(
+            "wireguard-tools installed but wg-quick still not found",
+        ));
+    }
+
+    eprintln!("  wireguard-tools installed");
+    Ok(())
+}
+
+/// Check if a command exists on the system.
+fn which(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Generate the WireGuard config file content.
 pub fn generate_wg_conf(
     private_key: &str,

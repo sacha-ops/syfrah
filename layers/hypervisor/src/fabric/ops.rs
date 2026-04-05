@@ -43,6 +43,9 @@ pub fn init(
         ));
     }
 
+    // Ensure WireGuard is installed
+    service::ensure_wireguard()?;
+
     // Create identities
     let (mesh_id, secret) = mesh::create_mesh();
     let hv = mesh::create_hypervisor(node_name, region, zone, port, None, &mesh_id.prefix)?;
@@ -170,6 +173,9 @@ pub async fn join(
             "already initialized. Run 'syfrah hypervisor leave' first.",
         ));
     }
+
+    // Ensure WireGuard is installed
+    service::ensure_wireguard()?;
 
     // Build join request
     // We need a temporary keypair to send in the request
