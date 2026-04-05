@@ -2163,6 +2163,17 @@ pub async fn run_daemon(
                 });
             }
 
+            // Inject the Raft state machine into the compute handler so
+            // GetVm/ListVms can read VM records from Raft (#1311).
+            if let Some(ref handler) = raft_compute_handler_ref {
+                let handler = Arc::clone(handler);
+                let sm_ref = Arc::clone(&sm);
+                tokio::spawn(async move {
+                    handler.set_state_machine(sm_ref).await;
+                    info!("raft: injected state machine into compute handler for VM records");
+                });
+            }
+
             // Inject the Raft client into the org handler so mutations go through Raft.
             if let Some(ref handler) = raft_org_handler {
                 let handler = Arc::clone(handler);
@@ -3021,6 +3032,16 @@ pub async fn run_daemon(
                                         let mut guard = holder.write().await;
                                         *guard = Some(sm_ref);
                                         info!("raft: injected state machine into storage reconciler (in-process)");
+                                    });
+                                }
+
+                                // Inject Raft state machine into compute handler for VM records (#1311).
+                                if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                    let handler = Arc::clone(handler);
+                                    let sm_ref = Arc::clone(&sm);
+                                    tokio::spawn(async move {
+                                        handler.set_state_machine(sm_ref).await;
+                                        info!("raft: injected state machine into compute handler for VM records (in-process)");
                                     });
                                 }
 
