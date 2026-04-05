@@ -1,0 +1,20 @@
+[package]
+name = "syfrah-hypervisor"
+description = "Hypervisor layer — mesh networking, consensus, compute, storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+syfrah-core = { path = "../core" }
+syfrah-state = { path = "../state" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

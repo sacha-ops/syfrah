@@ -1164,6 +1164,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "syfrah-hypervisor"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "serde",
+ "serde_json",
+ "syfrah-core",
+ "syfrah-state",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "syfrah-state"
 version = "2.0.0"
 dependencies = [

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "layers/core",
     "layers/state",
+    "layers/hypervisor",
     "bin/syfrah",
 ]
 
