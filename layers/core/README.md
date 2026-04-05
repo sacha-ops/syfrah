@@ -4,6 +4,8 @@ Core building blocks for the Syfrah cloud platform. Contains:
 
 - **Resource framework** — declarative CLI generation from resource definitions
 - **Typed IDs** — ULID-backed, sortable, validated resource identifiers
+- **Error types** — unified error model with codes, HTTP mapping, retry hints
+- **Validation** — shared input validators for names, CIDRs, ports, durations
 
 ---
 
@@ -68,6 +70,140 @@ IDs serialize as plain strings (transparent), so JSON looks like:
 ```
 
 Not `{"id": {"VpcId": "..."}}`.
+
+---
+
+## Error Types (`syfrah_core::error`)
+
+Unified error model for the entire platform. Every layer returns `SyfrahError` so errors are consistent, actionable, and machine-parseable.
+
+### Structure
+
+```rust
+use syfrah_core::error::{SyfrahError, ErrorCode};
+
+let err = SyfrahError::not_found("vpc", "my-vpc")
+    .with_suggestion("List available VPCs with: syfrah vpc list")
+    .with_context("zone", "fsn1");
+
+// Typed code — compiler catches typos
+assert_eq!(err.code, ErrorCode::ResourceNotFound);
+
+// HTTP mapping for API responses
+assert_eq!(err.code.http_status(), 404);
+
+// Retry hint for callers
+assert!(!err.code.is_retryable());
+```
+
+### Error codes
+
+| Code | HTTP | Retryable | When |
+|------|------|-----------|------|
+| `ResourceNotFound` | 404 | no | Resource doesn't exist |
+| `ResourceAlreadyExists` | 409 | no | Duplicate create |
+| `ValidationError` | 400 | no | Bad input |
+| `InvalidName` | 400 | no | Name format violation |
+| `PermissionDenied` | 403 | no | Not authorized |
+| `Conflict` | 409 | no | State prevents operation |
+| `PreconditionFailed` | 412 | no | Something must be done first |
+| `AmbiguousName` | 400 | no | Multiple resources match |
+| `RateLimited` | 429 | **yes** | Too many requests |
+| `InternalError` | 500 | no | Unexpected server error |
+| `NotImplemented` | 501 | no | Feature not available |
+| `DaemonUnreachable` | 503 | **yes** | Daemon not running |
+| `Timeout` | 504 | **yes** | Operation timed out |
+| `NetworkError` | 502 | **yes** | Network failure |
+| `StorageError` | 500 | no | Storage backend error |
+
+### Common constructors
+
+```rust
+SyfrahError::not_found("vpc", "web")
+SyfrahError::already_exists("org", "acme")
+SyfrahError::validation("CIDR must include prefix length")
+SyfrahError::invalid_name("MY_VPC", "must be lowercase")
+SyfrahError::conflict("subnet", "web", "has active VMs")
+SyfrahError::precondition("storage not configured for zone fsn1")
+    .with_suggestion("Run: syfrah storage configure --zone fsn1 ...")
+SyfrahError::daemon_unreachable()  // includes suggestion automatically
+SyfrahError::ambiguous("vpc", "web", vec![("vpc-01AAA", "org: acme"), ...])
+SyfrahError::timeout("vm create", 60)
+SyfrahError::rate_limited()
+```
+
+### Dual formatting
+
+```rust
+// CLI mode (default):
+// Error: vpc 'web' not found
+// List available VPCs with: syfrah vpc list
+err.format_cli();
+
+// JSON mode (--json or API):
+// {"code": "RESOURCE_NOT_FOUND", "message": "vpc 'web' not found", "suggestion": "..."}
+err.format_json();
+```
+
+### Auto-conversion from common errors
+
+```rust
+// io::Error → SyfrahError (maps ErrorKind to correct code)
+let err: SyfrahError = io_error.into();  // NotFound → 404, PermissionDenied → 403, etc.
+
+// serde_json::Error → SyfrahError
+let err: SyfrahError = json_error.into();  // → InternalError
+
+// Convenience alias
+fn my_fn() -> SyfrahResult<()> {
+    Err(SyfrahError::not_found("vpc", "web"))
+}
+```
+
+---
+
+## Validation (`syfrah_core::validate`)
+
+Shared input validators. Every user-facing input passes through these — never duplicated across layers.
+
+```rust
+use syfrah_core::validate;
+
+// Resource names: 3-63 chars, lowercase, alphanumeric + hyphens, DNS-label compliant
+validate::name("my-vpc")?;      // ok
+validate::name("MY_VPC")?;      // Err: invalid character
+validate::name("ab")?;          // Err: too short
+
+// CIDR blocks: validates octets, prefix length, and network address
+validate::cidr("10.1.0.0/16")?;     // ok
+validate::cidr("10.1.1.0/16")?;     // Err: host bits not zero, suggests 10.1.0.0/16
+validate::cidr("10.0.0.0/33")?;     // Err: prefix > 32
+
+// Ports
+validate::port(443)?;               // ok
+validate::port(0)?;                  // Err
+validate::port_str("80")?;          // ok, returns u16
+
+// Regions and zones
+validate::region("eu-west")?;       // ok
+validate::zone("fsn1")?;            // ok
+
+// Labels (key=value)
+let (k, v) = validate::label("env=prod")?;  // ok
+
+// Sizes and compute
+validate::size_gb(50)?;             // ok (1-65536 GB)
+validate::memory_mb(2048)?;         // ok (128 MB - 1 TB)
+validate::vcpus(4)?;                // ok (1-256)
+
+// Durations: "30s", "5m", "2h", "7d" → returns seconds
+let secs = validate::duration("2h")?;  // 7200
+```
+
+All validators return `SyfrahError` with actionable messages:
+```
+Error: invalid CIDR '10.1.1.0/16': host bits must be zero. Did you mean 10.1.0.0/16?
+```
 
 ---
 
