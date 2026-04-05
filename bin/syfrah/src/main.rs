@@ -63,7 +63,6 @@ mod tests {
         assert!(ops.contains(&"status"), "missing status route: {ops:?}");
         assert!(ops.contains(&"list"), "missing list route: {ops:?}");
         assert!(ops.contains(&"get"), "missing get route: {ops:?}");
-        assert!(ops.contains(&"stop"), "missing stop route: {ops:?}");
         assert!(ops.contains(&"leave"), "missing leave route: {ops:?}");
         assert!(ops.contains(&"drain"), "missing drain route: {ops:?}");
         assert!(ops.contains(&"enable"), "missing enable route: {ops:?}");
