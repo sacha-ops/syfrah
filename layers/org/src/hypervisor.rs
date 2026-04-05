@@ -1,13 +1,17 @@
 //! Hypervisor persistence — CRUD for the hypervisor compute host model.
 //!
-//! Backed by a redb table `hypervisors` with key = hypervisor name.
+//! Primary table `hypervisors` keyed by `HypervisorId`.
+//! Secondary index table `hypervisors_name_idx` maps name → id for lookups.
 
 use syfrah_state::LayerDb;
 
 use crate::error::{OrgError, Result};
 use crate::types::{AllocatableCapacity, Hypervisor, HypervisorId, HypervisorState};
 
+/// Primary table: keyed by hypervisor ID, value is the full Hypervisor record.
 const TABLE: &str = "hypervisors";
+/// Name-to-ID index table: keyed by hypervisor name, value is the ID string.
+const NAME_INDEX: &str = "hypervisors_name_idx";
 
 /// Persistent store for hypervisors backed by redb.
 pub struct HypervisorStore {
@@ -27,27 +31,42 @@ impl HypervisorStore {
 
     /// Table names used by this store (for snapshot export/import).
     pub fn table_names() -> &'static [&'static str] {
-        &[TABLE]
+        &[TABLE, NAME_INDEX]
     }
 
     /// Create a new hypervisor record. Fails if the name is already taken.
     pub fn create(&self, hv: &Hypervisor) -> Result<()> {
-        if self.db.exists(TABLE, &hv.name)? {
+        // Check name uniqueness via the index.
+        if self.db.exists(NAME_INDEX, &hv.name)? {
             return Err(OrgError::AlreadyExists(hv.name.clone()));
         }
-        self.db.set(TABLE, &hv.name, hv)?;
+        // Also guard against ID collision (should not happen with generated IDs).
+        if self.db.exists(TABLE, &hv.id.0)? {
+            return Err(OrgError::AlreadyExists(hv.id.0.clone()));
+        }
+        self.db.set(TABLE, &hv.id.0, hv)?;
+        self.db.set(NAME_INDEX, &hv.name, &hv.id.0)?;
         Ok(())
     }
 
-    /// Get a hypervisor by name. Returns `None` if not found.
+    /// Get a hypervisor by name. Resolves via the name→id index.
     pub fn get(&self, name: &str) -> Result<Option<Hypervisor>> {
-        Ok(self.db.get(TABLE, name)?)
+        // Resolve name → id through the index.
+        let id: Option<String> = self.db.get(NAME_INDEX, name)?;
+        match id {
+            Some(id) => self.get_by_id_str(&id),
+            None => Ok(None),
+        }
     }
 
-    /// Get a hypervisor by its ID. Scans all records.
+    /// Get a hypervisor by its ID.
     pub fn get_by_id(&self, id: &HypervisorId) -> Result<Option<Hypervisor>> {
-        let all = self.list()?;
-        Ok(all.into_iter().find(|h| h.id == *id))
+        self.get_by_id_str(&id.0)
+    }
+
+    /// Internal: get by raw ID string.
+    fn get_by_id_str(&self, id: &str) -> Result<Option<Hypervisor>> {
+        Ok(self.db.get(TABLE, id)?)
     }
 
     /// Get a hypervisor by fabric_node_id. Used for identity recovery on restart.
@@ -76,10 +95,25 @@ impl HypervisorStore {
 
     /// Delete a hypervisor by name.
     pub fn delete(&self, name: &str) -> Result<()> {
-        if !self.db.exists(TABLE, name)? {
-            return Err(OrgError::NotFound(format!("hypervisor '{name}'")));
+        // Resolve name → id.
+        let id: Option<String> = self.db.get(NAME_INDEX, name)?;
+        match id {
+            Some(id) => {
+                self.db.delete(TABLE, &id)?;
+                self.db.delete(NAME_INDEX, name)?;
+                Ok(())
+            }
+            None => Err(OrgError::NotFound(format!("hypervisor '{name}'"))),
         }
-        self.db.delete(TABLE, name)?;
+    }
+
+    /// Delete a hypervisor by ID.
+    pub fn delete_by_id(&self, id: &HypervisorId) -> Result<()> {
+        let hv = self
+            .get_by_id(id)?
+            .ok_or_else(|| OrgError::NotFound(format!("hypervisor '{}'", id.0)))?;
+        self.db.delete(TABLE, &id.0)?;
+        self.db.delete(NAME_INDEX, &hv.name)?;
         Ok(())
     }
 
@@ -91,7 +125,7 @@ impl HypervisorStore {
 
         validate_state_transition(&hv.state, &new_state)?;
         hv.state = new_state;
-        self.db.set(TABLE, name, &hv)?;
+        self.db.set(TABLE, &hv.id.0, &hv)?;
         Ok(())
     }
 
@@ -101,16 +135,39 @@ impl HypervisorStore {
             .get(name)?
             .ok_or_else(|| OrgError::NotFound(format!("hypervisor '{name}'")))?;
         hv.capacity = capacity;
-        self.db.set(TABLE, name, &hv)?;
+        self.db.set(TABLE, &hv.id.0, &hv)?;
         Ok(())
     }
 
     /// Update the full hypervisor record (used for re-probe on restart).
     pub fn update(&self, hv: &Hypervisor) -> Result<()> {
-        if !self.db.exists(TABLE, &hv.name)? {
+        if !self.db.exists(TABLE, &hv.id.0)? {
             return Err(OrgError::NotFound(format!("hypervisor '{}'", hv.name)));
         }
-        self.db.set(TABLE, &hv.name, hv)?;
+        self.db.set(TABLE, &hv.id.0, hv)?;
+        // Ensure name index is consistent (in case name somehow changed).
+        self.db.set(NAME_INDEX, &hv.name, &hv.id.0)?;
+        Ok(())
+    }
+
+    /// Migrate a legacy record that was keyed by name to be keyed by ID.
+    ///
+    /// Called during startup to transparently upgrade old stores.
+    pub fn migrate_legacy_record(&self, name: &str) -> Result<()> {
+        // If name index already has an entry, the record is already migrated.
+        if self.db.exists(NAME_INDEX, name)? {
+            return Ok(());
+        }
+        // Try reading from the primary table using the name as key (legacy format).
+        let legacy: Option<Hypervisor> = self.db.get(TABLE, name)?;
+        if let Some(hv) = legacy {
+            // Remove old name-keyed entry.
+            self.db.delete(TABLE, name)?;
+            // Write with ID key.
+            self.db.set(TABLE, &hv.id.0, &hv)?;
+            // Create name → id index.
+            self.db.set(NAME_INDEX, &hv.name, &hv.id.0)?;
+        }
         Ok(())
     }
 }
@@ -194,6 +251,16 @@ mod tests {
     }
 
     #[test]
+    fn create_and_get_by_id() {
+        let (_dir, store) = temp_store();
+        let hv = test_hypervisor("hv-001");
+        store.create(&hv).unwrap();
+
+        let got = store.get_by_id(&hv.id).unwrap().unwrap();
+        assert_eq!(got.name, "hv-001");
+    }
+
+    #[test]
     fn create_duplicate_fails() {
         let (_dir, store) = temp_store();
         let hv = test_hypervisor("hv-001");
@@ -216,6 +283,17 @@ mod tests {
         store.create(&test_hypervisor("hv-001")).unwrap();
         store.delete("hv-001").unwrap();
         assert!(store.get("hv-001").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_by_id() {
+        let (_dir, store) = temp_store();
+        let hv = test_hypervisor("hv-001");
+        let id = hv.id.clone();
+        store.create(&hv).unwrap();
+        store.delete_by_id(&id).unwrap();
+        assert!(store.get("hv-001").unwrap().is_none());
+        assert!(store.get_by_id(&id).unwrap().is_none());
     }
 
     #[test]
@@ -293,5 +371,32 @@ mod tests {
         // Decommissioned -> Available is invalid
         let result = store.update_state("hv-001", HypervisorState::Available);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn migrate_legacy_record() {
+        let (_dir, store) = temp_store();
+        // Simulate a legacy record stored with name as key.
+        let hv = test_hypervisor("hv-legacy");
+        store.db.set(TABLE, &hv.name, &hv).unwrap();
+
+        // Before migration, name index does not exist.
+        let idx: Option<String> = store.db.get(NAME_INDEX, &hv.name).unwrap();
+        assert!(idx.is_none());
+
+        // Migrate.
+        store.migrate_legacy_record("hv-legacy").unwrap();
+
+        // After migration, get by name works via index.
+        let got = store.get("hv-legacy").unwrap().unwrap();
+        assert_eq!(got.id, hv.id);
+
+        // Get by ID also works.
+        let got2 = store.get_by_id(&hv.id).unwrap().unwrap();
+        assert_eq!(got2.name, "hv-legacy");
+
+        // Old name-keyed entry in primary table should be gone.
+        let old: Option<Hypervisor> = store.db.get(TABLE, "hv-legacy").unwrap();
+        assert!(old.is_none());
     }
 }
