@@ -9,6 +9,7 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Transport** — Unix socket protocol between CLI and daemon (framing, router, client/server)
 - **Config** — `~/.syfrah/config.toml` parsing with defaults, validation, env/CLI overrides
 - **Logging** — structured logging setup with file rotation, JSON/text modes, runtime reconfiguration
+- **UI** — terminal output system: tables, spinners, progress bars, colors, responsive layout
 
 ---
 
@@ -473,6 +474,123 @@ let errors = logging::error_count(); // errors since init
 2026-04-05T15:33:27Z ERROR syfrah: PANIC: index out of bounds  location=layers/fabric/src/daemon.rs:42:5  panic=true
 ```
 Panics are captured, logged as ERROR with location, then the default handler runs.
+
+---
+
+## UI (`syfrah_core::ui`)
+
+Terminal output system. No `println!` in business logic — everything goes through `Ui`.
+
+### The Ui object
+
+```rust
+use syfrah_core::ui::{Ui, OutputFormat};
+
+let ui = Ui::new(OutputFormat::Human, "auto");
+
+// Steps
+ui.step("Mesh secret generated");                       // ✓  Mesh secret generated
+ui.step_detail("Volume ready", "20 GB");                 // ✓  Volume ready                   20 GB
+ui.warn("Peer unreachable");                             // ▲  Peer unreachable
+ui.error(&syfrah_error);                                 // ✖  vpc 'web' not found\n  syfrah vpc list
+
+// Info blocks
+ui.title("my-cloud");
+ui.info(&[("node", "HYPERVISOR"), ("region", "eu"), ("zone", "fsn1")]);
+ui.next("Next", "syfrah storage configure --zone fsn1 ...");
+ui.summary("2 hypervisors · 5 vCPU total · 4G total");
+ui.empty("No VMs found.", Some("syfrah compute vm create --name <name> --image alpine-3.20"));
+```
+
+### Tables — responsive, truncating, no borders
+
+```rust
+use syfrah_core::ui::Table;
+
+Table::new(vec!["NAME", "IMAGE", "PHASE", "IP", "CPU", "ZONE"])
+    .status_column(2)                   // PHASE column gets colored dots
+    .priority(5, 10)                    // ZONE hidden first on narrow terminals
+    .row(vec!["web-1", "alpine-3.20", "running", "10.1.0.4", "2", "fsn1"])
+    .row(vec!["web-2", "alpine-3.20", "creating", "—", "2", "nbg1"])
+    .render(ui.width(), ui.has_color());
+```
+
+Output:
+```
+  NAME     IMAGE        PHASE       IP          CPU  ZONE
+  ──────────────────────────────────────────────────────────
+  web-1    alpine-3.20  ● running   10.1.0.4    2    fsn1
+  web-2    alpine-3.20  ◌ creating  —           2    nbg1
+```
+
+Features:
+- **Auto-sizing**: columns size to content
+- **Responsive**: narrow terminal → low-priority columns hidden
+- **Truncation**: long values get `…`
+- **Status colors**: `● running` green, `◌ creating` blue, `■ stopped` dim, `✖ failed` red
+- **TSV mode**: `table.render_tsv()` for pipe
+- **JSON mode**: `table.render_json()` for `--json`
+
+### Spinners and progress bars
+
+```rust
+use syfrah_core::ui::spinner;
+
+let sp = spinner::spinner("Scheduling VM...");     // ⠋ Scheduling VM...
+// ... work ...
+spinner::finish_ok(&sp, "Scheduled on HYPERVISOR");  // ✓  Scheduled on HYPERVISOR
+
+let pb = spinner::progress("Pulling alpine-3.20", 90_000_000);
+pb.inc(chunk_size);                                    // ↓  Pulling alpine-3.20  ━━━━━━━━━  45%
+spinner::progress_finish(&pb, "Image ready");          // ✓  Image ready
+```
+
+### Confirmations
+
+```rust
+use syfrah_core::ui::confirm;
+
+// Simple yes/no
+if confirm::confirm("Delete vpc 'web'?")? { ... }
+
+// Critical: type name to confirm + impact table
+if confirm::confirm_destructive("vpc", "my-vpc", &[("subnets", "2"), ("vms", "3")])? { ... }
+```
+
+### Colors
+
+```rust
+use syfrah_core::ui::color;
+
+color::green("success")      // green text
+color::red("error")          // red text
+color::yellow("warning")     // yellow text
+color::blue("info")          // blue text
+color::dim("subtle")         // gray/dim text
+color::bold("header")        // bold text
+color::status_dot("running") // ● running  (green)
+color::status_dot("creating")// ◌ creating (blue)
+color::status_dot("failed")  // ✖ failed   (red)
+```
+
+### Relative time
+
+```rust
+use syfrah_core::ui::time_fmt;
+
+time_fmt::relative(epoch_secs)   // "2 hours ago", "just now"
+time_fmt::duration(3661)         // "1h 1m"
+time_fmt::bytes(1_073_741_824)   // "1.0 GiB"
+```
+
+### Output modes
+
+| Mode | Flag | Tables | Steps | Colors | Spinners |
+|------|------|--------|-------|--------|----------|
+| Human | (default TTY) | formatted | shown | yes | yes |
+| Pipe | (stdout not TTY) | TSV | hidden | no | no |
+| JSON | `--json` | JSON array | JSON events | no | no |
+| Quiet | `--quiet` | TSV | hidden | no | no |
 
 ---
 
