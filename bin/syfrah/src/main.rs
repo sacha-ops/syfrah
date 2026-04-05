@@ -38,52 +38,9 @@ enum Commands {
         #[command(subcommand)]
         command: FabricCommand,
     },
-    /// Manage virtual machines and compute resources
-    Compute {
-        #[command(subcommand)]
-        command: syfrah_compute::cli::ComputeCommand,
-    },
-    /// Manage organizations
-    Org {
-        #[command(subcommand)]
-        command: syfrah_org::OrgCommand,
-    },
-    /// Manage projects within organizations
-    Project {
-        #[command(subcommand)]
-        command: syfrah_org::ProjectCommand,
-    },
-    /// Manage environments within projects
-    Env {
-        #[command(subcommand)]
-        command: syfrah_org::EnvCommand,
-    },
-    /// Manage Virtual Private Clouds (VPCs)
-    Vpc {
-        #[command(subcommand)]
-        command: syfrah_org::VpcCommand,
-    },
-    /// Manage subnets within VPCs
-    Subnet {
-        #[command(subcommand)]
-        command: syfrah_org::SubnetCommand,
-    },
-    /// Manage security groups
-    Sg {
-        #[command(subcommand)]
-        command: syfrah_org::SgCommand,
-    },
-    /// Manage NAT gateways
-    #[command(name = "nat-gw")]
-    NatGw {
-        #[command(subcommand)]
-        command: syfrah_org::NatGwCommand,
-    },
-    /// Manage route tables and routes
-    Route {
-        #[command(subcommand)]
-        command: syfrah_org::RouteCommand,
-    },
+    // --- Disabled features (coming soon) ---
+    // compute, org, project, env, vpc, subnet, sg, nat-gw, route, volume
+    // are disabled until the fabric + hypervisor foundation is solid.
     /// Manage hypervisors (compute hosts)
     Hypervisor {
         #[command(subcommand)]
@@ -94,11 +51,7 @@ enum Commands {
         #[command(subcommand)]
         command: syfrah_storage::StorageCommand,
     },
-    /// Manage block storage volumes
-    Volume {
-        #[command(subcommand)]
-        command: syfrah_storage::VolumeCommand,
-    },
+    // Volume command disabled (coming soon)
     /// Manage the Raft control plane
     #[command(name = "controlplane")]
     ControlPlane {
@@ -987,18 +940,10 @@ async fn run() -> Result<()> {
                 }
             }
         },
-        Commands::Compute { command } => syfrah_compute::cli::run(command).await,
-        Commands::Org { command } => syfrah_org::cli::run(command).await,
-        Commands::Project { command } => syfrah_org::cli::run_project(command).await,
-        Commands::Env { command } => syfrah_org::cli::run_env(command).await,
-        Commands::Vpc { command } => syfrah_org::cli::run_vpc(command).await,
-        Commands::Subnet { command } => syfrah_org::cli::run_subnet(command).await,
-        Commands::Sg { command } => syfrah_org::cli::run_sg(command).await,
-        Commands::NatGw { command } => syfrah_org::cli::run_nat_gw(command).await,
-        Commands::Route { command } => syfrah_org::cli::run_route(command).await,
+        // Disabled features — dispatch removed
         Commands::Hypervisor { command } => syfrah_org::cli::run_hypervisor(command).await,
         Commands::Storage { command } => syfrah_storage::cli::run_storage(command).await,
-        Commands::Volume { command } => syfrah_storage::cli::run(command).await,
+        // Commands::Volume disabled
         Commands::ControlPlane { command } => controlplane::run(command).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1177,66 +1122,5 @@ mod tests {
         assert!(s.contains("max 64"), "unexpected: {s}");
     }
 
-    // ── project CLI parsing ──────────────────────────────────────
-
-    #[test]
-    fn project_create_parse() {
-        let cli = Cli::try_parse_from(["syfrah", "project", "create", "backend", "--org", "acme"])
-            .unwrap();
-        match cli.command {
-            Commands::Project {
-                command: syfrah_org::ProjectCommand::Create { name, org },
-            } => {
-                assert_eq!(name, "backend");
-                assert_eq!(org, "acme");
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn project_list_parse() {
-        // With --org filter and --json
-        let cli =
-            Cli::try_parse_from(["syfrah", "project", "list", "--org", "acme", "--json"]).unwrap();
-        match cli.command {
-            Commands::Project {
-                command: syfrah_org::ProjectCommand::List { org, json },
-            } => {
-                assert_eq!(org.as_deref(), Some("acme"));
-                assert!(json);
-            }
-            _ => panic!("unexpected command variant"),
-        }
-
-        // Without flags
-        let cli = Cli::try_parse_from(["syfrah", "project", "list"]).unwrap();
-        match cli.command {
-            Commands::Project {
-                command: syfrah_org::ProjectCommand::List { org, json },
-            } => {
-                assert!(org.is_none());
-                assert!(!json);
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn project_delete_parse() {
-        let cli = Cli::try_parse_from([
-            "syfrah", "project", "delete", "backend", "--org", "acme", "--yes",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Project {
-                command: syfrah_org::ProjectCommand::Delete { name, org, yes },
-            } => {
-                assert_eq!(name, "backend");
-                assert_eq!(org, "acme");
-                assert!(yes);
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
+    // project CLI parsing tests removed — project command disabled
 }
