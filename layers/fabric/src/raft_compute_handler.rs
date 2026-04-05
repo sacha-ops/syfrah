@@ -40,6 +40,8 @@ pub struct RaftComputeHandler {
     org_store: RwLock<Option<Arc<syfrah_org::OrgStore>>>,
     /// Storage store — used to read configured storage zones for preflight checks.
     storage_store: RwLock<Option<Arc<syfrah_org::StorageStore>>>,
+    /// Raft state machine — used to read VM records for `vm get`/`vm list` (#1311).
+    state_machine: RwLock<Option<Arc<syfrah_controlplane::RedbStateMachine>>>,
 }
 
 impl RaftComputeHandler {
@@ -54,6 +56,7 @@ impl RaftComputeHandler {
             hypervisor_store: RwLock::new(None),
             org_store: RwLock::new(None),
             storage_store: RwLock::new(None),
+            state_machine: RwLock::new(None),
         }
     }
 
@@ -85,6 +88,12 @@ impl RaftComputeHandler {
     pub async fn set_storage_store(&self, store: Arc<syfrah_org::StorageStore>) {
         let mut guard = self.storage_store.write().await;
         *guard = Some(store);
+    }
+
+    /// Set the Raft state machine (called during daemon init for VM record lookups #1311).
+    pub async fn set_state_machine(&self, sm: Arc<syfrah_controlplane::RedbStateMachine>) {
+        let mut guard = self.state_machine.write().await;
+        *guard = Some(sm);
     }
 
     /// Build a set of zone names that have storage configured.
@@ -196,6 +205,10 @@ impl RaftComputeHandler {
     }
 
     /// Handle a CreateVm request with scheduler integration.
+    ///
+    /// Phase 1 (#1311): When Raft is available, writes a `CreateVmIntent` to Raft
+    /// and returns immediately with `VmIntentAccepted`. The daemon continues
+    /// provisioning in the background and updates the VM phase via `UpdateVmPhase`.
     #[allow(clippy::too_many_arguments)]
     async fn handle_create_vm(
         &self,
@@ -222,6 +235,134 @@ impl RaftComputeHandler {
             None => {
                 // No Raft — direct local create (backward compatible).
                 debug!("raft compute: no raft, falling back to direct create");
+                return self.inner.handle(request.to_vec(), caller_uid).await;
+            }
+        };
+
+        // Phase 1 (#1311): Write CreateVmIntent to Raft so the CLI can return
+        // immediately. The daemon continues provisioning in the background.
+        let intent_cmd = StateMachineCommand::CreateVmIntent {
+            name: name.clone(),
+            image: image.clone(),
+            vcpus,
+            memory_mb,
+            zone: zone.clone(),
+            subnet: subnet.as_ref().map(|s| s.name.clone()),
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: ssh_key.clone(),
+            disk_size_gb: root_disk_size_gb,
+        };
+
+        match client.write(intent_cmd).await {
+            Ok(StateMachineResponse::Created(vm_id)) => {
+                info!("raft compute: VM intent accepted for '{vm_id}' (Pending)");
+
+                // Spawn background provisioning — the daemon does the actual
+                // scheduling + create synchronously, updating the phase as it
+                // goes. This keeps Phase 1 scope tight: CLI returns fast,
+                // daemon still does the work.
+                let inner = Arc::clone(&self.inner);
+                let request_bytes = request.to_vec();
+                let raft_client_bg = client.clone();
+                let name_bg = name.clone();
+                tokio::spawn(async move {
+                    // Update phase to Scheduling.
+                    let _ = raft_client_bg
+                        .write(StateMachineCommand::UpdateVmPhase {
+                            vm_id: name_bg.clone(),
+                            phase: "Scheduling".to_string(),
+                            hypervisor_id: None,
+                            ip: None,
+                            error: None,
+                        })
+                        .await;
+
+                    // Update phase to Creating.
+                    let _ = raft_client_bg
+                        .write(StateMachineCommand::UpdateVmPhase {
+                            vm_id: name_bg.clone(),
+                            phase: "Creating".to_string(),
+                            hypervisor_id: None,
+                            ip: None,
+                            error: None,
+                        })
+                        .await;
+
+                    // Perform the actual provisioning via the inner handler.
+                    let result = inner.handle(request_bytes, caller_uid).await;
+
+                    // Check if provisioning succeeded and update phase accordingly.
+                    match serde_json::from_slice::<ComputeResponse>(&result) {
+                        Ok(ComputeResponse::Vm(v)) => {
+                            let ip = v.get("ip").and_then(|i| i.as_str()).map(|s| s.to_string());
+                            let hv = v
+                                .get("hypervisor_id")
+                                .and_then(|h| h.as_str())
+                                .map(|s| s.to_string());
+                            let _ = raft_client_bg
+                                .write(StateMachineCommand::UpdateVmPhase {
+                                    vm_id: name_bg.clone(),
+                                    phase: "Running".to_string(),
+                                    hypervisor_id: hv,
+                                    ip,
+                                    error: None,
+                                })
+                                .await;
+                        }
+                        Ok(ComputeResponse::Error(msg)) => {
+                            let _ = raft_client_bg
+                                .write(StateMachineCommand::UpdateVmPhase {
+                                    vm_id: name_bg.clone(),
+                                    phase: "Failed".to_string(),
+                                    hypervisor_id: None,
+                                    ip: None,
+                                    error: Some(msg),
+                                })
+                                .await;
+                        }
+                        _ => {
+                            let _ = raft_client_bg
+                                .write(StateMachineCommand::UpdateVmPhase {
+                                    vm_id: name_bg.clone(),
+                                    phase: "Failed".to_string(),
+                                    hypervisor_id: None,
+                                    ip: None,
+                                    error: Some(
+                                        "unexpected response from compute handler".to_string(),
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                });
+
+                // Return immediately with the intent accepted response.
+                let resp = ComputeResponse::VmIntentAccepted {
+                    vm_id,
+                    phase: "Pending".to_string(),
+                };
+                return serde_json::to_vec(&resp).unwrap_or_default();
+            }
+            Ok(StateMachineResponse::Error(e)) => {
+                let resp = ComputeResponse::Error(format!("failed to write VM intent: {e}"));
+                return serde_json::to_vec(&resp).unwrap_or_default();
+            }
+            Err(e) => {
+                warn!("raft compute: failed to write CreateVmIntent to Raft: {e}");
+                // Fall through to direct create path as fallback.
+            }
+            _ => {
+                // Unexpected response; fall through to original path.
+            }
+        }
+        // Drop raft client before fall-through since we re-acquire it below.
+        drop(raft_client);
+        let raft_client = self.raft_client.read().await;
+        let client = match raft_client.as_ref() {
+            Some(c) => c,
+            None => {
                 return self.inner.handle(request.to_vec(), caller_uid).await;
             }
         };
@@ -767,6 +908,122 @@ impl RaftComputeHandler {
 
         result
     }
+
+    /// Convert a Raft VmRecord to a JSON value matching the CLI's expected format.
+    fn vm_record_to_json(record: &syfrah_controlplane::VmRecord) -> serde_json::Value {
+        serde_json::json!({
+            "id": record.id,
+            "phase": record.phase.to_string(),
+            "vcpus": record.vcpus,
+            "memory_mb": record.memory_mb,
+            "image": record.image,
+            "runtime": null,
+            "created_at": record.created_at,
+            "uptime_secs": null,
+            "ip": record.ip,
+            "subnet": record.subnet_id,
+            "vpc": null,
+            "security_groups": [],
+            "hypervisor_id": record.hypervisor_id,
+            "region": null,
+            "zone": record.zone,
+            "root_volume_id": format!("vol-root-{}", record.id),
+            "error": record.error,
+        })
+    }
+
+    /// Handle GetVm by checking Raft VM records first, then falling back to the
+    /// inner handler. When both exist, prefer the inner handler's data but
+    /// overlay the Raft phase if the VM is still provisioning.
+    async fn handle_get_vm(&self, request: &[u8], caller_uid: Option<u32>, vm_id: &str) -> Vec<u8> {
+        // Check Raft state machine for the VM record.
+        let raft_record = {
+            let sm_guard = self.state_machine.read().await;
+            sm_guard.as_ref().and_then(|sm| {
+                let storage = sm.storage.read().unwrap();
+                storage.vm_records.get(vm_id).cloned()
+            })
+        };
+
+        // Also try the inner handler (local compute).
+        let inner_result = self.inner.handle(request.to_vec(), caller_uid).await;
+        let inner_resp: Option<ComputeResponse> = serde_json::from_slice(&inner_result).ok();
+
+        match (raft_record, inner_resp) {
+            (Some(record), Some(ComputeResponse::Vm(mut v))) => {
+                // Merge: use inner handler's runtime data, overlay Raft phase
+                // if the VM hasn't fully started yet.
+                let raft_phase = record.phase.to_string();
+                v["phase"] = serde_json::Value::String(raft_phase);
+                if let Some(ref err) = record.error {
+                    v["error"] = serde_json::Value::String(err.clone());
+                }
+                let resp = ComputeResponse::Vm(v);
+                serde_json::to_vec(&resp).unwrap_or_default()
+            }
+            (Some(record), _) => {
+                // VM only exists in Raft (still provisioning or on remote node).
+                let resp = ComputeResponse::Vm(Self::vm_record_to_json(&record));
+                serde_json::to_vec(&resp).unwrap_or_default()
+            }
+            (None, _) => {
+                // No Raft record — return inner handler's response as-is.
+                inner_result
+            }
+        }
+    }
+
+    /// Handle ListVms by merging Raft VM records with local VM list.
+    async fn handle_list_vms(&self, request: &[u8], caller_uid: Option<u32>) -> Vec<u8> {
+        // Get local VMs from inner handler.
+        let inner_result = self.inner.handle(request.to_vec(), caller_uid).await;
+        let inner_resp: Option<ComputeResponse> = serde_json::from_slice(&inner_result).ok();
+
+        // Get Raft VM records.
+        let raft_records = {
+            let sm_guard = self.state_machine.read().await;
+            sm_guard.as_ref().map(|sm| {
+                let storage = sm.storage.read().unwrap();
+                storage.vm_records.clone()
+            })
+        };
+
+        match (raft_records, inner_resp) {
+            (Some(records), Some(ComputeResponse::VmList(mut local_vms))) => {
+                // Build a set of local VM IDs for dedup.
+                let local_ids: std::collections::HashSet<String> = local_vms
+                    .iter()
+                    .filter_map(|v| {
+                        v.get("id")
+                            .and_then(|id| id.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect();
+
+                // Overlay Raft phase on local VMs.
+                for vm in &mut local_vms {
+                    if let Some(id) = vm.get("id").and_then(|id| id.as_str()) {
+                        if let Some(record) = records.get(id) {
+                            vm["phase"] = serde_json::Value::String(record.phase.to_string());
+                        }
+                    }
+                }
+
+                // Add VMs that exist only in Raft (provisioning on remote nodes).
+                for (id, record) in &records {
+                    if !local_ids.contains(id)
+                        && record.phase != syfrah_controlplane::VmPhase::Deleting
+                    {
+                        local_vms.push(Self::vm_record_to_json(record));
+                    }
+                }
+
+                let resp = ComputeResponse::VmList(local_vms);
+                serde_json::to_vec(&resp).unwrap_or_default()
+            }
+            _ => inner_result,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -781,8 +1038,7 @@ impl LayerHandler for RaftComputeHandler {
             }
         };
 
-        // Only intercept CreateVm for scheduler routing.
-        // All other operations (list, get, start, stop, delete) are local.
+        // Intercept VM lifecycle operations for Raft integration (#1311).
         match req {
             ComputeRequest::CreateVm {
                 name,
@@ -824,6 +1080,8 @@ impl LayerHandler for RaftComputeHandler {
                 self.handle_delete_vm(&request, caller_uid, &id, retain_disk)
                     .await
             }
+            ComputeRequest::GetVm { id } => self.handle_get_vm(&request, caller_uid, &id).await,
+            ComputeRequest::ListVms => self.handle_list_vms(&request, caller_uid).await,
             _ => {
                 // Pass through to inner handler.
                 self.inner.handle(request, caller_uid).await

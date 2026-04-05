@@ -96,6 +96,92 @@ pub enum VolumeState {
 /// Default tombstone retention period: 30 days in seconds.
 pub const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 3600;
 
+// ---------------------------------------------------------------------------
+// VM lifecycle phases (Phase 1: async provisioning #1311)
+// ---------------------------------------------------------------------------
+
+/// Phase of a VM in the Raft state machine.
+///
+/// Tracks the lifecycle of a VM from intent to running/failed/deleted.
+/// The CLI writes a `CreateVmIntent` which creates a record in `Pending`;
+/// the daemon/forge updates the phase as provisioning progresses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VmPhase {
+    /// Intent written, not yet scheduled.
+    Pending,
+    /// Scheduler picking a hypervisor.
+    Scheduling,
+    /// Volume + network being set up.
+    Creating,
+    /// Container/VM booting.
+    Starting,
+    /// Healthy and serving.
+    Running,
+    /// Graceful shutdown in progress.
+    Stopping,
+    /// Explicitly stopped by operator.
+    Stopped,
+    /// Something went wrong (see error field on VmRecord).
+    Failed,
+    /// Cleanup in progress.
+    Deleting,
+}
+
+impl std::fmt::Display for VmPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmPhase::Pending => write!(f, "Pending"),
+            VmPhase::Scheduling => write!(f, "Scheduling"),
+            VmPhase::Creating => write!(f, "Creating"),
+            VmPhase::Starting => write!(f, "Starting"),
+            VmPhase::Running => write!(f, "Running"),
+            VmPhase::Stopping => write!(f, "Stopping"),
+            VmPhase::Stopped => write!(f, "Stopped"),
+            VmPhase::Failed => write!(f, "Failed"),
+            VmPhase::Deleting => write!(f, "Deleting"),
+        }
+    }
+}
+
+impl VmPhase {
+    /// Parse a phase from a string (case-insensitive first letter, exact otherwise).
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s {
+            "Pending" => Some(VmPhase::Pending),
+            "Scheduling" => Some(VmPhase::Scheduling),
+            "Creating" => Some(VmPhase::Creating),
+            "Starting" => Some(VmPhase::Starting),
+            "Running" => Some(VmPhase::Running),
+            "Stopping" => Some(VmPhase::Stopping),
+            "Stopped" => Some(VmPhase::Stopped),
+            "Failed" => Some(VmPhase::Failed),
+            "Deleting" => Some(VmPhase::Deleting),
+            _ => None,
+        }
+    }
+}
+
+/// VM record tracked by the Raft state machine.
+///
+/// Created by `CreateVmIntent`, updated by `UpdateVmPhase`.
+/// Keyed by `id` (same as the VM name).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VmRecord {
+    pub id: String,
+    pub name: String,
+    pub phase: VmPhase,
+    pub image: String,
+    pub vcpus: u32,
+    pub memory_mb: u32,
+    pub zone: Option<String>,
+    pub subnet_id: Option<String>,
+    pub hypervisor_id: Option<String>,
+    pub ip: Option<String>,
+    pub error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Snapshot lifecycle state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SnapshotState {
@@ -166,6 +252,10 @@ pub struct StorageState {
     /// there are no snapshots.
     #[serde(default)]
     pub min_wal_position: Option<u64>,
+    /// VM records keyed by VM ID (Phase 1: async provisioning #1311).
+    /// Tracks the lifecycle phase of each VM from intent to running/deleted.
+    #[serde(default)]
+    pub vm_records: HashMap<String, VmRecord>,
 }
 
 /// Manifest pointer record tracked by the state machine (ADR-006 §12b).
@@ -1721,6 +1811,99 @@ impl RedbStateMachine {
                         StateMachineResponse::Ok
                     }
                     Err(e) => StateMachineResponse::Error(e.to_string()),
+                }
+            }
+
+            // -- VM Lifecycle (Phase 1: async provisioning #1311) --
+            StateMachineCommand::CreateVmIntent {
+                name,
+                image,
+                vcpus,
+                memory_mb,
+                zone,
+                subnet,
+                env: _,
+                project: _,
+                org: _,
+                ssh_key_path: _,
+                disk_size_gb: _,
+            } => {
+                let mut storage = self.storage.write().unwrap();
+                if storage.vm_records.contains_key(name) {
+                    return StateMachineResponse::Error(format!("VM already exists: {name}"));
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let record = VmRecord {
+                    id: name.clone(),
+                    name: name.clone(),
+                    phase: VmPhase::Pending,
+                    image: image.clone(),
+                    vcpus: *vcpus,
+                    memory_mb: *memory_mb,
+                    zone: zone.clone(),
+                    subnet_id: subnet.clone(),
+                    hypervisor_id: None,
+                    ip: None,
+                    error: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                storage.vm_records.insert(name.clone(), record);
+                info!(vm_id = name, "created VM intent (Pending)");
+                StateMachineResponse::Created(name.clone())
+            }
+            StateMachineCommand::UpdateVmPhase {
+                vm_id,
+                phase,
+                hypervisor_id,
+                ip,
+                error,
+            } => {
+                let new_phase = match VmPhase::from_str_loose(phase) {
+                    Some(p) => p,
+                    None => {
+                        return StateMachineResponse::Error(format!("unknown VM phase: {phase}"))
+                    }
+                };
+                let mut storage = self.storage.write().unwrap();
+                match storage.vm_records.get_mut(vm_id) {
+                    Some(record) => {
+                        record.phase = new_phase;
+                        if let Some(hv) = hypervisor_id {
+                            record.hypervisor_id = Some(hv.clone());
+                        }
+                        if let Some(ip_val) = ip {
+                            record.ip = Some(ip_val.clone());
+                        }
+                        if let Some(err) = error {
+                            record.error = Some(err.clone());
+                        }
+                        record.updated_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        info!(vm_id = vm_id, phase = %record.phase, "updated VM phase");
+                        StateMachineResponse::Ok
+                    }
+                    None => StateMachineResponse::Error(format!("VM not found: {vm_id}")),
+                }
+            }
+            StateMachineCommand::DeleteVmIntent { vm_id } => {
+                let mut storage = self.storage.write().unwrap();
+                match storage.vm_records.get_mut(vm_id) {
+                    Some(record) => {
+                        record.phase = VmPhase::Deleting;
+                        record.updated_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        info!(vm_id = vm_id, "VM marked for deletion (Deleting)");
+                        StateMachineResponse::Ok
+                    }
+                    None => StateMachineResponse::Error(format!("VM not found: {vm_id}")),
                 }
             }
 
@@ -5916,5 +6099,379 @@ mod tests {
         assert!(vol.migration_target_zone.is_none());
         assert!(vol.pre_migration_hypervisor.is_none());
         assert!(vol.pre_migration_vm_id.is_none());
+    }
+
+    // -- VM lifecycle tests (#1311) ------------------------------------------
+
+    #[test]
+    fn apply_create_vm_intent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: Some("eu-west-1".to_string()),
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Created(id) => assert_eq!(id, "web-1"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Verify record in storage.
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Pending);
+        assert_eq!(record.image, "alpine-3.20");
+        assert_eq!(record.vcpus, 2);
+        assert_eq!(record.memory_mb, 2048);
+        assert_eq!(record.zone, Some("eu-west-1".to_string()));
+    }
+
+    #[test]
+    fn apply_create_vm_intent_duplicate() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let _ = sm.apply_command(&cmd);
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        // Create intent first.
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine-3.20".to_string(),
+            vcpus: 2,
+            memory_mb: 2048,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 20,
+        };
+        let _ = sm.apply_command(&create);
+
+        // Update to Running with hypervisor and IP.
+        let update = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+        };
+        let resp = sm.apply_command(&update);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Running);
+        assert_eq!(record.hypervisor_id, Some("hv1".to_string()));
+        assert_eq!(record.ip, Some("10.0.0.5".to_string()));
+        assert!(record.error.is_none());
+    }
+
+    #[test]
+    fn apply_update_vm_phase_not_found() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "nonexistent".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase_invalid_phase() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "BogusPhase".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("unknown VM phase")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_vm_phase_failed_with_error() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::UpdateVmPhase {
+            vm_id: "web-1".to_string(),
+            phase: "Failed".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: Some("image not found".to_string()),
+        };
+        let resp = sm.apply_command(&cmd);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Failed);
+        assert_eq!(record.error, Some("image not found".to_string()));
+    }
+
+    #[test]
+    fn apply_delete_vm_intent() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let create = StateMachineCommand::CreateVmIntent {
+            name: "web-1".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        };
+        let _ = sm.apply_command(&create);
+
+        let cmd = StateMachineCommand::DeleteVmIntent {
+            vm_id: "web-1".to_string(),
+        };
+        let resp = sm.apply_command(&cmd);
+        assert!(matches!(resp, StateMachineResponse::Ok));
+
+        let storage = sm.storage.read().unwrap();
+        let record = storage.vm_records.get("web-1").unwrap();
+        assert_eq!(record.phase, VmPhase::Deleting);
+    }
+
+    #[test]
+    fn apply_delete_vm_intent_not_found() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+        let cmd = StateMachineCommand::DeleteVmIntent {
+            vm_id: "ghost".to_string(),
+        };
+        let resp = sm.apply_command(&cmd);
+        match resp {
+            StateMachineResponse::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_phase_display_roundtrip() {
+        let phases = [
+            VmPhase::Pending,
+            VmPhase::Scheduling,
+            VmPhase::Creating,
+            VmPhase::Starting,
+            VmPhase::Running,
+            VmPhase::Stopping,
+            VmPhase::Stopped,
+            VmPhase::Failed,
+            VmPhase::Deleting,
+        ];
+        for phase in &phases {
+            let s = phase.to_string();
+            let parsed = VmPhase::from_str_loose(&s).unwrap();
+            assert_eq!(*phase, parsed);
+        }
+    }
+
+    #[test]
+    fn vm_record_serde_roundtrip() {
+        let record = VmRecord {
+            id: "web-1".to_string(),
+            name: "web-1".to_string(),
+            phase: VmPhase::Running,
+            image: "alpine-3.20".to_string(),
+            vcpus: 4,
+            memory_mb: 4096,
+            zone: Some("eu-west-1".to_string()),
+            subnet_id: Some("frontend".to_string()),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+            created_at: 1700000000,
+            updated_at: 1700000100,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "web-1");
+        assert_eq!(back.phase, VmPhase::Running);
+        assert_eq!(back.vcpus, 4);
+        assert_eq!(back.hypervisor_id, Some("hv1".to_string()));
+    }
+
+    #[test]
+    fn vm_records_included_in_storage_state_serde() {
+        let mut state = StorageState::default();
+        state.vm_records.insert(
+            "test-vm".to_string(),
+            VmRecord {
+                id: "test-vm".to_string(),
+                name: "test-vm".to_string(),
+                phase: VmPhase::Pending,
+                image: "ubuntu".to_string(),
+                vcpus: 2,
+                memory_mb: 2048,
+                zone: None,
+                subnet_id: None,
+                hypervisor_id: None,
+                ip: None,
+                error: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        let back: StorageState = serde_json::from_str(&json).unwrap();
+        assert!(back.vm_records.contains_key("test-vm"));
+        assert_eq!(back.vm_records["test-vm"].phase, VmPhase::Pending);
+    }
+
+    #[test]
+    fn vm_phase_full_lifecycle() {
+        let (_dir, store) = make_org_store();
+        let sm = RedbStateMachine::new(store);
+
+        // Create
+        let _ = sm.apply_command(&StateMachineCommand::CreateVmIntent {
+            name: "lifecycle-vm".to_string(),
+            image: "alpine".to_string(),
+            vcpus: 1,
+            memory_mb: 512,
+            zone: None,
+            subnet: None,
+            env: None,
+            project: None,
+            org: None,
+            ssh_key_path: None,
+            disk_size_gb: 10,
+        });
+
+        // Scheduling
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Scheduling".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Scheduling
+        );
+
+        // Creating
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Creating".to_string(),
+            hypervisor_id: Some("hv1".to_string()),
+            ip: None,
+            error: None,
+        });
+
+        // Starting
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Starting".to_string(),
+            hypervisor_id: None,
+            ip: None,
+            error: None,
+        });
+
+        // Running
+        let _ = sm.apply_command(&StateMachineCommand::UpdateVmPhase {
+            vm_id: "lifecycle-vm".to_string(),
+            phase: "Running".to_string(),
+            hypervisor_id: None,
+            ip: Some("10.0.0.5".to_string()),
+            error: None,
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Running
+        );
+
+        // Delete
+        let _ = sm.apply_command(&StateMachineCommand::DeleteVmIntent {
+            vm_id: "lifecycle-vm".to_string(),
+        });
+        assert_eq!(
+            sm.storage.read().unwrap().vm_records["lifecycle-vm"].phase,
+            VmPhase::Deleting
+        );
     }
 }

@@ -121,6 +121,8 @@ pub enum ComputeResponse {
     ImageMeta(serde_json::Value),
     /// Image catalog (remote).
     ImageCatalog(serde_json::Value),
+    /// VM intent accepted — returns VM ID and initial phase (async provisioning #1311).
+    VmIntentAccepted { vm_id: String, phase: String },
 }
 
 // ---------------------------------------------------------------------------
