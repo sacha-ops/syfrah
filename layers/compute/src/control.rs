@@ -121,6 +121,8 @@ pub enum ComputeResponse {
     ImageMeta(serde_json::Value),
     /// Image catalog (remote).
     ImageCatalog(serde_json::Value),
+    /// VM intent accepted — returns VM ID and initial phase (async provisioning #1311).
+    VmIntentAccepted { vm_id: String, phase: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +144,7 @@ fn vm_status_to_json(s: &crate::types::VmStatus) -> serde_json::Value {
     let runtime = s.runtime.map(|r| r.to_string());
     serde_json::json!({
         "id": s.vm_id.0,
+        "name": s.name,
         "phase": format!("{:?}", s.phase),
         "vcpus": s.vcpus,
         "memory_mb": s.memory_mb,
@@ -216,13 +219,16 @@ async fn handle_compute_request(mgr: &VmManager, req: ComputeRequest) -> Compute
                 tap_name,
                 mac: None,
             });
-            // Generate a root volume ID for the auto-created root volume.
+            // Generate a proper VmId for this VM.
+            let vm_id = VmId::generate();
+            // Generate a root volume ID derived from the VmId (not the name).
             // The actual Raft CreateVolume command is issued by the daemon/forge
             // layer; here we record the intent in the VmSpec.
-            let root_volume_id = Some(format!("vol-root-{name}", name = &name));
+            let root_volume_id = Some(format!("vol-root-{}", &vm_id.0));
             let _ = root_disk_size_gb; // Carried on the VmSpec for daemon to issue CreateVolume
             let spec = VmSpec {
-                id: VmId(name),
+                id: vm_id,
+                name,
                 vcpus,
                 memory_mb,
                 image,

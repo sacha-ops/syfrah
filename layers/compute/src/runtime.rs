@@ -25,6 +25,8 @@ pub(crate) enum ReconnectSource {
 #[allow(dead_code)]
 pub(crate) struct VmRuntimeState {
     pub(crate) vm_id: VmId,
+    /// Human-friendly name for the VM.
+    pub(crate) name: Option<String>,
     pub(crate) pid: u32,
     pub(crate) socket_path: PathBuf,
     pub(crate) cgroup_path: Option<PathBuf>,
@@ -104,6 +106,7 @@ impl VmRuntimeState {
 
         VmStatus {
             vm_id: self.vm_id.clone(),
+            name: self.name.clone().unwrap_or_default(),
             phase: self.current_phase,
             vcpus: self.vcpus,
             memory_mb: self.memory_mb,
@@ -130,6 +133,7 @@ mod tests {
     fn sample_runtime(phase: VmPhase) -> VmRuntimeState {
         VmRuntimeState {
             vm_id: VmId("vm-rt-1".to_string()),
+            name: Some("rt-1".to_string()),
             pid: 4242,
             socket_path: PathBuf::from("/tmp/ch-vm-rt-1.sock"),
             cgroup_path: Some(PathBuf::from("/sys/fs/cgroup/syfrah/vm-rt-1")),

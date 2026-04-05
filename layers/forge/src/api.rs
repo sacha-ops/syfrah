@@ -1221,8 +1221,11 @@ async fn create_instance_handler(
         None
     };
 
+    let vm_id = syfrah_compute::VmId::generate();
+    let root_volume_id = Some(format!("vol-root-{}", &vm_id.0));
     let spec = syfrah_compute::VmSpec {
-        id: syfrah_compute::VmId(req.name.clone()),
+        id: vm_id,
+        name: req.name.clone(),
         vcpus: req.vcpus,
         memory_mb: req.memory_mb,
         image: req.image,
@@ -1240,7 +1243,7 @@ async fn create_instance_handler(
         },
         pre_allocated_ip: req.pre_allocated_ip,
         pre_allocated_mac: req.pre_allocated_mac,
-        root_volume_id: None,
+        root_volume_id,
     };
 
     match vm_manager.create_vm(spec).await {

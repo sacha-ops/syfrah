@@ -708,6 +708,7 @@ pub(crate) async fn spawn_vm_inner(
     info!(vm_id = %vm_id_str, pid = pid, "VM is running");
     Ok(VmRuntimeState {
         vm_id: spec.id.clone(),
+        name: Some(spec.name.clone()),
         pid,
         socket_path,
         cgroup_path: None,
@@ -1296,6 +1297,7 @@ pub async fn reconnect(base_dir: &Path, event_tx: broadcast::Sender<VmEvent>) ->
 
         let state = VmRuntimeState {
             vm_id: VmId(vm_id_str.clone()),
+            name: None, // Recovered VMs get name populated from placement store
             pid: meta.pid,
             socket_path,
             cgroup_path: None,
@@ -1663,6 +1665,7 @@ mod tests {
         use crate::types::{GpuMode, VmId, VmSpec};
         let spec = VmSpec {
             id: VmId("vm-hash".to_string()),
+            name: "hash-vm".to_string(),
             vcpus: 2,
             memory_mb: 512,
             image: "test".to_string(),
@@ -1696,6 +1699,7 @@ mod tests {
 
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-del".to_string()),
+            name: None,
             pid: 4_000_000, // nonexistent
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -1738,6 +1742,7 @@ mod tests {
 
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-stop-del".to_string()),
+            name: None,
             pid: 4_000_000,
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -1780,6 +1785,7 @@ mod tests {
 
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-fail-del".to_string()),
+            name: None,
             pid: 4_000_000,
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -1824,6 +1830,7 @@ mod tests {
 
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-kill-dead".to_string()),
+            name: None,
             pid: 4_000_000, // nonexistent PID
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -2044,6 +2051,7 @@ mod tests {
 
         let state = VmRuntimeState {
             vm_id: VmId("vm-monitor-dead".to_string()),
+            name: None,
             pid: 4_000_000, // nonexistent
             socket_path: PathBuf::from("/tmp/nonexistent.sock"),
             cgroup_path: None,
@@ -2192,6 +2200,7 @@ mod tests {
 
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-pending-del".to_string()),
+            name: None,
             pid: 4_000_000,
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -2254,6 +2263,7 @@ mod tests {
         let client = ChClient::new(dir.socket_path());
         let mut state = VmRuntimeState {
             vm_id: VmId("vm-kill-clean".to_string()),
+            name: None,
             pid: 4_000_000,
             socket_path: dir.socket_path(),
             cgroup_path: None,
@@ -2381,6 +2391,7 @@ mod tests {
 
         let state = VmRuntimeState {
             vm_id: VmId("vm-stopped".to_string()),
+            name: None,
             pid: 4_000_000,
             socket_path: PathBuf::from("/tmp/nonexistent.sock"),
             cgroup_path: None,

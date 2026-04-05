@@ -94,6 +94,7 @@ impl ComputeRuntime for ChRuntime {
         // Build a VmSpec from RuntimeSpec so we can reuse validate/resolve/map.
         let vm_spec = VmSpec {
             id: VmId(id.to_string()),
+            name: id.to_string(),
             vcpus: spec.vcpus,
             memory_mb: spec.memory_mb,
             image: spec.rootfs_path.to_string_lossy().into_owned(),

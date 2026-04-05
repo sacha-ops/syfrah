@@ -1336,6 +1336,14 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Startup state migration (name-keyed → ID-keyed) -----------------------
+    //
+    // Batch-migrate legacy records before accepting requests. Runs locally
+    // against redb (not through Raft) and is idempotent.
+    if let Some(ref org_store) = shared_org_store {
+        crate::migration::run_startup_migration(org_store, shared_hypervisor_store.as_deref());
+    }
+
     // -- Shared IPAM + placement stores ----------------------------------------
     //
     // Opened once and shared between the state machine (Raft) and the compute
@@ -2160,6 +2168,17 @@ pub async fn run_daemon(
                     let mut guard = holder.write().await;
                     *guard = Some(sm_ref);
                     info!("raft: injected state machine into storage reconciler");
+                });
+            }
+
+            // Inject the Raft state machine into the compute handler so
+            // GetVm/ListVms can read VM records from Raft (#1311).
+            if let Some(ref handler) = raft_compute_handler_ref {
+                let handler = Arc::clone(handler);
+                let sm_ref = Arc::clone(&sm);
+                tokio::spawn(async move {
+                    handler.set_state_machine(sm_ref).await;
+                    info!("raft: injected state machine into compute handler for VM records");
                 });
             }
 
@@ -3021,6 +3040,16 @@ pub async fn run_daemon(
                                         let mut guard = holder.write().await;
                                         *guard = Some(sm_ref);
                                         info!("raft: injected state machine into storage reconciler (in-process)");
+                                    });
+                                }
+
+                                // Inject Raft state machine into compute handler for VM records (#1311).
+                                if let Some(ref handler) = aj_raft_compute_handler_ref {
+                                    let handler = Arc::clone(handler);
+                                    let sm_ref = Arc::clone(&sm);
+                                    tokio::spawn(async move {
+                                        handler.set_state_machine(sm_ref).await;
+                                        info!("raft: injected state machine into compute handler for VM records (in-process)");
                                     });
                                 }
 

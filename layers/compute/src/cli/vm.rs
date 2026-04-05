@@ -75,6 +75,11 @@ pub enum VmCommand {
         /// Single-node: warning emitted.
         #[arg(long)]
         spread_topology: Option<String>,
+        /// Wait for the VM to reach Running or Failed phase before returning.
+        /// Without this flag, the CLI returns immediately after the intent is
+        /// accepted (phase=Pending).
+        #[arg(long)]
+        wait: bool,
     },
     /// List all virtual machines
     #[command(after_help = "Examples:\n  syfrah compute vm list\n  syfrah compute vm list --json")]
@@ -157,6 +162,7 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
             node_selector,
             anti_affinity,
             spread_topology,
+            wait,
         } => {
             run_create(
                 name,
@@ -176,6 +182,7 @@ pub async fn run(cmd: VmCommand) -> anyhow::Result<()> {
                 node_selector,
                 anti_affinity,
                 spread_topology,
+                wait,
             )
             .await
         }
@@ -294,6 +301,7 @@ async fn run_create(
     node_selector: Vec<String>,
     anti_affinity: Option<String>,
     spread_topology: Option<String>,
+    wait: bool,
 ) -> anyhow::Result<()> {
     let ssh_key = match ssh_key_path {
         Some(ref path) => Some(read_ssh_key(path)?),
@@ -313,7 +321,7 @@ async fn run_create(
     };
 
     let req = ComputeRequest::CreateVm {
-        name,
+        name: name.clone(),
         vcpus,
         memory_mb: memory,
         image,
@@ -338,12 +346,25 @@ async fn run_create(
         })?;
 
     match resp {
+        ComputeResponse::VmIntentAccepted { vm_id, phase } => {
+            println!(
+                "VM {vm_id} created ({phase}). Run 'syfrah compute vm get {vm_id}' to check status."
+            );
+            if wait {
+                poll_vm_until_terminal(&vm_id).await?;
+            }
+            Ok(())
+        }
         ComputeResponse::Vm(v) => {
-            let vm_name = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+            // Backward-compatible path: daemon returned full VM info (no Raft).
+            let vm_id = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+            let vm_name = v.get("name").and_then(|n| n.as_str()).unwrap_or("?");
             let vm_image = v.get("image").and_then(|i| i.as_str()).unwrap_or("?");
             let vm_vcpus = v.get("vcpus").and_then(|c| c.as_u64()).unwrap_or(0);
             let vm_memory = v.get("memory_mb").and_then(|m| m.as_u64()).unwrap_or(0);
-            println!("VM created: {vm_name} ({vm_image}, {vm_vcpus} vCPU, {vm_memory} MB)");
+            println!(
+                "VM created: {vm_name} (id: {vm_id}, {vm_image}, {vm_vcpus} vCPU, {vm_memory} MB)"
+            );
             if let Some(vol_id) = v.get("root_volume_id").and_then(|v| v.as_str()) {
                 println!("Root volume: {vol_id} ({disk_size_gb} GB)");
             }
@@ -371,6 +392,59 @@ async fn run_create(
     }
 }
 
+/// Poll `vm get` until the VM reaches Running or Failed phase.
+///
+/// Used by the `--wait` flag on `vm create`. Polls every 2 seconds
+/// with a maximum of 150 attempts (5 minutes).
+async fn poll_vm_until_terminal(vm_id: &str) -> anyhow::Result<()> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_POLLS: u32 = 150;
+
+    for i in 0..MAX_POLLS {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let req = ComputeRequest::GetVm {
+            id: vm_id.to_string(),
+        };
+        let resp = send_compute_request(&control_socket_path(), &req).await;
+        match resp {
+            Ok(ComputeResponse::Vm(v)) => {
+                let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
+                if i % 5 == 0 {
+                    eprintln!("  Phase: {phase}...");
+                }
+                match phase {
+                    "Running" => {
+                        println!("VM {vm_id} is now Running.");
+                        if let Some(ip) = v.get("ip").and_then(|i| i.as_str()) {
+                            println!("  IP: {ip}");
+                        }
+                        return Ok(());
+                    }
+                    "Failed" => {
+                        let error = v
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("unknown error");
+                        anyhow::bail!("VM {vm_id} failed: {error}");
+                    }
+                    _ => {} // keep polling
+                }
+            }
+            Ok(ComputeResponse::Error(msg)) => {
+                anyhow::bail!("error polling VM status: {msg}");
+            }
+            Err(e) => {
+                eprintln!("  Warning: poll failed ({e}), retrying...");
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!(
+        "timed out waiting for VM {vm_id} to reach Running (last poll after {} seconds)",
+        MAX_POLLS * 2
+    );
+}
+
 async fn run_list(json: bool) -> anyhow::Result<()> {
     let req = ComputeRequest::ListVms;
     let resp = match send_compute_request(&control_socket_path(), &req).await {
@@ -392,7 +466,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             } else {
                 let tw = super::term_width();
                 let header = format!(
-                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10} {:<15}",
+                    "{:<18} {:<18} {:<18} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10} {:<15}",
+                    "ID",
                     "NAME",
                     "IMAGE",
                     "PHASE",
@@ -409,12 +484,13 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                 } else {
                     println!("{}", &header[..header.len().min(tw)]);
                 }
-                println!("{}", "-".repeat(106.min(tw)));
+                println!("{}", "-".repeat(125.min(tw)));
                 if vms.is_empty() {
                     println!("(no VMs)");
                 } else {
                     for vm in &vms {
-                        let name = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                        let id = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                        let name = vm.get("name").and_then(|n| n.as_str()).unwrap_or("-");
                         let image = vm.get("image").and_then(|i| i.as_str()).unwrap_or("");
                         let phase = vm.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
                         let ip = vm.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
@@ -430,11 +506,12 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .get("hypervisor_id")
                             .and_then(|h| h.as_str())
                             .unwrap_or("-");
-                        let name = super::truncate(name, 19);
-                        let image = super::truncate(image, 19);
+                        let id = super::truncate(id, 17);
+                        let name = super::truncate(name, 17);
+                        let image = super::truncate(image, 17);
                         let ip = super::truncate(ip, 15);
                         let hypervisor = super::truncate(hypervisor, 14);
-                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10} {hypervisor:<15}");
+                        let row = format!("{id:<18} {name:<18} {image:<18} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10} {hypervisor:<15}");
                         println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
@@ -474,7 +551,8 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                let name = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                let vm_id = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                let vm_name = v.get("name").and_then(|n| n.as_str()).unwrap_or("-");
                 let image = v.get("image").and_then(|i| i.as_str()).unwrap_or("");
                 let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
                 let runtime = v.get("runtime").and_then(|r| r.as_str()).unwrap_or("-");
@@ -489,7 +567,8 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 let subnet_val = v.get("subnet").and_then(|s| s.as_str()).unwrap_or("-");
                 let vpc_val = v.get("vpc").and_then(|s| s.as_str()).unwrap_or("-");
                 println!("VM Details");
-                println!("  Name:      {name}");
+                println!("  ID:        {vm_id}");
+                println!("  Name:      {vm_name}");
                 println!("  Image:     {image}");
                 println!("  Phase:     {phase}");
                 println!("  Runtime:   {runtime}");
@@ -765,6 +844,7 @@ mod tests {
                 node_selector: _,
                 anti_affinity: _,
                 spread_topology: _,
+                wait,
             } => {
                 assert_eq!(name, "test-vm");
                 assert_eq!(vcpus, 2); // default
@@ -779,6 +859,7 @@ mod tests {
                 assert!(project.is_none());
                 assert!(org.is_none());
                 assert!(sg.is_empty());
+                assert!(!wait); // default is false
             }
             other => panic!("expected Create, got {other:?}"),
         }
