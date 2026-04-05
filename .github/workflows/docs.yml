@@ -5,6 +5,9 @@ on:
     branches: [main, v2]
     paths:
       - 'docs/**'
+      - 'layers/**/*.rs'
+      - 'bin/**/*.rs'
+      - 'Cargo.toml'
   workflow_dispatch:
 
 permissions:
@@ -26,13 +29,21 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install dependencies
-        working-directory: docs
-        run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build site
+      - name: Build Starlight site
         working-directory: docs
-        run: npx astro build
+        run: |
+          npm ci
+          npx astro build
+
+      - name: Build Rust API docs
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "--default-theme ayu"
+
+      - name: Copy rustdoc into site
+        run: cp -r target/doc docs/dist/api
 
       - uses: actions/upload-pages-artifact@v3
         with:
