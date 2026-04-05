@@ -1,0 +1,108 @@
+---
+title: Fabric Ops
+description: The orchestration heart of the hypervisor — init, join, status, start, stop, and leave, fully explained.
+---
+
+The `ops` module is where the work actually happens. Every high-level `syfrah hv` command ultimately calls a function here. Ops orchestrates the other fabric sub-modules — identity, WireGuard, systemd, peering, state — into coherent multi-step workflows.
+
+## init
+
+`init` bootstraps the first node in a new mesh.
+
+**What it does:**
+
+1. Generates a `MeshIdentity` (UUID + `/48` prefix) via `create_mesh()`
+2. Generates a `HypervisorIdentity` (WG keypair, assigns mesh IPv6) via `create_hypervisor()`
+3. Installs the WireGuard systemd service via the [service module](/syfrah/layers/hypervisor/fabric/service)
+4. Starts the service
+5. Persists `FabricState` to `~/.syfrah/fabric.redb`
+6. Derives a short PIN from the mesh secret for use during peer joins
+
+**Usage:**
+
+```sh
+syfrah hv init --name web-01 --region us-east --zone us-east-1a
+# Mesh secret: syf_sk_AbC123...
+# PIN: 7842
+```
+
+If any step fails, init cleans up (stops and uninstalls the service, removes state) so you can safely retry.
+
+## join
+
+`join` connects a new node to an existing mesh.
+
+**What it does:**
+
+1. Connects to the target's peering port (WG port + 1) via TCP
+2. Sends a `JoinRequest` with name, region, zone, WG pubkey, and PIN
+3. Receives a `JoinResponse` containing the mesh secret, the `/48` prefix, and the full peer list
+4. Creates a `HypervisorIdentity` for this node using the received mesh data
+5. Installs and starts the WireGuard service with all received peers pre-configured
+6. Persists `FabricState`
+
+**Usage:**
+
+```sh
+syfrah hv join --target 203.0.113.10 --name web-02 --region us-east --zone us-east-1a
+```
+
+The target must be a running Syfrah hypervisor. You need the PIN displayed when the mesh was initialized.
+
+## listen_for_peers
+
+`listen_for_peers` starts the TCP listener that accepts incoming `join` requests. This runs in the background as part of a running hypervisor. When a join request arrives:
+
+1. The database is opened fresh per-request (to avoid holding a long-lived write lock)
+2. The PIN is validated
+3. The mesh secret and current peer list are sent to the joiner
+4. A `PeerAnnounce` is broadcast to all existing peers so they add the new node
+
+The per-request database open is intentional — it prevents one slow join from blocking other operations.
+
+## status
+
+`status` loads `FabricState`, queries the WireGuard interface, and checks the systemd service state. It returns:
+
+- Mesh ID and prefix
+- This node's name, region, zone, mesh IPv6
+- Service status (running / stopped)
+- WireGuard listen port, peer count, RX/TX bytes
+- List of peers with their current status
+
+```sh
+syfrah hv status
+```
+
+## start
+
+`start` enables and starts the `wg-quick@syfrah0` systemd service. If the service is already running, the command succeeds without doing anything. State must exist (i.e. the node must have been initialized) for start to work.
+
+```sh
+syfrah hv start
+```
+
+## stop
+
+`stop` stops the `wg-quick@syfrah0` service. The WireGuard interface is brought down, and all peer tunnels are closed. State is preserved — you can `start` again to reconnect.
+
+```sh
+syfrah hv stop
+```
+
+## leave
+
+`leave` permanently removes this node from the mesh.
+
+**What it does:**
+
+1. Stops the WireGuard service
+2. Uninstalls the service and config files
+3. Removes the `syfrah0` interface if it still exists
+4. Deletes `FabricState` from the database
+
+After `leave`, the node is clean. Other nodes will detect it as `Unreachable` and eventually mark it `Removed`. To rejoin, run `syfrah hv join` again.
+
+```sh
+syfrah hv leave
+```

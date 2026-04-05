@@ -1,0 +1,54 @@
+---
+title: Syfrah
+description: Turn bare-metal servers into a programmable cloud.
+template: splash
+hero:
+  tagline: An open-source platform that transforms dedicated servers into a unified cloud.
+  actions:
+    - text: Get Started
+      link: /syfrah/layers/core/overview/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/sacha-ops/syfrah
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## How it works
+
+Syfrah is a **CLI orchestrator** — not a daemon. It configures system services (WireGuard, systemd), then exits. The kernel does the heavy lifting.
+
+```bash
+# Server 1: create a mesh
+syfrah hypervisor init --region eu --zone fsn1 --peering
+
+# Server 2: join the mesh
+syfrah hypervisor join --target 46.224.166.60 --pin G7CCZX --region eu --zone nbg1
+
+# Check status
+syfrah hypervisor status
+```
+
+## Architecture
+
+<CardGrid>
+  <Card title="Core" icon="setting">
+    Pure types, crypto, addressing, resource framework. No I/O, no async — just data structures and validation.
+  </Card>
+  <Card title="State" icon="document">
+    Embedded key-value persistence backed by redb. One database file per layer, crash-safe ACID transactions.
+  </Card>
+  <Card title="Hypervisor" icon="laptop">
+    The central concept. Manages the WireGuard mesh (fabric), peering protocol, service lifecycle, and peer state.
+  </Card>
+</CardGrid>
+
+## Design principles
+
+1. **Hypervisor-centric** — every server is a hypervisor. The mesh connects them.
+2. **No daemon** — syfrah configures systemd services and exits. WireGuard runs in the kernel.
+3. **Declarative resources** — a single `ResourceDef` generates both CLI commands and REST API routes.
+4. **IPv6-native** — each mesh gets a ULA /48 prefix, each node a /128 address.
+5. **Manual peering** — no automatic discovery. Operators approve every join via PIN or interactive prompt.

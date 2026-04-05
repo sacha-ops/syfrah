@@ -1,0 +1,92 @@
+---
+title: State Layer
+description: Embedded persistence for Syfrah layers — typed tables, TTL, watch notifications, and safe concurrent access backed by redb.
+---
+
+The state layer is Syfrah's embedded persistence engine. Every layer that needs to store data — the hypervisor, the control plane, Forge — has its own isolated database file. There is no shared database between layers, which keeps concerns clean and avoids lock contention across unrelated subsystems.
+
+## One database per layer
+
+Each layer gets its own redb file at `~/.syfrah/{layer}.redb`. For example:
+
+- `~/.syfrah/fabric.redb` — hypervisor mesh state
+- `~/.syfrah/control.redb` — control plane state
+- `~/.syfrah/forge.redb` — Forge reconciliation state
+
+This means a problem in one layer's storage never affects another. You can also inspect, back up, or wipe a single layer without touching the rest.
+
+## Typed tables
+
+The core abstraction is `TypedTable<T>`. You declare a table with a specific value type and the compiler enforces it everywhere. There are no raw byte buffers to deserialize by hand — the table handles serialization for you.
+
+```rust
+let table = TypedTable::<HypervisorRecord>::open(&db, "hypervisors")?;
+table.insert(txn, "node-1", &record)?;
+let record = table.get(txn, "node-1")?;
+```
+
+Keys are always strings. Values are any type that implements the table's codec (JSON by default). You get a compile error if you try to store the wrong type.
+
+## Querying data
+
+The state layer supports prefix scans and pagination for listing records:
+
+```rust
+// List all hypervisors in region "us-east"
+let results = table.scan_prefix(txn, "us-east/")?;
+
+// Paginate through records
+let page = table.paginate(txn, cursor, page_size)?;
+```
+
+Secondary indexes let you look up records by fields other than the primary key. For example, you could index hypervisors by zone or by status without scanning the entire table.
+
+## TTL and expiration
+
+Records can be written with a time-to-live. Expired records are invisible to reads and are cleaned up by the GC:
+
+```rust
+table.insert_with_ttl(txn, "session-abc", &session, Duration::from_secs(3600))?;
+```
+
+This is used for things like join tokens and short-lived coordination state that should not accumulate.
+
+## Watch notifications
+
+Any code can subscribe to changes on a key or prefix. When a write commits, watchers are notified:
+
+```rust
+let rx = table.watch("peers/");
+// rx receives a notification whenever any key under "peers/" changes
+```
+
+This powers reactive components that need to respond to state changes without polling.
+
+## Optimistic locking
+
+The state layer supports compare-and-swap (CAS) for safe concurrent updates. A write only commits if the current value matches what you expect:
+
+```rust
+table.compare_and_swap(txn, "config", &expected, &new_value)?;
+```
+
+If another writer has changed the value since you read it, the CAS fails and you retry. This prevents lost updates in concurrent workflows.
+
+## Batches and transactions
+
+Multiple writes can be grouped into a single atomic batch. Either all writes land, or none do:
+
+```rust
+let txn = db.begin_write()?;
+table_a.insert(&txn, "key1", &val1)?;
+table_b.insert(&txn, "key2", &val2)?;
+txn.commit()?;
+```
+
+## Snapshots and metrics
+
+The state layer can produce a point-in-time snapshot of any table. Metrics (record count, table size, GC stats) are available for observability tooling.
+
+## Thread safety
+
+State handles are `Clone` and `Arc`-safe. You can share a handle across async tasks without additional synchronization. The underlying redb file uses a single-writer / multiple-reader model; the state layer manages that for you.

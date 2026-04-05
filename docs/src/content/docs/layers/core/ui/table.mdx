@@ -1,0 +1,78 @@
+---
+title: Table Rendering
+description: How list output is rendered as an aligned terminal table — column widths, alignment, truncation, and status coloring.
+---
+
+When a `list` operation returns results, they are rendered as a terminal table. The table renderer handles column width calculation, alignment, truncation, and color automatically, using the `ColumnDef` configuration from the `ResourceDef`.
+
+## What a table looks like
+
+```
+NAME            STATUS      VCPUS   MEMORY   ID
+web-server-1    ● running   4       8.0 GiB  vm-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+db-primary      ● running   8       32.0 GiB vm-01HWKZ4A9C1F8E3M6GXZNQ5BYK
+worker-1        ● stopped   2       4.0 GiB  vm-01HWKZ5B0D2G9F4N7HYZO6CWL
+```
+
+Headers are uppercase. Rows are separated by newlines. No borders — just aligned columns with consistent spacing.
+
+## Column width
+
+Column widths are calculated automatically based on the widest value in each column (including the header). The renderer makes one pass over all rows to compute widths, then a second pass to render. This means the full result set must be in memory before rendering begins, which is acceptable for CLI output.
+
+## Alignment
+
+Columns are left-aligned by default. Numeric columns should be right-aligned for readability:
+
+```rust
+ColumnDef::new("vcpus", "vCPUs").right_aligned()
+ColumnDef::new("memory_bytes", "Memory").right_aligned().format(DisplayFormat::Bytes)
+```
+
+Right-aligned columns also right-align the header.
+
+## Truncation
+
+Long values can be truncated to keep the table readable:
+
+```rust
+ColumnDef::new("description", "Description").truncate(40)
+```
+
+Truncated values are displayed with a `…` suffix:
+
+```
+DESCRIPTION
+This is a long description that exceeds th…
+```
+
+The truncation limit is the number of displayed characters, not bytes.
+
+## Status coloring
+
+Columns with `.colored()` apply terminal color based on the value string. See the [color module docs](/syfrah/layers/core/ui/color) for the full mapping. In a terminal that supports color, status values render as colored text. In a non-color context (piped output, `NO_COLOR` set), status values render as plain text with no escape codes.
+
+## Empty state
+
+When a list returns no results, the table renderer prints a message instead of an empty table:
+
+```
+No virtual machines found.
+```
+
+The message uses the resource's plural name from its identity configuration.
+
+## Programmatic access
+
+The table renderer can also be used directly for custom output:
+
+```rust
+use syfrah_core::ui::Table;
+
+let mut table = Table::new(vec!["Name", "Status", "ID"]);
+table.add_row(vec!["web-1", "running", "vm-01HW..."]);
+table.add_row(vec!["db-1", "stopped", "vm-01HW..."]);
+table.print();
+```
+
+This is useful in handlers that need to display structured output that isn't tied to a specific resource's column configuration.

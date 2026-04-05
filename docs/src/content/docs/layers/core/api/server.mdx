@@ -1,0 +1,101 @@
+---
+title: API Server
+description: The axum-based HTTP server — how it starts, composes middleware and routes, and shuts down gracefully on SIGTERM or SIGINT.
+---
+
+The API server wraps the generated axum router with middleware, binds to a socket, and handles graceful shutdown. It is designed to be embedded into any Syfrah binary that needs to expose the REST API.
+
+## Starting the server
+
+```rust
+use syfrah_core::api::{ApiServer, ApiServerConfig};
+
+let config = ApiServerConfig {
+    bind: "0.0.0.0:8080".parse()?,
+    version: env!("CARGO_PKG_VERSION"),
+};
+
+ApiServer::new(config, registry)
+    .start()
+    .await?;
+```
+
+`start()` binds the socket, composes the middleware stack, registers the routes, and begins serving. It returns when the server shuts down.
+
+## Middleware stack
+
+The server composes middleware in a fixed order. See the [middleware docs](/syfrah/layers/core/api/middleware) for details on each layer.
+
+```
+Request
+  │
+  ▼
+Rate limiter         — rejects requests that exceed per-IP limits
+  │
+  ▼
+X-Request-Id         — assigns a unique ID to every request
+  │
+  ▼
+X-Syfrah-Version     — attaches the server version to every response
+  │
+  ▼
+Pagination defaults  — normalizes limit/offset query params
+  │
+  ▼
+Router               — dispatches to the correct resource handler
+  │
+  ▼
+Error normalization  — converts SyfrahError to JSON error responses
+  │
+  ▼
+Response
+```
+
+## Graceful shutdown
+
+The server listens for `SIGTERM` and `SIGINT` (Ctrl+C) and initiates graceful shutdown when either is received.
+
+On shutdown:
+1. The server stops accepting new connections immediately
+2. In-flight requests are given up to 30 seconds to complete
+3. Once all in-flight requests finish (or the timeout expires), the process exits
+
+This ensures that long-running operations like VM creation or mesh join are not interrupted mid-flight.
+
+```
+SIGTERM received. Shutting down gracefully...
+Waiting for 3 in-flight requests to complete...
+All requests complete. Exiting.
+```
+
+The shutdown timeout is configurable:
+
+```rust
+ApiServerConfig {
+    bind: "0.0.0.0:8080".parse()?,
+    version: env!("CARGO_PKG_VERSION"),
+    shutdown_timeout: Duration::from_secs(60),
+}
+```
+
+## Health endpoint
+
+The server automatically registers a `GET /health` endpoint that returns `200 OK` with a JSON body:
+
+```json
+{
+  "status": "ok",
+  "version": "0.3.1"
+}
+```
+
+This endpoint bypasses all middleware (including rate limiting) and is designed for load balancer health checks. It does not touch the resource registry or any layer state.
+
+## Introspection endpoints
+
+Two additional endpoints are registered automatically:
+
+- `GET /openapi.json` — the full OpenAPI 3.0 spec for all registered resources
+- `GET /resources` — a list of all registered resource names and operation counts
+
+These are useful for debugging and for tooling that needs to discover what a running server supports.

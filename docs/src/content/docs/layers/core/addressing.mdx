@@ -1,0 +1,66 @@
+---
+title: IPv6 Addressing
+description: Deterministic IPv6 ULA address assignment for mesh nodes, derived from WireGuard public keys.
+---
+
+Every node in a Syfrah mesh has an IPv6 address. These addresses are not assigned by a DHCP server or allocated from a central pool — they are derived deterministically from cryptographic material. The same key always produces the same address.
+
+## ULA address space
+
+Syfrah uses **Unique Local Addresses** (ULA), defined in [RFC 4193](https://www.rfc-editor.org/rfc/rfc4193). ULA addresses begin with `fd00::/8` and are intended for private networks that are not globally routed. They are the IPv6 equivalent of `10.0.0.0/8` or `192.168.0.0/16`.
+
+Each mesh gets a randomly generated `/48` prefix:
+
+```
+fd{random-16-bits}:{random-16-bits}:{random-16-bits}::/48
+```
+
+For example: `fd3a:b7c2:9f01::/48`
+
+This prefix is generated once when the mesh is created and stored in the mesh record. With a `/48`, the mesh has 2^80 addresses available — far more than any realistic deployment will use.
+
+## Node address derivation
+
+Each node's address is a `/128` (a single host address) derived from its WireGuard public key:
+
+```
+node_address = mesh_prefix | sha256(wg_public_key)[0..10]
+```
+
+In detail:
+
+1. Take the node's WireGuard public key (32 bytes)
+2. Compute SHA-256 of the public key (32 bytes)
+3. Take the first 10 bytes (80 bits) of the SHA-256 output
+4. Combine with the 6-byte (48-bit) mesh prefix to form a 128-bit address
+
+```
+[48-bit mesh prefix] [80-bit key-derived suffix]
+fd3a:b7c2:9f01    :    xxxx:xxxx:xxxx:xxxx:xxxx
+```
+
+## Why deterministic addressing?
+
+**No address allocation service.** A node can compute its own address before it has contacted any control plane. This matters during bootstrapping and recovery scenarios — a node can know its address and configure its WireGuard interface even if the control plane is temporarily unreachable.
+
+**No address conflicts.** Two nodes cannot end up with the same address unless they have the same WireGuard public key, which is cryptographically impossible to engineer (Curve25519 discrete log problem). No coordination is needed to assign addresses.
+
+**Auditable.** Given a WireGuard public key, anyone with access to the mesh record can independently verify what address a node should have. There is no address-to-node mapping table that can get out of sync.
+
+## Example
+
+A mesh is created with prefix `fd3a:b7c2:9f01::/48`.
+
+Node A has WireGuard public key `ABC123...` (Base64). SHA-256 of the decoded key bytes starts with `e4 7f 2a 01 b3 9c d5 44 a1 f0 ...`. Taking the first 10 bytes: `e47f:2a01:b39c:d544:a1f0`.
+
+Node A's address: `fd3a:b7c2:9f01:e47f:2a01:b39c:d544:a1f0/128`
+
+Node B has a different keypair, so SHA-256 of its public key produces a different 10-byte suffix. Its address is in the same `/48` but at a different `/128`.
+
+Nodes communicate directly by address within the mesh — the WireGuard tunnel handles routing, and no ARP or NDP is needed because every address is a `/128`.
+
+## Address stability
+
+A node's address is stable as long as its WireGuard keypair is stable. WireGuard keypairs are generated once during node enrollment and do not change under normal operation.
+
+If a node's keypair is rotated (for example, after a suspected key compromise), its address changes. Peers learn the new address through the control plane's gossip layer and update their WireGuard peer configurations automatically.

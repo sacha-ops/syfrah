@@ -1,0 +1,81 @@
+---
+title: CLI Generation
+description: How generate_command() converts a ResourceDef into a clap command tree — subcommands, flags, and help text, all automatic.
+---
+
+Once you have a `ResourceDef`, turning it into a fully functional CLI command tree requires one call:
+
+```rust
+let command = generate_command(&resource_def);
+```
+
+This returns a `clap::Command` that you can mount into the top-level CLI. No manual clap code, no hand-written argument lists, no duplicated help strings.
+
+## What gets generated
+
+For each operation on the resource, `generate_command` creates a `clap::Command` subcommand. The subcommand name is the operation name: `list`, `get`, `create`, `update`, `delete`, or the custom action name.
+
+For each `OperationArg` on the operation, a `clap::Arg` is generated:
+- Required args generate `--flag <value>` syntax and are marked as required in clap
+- Optional args generate `--flag [value]` syntax
+- Positional args generate bare `<value>` syntax
+- Flag (boolean) args generate `--flag` with no value
+
+Scope flags (`--org`, `--project`, `--vpc`) are injected automatically based on the resource's declared scope. You don't need to add them to each operation.
+
+The `--yes` flag is injected automatically on any operation with `.with_confirm()`.
+
+The `--output` / `-o` flag is injected on all operations.
+
+## Help text
+
+Help text is derived from the `FieldDef` descriptions, operation descriptions, and any `.example()` calls on operations:
+
+```
+syfrah vpc create --help
+
+Create a new Virtual Private Cloud.
+
+Usage: syfrah vpc create [OPTIONS] --name <name>
+
+Options:
+  --name <name>          VPC name
+  --description <desc>   Optional description
+  --org <id>             Organization ID
+  --output <format>      Output format [json|yaml|id]
+  -h, --help             Print help
+
+Examples:
+  syfrah vpc create --name production
+```
+
+The "Examples:" section is generated from `.example()` calls on the operation.
+
+## Aliases
+
+Resource aliases are registered as `clap` command aliases. Users typing `syfrah v list` and `syfrah vpc list` get the same command:
+
+```rust
+// Generated automatically from .alias("v")
+command.alias("v")
+```
+
+## Integrating into the top-level CLI
+
+Generated commands are typically collected at startup from the resource registry and added to the root command:
+
+```rust
+let mut root = clap::Command::new("syfrah");
+
+for resource in registry.resources() {
+    root = root.subcommand(generate_command(resource));
+}
+```
+
+The binary has no knowledge of specific resources — it just collects whatever is registered. Adding a new resource to the registry automatically makes it available in the CLI.
+
+## What generate_command does NOT do
+
+- It does not execute any logic. The command tree is purely structural.
+- It does not connect to the handler. Dispatch happens separately (see [dispatch](/syfrah/layers/core/resource/dispatch)).
+- It does not validate business logic. clap validates argument presence and types; constraint checking and handler invocation happen in the dispatch layer.

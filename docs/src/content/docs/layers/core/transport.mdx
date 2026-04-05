@@ -1,0 +1,122 @@
+---
+title: Control Socket Transport
+description: Unix domain socket transport with length-prefixed JSON framing, request/response types, and a resource-based router.
+---
+
+The transport module defines how the Syfrah CLI and any other local client communicate with the running Syfrah process. All communication happens over a Unix domain socket using a simple, inspectable wire format.
+
+## Why Unix sockets?
+
+Unix domain sockets are ideal for local process-to-process communication:
+
+- **No network stack overhead** — faster than loopback TCP for local calls
+- **Filesystem permissions** — socket access is controlled by file permissions, not port numbers
+- **No port conflicts** — no risk of colliding with other services
+- **Atomic cleanup** — the socket file can be removed when the process exits
+
+The socket is located at `~/.syfrah/syfrah.sock` by default (see [process](/syfrah/layers/core/process)).
+
+## Wire format
+
+Messages are length-prefixed JSON:
+
+```
+[4 bytes: big-endian uint32 length][N bytes: UTF-8 JSON payload]
+```
+
+The 4-byte header encodes the byte length of the JSON body that follows. The receiver reads the 4-byte header first, allocates a buffer of that size, then reads the body.
+
+This framing is simple, easy to implement in any language, and easy to inspect with standard tools. The maximum message size is **1 MB**. Responses larger than 1 MB indicate a design problem and are rejected.
+
+## Request and Response types
+
+All messages are either a `Request` or a `Response`.
+
+**Request:**
+
+```json
+{
+  "id": "01HWKZ3P8B0E7D2N5FVYMR4CXJ",
+  "resource": "vpc",
+  "action": "list",
+  "payload": {
+    "org_id": "org-01HWKZ3P8B0E7D2N5FVYMR4CXJ"
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `id` | Request correlation ID (ULID). Matched in the response. |
+| `resource` | The resource kind being operated on |
+| `action` | The operation: `create`, `get`, `list`, `delete`, `update` |
+| `payload` | Action-specific parameters |
+
+**Response:**
+
+```json
+{
+  "id": "01HWKZ3P8B0E7D2N5FVYMR4CXJ",
+  "ok": true,
+  "payload": { ... }
+}
+```
+
+Or on error:
+
+```json
+{
+  "id": "01HWKZ3P8B0E7D2N5FVYMR4CXJ",
+  "ok": false,
+  "error": {
+    "code": "NotFound",
+    "message": "VPC 'staging' not found",
+    "suggestion": "run 'syfrah vpc list' to see available VPCs"
+  }
+}
+```
+
+The `id` field in the response matches the request, allowing the client to correlate responses when pipelining multiple requests.
+
+## Resource kinds
+
+The `resource` field in a request is one of the defined resource kind strings:
+
+| Kind | Description |
+|------|-------------|
+| `org` | Organization |
+| `vpc` | Virtual Private Cloud |
+| `hypervisor` | Hypervisor node |
+| `mesh` | WireGuard mesh |
+| `node` | Mesh node |
+| `vm` | Virtual machine |
+| `volume` | Storage volume |
+| `snapshot` | Volume snapshot |
+| `image` | Boot image |
+| `network` | Network attachment |
+| `firewall` | Firewall ruleset |
+| `key` | SSH or API key |
+
+## Router
+
+The router dispatches incoming requests to the appropriate handler based on the `resource` field:
+
+```
+Router {
+  handlers: HashMap<ResourceKind, Box<dyn Handler>>,
+}
+```
+
+Each layer registers its handlers during startup. When a request arrives, the router looks up the handler by resource kind and passes the request to it. Unknown resource kinds return a `NotFound` error immediately.
+
+The router runs synchronously within the async task that accepted the socket connection. Each connection gets its own task, so concurrent requests from different clients are handled in parallel. A single client's requests are handled sequentially in order of arrival.
+
+## Inspecting traffic
+
+Because the wire format is JSON, you can inspect socket traffic during development using `socat`:
+
+```sh
+socat -v UNIX-CONNECT:~/.syfrah/syfrah.sock -
+```
+
+This connects to the socket and lets you type raw requests. The `-v` flag prints a hex dump of all bytes, which makes the 4-byte length header visible.

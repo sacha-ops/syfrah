@@ -1,0 +1,92 @@
+---
+title: Route Generation
+description: How axum routes are automatically generated from ResourceDef — standard CRUD paths, scoped URL hierarchies, and OpenAPI 3.0 spec output.
+---
+
+Just as `generate_command()` builds a clap command tree from a `ResourceDef`, `build_router()` builds an axum router. Every registered resource gets the correct HTTP routes, request parsing, and handler wiring — with no manual axum code.
+
+## Generated routes
+
+For a resource with `Scope::global()` and name `hypervisor`, plural `hypervisors`:
+
+```
+GET    /hypervisors              → list
+POST   /hypervisors              → create
+GET    /hypervisors/{id}         → get
+PATCH  /hypervisors/{id}         → update
+DELETE /hypervisors/{id}         → delete
+```
+
+For a resource with `Scope::vpc()` and name `vm`, plural `vms`:
+
+```
+GET    /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms
+POST   /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms
+GET    /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms/{id}
+PATCH  /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms/{id}
+DELETE /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms/{id}
+```
+
+Custom actions generate additional POST routes:
+
+```
+POST   /hypervisors/{id}/drain
+POST   /hypervisors/{id}/join
+POST   /hypervisors/init          (no id, creates the initial state)
+```
+
+## Building the router
+
+```rust
+use syfrah_core::api::build_router;
+
+let router = build_router(&registry);
+```
+
+The router is an `axum::Router` that can be composed with additional middleware and served directly.
+
+## Request parsing
+
+For each route, the generated handler:
+
+1. Extracts path parameters (`{org_id}`, `{id}`, etc.) into the scope context
+2. Deserializes the JSON request body into a `FieldMap` (for create/update/action)
+3. Parses query parameters (`?limit=20&offset=40`) for list operations
+4. Validates all fields and constraints
+5. Calls the registered handler via the registry
+
+The same dispatch pipeline used by the CLI is used here. Fields, constraints, and handlers are shared.
+
+## OpenAPI 3.0 spec
+
+The route generator also produces a complete OpenAPI 3.0 spec from the resource registry:
+
+```rust
+use syfrah_core::api::openapi_spec;
+
+let spec = openapi_spec(&registry);
+// Returns serde_json::Value — the full OpenAPI 3.0 document
+```
+
+The spec includes:
+- All paths and HTTP methods
+- Request body schemas derived from `FieldDef` types and constraints
+- Response schemas for each operation's `OutputKind`
+- Tag groups by resource name
+- Summary and description from operation and resource descriptions
+
+The spec is served at `GET /openapi.json` by default when the API server starts.
+
+## Pagination
+
+List routes automatically support pagination via query parameters:
+
+```
+GET /vms?limit=25&offset=50
+```
+
+The `limit` and `offset` values are passed to the handler via `req.pagination`. See [middleware](/syfrah/layers/core/api/middleware) for defaults and limits.
+
+## Content negotiation
+
+All routes accept and return `application/json`. Requests with a different `Content-Type` get a `415 Unsupported Media Type` response. The response `Content-Type` is always `application/json`.

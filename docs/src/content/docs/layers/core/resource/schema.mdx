@@ -1,0 +1,109 @@
+---
+title: Resource Schema
+description: How fields are defined for operations — types, defaults, validation, and how OperationArg wraps fields as required or optional.
+---
+
+Every operation that takes user input relies on field definitions. A `FieldDef` describes a single piece of input: its name, type, description, and default value. An `OperationArg` wraps a `FieldDef` and marks it as required or optional for a specific operation.
+
+## FieldDef
+
+A `FieldDef` defines a reusable input field:
+
+```rust
+FieldDef::string("name", "Human-readable name for this resource")
+FieldDef::integer("port", "Port number to listen on")
+FieldDef::boolean("private", "Whether the resource is private")
+FieldDef::flag("force", "Skip safety checks")
+```
+
+### Field types
+
+| Type | Rust equivalent | CLI appearance | Notes |
+|------|----------------|----------------|-------|
+| `string` | `String` | `--name <value>` | Free-form text |
+| `integer` | `i64` | `--port <number>` | Parsed as base-10 integer |
+| `boolean` | `bool` | `--private <true\|false>` | Explicit true/false value |
+| `flag` | `bool` (presence) | `--force` | Present = true, absent = false |
+
+### Defaults
+
+Fields can have default values. Defaults are displayed in help text and used when the field is omitted:
+
+```rust
+FieldDef::integer("port", "Port to bind")
+    .default("8080")
+
+FieldDef::string("region", "Deployment region")
+    .default("eu-west")
+```
+
+If a field has a default, it is implicitly optional — the default is used when the field is not provided.
+
+### Validation
+
+Fields can have inline validation beyond their type:
+
+```rust
+FieldDef::string("name", "Resource name")
+    .validate(|v| validate_name(v))
+
+FieldDef::integer("port", "Port number")
+    .min(1)
+    .max(65535)
+```
+
+Validation runs before the operation handler is called. If validation fails, the user sees a clear error with the field name and what was wrong.
+
+## OperationArg
+
+An `OperationArg` wraps a `FieldDef` and attaches it to a specific operation. It controls whether the field is required or optional for that operation.
+
+```rust
+// Required: user must provide --name or be prompted for it
+OperationArg::required(FieldDef::string("name", "Name for the new VPC"))
+
+// Optional: --description is accepted but not mandatory
+OperationArg::optional(FieldDef::string("description", "Optional description"))
+```
+
+### Required fields and interactive prompts
+
+When a required field is missing and stdin is a TTY, the framework prompts the user interactively rather than failing immediately. This makes the CLI usable both in scripts (where all args must be provided) and interactively (where the user can fill things in as they go).
+
+In non-TTY contexts (pipes, CI, scripts), a missing required field is always an error.
+
+### Positional arguments
+
+Some operations take a positional argument rather than a named flag — typically the resource identifier:
+
+```rust
+OperationArg::positional(FieldDef::string("id", "Resource ID or name"))
+```
+
+Positional args appear in the CLI as bare values:
+
+```
+syfrah vpc get vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+```
+
+rather than:
+
+```
+syfrah vpc get --id vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+```
+
+## Sharing field definitions
+
+Field definitions are plain structs — you can define them once and reference them in multiple operations:
+
+```rust
+let name_field = FieldDef::string("name", "Resource name").validate(|v| validate_name(v));
+
+ResourceDef::build("vpc", "Virtual Private Cloud")
+    .op(Operation::create()
+        .with_arg(OperationArg::required(name_field.clone())))
+    .op(Operation::update()
+        .with_arg(OperationArg::optional(name_field.clone())))
+```
+
+This ensures consistent validation and help text across operations.

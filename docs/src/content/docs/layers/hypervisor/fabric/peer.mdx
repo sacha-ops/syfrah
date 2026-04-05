@@ -1,0 +1,70 @@
+---
+title: Peer Management
+description: How Syfrah tracks the other hypervisors in your mesh — peer records, status transitions, and the local peer list.
+---
+
+Every node in a Syfrah mesh maintains a local list of its peers. This list is the node's view of the mesh: who else is in it, how to reach them over WireGuard, and whether they are currently reachable.
+
+## The Peer struct
+
+Each peer is described by a `Peer` record:
+
+| Field             | Description                                              |
+|-------------------|----------------------------------------------------------|
+| `name`            | Human-readable name (e.g. `web-02`)                      |
+| `region`          | Region the peer is in                                    |
+| `zone`            | Availability zone the peer is in                         |
+| `wg_pubkey`       | Peer's WireGuard public key                              |
+| `endpoint`        | Peer's public IP or hostname                             |
+| `mesh_ipv6`       | Peer's address within the mesh prefix                    |
+| `status`          | Current reachability status                              |
+| `last_handshake`  | Timestamp of the last successful WireGuard handshake     |
+
+## PeerStatus
+
+A peer is in one of three states:
+
+| Status        | Meaning                                                            |
+|---------------|--------------------------------------------------------------------|
+| `Active`      | Handshake within the last 300 seconds — the tunnel is healthy      |
+| `Unreachable` | No recent handshake — the peer may be down or the endpoint changed |
+| `Removed`     | Peer has left the mesh and should no longer receive traffic        |
+
+The 300-second threshold matches WireGuard's own keepalive window. A peer that has not completed a handshake in that window is considered unreachable until contact is re-established.
+
+## PeerList
+
+`PeerList` is the collection type that holds all peers for a node. It provides the operations you need for mesh membership:
+
+### add
+
+Add a new peer to the list. Called during `join` when the joining node receives the existing peer list, and called on existing nodes when a new peer is announced.
+
+### remove
+
+Mark a peer as `Removed`. The peer record is retained (so you can see it in history) but it will no longer receive traffic.
+
+### find_by_name
+
+Look up a peer by its human-readable name:
+
+```sh
+syfrah hv get web-02
+```
+
+### active_count
+
+Returns the number of peers currently in `Active` status. Useful for cluster health checks — if `active_count` drops suddenly, something may be wrong with the mesh.
+
+## How the peer list is kept current
+
+Peers are added in two ways:
+
+1. **During join**: when a node joins, the accepting peer sends it the full current `PeerList`. The joining node initializes its list from that snapshot.
+2. **Via peer announce**: after a join completes, the accepting node broadcasts a `PeerAnnounce` to all existing peers so they add the new node to their own lists.
+
+Status is updated by polling WireGuard's handshake timestamps. See [wg](/syfrah/layers/hypervisor/fabric/wg) for how those are read from the interface.
+
+## Persistence
+
+The peer list is part of [`FabricState`](/syfrah/layers/hypervisor/fabric/state) and is persisted to `~/.syfrah/fabric.redb` on every change. If the node restarts, it reloads the full peer list and re-configures WireGuard from it.

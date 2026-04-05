@@ -1,0 +1,97 @@
+---
+title: Request Dispatch
+description: How the dispatch layer extracts args, prompts for missing input, validates constraints, confirms destructive ops, calls the handler, and renders output.
+---
+
+Dispatch is the bridge between the parsed CLI arguments (or incoming HTTP request) and the registered handler. It's the layer that makes the CLI feel polished: prompting for missing input, confirming destructive operations, and rendering the result correctly.
+
+## The dispatch pipeline
+
+When a command like `syfrah vpc create --name production` is executed, dispatch follows this sequence:
+
+```
+1. Extract args from clap matches
+2. Identify the resource and operation
+3. Prompt for any missing required args (if TTY)
+4. Validate all field types and individual constraints
+5. Evaluate cross-field constraints (Requires, Conflicts, etc.)
+6. Show confirmation prompt if operation requires it (unless --yes)
+7. Build OperationRequest
+8. Call handler
+9. Render OperationResponse
+```
+
+If any step fails, dispatch stops and reports the error. Steps that fail before the handler is called never execute any state changes.
+
+## Prompting for missing args
+
+When a required arg is absent and stdin is a TTY, dispatch prompts interactively:
+
+```
+$ syfrah vpc create
+
+? VPC name: production
+? Description (optional, press Enter to skip):
+
+Created VPC "production" (vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ)
+```
+
+When stdin is not a TTY (pipes, CI), missing required args are always errors:
+
+```
+$ echo "" | syfrah vpc create
+Error: missing required argument --name
+  Hint: provide --name <value> to specify the VPC name
+```
+
+The interactive prompts are rendered by the [prompt module](/syfrah/layers/core/ui/prompt).
+
+## The OperationRequest
+
+The handler receives an `OperationRequest` containing everything it needs:
+
+```rust
+pub struct OperationRequest {
+    /// Which operation is being performed
+    pub operation: OperationKind,
+    /// The resource name (from the ResourceDef)
+    pub resource: String,
+    /// Parsed field values
+    pub fields: FieldMap,
+    /// Scope context (org_id, project_id, vpc_id as applicable)
+    pub scope: ScopeContext,
+    /// The resource ID, for get/update/delete and custom actions
+    pub id: Option<ResourceId>,
+}
+```
+
+Handlers don't need to re-parse arguments or re-validate types — by the time the handler is called, the request is clean.
+
+## The OperationResponse
+
+Handlers return an `OperationResponse`:
+
+```rust
+pub enum OperationResponse {
+    Resource(serde_json::Value),
+    ResourceList(Vec<serde_json::Value>),
+    Message(String),
+    Empty,
+}
+```
+
+Dispatch selects the correct renderer based on the response variant and the operation's declared `OutputKind`. A `ResourceList` response renders as a table using the `ColumnDef` configuration on the `ResourceDef`. A `Resource` response renders as a detail view using the `DetailField` configuration.
+
+## HTTP dispatch
+
+For API requests, dispatch works the same way but skips the prompting step. Args are extracted from the request body and URL parameters instead of clap matches. Constraints are evaluated identically. The same handler is called. Error responses follow the [error response format](/syfrah/layers/core/api/error-response).
+
+This means the same handler code runs whether the operation was triggered by the CLI or the API — no duplication, no divergence.
+
+## Error propagation
+
+Handlers return `Result<OperationResponse, SyfrahError>`. Dispatch translates `SyfrahError` to:
+- A formatted terminal error (with suggestion text) for CLI
+- A structured JSON error response for API
+
+The handler never needs to know which transport it's running on.

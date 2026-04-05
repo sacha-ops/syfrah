@@ -1,0 +1,135 @@
+---
+title: Operations
+description: The standard CRUD operations and custom actions that a resource can support, and how each is configured.
+---
+
+An operation is something you can do to a resource. The framework provides standard CRUD operations that cover most cases, plus a mechanism for custom actions when you need something that doesn't fit the CRUD mold.
+
+## Standard operations
+
+These are the five CRUD operations built into the framework. Each generates a predictable CLI subcommand and API route.
+
+### list
+
+Fetches all resources of this type (with optional filtering). Renders as a table.
+
+```rust
+Operation::list()
+    .with_arg(OperationArg::optional(FieldDef::string("status", "Filter by status")))
+```
+
+CLI: `syfrah vpc list [--status active]`  
+API: `GET /vpcs`
+
+### get
+
+Fetches a single resource by ID or name. Renders as a detail view.
+
+```rust
+Operation::get()
+```
+
+CLI: `syfrah vpc get <id>`  
+API: `GET /vpcs/{id}`
+
+### create
+
+Creates a new resource. Takes field args that define the initial state.
+
+```rust
+Operation::create()
+    .with_arg(OperationArg::required(FieldDef::string("name", "VPC name")))
+    .with_arg(OperationArg::optional(FieldDef::string("cidr", "CIDR block")))
+```
+
+CLI: `syfrah vpc create --name prod [--cidr 10.0.0.0/16]`  
+API: `POST /vpcs`
+
+### update
+
+Modifies an existing resource. All args are typically optional — only the provided fields are changed.
+
+```rust
+Operation::update()
+    .with_arg(OperationArg::optional(FieldDef::string("name", "New name")))
+```
+
+CLI: `syfrah vpc update <id> [--name new-name]`  
+API: `PATCH /vpcs/{id}`
+
+### delete
+
+Removes a resource. Supports confirmation prompts for safety.
+
+```rust
+Operation::delete()
+    .with_confirm()
+```
+
+CLI: `syfrah vpc delete <id>` (prompts "Are you sure?")  
+API: `DELETE /vpcs/{id}`
+
+## Custom actions
+
+Not everything fits into CRUD. Custom actions let you define operations with arbitrary names and behaviors.
+
+```rust
+Operation::action("drain", "Gracefully drain all workloads before removal")
+    .with_arg(OperationArg::optional(FieldDef::integer("timeout", "Drain timeout in seconds").default("300")))
+    .with_confirm()
+
+Operation::action("join", "Join this hypervisor to a mesh")
+    .with_arg(OperationArg::required(FieldDef::string("target", "Target hypervisor IP or hostname")))
+    .with_arg(OperationArg::required(FieldDef::string("pin", "One-time join PIN")))
+```
+
+Common custom actions in Syfrah:
+
+| Action | Resource | What it does |
+|--------|----------|-------------|
+| `init` | hypervisor | Initialize a new mesh on this node |
+| `join` | hypervisor | Join an existing mesh |
+| `start` | vm | Start a stopped VM |
+| `stop` | vm | Gracefully shut down a VM |
+| `drain` | hypervisor | Drain workloads before maintenance |
+| `leave` | hypervisor | Leave the mesh |
+
+Custom actions generate CLI subcommands (`syfrah hypervisor drain <id>`) and API routes (`POST /hypervisors/{id}/drain`).
+
+## Operation output kinds
+
+Every operation declares what kind of output it produces. The framework uses this to choose the right renderer.
+
+| Output kind | When to use | How it renders |
+|------------|-------------|----------------|
+| `OutputKind::Resource` | Single item (get, create, update) | Detail view |
+| `OutputKind::ResourceList` | Multiple items (list) | Table |
+| `OutputKind::Message` | Confirmation text, no data | Plain message |
+| `OutputKind::Empty` | Operation with no output | Nothing printed |
+
+## Confirmation
+
+Operations that are destructive or irreversible should use `.with_confirm()`. This causes the CLI to print a summary of what will happen and ask "Are you sure? [y/N]" before proceeding.
+
+```rust
+Operation::delete().with_confirm()
+Operation::action("drain", "Drain workloads").with_confirm()
+```
+
+Users can bypass confirmation with `--yes`:
+
+```
+syfrah hypervisor drain hv-01HW... --yes
+```
+
+The `--yes` flag is injected automatically for any operation that has `.with_confirm()` — you don't need to declare it.
+
+## Examples in help text
+
+Operations can include usage examples that appear in `--help` output:
+
+```rust
+Operation::create()
+    .example("syfrah vpc create --name production")
+    .example("syfrah vpc create --name staging --cidr 10.1.0.0/16")
+```

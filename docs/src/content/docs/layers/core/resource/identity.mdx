@@ -1,0 +1,70 @@
+---
+title: Resource Identity
+description: How resources are named, aliased, and pluralized — and how those names become CLI commands and API paths.
+---
+
+Every resource has an identity: a canonical name, optional aliases, and a plural form. These three things determine how the resource appears in the CLI and in the REST API.
+
+## Name
+
+The canonical name is how the resource is referred to everywhere. It becomes the top-level CLI subcommand and the singular form used in log messages and error text.
+
+```rust
+ResourceDef::build("hypervisor", "A bare-metal server in the mesh")
+```
+
+This produces the `syfrah hypervisor` command family.
+
+Names must be lowercase, use only letters and hyphens, and be unique across all registered resources. A resource named `load-balancer` becomes `syfrah load-balancer ...` in the CLI.
+
+## Aliases
+
+Aliases let users type shorter versions of a command. A resource can have multiple aliases.
+
+```rust
+ResourceDef::build("hypervisor", "A bare-metal server in the mesh")
+    .alias("hv")
+```
+
+With this alias, both `syfrah hypervisor list` and `syfrah hv list` work identically. Aliases also apply to API route matching, so `/hv` and `/hypervisors` both resolve to the same handler.
+
+Aliases are useful for resources with long names that operators will type frequently. Common patterns:
+
+| Resource | Alias |
+|----------|-------|
+| `hypervisor` | `hv` |
+| `virtual-machine` | `vm` |
+| `load-balancer` | `lb` |
+| `firewall` | `fw` |
+
+## Plural form
+
+The plural form is used for API route paths and in table headers. By default, Syfrah appends `s` to the name. For resources where that produces the wrong result, set it explicitly.
+
+```rust
+ResourceDef::build("gateway", "Network gateway")
+    .plural("gateways")  // default: "gateways" — fine here
+
+ResourceDef::build("policy", "IAM policy")
+    .plural("policies")  // default would be "policys" — wrong
+```
+
+The plural is used in:
+
+- REST API base path: `/gateways`, `/policies`
+- Table header context lines: "Showing 4 gateways"
+- Empty state messages: "No policies found"
+
+## How identity maps to routes
+
+Given a resource with name `vpc`, alias `v`, plural `vpcs`:
+
+| CLI | API |
+|-----|-----|
+| `syfrah vpc list` | `GET /vpcs` |
+| `syfrah v list` | `GET /vpcs` (alias resolves to same handler) |
+| `syfrah vpc get <id>` | `GET /vpcs/{id}` |
+| `syfrah vpc create` | `POST /vpcs` |
+| `syfrah vpc delete <id>` | `DELETE /vpcs/{id}` |
+
+The plural form controls the API path. The name and aliases control the CLI. They are independent — changing the plural doesn't change the CLI command name.

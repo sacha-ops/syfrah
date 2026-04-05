@@ -1,0 +1,113 @@
+---
+title: Structured Logging
+description: Tracing-based structured logging with text and JSON output, file rotation, panic hooks, and global context fields.
+---
+
+Syfrah uses the [tracing](https://docs.rs/tracing) ecosystem for structured logging. Every log line carries context — not just a timestamp and a message, but the node ID, region, zone, and any span context from the current operation.
+
+## Output formats
+
+Two formats are available, set via the `logging.format` config key or `SYFRAH_LOGGING_FORMAT`:
+
+**Text format** (default) — readable by humans:
+
+```
+2026-03-15T14:22:01Z  INFO syfrah::networking  peer connected  node=node-01HWK...  mesh=mesh-01HWK...  latency_ms=12
+2026-03-15T14:22:03Z  WARN syfrah::storage     cache miss rate high  rate=0.87  threshold=0.80
+```
+
+**JSON format** — structured, suitable for log aggregators (Loki, Datadog, etc.):
+
+```json
+{"timestamp":"2026-03-15T14:22:01Z","level":"INFO","target":"syfrah::networking","message":"peer connected","node":"node-01HWK...","mesh":"mesh-01HWK...","latency_ms":12}
+```
+
+Use JSON format when running in production with a log aggregation pipeline. Use text format when developing or reading logs interactively.
+
+## Log levels
+
+| Level | When to use |
+|-------|-------------|
+| `error` | Operation failures that require attention |
+| `warn` | Degraded state, approaching limits, recoverable issues |
+| `info` | Normal operational events (connections, state changes) |
+| `debug` | Detailed per-operation tracing, useful for troubleshooting |
+| `trace` | Very high volume per-packet or per-frame data |
+
+Set the level via config, env var, or CLI flag:
+
+```sh
+SYFRAH_DAEMON_LOG_LEVEL=debug syfrah run
+syfrah run --log-level debug
+```
+
+## Global context fields
+
+When Syfrah initializes, it registers global fields that appear on every log line:
+
+| Field | Example | Description |
+|-------|---------|-------------|
+| `node` | `node-01HWK...` | This node's ID |
+| `region` | `htz-fsn1` | Node's region |
+| `zone` | `htz-fsn1-a` | Node's zone |
+
+These fields are set once at startup and cannot be changed. They make it easy to filter logs from a specific node in a multi-node log stream.
+
+## File logging and rotation
+
+To write logs to a file in addition to stderr:
+
+```toml
+[logging]
+file = "~/.syfrah/logs/syfrah.log"
+rotation = "daily"
+```
+
+Rotation options:
+
+- `hourly` — new file every hour, named `syfrah.log.2026-03-15-14`
+- `daily` — new file every day, named `syfrah.log.2026-03-15`
+- `never` — single file, no rotation (suitable for external log rotation via logrotate)
+
+Old log files are not automatically deleted. If disk space is a concern, configure logrotate or a similar tool to clean up old files.
+
+## Panic hook
+
+Panics in Syfrah are routed through the tracing system rather than printing directly to stderr:
+
+```
+2026-03-15T14:22:01Z  ERROR syfrah  PANIC  message="called unwrap() on None"  file="src/storage/db.rs"  line=142  backtrace=...
+```
+
+This means panics appear in the log file and JSON output just like other errors, making them visible to log aggregators and alerting systems. Without this hook, a panic would write to stderr and be invisible to anything monitoring structured log output.
+
+## Dependency noise suppression
+
+Third-party dependencies — particularly `hyper`, `tokio`, `redb`, and `rustls` — produce high-volume debug and trace logs that are rarely useful to Syfrah operators. These are suppressed to `warn` level by default, regardless of the configured log level.
+
+If you need to debug an issue at the dependency level, you can re-enable full logging for specific crates:
+
+```sh
+RUST_LOG=syfrah=debug,hyper=trace syfrah run
+```
+
+## Warn and error counters
+
+The logging system maintains in-process counters for warn and error events:
+
+```sh
+syfrah metrics show | grep log_events
+```
+
+```
+log_events_warn_total    47
+log_events_error_total   3
+```
+
+These counters are exposed as metrics and can be used to alert on unusual error rates without parsing log files.
+
+## Guard pattern
+
+The logging system returns a `LoggingGuard` on initialization. This guard must be held for the lifetime of the process — dropping it flushes buffered log lines and closes the log file cleanly.
+
+This prevents log loss on shutdown. A common bug in async applications is dropping the logger before background tasks have finished writing their final log lines. The guard pattern makes this explicit: hold the guard, get clean logs.

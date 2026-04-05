@@ -1,0 +1,104 @@
+---
+title: Version Management
+description: Semver with release channels, compatibility checking, and rollback support.
+---
+
+Syfrah uses semantic versioning with release channel suffixes. The version system supports checking compatibility between components, comparing versions across channels, and managing backup/rollback for safe upgrades.
+
+## Version format
+
+```
+v{major}.{minor}.{patch}-{channel}.{build}
+```
+
+Examples:
+
+```
+v2.1.0-stable
+v2.1.0-rc.3
+v2.1.0-beta.14
+v2.1.0-dev.47
+```
+
+The channel suffix is always present. There is no "bare" version like `v2.1.0` — the channel is explicit so there is never ambiguity about what kind of build you are running.
+
+## Release channels
+
+| Channel | Meaning |
+|---------|---------|
+| `dev` | Development builds from main branch. Not suitable for production. May have incomplete features or known bugs. |
+| `beta` | Feature-complete builds undergoing testing. Suitable for staging and early-adopter production use. |
+| `rc` | Release candidate. Code is frozen; only bug fixes are applied. Suitable for final pre-production validation. |
+| `stable` | Production release. Fully tested, supported, and eligible for security patches. |
+
+Channel ordering for comparison purposes: `dev < beta < rc < stable`.
+
+## Compatibility checking
+
+Before a component connects to another, it checks version compatibility. The rules:
+
+- **Major version must match.** A `v2.x` client cannot communicate with a `v3.x` server. Breaking API changes only happen on major version bumps.
+- **Minor version of the server must be >= client.** A `v2.1` client can connect to a `v2.2` server (server has new features the client doesn't use). A `v2.3` client cannot connect to a `v2.1` server (client expects features the server doesn't have).
+- **Patch version is always compatible within the same major.minor.** Bug fix releases do not change the API.
+- **Channel does not affect compatibility.** A `beta` build can connect to a `stable` build of the same version, which is intentional for staging-to-production testing.
+
+## Version diffing
+
+The version diff tells you what kind of upgrade you are doing:
+
+```
+diff(from: Version, to: Version) -> VersionDiff
+```
+
+| Diff kind | Example | Notes |
+|-----------|---------|-------|
+| `Major` | v1.x → v2.x | Breaking changes. Manual migration may be required. |
+| `Minor` | v2.1 → v2.3 | New features. Backward compatible. |
+| `Patch` | v2.1.0 → v2.1.4 | Bug fixes only. Safe to apply without downtime planning. |
+| `ChannelPromotion` | v2.1.0-beta.3 → v2.1.0-stable | Same code, different channel label. |
+| `Downgrade` | v2.2 → v2.1 | Rolling back to a previous version. |
+
+## Backup and rollback
+
+Before applying any upgrade, Syfrah automatically creates a backup snapshot of the local state database. The backup is tagged with the current version:
+
+```
+~/.syfrah/data/backups/v2.1.0-stable-before-v2.2.0-stable.db
+```
+
+If the upgrade fails or the new version does not pass health checks, the operator can roll back:
+
+```sh
+syfrah upgrade rollback
+```
+
+This restores the state backup and re-installs the previous binary. The rollback is only available one version back — it is not a full version history system.
+
+## Checking the current version
+
+```sh
+syfrah version
+```
+
+Output:
+
+```
+syfrah v2.1.0-stable
+  build:    2026-03-12T14:22:00Z
+  commit:   a4f3e2d
+  platform: linux/amd64
+```
+
+```sh
+syfrah version --check
+```
+
+Queries the update channel for newer versions and reports whether an upgrade is available:
+
+```
+current:   v2.1.0-stable
+available: v2.2.0-stable
+channel:   stable
+
+Run 'syfrah upgrade' to install v2.2.0-stable.
+```

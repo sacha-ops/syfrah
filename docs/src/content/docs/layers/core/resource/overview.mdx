@@ -1,0 +1,73 @@
+---
+title: Resource Framework
+description: A single ResourceDef declaration generates CLI commands, REST API routes, validation, and interactive prompts — all from one definition.
+---
+
+The resource framework is the heart of Syfrah's CLI and API. Instead of writing separate clap argument parsers, axum route handlers, validation logic, and display code for every resource, you write one `ResourceDef` and get all of that for free.
+
+## The problem it solves
+
+Building a CLI tool and a REST API for the same resources is tedious. The same concepts — "list hypervisors", "create a VPC", "delete a volume" — have to be expressed three times: once in the CLI argument parser, once in the HTTP router, and once in the display layer. When things change, they have to change in all three places.
+
+The resource framework eliminates that duplication. A `ResourceDef` is the single source of truth for what a resource is, what operations it supports, what its fields look like, and how it should be displayed.
+
+## What a ResourceDef contains
+
+| Section | Purpose |
+|---------|---------|
+| [Identity](/syfrah/layers/core/resource/identity) | Name, aliases, plural form — used for CLI commands and API paths |
+| [Scope](/syfrah/layers/core/resource/scope) | Where the resource lives in the hierarchy (org, project, VPC) |
+| [Schema](/syfrah/layers/core/resource/schema) | Field definitions with types, defaults, and validation |
+| [Operations](/syfrah/layers/core/resource/operation) | Which CRUD and custom actions are supported |
+| [Constraints](/syfrah/layers/core/resource/constraint) | Cross-field rules like "A requires B" or "A conflicts with C" |
+| [Presentation](/syfrah/layers/core/resource/presentation) | Which columns appear in table output and detail view |
+
+## One definition, many outputs
+
+From a single `ResourceDef`, the framework generates:
+
+- **CLI subcommands** — `syfrah vpc list`, `syfrah vpc create --name prod`, etc. via [CLI generation](/syfrah/layers/core/resource/cli-gen)
+- **REST API routes** — `GET /vpcs`, `POST /vpcs`, `GET /vpcs/{id}`, etc. via [route generation](/syfrah/layers/core/api/route-gen)
+- **Interactive prompts** — when a required field is missing and stdin is a TTY, the user is prompted rather than getting an error
+- **Confirmation dialogs** — destructive operations ask "Are you sure?" before proceeding
+- **Table and detail output** — `list` results render as aligned tables; `get` results render as key-value detail views
+
+## A minimal example
+
+```rust
+let vpc = ResourceDef::build("vpc", "Virtual Private Cloud")
+    .plural("vpcs")
+    .op(Operation::list())
+    .op(Operation::create().with_arg(
+        OperationArg::required(FieldDef::string("name", "VPC name"))
+    ))
+    .op(Operation::get())
+    .op(Operation::delete().with_confirm())
+    .column(ColumnDef::new("name", "Name"))
+    .column(ColumnDef::new("status", "Status").colored())
+    .done();
+```
+
+That definition generates:
+
+```
+syfrah vpc list
+syfrah vpc create --name <name>
+syfrah vpc get <id>
+syfrah vpc delete <id>
+```
+
+And the API equivalents:
+
+```
+GET    /vpcs
+POST   /vpcs
+GET    /vpcs/{id}
+DELETE /vpcs/{id}
+```
+
+## Registration
+
+Resources are registered at startup. Each layer calls `registry.register(resource_def, handler)` to add its resources. The CLI and API server both draw from this registry — there's no separate wiring needed.
+
+See the [registry docs](/syfrah/layers/core/resource/registry) for how registration works, and the [builder docs](/syfrah/layers/core/resource/builder) for the full fluent API.

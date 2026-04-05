@@ -1,0 +1,116 @@
+---
+title: Resource Registry
+description: How ResourceDefs and their handlers are registered at startup, and how the CLI and API server discover them.
+---
+
+The resource registry is the central catalog of everything Syfrah knows how to do. At startup, each layer registers its resources. The CLI and API server then draw from this registry to build their command trees and route tables — with no layer-specific wiring needed in the binary.
+
+## What the registry stores
+
+For each registered resource, the registry stores:
+
+- The `ResourceDef` — identity, scope, schema, operations, presentation
+- The `HandlerFn` — the async function that executes operations for this resource
+
+```rust
+pub type HandlerFn = Arc<
+    dyn Fn(OperationRequest) -> BoxFuture<'static, Result<OperationResponse, SyfrahError>>
+        + Send
+        + Sync
+>;
+```
+
+## Registering a resource
+
+Each layer registers its resources during initialization:
+
+```rust
+registry.register(
+    vpc_resource_def,
+    Arc::new(|req| Box::pin(vpc_handler(req)))
+);
+```
+
+The `registry.register()` call stores both the definition and the handler, keyed by the resource name. Duplicate registrations (same name, different definition) panic at startup — this is a programming error.
+
+## HandlerFn
+
+A handler function receives an `OperationRequest` and returns `Result<OperationResponse, SyfrahError>`. It is responsible for:
+
+- Reading the operation kind from `req.operation`
+- Extracting field values from `req.fields`
+- Performing the actual work (database reads/writes, API calls, etc.)
+- Returning the appropriate `OperationResponse` variant
+
+```rust
+async fn vpc_handler(req: OperationRequest) -> Result<OperationResponse, SyfrahError> {
+    match req.operation {
+        OperationKind::List => {
+            let vpcs = state.list_vpcs(req.scope.org_id()?).await?;
+            Ok(OperationResponse::ResourceList(vpcs.into_iter().map(|v| v.to_json()).collect()))
+        }
+        OperationKind::Create => {
+            let name = req.fields.require_string("name")?;
+            let vpc = state.create_vpc(req.scope.org_id()?, name).await?;
+            Ok(OperationResponse::Resource(vpc.to_json()))
+        }
+        OperationKind::Delete => {
+            let id = req.id.ok_or(SyfrahError::missing_id("vpc"))?;
+            state.delete_vpc(id).await?;
+            Ok(OperationResponse::Message(format!("Deleted VPC {id}")))
+        }
+        _ => Err(SyfrahError::unsupported_operation(req.operation, "vpc")),
+    }
+}
+```
+
+## OperationRequest and OperationResponse
+
+These are the only types that cross the boundary between the framework and your handler code.
+
+**OperationRequest:**
+
+```rust
+pub struct OperationRequest {
+    pub operation: OperationKind,
+    pub resource: String,
+    pub fields: FieldMap,
+    pub scope: ScopeContext,
+    pub id: Option<ResourceId>,
+}
+```
+
+**OperationResponse:**
+
+```rust
+pub enum OperationResponse {
+    Resource(serde_json::Value),       // single item
+    ResourceList(Vec<serde_json::Value>), // multiple items
+    Message(String),                   // status text
+    Empty,                             // no output
+}
+```
+
+## Startup sequence
+
+The typical startup sequence for a Syfrah binary:
+
+1. Create a `Registry::new()`
+2. Initialize each layer (which calls `registry.register(...)` for its resources)
+3. Pass the registry to `generate_cli(®istry)` to build the command tree
+4. Pass the registry to `build_router(®istry)` to build the axum router
+5. Start the server and/or run the CLI command
+
+The binary itself has no knowledge of what resources exist. Layers are self-registering.
+
+## Listing registered resources
+
+The registry exposes an iterator for introspection:
+
+```rust
+for (name, def) in registry.resources() {
+    println!("{}: {} operations", name, def.operations().len());
+}
+```
+
+This is used by the CLI to build help text and by the API server to generate the OpenAPI spec.

@@ -1,0 +1,90 @@
+---
+title: Cryptographic Primitives
+description: WireGuard keypairs, mesh secrets, HKDF key derivation, and secure random utilities.
+---
+
+The Core crypto module provides the cryptographic building blocks used throughout Syfrah. It does not implement any crypto algorithms itself — it composes well-audited libraries into a small, focused API.
+
+## WireGuard keypairs
+
+WireGuard uses Curve25519 for key exchange. Every hypervisor node and every mesh peer has a WireGuard keypair.
+
+```
+generate_wg_keypair() -> (WgPrivateKey, WgPublicKey)
+```
+
+The private key is a 32-byte scalar. The public key is the corresponding Curve25519 point. Keys are encoded as Base64 for storage and display, which is the format WireGuard itself expects.
+
+You will rarely call this directly. The `syfrah init` command generates keypairs during node enrollment and stores them in the local config. The public key is registered with the control plane; the private key never leaves the node.
+
+## Mesh secrets
+
+A `MeshSecret` is a 32-byte shared secret used to bootstrap trust between nodes that want to join the same mesh.
+
+```
+MeshSecret::generate() -> MeshSecret
+MeshSecret::display() -> "syf_sk_<base58-encoded-bytes>"
+MeshSecret::from_str("syf_sk_...") -> Result<MeshSecret>
+```
+
+The `syf_sk_` prefix makes mesh secrets visually distinct from other secrets and allows automated scanning tools to detect accidental exposure (in logs, environment variables, etc.).
+
+Mesh secrets are used as the input keying material for HKDF derivation. They are not used directly for encryption.
+
+## Key derivation with HKDF
+
+Once two nodes share a mesh secret, they derive per-purpose keys using HKDF-SHA256. HKDF takes a master secret (the mesh secret), an optional salt, and an "info" string that binds the derived key to its intended use.
+
+```
+hkdf_derive(
+    secret: &MeshSecret,
+    info: &str,
+    output: &mut [u8],
+)
+```
+
+For example, the peering PIN used during mesh join is derived as:
+
+```
+hkdf_derive(&mesh_secret, "syfrah-peering-pin-v1", &mut pin_bytes)
+```
+
+If the peering info string changes — say, for a v2 peering protocol — a different key is derived automatically, even from the same secret. This prevents key reuse across protocol versions.
+
+## PIN derivation for peering
+
+When a node wants to join a mesh, it needs to prove it knows the mesh secret without transmitting the secret itself. It does this by presenting a short PIN derived from the secret.
+
+```
+derive_peering_pin(secret: &MeshSecret) -> PeeringPin
+```
+
+The PIN is a 6-digit decimal number derived via HKDF. It changes based on a time window (similar to TOTP), so a captured PIN cannot be replayed indefinitely. The joining node and the accepting node both derive the same PIN independently and compare them.
+
+## SHA-256 hashing
+
+```
+sha256(data: &[u8]) -> [u8; 32]
+sha256_hex(data: &[u8]) -> String
+```
+
+Used by the [addressing](/syfrah/layers/core/addressing) module to derive IPv6 node addresses from WireGuard public keys, and for content-addressable storage in the snapshot subsystem.
+
+## Secure random bytes
+
+```
+random_bytes(len: usize) -> Vec<u8>
+random_u64() -> u64
+```
+
+These use the operating system's cryptographically secure random source (`getrandom` on Linux). Never use these for secrets that need to be reproducible — use HKDF derivation instead.
+
+## What this module does not do
+
+The crypto module does not handle:
+
+- TLS or mTLS — that is handled at the transport layer using rustls
+- Token signing or verification — handled by the auth module with Ed25519
+- Disk encryption — handled by the storage layer with AES-256-GCM
+
+The boundary is intentional. Mixing responsibilities in a crypto module is a common source of subtle bugs. Each layer owns its own crypto needs and calls into Core only for the shared primitives.

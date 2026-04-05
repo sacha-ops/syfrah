@@ -1,0 +1,101 @@
+---
+title: Hypervisor Layer
+description: Every server running Syfrah is a hypervisor. This layer manages the WireGuard mesh, peer lifecycle, and the commands that control it all.
+---
+
+In Syfrah, every server is a hypervisor. There is no separate "controller" host — each node in your cluster is both a participant and a peer. The hypervisor layer is what turns a plain Linux server into a Syfrah node: it joins the WireGuard mesh, tracks peers, manages the tunnel service, and exposes a CLI for day-to-day operations.
+
+## What the hypervisor does
+
+When you initialize a server with Syfrah, the hypervisor layer:
+
+1. Generates a WireGuard keypair and a mesh identity for the node
+2. Creates the WireGuard interface (`syfrah0`) and a systemd service to manage it
+3. Persists the node's identity and peer list to the [state layer](/syfrah/layers/state/overview)
+4. Listens for incoming join requests so other nodes can peer with it
+
+After initialization, the node is a full member of the mesh. Every other node that joins will establish a direct encrypted tunnel to it.
+
+## Aliases
+
+The hypervisor is exposed as both `hv` and `node` in the CLI. They are identical — use whichever feels natural.
+
+```sh
+syfrah hv status
+syfrah node status
+```
+
+## Commands
+
+### init
+
+Create a new mesh and initialize this server as the first hypervisor.
+
+```sh
+syfrah hv init --name web-01 --region us-east --zone us-east-1a
+```
+
+This generates the mesh secret (a `syf_sk_...` token), creates the WireGuard service, and starts it. Save the mesh secret — other nodes need it to join.
+
+### join
+
+Add this server to an existing mesh by connecting to a peer that is already a member.
+
+```sh
+syfrah hv join --target 203.0.113.10 --name web-02 --region us-east --zone us-east-1a
+```
+
+The join command connects to the target's peering port, authenticates with the mesh PIN, receives the mesh secret and existing peer list, then brings up the WireGuard service with all known peers configured.
+
+### status
+
+Show the current state of this node: mesh identity, WireGuard service health, and connected peer count.
+
+```sh
+syfrah hv status
+```
+
+### start / stop
+
+Start or stop the WireGuard service on this node. Both commands are idempotent — running start on an already-running node is safe.
+
+```sh
+syfrah hv start
+syfrah hv stop
+```
+
+### leave
+
+Gracefully remove this node from the mesh. Stops and uninstalls the WireGuard service, removes the interface, and deletes local state.
+
+```sh
+syfrah hv leave
+```
+
+### peering
+
+Manage inbound join requests. By default, a running hypervisor listens for peers automatically. Use this command to inspect or control that listener.
+
+```sh
+syfrah hv peering
+```
+
+### list / get
+
+List all known peers or inspect a specific one.
+
+```sh
+syfrah hv list
+syfrah hv get web-01
+```
+
+## Sub-modules
+
+The hypervisor layer is built on the [fabric](/syfrah/layers/hypervisor/fabric/mesh) sub-module, which handles the lower-level details:
+
+- [mesh](/syfrah/layers/hypervisor/fabric/mesh) — mesh and node identity
+- [peer](/syfrah/layers/hypervisor/fabric/peer) — peer tracking and status
+- [ops](/syfrah/layers/hypervisor/fabric/ops) — high-level orchestration (init, join, leave, etc.)
+- [wg](/syfrah/layers/hypervisor/fabric/wg) — WireGuard interface management
+- [service](/syfrah/layers/hypervisor/fabric/service) — systemd service lifecycle
+- [peering](/syfrah/layers/hypervisor/fabric/peering) — join protocol types

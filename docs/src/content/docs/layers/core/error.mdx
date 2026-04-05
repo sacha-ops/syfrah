@@ -1,0 +1,105 @@
+---
+title: Error Model
+description: Every Syfrah error has a code, a message, a suggestion, and optional context. No silent failures, no opaque codes.
+---
+
+Syfrah uses a unified error model across every layer. Whether an error originates in the CLI, the daemon, the networking stack, or the storage engine, it always has the same shape.
+
+## Anatomy of a SyfrahError
+
+```
+SyfrahError {
+    code:       ErrorCode,     // machine-readable classification
+    message:    String,        // what went wrong
+    suggestion: String,        // what to do about it
+    context:    Option<Value>, // structured diagnostic data (optional)
+}
+```
+
+Every error has:
+
+- A **code** — a stable, machine-parseable identifier for the error class
+- A **message** — a human-readable description of what went wrong
+- A **suggestion** — a concrete hint about what to do next
+- Optional **context** — structured JSON with diagnostic detail (resource IDs, field names, actual vs. expected values)
+
+The suggestion is not optional. Every error must tell the operator what to try. Silent failures and opaque error codes are not acceptable in a system managing production infrastructure.
+
+## Error codes
+
+| Code | HTTP | Meaning |
+|------|------|---------|
+| `NotFound` | 404 | The requested resource does not exist |
+| `AlreadyExists` | 409 | A resource with that name or ID already exists |
+| `InvalidInput` | 400 | A field or parameter failed validation |
+| `Unauthorized` | 401 | Authentication is required or failed |
+| `Forbidden` | 403 | Authenticated but not permitted |
+| `Conflict` | 409 | The operation conflicts with current state |
+| `ResourceExhausted` | 429 | A limit (quota, rate, capacity) was exceeded |
+| `Unavailable` | 503 | The service or dependency is temporarily unavailable |
+| `Timeout` | 504 | The operation did not complete in time |
+| `Internal` | 500 | An unexpected internal error |
+| `NotReady` | 503 | The resource exists but is not yet in a usable state |
+| `InvalidState` | 409 | The operation is not valid for the resource's current state |
+| `DependencyFailed` | 502 | A required upstream call failed |
+| `Unimplemented` | 501 | This operation is not yet implemented |
+| `Cancelled` | 499 | The operation was cancelled by the caller |
+
+## Retryable vs. terminal errors
+
+Errors are classified as retryable or terminal:
+
+- **Retryable**: `Unavailable`, `Timeout`, `ResourceExhausted` — the same request may succeed if retried after a delay
+- **Terminal**: `NotFound`, `InvalidInput`, `Forbidden`, `AlreadyExists` — retrying will not change the outcome
+
+This classification drives automatic retry logic in clients and the Forge reconciliation loop.
+
+## Client vs. server errors
+
+Errors are also classified by fault:
+
+- **Client errors** (4xx): `NotFound`, `AlreadyExists`, `InvalidInput`, `Unauthorized`, `Forbidden`, `InvalidState` — the caller needs to change the request
+- **Server errors** (5xx): `Internal`, `Unavailable`, `Timeout`, `DependencyFailed` — the system failed, the caller may retry
+
+## What a real error looks like
+
+When a VPC creation fails because the name is already taken:
+
+```json
+{
+  "code": "AlreadyExists",
+  "message": "a VPC named 'production' already exists in org org-01HWKZ3P8B0E7D2N5FVYMR4CXJ",
+  "suggestion": "choose a different name, or delete the existing VPC first with 'syfrah vpc delete production'",
+  "context": {
+    "existing_id": "vpc-01HWKZ4A9C1F8E3M6GXZNQ5BYK",
+    "org_id": "org-01HWKZ3P8B0E7D2N5FVYMR4CXJ",
+    "name": "production"
+  }
+}
+```
+
+When a port number is out of range:
+
+```json
+{
+  "code": "InvalidInput",
+  "message": "port 99999 is out of range",
+  "suggestion": "port must be between 1 and 65535",
+  "context": {
+    "field": "port",
+    "value": 99999,
+    "min": 1,
+    "max": 65535
+  }
+}
+```
+
+## Automatic conversions
+
+Standard library errors convert automatically to `SyfrahError`:
+
+- `std::io::Error` → `Internal` or `NotFound` depending on the IO error kind
+- `serde_json::Error` → `InvalidInput` with the field path from serde
+- `std::num::ParseIntError` → `InvalidInput`
+
+This means layers that work with files, sockets, or JSON serialization get consistent Syfrah errors without manual wrapping at every call site.

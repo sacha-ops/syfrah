@@ -1,0 +1,56 @@
+---
+title: Fabric State
+description: How the hypervisor persists its mesh membership — the FabricState snapshot that ties together identity, secret, and peers.
+---
+
+`FabricState` is the complete, persisted snapshot of a node's mesh membership. It is the single source of truth for what mesh this node belongs to, who this node is, what peers it knows about, and what shared secret authenticates new joiners.
+
+## What FabricState contains
+
+| Field                 | Description                                                     |
+|-----------------------|-----------------------------------------------------------------|
+| `mesh`                | The `MeshIdentity` — mesh UUID and `/48` prefix                 |
+| `hypervisor`          | This node's `HypervisorIdentity` — keys, endpoint, mesh address |
+| `secret`              | The shared mesh secret used to authenticate joins               |
+| `peers`               | The `PeerList` — all known peers and their current status       |
+
+All four fields must be present for a node to be considered initialized. If any are missing, the node is in a partial state and most commands will refuse to run.
+
+## Storage location
+
+`FabricState` is saved to `~/.syfrah/fabric.redb` under the key `"fabric"/"state"`. This uses the [state layer](/syfrah/layers/state/overview) for storage, so it benefits from atomic writes and crash safety.
+
+The key structure is intentionally simple — there is only one fabric state per node. If you need to inspect the raw value, the state layer's snapshot tooling can dump it.
+
+## CRUD operations
+
+The fabric state module exposes four operations:
+
+### save
+
+Write the current `FabricState` to the database. Called at the end of `init` and `join` once everything is confirmed to be working. If saving fails, the caller rolls back (stops the WireGuard service, removes the interface).
+
+### load
+
+Read `FabricState` from the database. Called at the start of most commands (`status`, `start`, `stop`, `leave`, etc.) to restore the node's context.
+
+### exists
+
+Check whether a `FabricState` record exists without loading it. Used to detect whether the node has been initialized:
+
+```sh
+syfrah hv status
+# If state does not exist, returns: "This node has not been initialized. Run: syfrah hv init"
+```
+
+### delete
+
+Remove the `FabricState` record entirely. Called by `leave` after the WireGuard service has been stopped and the interface removed. Once deleted, the node is as if it was never part of the mesh.
+
+## Consistency guarantees
+
+Because `FabricState` is written atomically through the state layer, there is no risk of partial writes. A save either fully commits or leaves the previous value intact. This means a crash during `init` or `join` will leave the database either empty (node not initialized) or with valid prior state — never with a corrupted half-written record.
+
+## Keeping state in sync with WireGuard
+
+`FabricState` is the definitive record. The actual WireGuard interface (`syfrah0`) is derived from it at service start time. If you manually edit the WireGuard config or use `wg` directly, the changes will be overwritten the next time the service is restarted from Syfrah state. Always use the `syfrah hv` commands to make changes.

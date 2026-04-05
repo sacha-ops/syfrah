@@ -1,0 +1,109 @@
+---
+title: Fluent Builder API
+description: How to construct a ResourceDef using the fluent builder — chaining identity, scope, operations, constraints, and presentation in one expression.
+---
+
+`ResourceDef` is constructed using a fluent builder. You start with `ResourceDef::build(name, description)` and chain methods to add everything the resource needs, finishing with `.done()` to produce the complete definition.
+
+## Basic structure
+
+```rust
+let resource = ResourceDef::build("vpc", "Virtual Private Cloud")
+    // Identity
+    .alias("v")
+    .plural("vpcs")
+
+    // Scope
+    .scope(Scope::org())
+
+    // Operations
+    .op(Operation::list())
+    .op(Operation::create()
+        .with_arg(OperationArg::required(FieldDef::string("name", "VPC name")))
+        .with_arg(OperationArg::optional(FieldDef::string("description", "Description")))
+        .example("syfrah vpc create --name production"))
+    .op(Operation::get())
+    .op(Operation::update()
+        .with_arg(OperationArg::optional(FieldDef::string("name", "New name"))))
+    .op(Operation::delete().with_confirm())
+
+    // Presentation
+    .column(ColumnDef::new("name", "Name"))
+    .column(ColumnDef::new("status", "Status").colored())
+    .column(ColumnDef::new("id", "ID"))
+    .detail(DetailField::new("id", "ID"))
+    .detail(DetailField::new("name", "Name"))
+    .detail(DetailField::new("status", "Status").colored())
+    .detail(DetailField::new("created_at", "Created").format(DisplayFormat::RelativeTime))
+
+    .done();
+```
+
+## Builder method reference
+
+### Identity methods
+
+| Method | Effect |
+|--------|--------|
+| `.alias("hv")` | Add a CLI/API alias |
+| `.plural("vpcs")` | Set the plural form (default: name + "s") |
+
+### Scope methods
+
+| Method | Effect |
+|--------|--------|
+| `.scope(Scope::global())` | No parent context required |
+| `.scope(Scope::org())` | Requires `--org` |
+| `.scope(Scope::project())` | Requires `--org`, `--project` |
+| `.scope(Scope::vpc())` | Requires `--org`, `--project`, `--vpc` |
+
+### Operation methods
+
+| Method | Effect |
+|--------|--------|
+| `.op(Operation::list())` | Add a list operation |
+| `.op(Operation::get())` | Add a get operation |
+| `.op(Operation::create())` | Add a create operation |
+| `.op(Operation::update())` | Add an update operation |
+| `.op(Operation::delete())` | Add a delete operation |
+| `.op(Operation::action("name", "desc"))` | Add a custom action |
+
+### Presentation methods
+
+| Method | Effect |
+|--------|--------|
+| `.column(ColumnDef::new("field", "Header"))` | Add a table column |
+| `.detail(DetailField::new("field", "Label"))` | Add a detail view row |
+
+## Operation builder methods
+
+Operations themselves have a fluent builder:
+
+```rust
+Operation::create()
+    .with_arg(OperationArg::required(field))   // add a required argument
+    .with_arg(OperationArg::optional(field))   // add an optional argument
+    .with_constraint(Constraint::requires("a", "b"))  // add a constraint
+    .with_confirm()                            // require confirmation
+    .example("syfrah vpc create --name foo")  // add a help example
+```
+
+## Reusing field definitions
+
+Fields can be defined as constants and reused across operations and resources:
+
+```rust
+const NAME_FIELD: FieldDef = FieldDef::string("name", "Human-readable name")
+    .validate(|v| validate_name(v));
+
+let vpc = ResourceDef::build("vpc", "VPC")
+    .op(Operation::create().with_arg(OperationArg::required(NAME_FIELD)))
+    .op(Operation::update().with_arg(OperationArg::optional(NAME_FIELD)))
+    .done();
+```
+
+## Completing the definition
+
+`.done()` validates the definition and returns a `ResourceDef`. If the definition is invalid (no operations defined, duplicate field names, unknown constraint references), `.done()` panics with a descriptive message. This is intentional — a malformed resource definition is a programming error, not a runtime error.
+
+After calling `.done()`, register the definition with the resource registry along with its handler. See the [registry docs](/syfrah/layers/core/resource/registry).

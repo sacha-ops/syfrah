@@ -1,0 +1,95 @@
+---
+title: Resource Scope
+description: How resources are nested in the org > project > VPC hierarchy, and how scope shapes CLI flags and API URL paths.
+---
+
+Resources in Syfrah are organized into a hierarchy. A VPC belongs to a project. A VM belongs to a VPC. A volume belongs to a VM. Scope encodes this relationship and drives how URLs are structured and which flags the CLI requires.
+
+## The hierarchy
+
+```
+org
+└── project
+    └── vpc
+        ├── subnet
+        ├── vm
+        │   └── volume
+        └── gateway
+```
+
+Every resource sits somewhere in this tree. Its scope determines what identifiers must be provided to locate it.
+
+## Declaring scope
+
+Scope is declared on the `ResourceDef` using the `.scope()` builder method:
+
+```rust
+ResourceDef::build("vm", "Virtual machine")
+    .scope(Scope::vpc())        // requires org_id, project_id, vpc_id
+    
+ResourceDef::build("project", "Project")
+    .scope(Scope::org())        // requires org_id only
+
+ResourceDef::build("hypervisor", "Bare-metal server")
+    .scope(Scope::global())     // no parent required
+```
+
+## Scope levels
+
+| Scope | Required context | Example resource |
+|-------|-----------------|-----------------|
+| `Scope::global()` | None | Hypervisors, regions |
+| `Scope::org()` | `--org <id>` | Projects, IAM policies |
+| `Scope::project()` | `--org`, `--project` | VPCs, SSH keys |
+| `Scope::vpc()` | `--org`, `--project`, `--vpc` | VMs, subnets, gateways |
+
+## How scope shapes CLI flags
+
+When a resource has `Scope::vpc()`, every operation automatically gets the scope flags injected:
+
+```
+syfrah vm list --org org-01HW... --project proj-01HW... --vpc vpc-01HW...
+syfrah vm create --org org-01HW... --project proj-01HW... --vpc vpc-01HW... --name web-1
+```
+
+These flags don't need to be declared on each operation — the scope injects them. If any scope flag is missing and stdin is a TTY, the user is prompted to supply it interactively.
+
+## How scope shapes API paths
+
+Scope determines the prefix of every API route. A VPC-scoped VM resource generates paths like:
+
+```
+GET    /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms
+POST   /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms
+GET    /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms/{id}
+DELETE /orgs/{org_id}/projects/{project_id}/vpcs/{vpc_id}/vms/{id}
+```
+
+An org-scoped project resource generates:
+
+```
+GET    /orgs/{org_id}/projects
+POST   /orgs/{org_id}/projects
+GET    /orgs/{org_id}/projects/{id}
+```
+
+A global resource generates top-level paths:
+
+```
+GET    /hypervisors
+GET    /hypervisors/{id}
+```
+
+## Scope context in handlers
+
+When a handler is called, it receives an `OperationRequest` that includes the full scope context — all parent IDs extracted from the URL or CLI flags. You don't need to re-parse them:
+
+```rust
+async fn handle_vm_list(req: OperationRequest) -> Result<OperationResponse> {
+    let vpc_id = req.scope.vpc_id()?;
+    let project_id = req.scope.project_id()?;
+    // ...
+}
+```
+
+The scope is validated before the handler is called. If a required parent ID is missing or malformed, the request is rejected before your code runs.
