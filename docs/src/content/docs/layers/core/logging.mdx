@@ -1,6 +1,8 @@
 ---
 title: Structured Logging
 description: Tracing-based structured logging with text and JSON output, file rotation, panic hooks, and global context fields.
+sidebar:
+  order: 11
 ---
 
 Syfrah uses the [tracing](https://docs.rs/tracing) ecosystem for structured logging. Every log line carries context — not just a timestamp and a message, but the node ID, region, zone, and any span context from the current operation.

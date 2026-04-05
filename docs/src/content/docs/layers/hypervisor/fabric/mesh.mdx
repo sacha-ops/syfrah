@@ -1,6 +1,8 @@
 ---
 title: Mesh Identity
 description: How a Syfrah mesh is defined — shared secrets, ULA IPv6 prefixes, and per-node identities with WireGuard keys.
+sidebar:
+  order: 1
 ---
 
 A Syfrah mesh is a private network shared by a group of hypervisors. Two things define a mesh: a shared secret and an IPv6 address space. Every node in the mesh shares these two values. Everything else — the node's name, its WireGuard keys, its endpoint — is per-node.

@@ -1,6 +1,8 @@
 ---
 title: Fluent Builder API
 description: How to construct a ResourceDef using the fluent builder — chaining identity, scope, operations, constraints, and presentation in one expression.
+sidebar:
+  order: 8
 ---
 
 `ResourceDef` is constructed using a fluent builder. You start with `ResourceDef::build(name, description)` and chain methods to add everything the resource needs, finishing with `.done()` to produce the complete definition.

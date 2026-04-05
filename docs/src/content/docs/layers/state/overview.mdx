@@ -1,6 +1,8 @@
 ---
 title: State Layer
 description: Embedded persistence for Syfrah layers — typed tables, TTL, watch notifications, and safe concurrent access backed by redb.
+sidebar:
+  order: 1
 ---
 
 The state layer is Syfrah's embedded persistence engine. Every layer that needs to store data — the hypervisor, the control plane, Forge — has its own isolated database file. There is no shared database between layers, which keeps concerns clean and avoids lock contention across unrelated subsystems.

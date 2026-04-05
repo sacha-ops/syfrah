@@ -1,6 +1,8 @@
 ---
 title: Interactive Prompts
 description: How Syfrah prompts for missing required arguments when stdin is a TTY, and falls back to errors in non-interactive contexts.
+sidebar:
+  order: 3
 ---
 
 When a required argument is missing and the CLI is running interactively (stdin is a TTY), Syfrah prompts the user to supply it rather than immediately printing an error. This makes the CLI comfortable to use without memorizing every flag, while still being fully scriptable.

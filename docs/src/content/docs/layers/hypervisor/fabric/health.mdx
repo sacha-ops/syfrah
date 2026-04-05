@@ -1,6 +1,8 @@
 ---
 title: Fabric Health Checks
 description: How the hypervisor monitors peer reachability using WireGuard handshake timestamps.
+sidebar:
+  order: 10
 ---
 
 The health check system keeps the peer list accurate by continuously polling WireGuard for handshake activity. It runs as a background task whenever the hypervisor is in peering mode.

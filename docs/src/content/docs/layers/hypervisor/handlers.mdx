@@ -1,6 +1,8 @@
 ---
 title: Hypervisor Handlers
 description: Thin translation layer that maps CLI commands to fabric operations. No logic lives here — handlers just wire the framework to the business layer.
+sidebar:
+  order: 2
 ---
 
 The hypervisor handler layer sits between the CLI framework and the [fabric ops](/syfrah/layers/hypervisor/fabric/ops) module. Its job is narrow: take an `OperationRequest` from the framework, call the right fabric function, and return an `OperationResponse`. That is all.

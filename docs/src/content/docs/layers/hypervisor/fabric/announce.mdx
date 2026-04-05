@@ -1,6 +1,8 @@
 ---
 title: Fabric Peer Announcement
 description: How the hypervisor broadcasts new nodes to existing mesh members after a join.
+sidebar:
+  order: 11
 ---
 
 When a new node joins the mesh, the accepting hypervisor needs to tell every other existing peer about it. That is what the announce system does. Without it, peers that were already in the mesh when the new node joined would not have a WireGuard entry for it and could not route traffic to it.

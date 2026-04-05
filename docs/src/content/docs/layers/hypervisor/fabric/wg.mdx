@@ -1,6 +1,8 @@
 ---
 title: WireGuard Interface
 description: How Syfrah creates and manages the syfrah0 WireGuard interface — using the wg and ip CLI tools under the hood.
+sidebar:
+  order: 5
 ---
 
 The `wg` module is responsible for the WireGuard network interface itself. It talks to the kernel's WireGuard implementation via the `wg` and `ip` command-line tools, translating Syfrah's peer data into the low-level configuration that WireGuard needs.

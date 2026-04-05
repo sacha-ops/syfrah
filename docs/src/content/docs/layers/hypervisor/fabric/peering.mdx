@@ -1,6 +1,8 @@
 ---
 title: Peering Protocol
 description: The TCP-based join protocol types — JoinRequest, JoinResponse, and PeerAnnounce — and how PIN validation works.
+sidebar:
+  order: 7
 ---
 
 When a new node wants to join a Syfrah mesh, it does not just connect to WireGuard directly. First it needs to prove it is authorized (via the PIN), then exchange identities and receive the peer list. This handshake is the peering protocol.

@@ -1,6 +1,8 @@
 ---
 title: Route Generation
 description: How axum routes are automatically generated from ResourceDef — standard CRUD paths, scoped URL hierarchies, and OpenAPI 3.0 spec output.
+sidebar:
+  order: 1
 ---
 
 Just as `generate_command()` builds a clap command tree from a `ResourceDef`, `build_router()` builds an axum router. Every registered resource gets the correct HTTP routes, request parsing, and handler wiring — with no manual axum code.

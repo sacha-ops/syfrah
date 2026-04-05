@@ -1,6 +1,8 @@
 ---
 title: Configuration
 description: How Syfrah loads, merges, and validates configuration from files, environment variables, and CLI flags.
+sidebar:
+  order: 7
 ---
 
 Syfrah's configuration system has a clear priority chain: CLI flags beat environment variables, which beat the config file, which beats built-in defaults. You never need to worry about which source "wins" — higher-priority sources always override lower ones.

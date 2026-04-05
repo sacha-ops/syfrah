@@ -1,6 +1,8 @@
 ---
 title: Resource Schema
 description: How fields are defined for operations — types, defaults, validation, and how OperationArg wraps fields as required or optional.
+sidebar:
+  order: 4
 ---
 
 Every operation that takes user input relies on field definitions. A `FieldDef` describes a single piece of input: its name, type, description, and default value. An `OperationArg` wraps a `FieldDef` and marks it as required or optional for a specific operation.

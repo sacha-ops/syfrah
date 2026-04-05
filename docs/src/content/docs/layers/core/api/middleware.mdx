@@ -1,6 +1,8 @@
 ---
 title: Middleware
 description: The request middleware stack — rate limiting, request ID injection, version headers, and pagination normalization.
+sidebar:
+  order: 3
 ---
 
 Every request that reaches a Syfrah API server passes through a middleware stack before hitting the resource handler. The middleware is applied in a fixed order and handles cross-cutting concerns that every endpoint needs.

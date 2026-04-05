@@ -1,6 +1,8 @@
 ---
 title: Peering Client
 description: The TCP client used during join — connects to an existing node's peering port, sends credentials, and receives the mesh secret and peer list.
+sidebar:
+  order: 9
 ---
 
 The peering client is the other half of the join handshake. When you run `syfrah hv join`, the peering client connects to the target node's peering port, authenticates, and retrieves everything needed to become a mesh member.

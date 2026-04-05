@@ -1,6 +1,8 @@
 ---
 title: Resource Registry
 description: How ResourceDefs and their handlers are registered at startup, and how the CLI and API server discover them.
+sidebar:
+  order: 11
 ---
 
 The resource registry is the central catalog of everything Syfrah knows how to do. At startup, each layer registers its resources. The CLI and API server then draw from this registry to build their command trees and route tables — with no layer-specific wiring needed in the binary.

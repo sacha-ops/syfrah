@@ -1,6 +1,8 @@
 ---
 title: Peering Server
 description: The TCP server that accepts join requests from new nodes — PIN validation, secret handoff, and peer announcement.
+sidebar:
+  order: 8
 ---
 
 The peering server is the TCP listener that runs on every active Syfrah hypervisor. When another node wants to join the mesh, it connects here. The server validates the PIN, sends back the mesh secret and peer list, and then announces the new node to everyone else.

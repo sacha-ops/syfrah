@@ -1,6 +1,8 @@
 ---
 title: IPv6 Addressing
 description: Deterministic IPv6 ULA address assignment for mesh nodes, derived from WireGuard public keys.
+sidebar:
+  order: 5
 ---
 
 Every node in a Syfrah mesh has an IPv6 address. These addresses are not assigned by a DHCP server or allocated from a central pool — they are derived deterministically from cryptographic material. The same key always produces the same address.

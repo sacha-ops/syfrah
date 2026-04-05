@@ -1,6 +1,8 @@
 ---
 title: Field Constraints
 description: Cross-field validation rules — Requires, Forbids, Conflicts, OneOf, AtLeastOne, and Custom — validated before any handler runs.
+sidebar:
+  order: 6
 ---
 
 Field constraints express rules that span multiple fields. Type validation (`--port` must be an integer) is handled by `FieldDef`. Constraints handle everything else: "if you set `--private`, you must also set `--cidr`", or "you can't use both `--image` and `--snapshot`".

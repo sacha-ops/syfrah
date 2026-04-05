@@ -1,6 +1,8 @@
 ---
 title: Hypervisor Layer
 description: Every server running Syfrah is a hypervisor. This layer manages the WireGuard mesh, peer lifecycle, and the commands that control it all.
+sidebar:
+  order: 1
 ---
 
 In Syfrah, every server is a hypervisor. There is no separate "controller" host — each node in your cluster is both a participant and a peer. The hypervisor layer is what turns a plain Linux server into a Syfrah node: it joins the WireGuard mesh, tracks peers, manages the tunnel service, and exposes a CLI for day-to-day operations.

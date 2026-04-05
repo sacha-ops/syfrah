@@ -1,6 +1,8 @@
 ---
 title: Request Dispatch
 description: How the dispatch layer extracts args, prompts for missing input, validates constraints, confirms destructive ops, calls the handler, and renders output.
+sidebar:
+  order: 10
 ---
 
 Dispatch is the bridge between the parsed CLI arguments (or incoming HTTP request) and the registered handler. It's the layer that makes the CLI feel polished: prompting for missing input, confirming destructive operations, and rendering the result correctly.

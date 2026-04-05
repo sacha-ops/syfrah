@@ -1,6 +1,8 @@
 ---
 title: WireGuard Service
 description: How Syfrah manages the WireGuard systemd service — config generation, service lifecycle, and where files live on disk.
+sidebar:
+  order: 6
 ---
 
 The `service` module manages the WireGuard systemd service that keeps the mesh tunnel running persistently. It generates the WireGuard configuration file and the systemd unit, and provides operations to install, start, stop, and remove them.

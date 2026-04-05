@@ -1,6 +1,8 @@
 ---
 title: API Server
 description: The axum-based HTTP server — how it starts, composes middleware and routes, and shuts down gracefully on SIGTERM or SIGINT.
+sidebar:
+  order: 2
 ---
 
 The API server wraps the generated axum router with middleware, binds to a socket, and handles graceful shutdown. It is designed to be embedded into any Syfrah binary that needs to expose the REST API.

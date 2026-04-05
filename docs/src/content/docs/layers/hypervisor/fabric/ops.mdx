@@ -1,6 +1,8 @@
 ---
 title: Fabric Ops
 description: The orchestration heart of the hypervisor — init, join, status, start, stop, and leave, fully explained.
+sidebar:
+  order: 4
 ---
 
 The `ops` module is where the work actually happens. Every high-level `syfrah hv` command ultimately calls a function here. Ops orchestrates the other fabric sub-modules — identity, WireGuard, systemd, peering, state — into coherent multi-step workflows.
