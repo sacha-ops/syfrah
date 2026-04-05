@@ -357,11 +357,14 @@ async fn run_create(
         }
         ComputeResponse::Vm(v) => {
             // Backward-compatible path: daemon returned full VM info (no Raft).
-            let vm_name = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+            let vm_id = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+            let vm_name = v.get("name").and_then(|n| n.as_str()).unwrap_or("?");
             let vm_image = v.get("image").and_then(|i| i.as_str()).unwrap_or("?");
             let vm_vcpus = v.get("vcpus").and_then(|c| c.as_u64()).unwrap_or(0);
             let vm_memory = v.get("memory_mb").and_then(|m| m.as_u64()).unwrap_or(0);
-            println!("VM created: {vm_name} ({vm_image}, {vm_vcpus} vCPU, {vm_memory} MB)");
+            println!(
+                "VM created: {vm_name} (id: {vm_id}, {vm_image}, {vm_vcpus} vCPU, {vm_memory} MB)"
+            );
             if let Some(vol_id) = v.get("root_volume_id").and_then(|v| v.as_str()) {
                 println!("Root volume: {vol_id} ({disk_size_gb} GB)");
             }
@@ -463,7 +466,8 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
             } else {
                 let tw = super::term_width();
                 let header = format!(
-                    "{:<20} {:<20} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10} {:<15}",
+                    "{:<18} {:<18} {:<18} {:<12} {:<16} {:<12} {:<6} {:<10} {:<10} {:<15}",
+                    "ID",
                     "NAME",
                     "IMAGE",
                     "PHASE",
@@ -480,12 +484,13 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                 } else {
                     println!("{}", &header[..header.len().min(tw)]);
                 }
-                println!("{}", "-".repeat(106.min(tw)));
+                println!("{}", "-".repeat(125.min(tw)));
                 if vms.is_empty() {
                     println!("(no VMs)");
                 } else {
                     for vm in &vms {
-                        let name = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                        let id = vm.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                        let name = vm.get("name").and_then(|n| n.as_str()).unwrap_or("-");
                         let image = vm.get("image").and_then(|i| i.as_str()).unwrap_or("");
                         let phase = vm.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
                         let ip = vm.get("ip").and_then(|i| i.as_str()).unwrap_or("-");
@@ -501,11 +506,12 @@ async fn run_list(json: bool) -> anyhow::Result<()> {
                             .get("hypervisor_id")
                             .and_then(|h| h.as_str())
                             .unwrap_or("-");
-                        let name = super::truncate(name, 19);
-                        let image = super::truncate(image, 19);
+                        let id = super::truncate(id, 17);
+                        let name = super::truncate(name, 17);
+                        let image = super::truncate(image, 17);
                         let ip = super::truncate(ip, 15);
                         let hypervisor = super::truncate(hypervisor, 14);
-                        let row = format!("{name:<20} {image:<20} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10} {hypervisor:<15}");
+                        let row = format!("{id:<18} {name:<18} {image:<18} {phase:<12} {ip:<16} {runtime:<12} {vcpus:<6} {memory:<10} {uptime:<10} {hypervisor:<15}");
                         println!("{}", &row[..row.len().min(tw)]);
                     }
                 }
@@ -545,7 +551,8 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                let name = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                let vm_id = v.get("id").and_then(|n| n.as_str()).unwrap_or("?");
+                let vm_name = v.get("name").and_then(|n| n.as_str()).unwrap_or("-");
                 let image = v.get("image").and_then(|i| i.as_str()).unwrap_or("");
                 let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("?");
                 let runtime = v.get("runtime").and_then(|r| r.as_str()).unwrap_or("-");
@@ -560,7 +567,8 @@ async fn run_get(id: String, json: bool) -> anyhow::Result<()> {
                 let subnet_val = v.get("subnet").and_then(|s| s.as_str()).unwrap_or("-");
                 let vpc_val = v.get("vpc").and_then(|s| s.as_str()).unwrap_or("-");
                 println!("VM Details");
-                println!("  Name:      {name}");
+                println!("  ID:        {vm_id}");
+                println!("  Name:      {vm_name}");
                 println!("  Image:     {image}");
                 println!("  Phase:     {phase}");
                 println!("  Runtime:   {runtime}");

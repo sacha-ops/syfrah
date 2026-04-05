@@ -8,9 +8,29 @@ use crate::runtime_backend::RuntimeType;
 /// Unique identifier for a VM.
 ///
 /// A thin wrapper around `String`, used as a key in maps and event payloads.
-/// The inner value is typically a human-readable slug like `"vm-web-1"`.
+/// Generated IDs follow the format `vm-{12 hex chars}` (e.g. `vm-a1b2c3d4e5f6`).
+/// Legacy name-based IDs are also accepted for backward compatibility.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VmId(pub String);
+
+impl VmId {
+    /// Generate a new unique `VmId` using a random UUID-v4 prefix.
+    ///
+    /// Format: `vm-{12 hex chars}` (e.g. `vm-a1b2c3d4e5f6`).
+    pub fn generate() -> Self {
+        let uuid = uuid::Uuid::new_v4();
+        let hex = uuid.as_simple().to_string();
+        Self(format!("vm-{}", &hex[..12]))
+    }
+
+    /// Returns `true` if this looks like a generated VmId (`vm-` prefix
+    /// followed by 12 hex characters).
+    pub fn is_generated(&self) -> bool {
+        self.0.len() == 15
+            && self.0.starts_with("vm-")
+            && self.0[3..].chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
 
 impl fmt::Display for VmId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -24,8 +44,13 @@ impl fmt::Display for VmId {
 /// into Cloud Hypervisor configuration, resolves paths, and validates constraints.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VmSpec {
-    /// Unique identifier for this VM.
+    /// Unique identifier for this VM (generated, immutable).
     pub id: VmId,
+    /// Human-friendly name for the VM (e.g. `"web-1"`). Displayed in CLI
+    /// and used for name-based lookups. Not required to be unique across the
+    /// cluster, but unique within the local node.
+    #[serde(default)]
+    pub name: String,
     /// Number of virtual CPUs (must be > 0).
     pub vcpus: u32,
     /// Memory allocation in megabytes (must be >= 128, power of 2).
@@ -140,6 +165,9 @@ pub enum GpuMode {
 pub struct VmStatus {
     /// Unique identifier of the VM.
     pub vm_id: VmId,
+    /// Human-friendly name.
+    #[serde(default)]
+    pub name: String,
     /// Current lifecycle phase.
     pub phase: VmPhase,
     /// Number of virtual CPUs allocated.
@@ -222,6 +250,27 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn vm_id_generate_format() {
+        let id = VmId::generate();
+        assert!(id.0.starts_with("vm-"), "got: {}", id.0);
+        assert_eq!(id.0.len(), 15, "got: {}", id.0);
+        assert!(id.is_generated());
+    }
+
+    #[test]
+    fn vm_id_generate_uniqueness() {
+        let a = VmId::generate();
+        let b = VmId::generate();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn vm_id_is_generated_false_for_names() {
+        let id = VmId("web-1".to_string());
+        assert!(!id.is_generated());
+    }
+
+    #[test]
     fn vm_id_serde_roundtrip() {
         let id = VmId("vm-abc-123".to_string());
         let json = serde_json::to_string(&id).unwrap();
@@ -247,6 +296,7 @@ mod tests {
     fn vm_spec_serde_roundtrip_full() {
         let spec = VmSpec {
             id: VmId("vm-full".to_string()),
+            name: "full-vm".to_string(),
             vcpus: 4,
             memory_mb: 8192,
             image: "ubuntu-22.04.qcow2".to_string(),
@@ -281,6 +331,7 @@ mod tests {
     fn vm_spec_serde_roundtrip_minimal() {
         let spec = VmSpec {
             id: VmId("vm-min".to_string()),
+            name: "min-vm".to_string(),
             vcpus: 1,
             memory_mb: 512,
             image: "alpine.qcow2".to_string(),
@@ -380,6 +431,7 @@ mod tests {
     fn vm_status_serde_roundtrip() {
         let status = VmStatus {
             vm_id: VmId("vm-status-1".to_string()),
+            name: "status-1".to_string(),
             phase: VmPhase::Running,
             vcpus: 2,
             memory_mb: 4096,
@@ -448,6 +500,7 @@ mod tests {
     fn vm_spec_with_ssh_key_and_disk_size_serde_roundtrip() {
         let spec = VmSpec {
             id: VmId("vm-extended".to_string()),
+            name: "extended-vm".to_string(),
             vcpus: 2,
             memory_mb: 1024,
             image: "ubuntu-24.04".to_string(),
@@ -495,6 +548,7 @@ mod tests {
     fn vm_list_shows_ip() {
         let status = VmStatus {
             vm_id: VmId("web-1".to_string()),
+            name: "web-1".to_string(),
             phase: VmPhase::Running,
             vcpus: 2,
             memory_mb: 2048,
@@ -519,6 +573,7 @@ mod tests {
     fn vm_get_shows_subnet() {
         let status = VmStatus {
             vm_id: VmId("db-1".to_string()),
+            name: "db-1".to_string(),
             phase: VmPhase::Running,
             vcpus: 4,
             memory_mb: 8192,
@@ -543,6 +598,7 @@ mod tests {
     fn vm_get_json_has_network_fields() {
         let status = VmStatus {
             vm_id: VmId("web-2".to_string()),
+            name: "web-2".to_string(),
             phase: VmPhase::Running,
             vcpus: 2,
             memory_mb: 2048,
