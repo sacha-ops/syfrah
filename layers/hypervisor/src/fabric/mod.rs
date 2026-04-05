@@ -10,6 +10,7 @@
 pub mod mesh;
 pub mod peer;
 pub mod peering;
+pub mod service;
 pub mod state;
 pub mod wg;
 
