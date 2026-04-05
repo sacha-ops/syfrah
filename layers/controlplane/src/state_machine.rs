@@ -18,6 +18,8 @@ use openraft::{EntryPayload, OptionalSend};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use syfrah_core::{EnvId, HypervisorId, OrgId, ProjectId, SnapshotId, VmId, VolumeId};
+
 use crate::commands::{
     QuotaScope, StateMachineCommand, StateMachineResponse, StorageConfig, VolumeType,
 };
@@ -38,16 +40,16 @@ pub struct StorageQuota {
 /// Volume record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeRecord {
-    pub id: String,
+    pub id: VolumeId,
     pub name: String,
     pub size_gb: u32,
-    pub org_id: String,
-    pub project_id: String,
-    pub env_id: String,
+    pub org_id: OrgId,
+    pub project_id: ProjectId,
+    pub env_id: EnvId,
     pub volume_type: VolumeType,
     pub state: VolumeState,
-    pub attached_vm_id: Option<String>,
-    pub attached_hypervisor_id: Option<String>,
+    pub attached_vm_id: Option<VmId>,
+    pub attached_hypervisor_id: Option<HypervisorId>,
     pub placement_generation: u64,
     /// The zone where this volume's data lives (determines which S3 bucket to use).
     /// Matches the hypervisor's zone at creation time.
@@ -71,11 +73,11 @@ pub struct VolumeRecord {
     /// Hypervisor the volume was attached to before migration started.
     /// Used for rollback if the migration fails.
     #[serde(default)]
-    pub pre_migration_hypervisor: Option<String>,
+    pub pre_migration_hypervisor: Option<HypervisorId>,
     /// VM the volume was attached to before migration started.
     /// Used for rollback if the migration fails.
     #[serde(default)]
-    pub pre_migration_vm_id: Option<String>,
+    pub pre_migration_vm_id: Option<VmId>,
 }
 
 /// Volume lifecycle state.
@@ -194,14 +196,14 @@ pub enum SnapshotState {
 /// Snapshot record tracked by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRecord {
-    pub id: String,
-    pub source_volume_id: String,
+    pub id: SnapshotId,
+    pub source_volume_id: VolumeId,
     pub sst_files: Vec<String>,
     pub wal_position: u64,
     /// org_id inherited from the source volume at creation time.
-    pub org_id: String,
+    pub org_id: OrgId,
     /// project_id inherited from the source volume at creation time.
-    pub project_id: String,
+    pub project_id: ProjectId,
     /// Size in GB of the source volume at snapshot time.
     /// Used by RestoreSnapshot so the restored volume gets the correct size
     /// even if the source volume has been deleted or resized since.
@@ -209,7 +211,7 @@ pub struct SnapshotRecord {
     pub size_gb: u32,
     /// env_id inherited from the source volume at creation time.
     #[serde(default)]
-    pub env_id: String,
+    pub env_id: EnvId,
     /// volume_type inherited from the source volume at creation time.
     #[serde(default = "default_volume_type")]
     pub volume_type: VolumeType,
@@ -230,14 +232,14 @@ pub struct SstRefCounts(pub HashMap<String, u64>);
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StorageState {
     pub quotas: HashMap<String, StorageQuota>,
-    pub volumes: HashMap<String, VolumeRecord>,
-    pub snapshots: HashMap<String, SnapshotRecord>,
+    pub volumes: HashMap<VolumeId, VolumeRecord>,
+    pub snapshots: HashMap<SnapshotId, SnapshotRecord>,
     pub sst_refcounts: SstRefCounts,
     /// Storage configs keyed by zone (migrated from per-region in #1281).
     pub storage_configs: HashMap<String, StorageConfig>,
     /// Manifest pointers keyed by volume_id (ADR-006 §12b).
     #[serde(default)]
-    pub manifest_pointers: HashMap<String, ManifestPointerRecord>,
+    pub manifest_pointers: HashMap<VolumeId, ManifestPointerRecord>,
     /// SST files whose refcount has reached 0 and are awaiting garbage
     /// collection. We mark them here rather than deleting immediately so
     /// that the GC worker can remove the S3 objects asynchronously.
@@ -246,7 +248,7 @@ pub struct StorageState {
     /// Snapshot IDs that currently have an in-progress restore. A snapshot
     /// cannot be deleted while a restore is in progress.
     #[serde(default)]
-    pub restores_in_progress: Vec<String>,
+    pub restores_in_progress: Vec<SnapshotId>,
     /// Minimum WAL position across all snapshots. Used by the log compactor
     /// to determine how far back WAL segments must be retained. `None` when
     /// there are no snapshots.
@@ -264,7 +266,7 @@ pub struct StorageState {
 /// is strictly sequential: each commit must present `last_committed + 1`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestPointerRecord {
-    pub volume_id: String,
+    pub volume_id: VolumeId,
     /// Must match the volume's current `placement_generation`.
     pub generation: u64,
     /// Strictly sequential manifest version (starts at 1).
@@ -272,7 +274,7 @@ pub struct ManifestPointerRecord {
     /// S3 key where the manifest is stored.
     pub s3_key: String,
     /// Hypervisor that published this manifest.
-    pub published_by: String,
+    pub published_by: HypervisorId,
 }
 
 /// Error returned when a storage quota is exceeded.
@@ -637,14 +639,14 @@ impl RedbStateMachine {
             return;
         };
         let now = syfrah_org::StorageStore::now();
-        let existing = store.get_volume(&vol.id).ok().flatten();
+        let existing = store.get_volume(vol.id.as_str()).ok().flatten();
         let store_vol = syfrah_org::storage_store::Volume {
-            id: vol.id.clone(),
+            id: vol.id.0.clone(),
             name: vol.name.clone(),
             size_gb: vol.size_gb,
-            org_id: vol.org_id.clone(),
-            project_id: vol.project_id.clone(),
-            env_id: vol.env_id.clone(),
+            org_id: vol.org_id.0.clone(),
+            project_id: vol.project_id.0.clone(),
+            env_id: vol.env_id.0.clone(),
             volume_type: match vol.volume_type {
                 VolumeType::Root => syfrah_org::storage_store::VolumeType::Root,
                 VolumeType::Data => syfrah_org::storage_store::VolumeType::Data,
@@ -655,8 +657,8 @@ impl RedbStateMachine {
                 VolumeState::Migrating => syfrah_org::storage_store::VolumeState::Migrating,
                 VolumeState::Deleted => syfrah_org::storage_store::VolumeState::Deleted,
             },
-            attached_vm_id: vol.attached_vm_id.clone(),
-            attached_hypervisor_id: vol.attached_hypervisor_id.clone(),
+            attached_vm_id: vol.attached_vm_id.as_ref().map(|id| id.0.clone()),
+            attached_hypervisor_id: vol.attached_hypervisor_id.as_ref().map(|id| id.0.clone()),
             placement_generation: vol.placement_generation,
             created_at: existing.as_ref().map_or(now, |e| e.created_at),
             updated_at: now,
@@ -666,18 +668,18 @@ impl RedbStateMachine {
         let old_hv = existing
             .as_ref()
             .and_then(|e| e.attached_hypervisor_id.as_deref());
-        let new_hv = vol.attached_hypervisor_id.as_deref();
+        let new_hv = vol.attached_hypervisor_id.as_ref().map(|id| id.as_str());
         if old_hv != new_hv {
             // Remove from old hypervisor index.
             if let Some(hv_id) = old_hv {
-                if let Err(e) = store.remove_from_hypervisor_index(hv_id, &vol.id) {
+                if let Err(e) = store.remove_from_hypervisor_index(hv_id, vol.id.as_str()) {
                     warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
                         "failed to remove volume from old hypervisor index");
                 }
             }
             // Add to new hypervisor index.
             if let Some(hv_id) = new_hv {
-                if let Err(e) = store.add_to_hypervisor_index(hv_id, &vol.id) {
+                if let Err(e) = store.add_to_hypervisor_index(hv_id, vol.id.as_str()) {
                     warn!(volume_id = %vol.id, hypervisor_id = %hv_id, error = %e,
                         "failed to add volume to new hypervisor index");
                 }
@@ -760,20 +762,20 @@ impl RedbStateMachine {
     /// Returns `None` if no quota is set (meaning unlimited).
     fn effective_quota_from(
         storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> Option<StorageQuota> {
         // Check project-level first.
         let project_key = Self::quota_key(&QuotaScope::Project {
-            org_id: org_id.to_string(),
-            project_id: project_id.to_string(),
+            org_id: org_id.clone(),
+            project_id: project_id.clone(),
         });
         if let Some(q) = storage.quotas.get(&project_key) {
             return Some(q.clone());
         }
         // Fall back to org-level.
         let org_key = Self::quota_key(&QuotaScope::Org {
-            org_id: org_id.to_string(),
+            org_id: org_id.clone(),
         });
         storage.quotas.get(&org_key).cloned()
     }
@@ -781,21 +783,21 @@ impl RedbStateMachine {
     /// Determine which scope is effective for quota from an already-locked storage.
     fn effective_quota_scope_from(
         storage: &StorageState,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> QuotaScope {
         let project_key = Self::quota_key(&QuotaScope::Project {
-            org_id: org_id.to_string(),
-            project_id: project_id.to_string(),
+            org_id: org_id.clone(),
+            project_id: project_id.clone(),
         });
         if storage.quotas.contains_key(&project_key) {
             QuotaScope::Project {
-                org_id: org_id.to_string(),
-                project_id: project_id.to_string(),
+                org_id: org_id.clone(),
+                project_id: project_id.clone(),
             }
         } else {
             QuotaScope::Org {
-                org_id: org_id.to_string(),
+                org_id: org_id.clone(),
             }
         }
     }
@@ -812,8 +814,8 @@ impl RedbStateMachine {
     /// volume insert are effectively atomic.
     fn check_volume_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
         new_size_gb: u32,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
@@ -855,8 +857,8 @@ impl RedbStateMachine {
     /// Same as `check_volume_quota` — Raft serializes all applies.
     fn check_resize_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
         delta_gb: u32,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
@@ -881,8 +883,8 @@ impl RedbStateMachine {
     /// Check snapshot quota for a CreateSnapshot operation.
     fn check_snapshot_quota(
         &self,
-        org_id: &str,
-        project_id: &str,
+        org_id: &OrgId,
+        project_id: &ProjectId,
     ) -> Result<(), QuotaExceededError> {
         let storage = self.storage.read().unwrap();
         let quota = match Self::effective_quota_from(&storage, org_id, project_id) {
@@ -2037,13 +2039,13 @@ impl RedbStateMachine {
                         // node's reconciler stops ZeroFS and the target's starts it
                         // with the new gen prefix (zero-copy migration via S3).
                         let mut storage = self.storage.write().unwrap();
-                        let vol_ids: Vec<String> = storage
+                        let vol_ids: Vec<VolumeId> = storage
                             .volumes
                             .iter()
                             .filter(|(_, vol)| {
                                 vol.state == VolumeState::Attached
-                                    && vol.attached_vm_id.as_deref() == Some(vm_id)
-                                    && vol.attached_hypervisor_id.as_deref() == Some(from)
+                                    && vol.attached_vm_id.as_deref() == Some(vm_id.as_str())
+                                    && vol.attached_hypervisor_id.as_deref() == Some(from.as_str())
                             })
                             .map(|(id, _)| id.clone())
                             .collect();
@@ -2051,13 +2053,13 @@ impl RedbStateMachine {
                         for vol_id in &vol_ids {
                             if let Some(vol) = storage.volumes.get_mut(vol_id) {
                                 vol.placement_generation += 1;
-                                vol.attached_hypervisor_id = Some(to.clone());
+                                vol.attached_hypervisor_id = Some(HypervisorId::from(to.as_str()));
                                 let synced = vol.clone();
                                 // Release storage lock temporarily to sync to redb.
                                 drop(storage);
                                 self.sync_volume_to_store(&synced);
                                 info!(
-                                    volume_id = vol_id,
+                                    volume_id = %vol_id,
                                     from = from,
                                     to = to,
                                     generation = synced.placement_generation,
@@ -2185,7 +2187,7 @@ impl RedbStateMachine {
                 }
                 drop(storage);
                 for id in &purged {
-                    self.sync_volume_delete_from_store(id);
+                    self.sync_volume_delete_from_store(id.as_str());
                 }
                 if !purged.is_empty() {
                     info!(count = purged.len(), "purged expired volume tombstones");
@@ -2259,10 +2261,10 @@ impl RedbStateMachine {
                     self.sync_volume_to_store(vol);
                 }
                 info!(
-                    id,
-                    name, size_gb, org_id, project_id, env_id, "volume created"
+                    id = %id,
+                    name, size_gb, org_id = %org_id, project_id = %project_id, env_id = %env_id, "volume created"
                 );
-                StateMachineResponse::Created(id.clone())
+                StateMachineResponse::Created(id.0.clone())
             }
 
             StateMachineCommand::DeleteVolume {
@@ -2294,7 +2296,7 @@ impl RedbStateMachine {
                     ),
                     Some(_) => {
                         // Check for non-deleted snapshots referencing this volume.
-                        let snapshot_ids: Vec<String> = storage
+                        let snapshot_ids: Vec<SnapshotId> = storage
                             .snapshots
                             .iter()
                             .filter(|(_, s)| {
@@ -2329,7 +2331,7 @@ impl RedbStateMachine {
                             }
 
                             // Collect SST files first to avoid borrow conflicts.
-                            let snap_ssts: Vec<(String, Vec<String>)> = snapshot_ids
+                            let snap_ssts: Vec<(SnapshotId, Vec<String>)> = snapshot_ids
                                 .iter()
                                 .filter_map(|snap_id| {
                                     let snap = storage.snapshots.get(snap_id)?;
@@ -2361,7 +2363,7 @@ impl RedbStateMachine {
                                 if let Some(snap) = storage.snapshots.get_mut(snap_id) {
                                     snap.state = SnapshotState::Deleted;
                                 }
-                                info!(snapshot_id = %snap_id, volume_id, "snapshot cascade-deleted");
+                                info!(snapshot_id = %snap_id, %volume_id, "snapshot cascade-deleted");
                             }
                             // Recalculate minimum WAL retention (excluding soft-deleted).
                             storage.min_wal_position = storage
@@ -2387,7 +2389,7 @@ impl RedbStateMachine {
                             self.sync_volume_to_store(vol);
                         }
 
-                        info!(volume_id, "volume marked as deleted (tombstone)");
+                        info!(%volume_id, "volume marked as deleted (tombstone)");
                         StateMachineResponse::Ok
                     }
                     None => StateMachineResponse::Error(format!("volume not found: {volume_id}")),
@@ -2409,7 +2411,7 @@ impl RedbStateMachine {
                         let synced = vol.clone();
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, vm_id, hypervisor_id, "volume attached");
+                        info!(%volume_id, %vm_id, %hypervisor_id, "volume attached");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2438,7 +2440,7 @@ impl RedbStateMachine {
                         storage.manifest_pointers.remove(volume_id);
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, "volume detached (manifest pointer cleared)");
+                        info!(%volume_id, "volume detached (manifest pointer cleared)");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2468,7 +2470,7 @@ impl RedbStateMachine {
                 match storage.volumes.get_mut(volume_id) {
                     Some(vol) if vol.state == VolumeState::Attached => {
                         // Validate the volume is currently on the source hypervisor.
-                        if vol.attached_hypervisor_id.as_deref() != Some(from_hypervisor) {
+                        if vol.attached_hypervisor_id.as_deref() != Some(from_hypervisor.as_str()) {
                             return StateMachineResponse::Error(format!(
                                 "volume '{}' is not on hypervisor '{}' (actual: {:?})",
                                 volume_id, from_hypervisor, vol.attached_hypervisor_id
@@ -2483,9 +2485,9 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         info!(
-                            volume_id,
-                            from = from_hypervisor,
-                            to = to_hypervisor,
+                            %volume_id,
+                            from = %from_hypervisor,
+                            to = %to_hypervisor,
                             generation = synced.placement_generation,
                             "volume rescheduled"
                         );
@@ -2546,10 +2548,10 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         info!(
-                            volume_id,
+                            %volume_id,
                             source_zone,
                             target_zone,
-                            target_hypervisor,
+                            target_hypervisor = %target_hypervisor,
                             generation = synced.placement_generation,
                             "volume migration started"
                         );
@@ -2575,7 +2577,7 @@ impl RedbStateMachine {
                         let synced = vol.clone();
                         drop(storage);
                         self.sync_volume_to_store(&synced);
-                        info!(volume_id, "volume migration completed");
+                        info!(%volume_id, "volume migration completed");
                         StateMachineResponse::Ok
                     }
                     Some(vol) => StateMachineResponse::Error(format!(
@@ -2600,7 +2602,7 @@ impl RedbStateMachine {
                         drop(storage);
                         self.sync_volume_to_store(&synced);
                         warn!(
-                            volume_id,
+                            %volume_id,
                             reason = reason.as_str(),
                             "volume migration rolled back"
                         );
@@ -2657,7 +2659,7 @@ impl RedbStateMachine {
                     let synced = vol.clone();
                     drop(storage);
                     self.sync_volume_to_store(&synced);
-                    info!(volume_id, new_size_gb, "volume resized");
+                    info!(%volume_id, new_size_gb, "volume resized");
                     StateMachineResponse::Ok
                 } else {
                     StateMachineResponse::Error(format!("volume not found: {volume_id}"))
@@ -2724,8 +2726,8 @@ impl RedbStateMachine {
                     None => *wal_position,
                 });
 
-                info!(id, source_volume_id, size_gb, "snapshot created");
-                StateMachineResponse::Created(id.clone())
+                info!(id = %id, source_volume_id = %source_volume_id, size_gb, "snapshot created");
+                StateMachineResponse::Created(id.0.clone())
             }
 
             StateMachineCommand::DeleteSnapshot { snapshot_id } => {
@@ -2770,7 +2772,7 @@ impl RedbStateMachine {
                     .filter(|s| s.state != SnapshotState::Deleted)
                     .map(|s| s.wal_position)
                     .min();
-                info!(snapshot_id, "snapshot deleted");
+                info!(%snapshot_id, "snapshot deleted");
                 StateMachineResponse::Ok
             }
 
@@ -2811,7 +2813,7 @@ impl RedbStateMachine {
 
                 // 3. published_by must match the assigned hypervisor.
                 let assigned_hv = vol.attached_hypervisor_id.as_deref().unwrap_or("");
-                if published_by != assigned_hv {
+                if published_by.as_str() != assigned_hv {
                     return StateMachineResponse::Error(format!(
                         "wrong publisher for volume '{volume_id}': \
                          expected '{assigned_hv}', got '{published_by}'"
@@ -2843,8 +2845,8 @@ impl RedbStateMachine {
                     },
                 );
                 info!(
-                    volume_id,
-                    generation, manifest_version, published_by, "manifest committed"
+                    %volume_id,
+                    generation, manifest_version, published_by = %published_by, "manifest committed"
                 );
                 StateMachineResponse::Ok
             }
@@ -2920,7 +2922,7 @@ impl RedbStateMachine {
                         generation: 0,
                         manifest_version: 1,
                         s3_key: format!("snapshots/{snapshot_id}/manifest.json"),
-                        published_by: format!("restore:{snapshot_id}"),
+                        published_by: HypervisorId::from(format!("restore:{snapshot_id}")),
                     },
                 );
 
@@ -2951,10 +2953,10 @@ impl RedbStateMachine {
                     self.sync_volume_to_store(vol);
                 }
                 info!(
-                    snapshot_id,
-                    new_volume_id, new_volume_name, size_gb, "snapshot restored"
+                    %snapshot_id,
+                    new_volume_id = %new_volume_id, new_volume_name, size_gb, "snapshot restored"
                 );
-                StateMachineResponse::Created(new_volume_id.clone())
+                StateMachineResponse::Created(new_volume_id.0.clone())
             }
 
             // -- Storage: MarkRestoreBegin / MarkRestoreComplete --
@@ -2968,14 +2970,14 @@ impl RedbStateMachine {
                 if !storage.restores_in_progress.contains(snapshot_id) {
                     storage.restores_in_progress.push(snapshot_id.clone());
                 }
-                info!(snapshot_id, "restore marked in-progress");
+                info!(%snapshot_id, "restore marked in-progress");
                 StateMachineResponse::Ok
             }
 
             StateMachineCommand::MarkRestoreComplete { snapshot_id } => {
                 let mut storage = self.storage.write().unwrap();
                 storage.restores_in_progress.retain(|id| id != snapshot_id);
-                info!(snapshot_id, "restore completed");
+                info!(%snapshot_id, "restore completed");
                 StateMachineResponse::Ok
             }
 
