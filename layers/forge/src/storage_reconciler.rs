@@ -488,6 +488,38 @@ impl StorageReconciler {
         let pending_detach_ids: std::collections::HashSet<String> =
             detaches.iter().map(|d| d.volume_id.clone()).collect();
         for detach in &detaches {
+            // Guard: orphaned volume with no VM (e.g. Ctrl+C during vm create).
+            // There is no VM to call remove-device on, so skip straight to
+            // stopping ZeroFS and cleaning up. Log once as a warning.
+            if detach.vm_id.is_empty() {
+                warn!(
+                    volume_id = %detach.volume_id,
+                    "storage reconciler: orphaned volume with empty vm_id, \
+                     skipping CH remove-device and stopping ZeroFS directly"
+                );
+                let flush = !detach.force;
+                match volume_mgr.stop_volume_flush(&detach.volume_id, flush).await {
+                    Ok(()) => {
+                        info!(
+                            volume_id = %detach.volume_id,
+                            "storage reconciler: orphaned volume cleaned up"
+                        );
+                        report.detached += 1;
+                    }
+                    Err(e) => {
+                        // If ZeroFS isn't even running, that's fine — just log
+                        // at debug level and move on.
+                        debug!(
+                            volume_id = %detach.volume_id,
+                            error = %e,
+                            "storage reconciler: failed to stop orphaned volume \
+                             (may already be stopped)"
+                        );
+                    }
+                }
+                continue;
+            }
+
             if !volume_mgr.is_running(&detach.volume_id) {
                 debug!(
                     volume_id = %detach.volume_id,
@@ -1496,6 +1528,77 @@ mod tests {
 
         // Cleanup.
         mgr.stop_volume("vol-fail").await.ok();
+    }
+
+    #[tokio::test]
+    async fn detach_orphaned_volume_empty_vm_id_skips_remove_device() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        // Simulate an orphaned volume whose ZeroFS is still running but has no
+        // associated VM (empty vm_id — happens when `vm create` is Ctrl+C'd).
+        mgr.inject_fake_process("vol-orphan", 1);
+
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-orphan".into(),
+            vm_id: "".into(), // <-- empty vm_id, the bug trigger
+            ch_device_id: "_disk_vol-orphan".into(),
+            force: false,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        // Should clean up the orphaned volume without calling remove_device.
+        assert_eq!(report.detached, 1, "orphaned volume should be detached");
+        assert!(
+            report.errors.is_empty(),
+            "no errors expected for orphaned volume cleanup"
+        );
+        assert_eq!(
+            ch.call_count(),
+            0,
+            "should NOT call remove_device when vm_id is empty"
+        );
+        assert!(
+            !mgr.is_running("vol-orphan"),
+            "ZeroFS should be stopped after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_orphaned_volume_empty_vm_id_not_running() {
+        let reconciler = StorageReconciler::new("hv-1".into(), "test-pass".into());
+        let reader = MockStateReader::new().with_config();
+        let ch = MockChProvider::new();
+        let mut mgr = VolumeMgr::new();
+
+        // Orphaned volume with empty vm_id that is NOT running — should not error.
+        reader.set_detaches(vec![DesiredDetach {
+            volume_id: "vol-orphan-stopped".into(),
+            vm_id: "".into(),
+            ch_device_id: "_disk_vol-orphan-stopped".into(),
+            force: false,
+        }]);
+
+        let report = reconciler
+            .reconcile_once_with_ch(&reader, &mut mgr, &ch)
+            .await;
+
+        // stop_volume_flush will fail because volume is not running, but we
+        // treat that as a no-op (debug log, no error in report).
+        assert!(
+            report.errors.is_empty(),
+            "no errors expected when orphaned volume is already stopped"
+        );
+        assert_eq!(
+            ch.call_count(),
+            0,
+            "should NOT call remove_device when vm_id is empty"
+        );
     }
 
     // -- Attach flow tests ---------------------------------------------------
