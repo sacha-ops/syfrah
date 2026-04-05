@@ -49,7 +49,7 @@ pub async fn listen(
                     }
                 };
 
-                match handle_join(&mut stream, &db, pin).await {
+                match handle_join(&mut stream, &db, pin, peer_addr).await {
                     Ok(peer_name) => {
                         tracing::info!(peer = %peer_addr, name = %peer_name, "join accepted");
                         accepted += 1;
@@ -83,8 +83,14 @@ async fn handle_join(
     stream: &mut tokio::net::TcpStream,
     db: &LayerDb,
     expected_pin: &str,
+    peer_addr: SocketAddr,
 ) -> Result<String, SyfrahError> {
-    let req = read_json::<JoinRequest>(stream).await?;
+    let mut req = read_json::<JoinRequest>(stream).await?;
+
+    // If the joiner didn't specify an endpoint, use their TCP source IP + WG port
+    if req.endpoint.is_none() {
+        req.endpoint = Some(format!("{}:{}", peer_addr.ip(), req.wg_port));
+    }
 
     if !super::peering::validate_pin(expected_pin, req.pin.as_deref()) {
         let resp = JoinResponse::rejected("invalid PIN");

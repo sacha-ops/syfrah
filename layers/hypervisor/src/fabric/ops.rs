@@ -228,15 +228,26 @@ pub async fn join(
         prefix,
     };
 
+    // Extract target IP for endpoint discovery
+    let target_ip = target
+        .split(':')
+        .next()
+        .unwrap_or(target)
+        .to_string();
+
     // Build peer list from response (acceptor + existing peers)
     let mut peers = PeerList::new();
     if let Some(acceptor) = &response.acceptor {
+        // If acceptor didn't set endpoint, use target IP + acceptor's WG port
+        let endpoint = acceptor.endpoint.clone().or_else(|| {
+            Some(format!("{}:{}", target_ip, acceptor.wg_port))
+        });
         let _ = peers.add(super::peer::Peer::new(
             acceptor.name.clone(),
             acceptor.region.clone(),
             acceptor.zone.clone(),
             acceptor.wg_public_key.clone(),
-            acceptor.endpoint.clone(),
+            endpoint,
             acceptor.mesh_ipv6,
         ));
     }
