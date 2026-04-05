@@ -143,7 +143,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     eprintln!();
     eprintln!("  name     {}", result.hypervisor.name);
     eprintln!("  id       {}", result.hypervisor.id.as_str());
-    eprintln!("  mesh     {}", result.mesh.id.to_string());
+    eprintln!("  mesh     {}", result.mesh.id);
     eprintln!("  region   {} · {}", region, zone);
     eprintln!("  address  {}", result.hypervisor.mesh_ipv6);
     eprintln!("  pin      {}", result.pin);

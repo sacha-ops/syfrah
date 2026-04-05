@@ -1,46 +1,51 @@
 # Syfrah
 
-Open-source control plane to transform dedicated servers into a programmable cloud.
+Open-source platform that turns bare-metal servers into a programmable cloud.
 
 ## Build & Test
 - `cargo build` — build all crates
-- `cargo test` — run all tests
+- `cargo test` — run all tests (458+)
 - `cargo clippy` — lint
+- `cd docs && npx astro build` — build docs site
 
 ## Repository Structure
-- `layers/core` — `syfrah-core`: Pure types, crypto, addressing (no I/O, no async)
-- `layers/fabric` — `syfrah-fabric`: WireGuard mesh + peering + daemon + CLI commands
-- `bin/syfrah` — Binary that composes all layers (zero logic)
-- `layers/{forge,compute,storage,overlay,controlplane,org,iam,products}` — Future layers (README only)
-- `handbook/` — Project handbook (cross-cutting docs)
+- `layers/core` — `syfrah-core`: Resource framework, typed IDs, crypto, addressing, API gen, UI, config (no I/O, no async)
+- `layers/state` — `syfrah-state`: Embedded persistence (redb), typed tables, TTL, CAS, watch
+- `layers/hypervisor` — `syfrah-hypervisor`: WireGuard mesh (fabric), peering protocol, service lifecycle, handlers
+- `bin/syfrah` — CLI binary that composes all layers (zero logic)
+- `docs/` — Starlight documentation site (deployed to GitHub Pages)
 
-## Workflow
-- Project board: Backlog > Ready > In Progress > In Review > Done
-- Pick highest-priority, smallest task from Ready
-- Branch: `{issue-number}-{short-slug}` from `main`
-- Run `cargo fmt && cargo clippy && cargo test` before pushing
-- PR must include `Closes #N`
-- CI validates; green → merge + delete branch; red → fix + re-push
-- See `handbook/workflow.md` for the full contribution workflow
+## Key Modules (layers/hypervisor/src/)
+- `fabric/mesh.rs` — Mesh + hypervisor identity, create_mesh(), create_hypervisor()
+- `fabric/peer.rs` — Peer management, PeerList, PeerStatus
+- `fabric/ops.rs` — High-level orchestration: init, join, status, start, stop, leave
+- `fabric/peering.rs` — TCP peering protocol types (JoinRequest, JoinResponse, PeerAnnounce)
+- `fabric/peering_server.rs` — TCP listener for join requests
+- `fabric/peering_client.rs` — TCP client for join flow
+- `fabric/wg.rs` — WireGuard interface management (syfrah0)
+- `fabric/service.rs` — systemd service management (wg-quick@syfrah0)
+- `fabric/state.rs` — FabricState persistence (redb)
+- `handlers.rs` — ResourceDef + thin handlers (delegate to fabric::ops)
 
-## Key Modules (layers/fabric/src/)
-- `peering.rs` — TCP peering protocol (join requests, peer announcements, PIN auto-accept)
-- `control.rs` — Unix domain socket for CLI-daemon communication
-- `daemon.rs` — Daemon loop, init/join/start/leave flows
-- `store.rs` — State persistence (~/.syfrah/state.json)
-- `wg.rs` — WireGuard interface management
-- `cli/` — CLI commands for `syfrah fabric ...`
+## Architecture
+- Syfrah is a CLI orchestrator, NOT a daemon. Configures systemd services, then exits.
+- Every server is a hypervisor. The mesh connects them.
+- ResourceDef generates both CLI commands (clap) and REST API routes (axum) from one definition.
+- IPv6-native: each mesh gets a ULA /48, each node a /128.
 
 ## CLI
-Only `syfrah fabric`, `syfrah state`, and `syfrah update` commands are currently implemented.
-All other namespaces (`forge`, `org`, `vm`, `vpc`, etc.) are planned. See `handbook/cli.md` for the full command tree.
+- `syfrah hypervisor init` — create a new mesh
+- `syfrah hypervisor join` — join an existing mesh
+- `syfrah hypervisor status` — show status
+- `syfrah hypervisor start/stop` — manage WireGuard service
+- `syfrah hypervisor leave` — leave the mesh
+- `syfrah hypervisor peering` — start peering listener
+- `syfrah hypervisor list/get` — list/get hypervisors
 
 ## Conventions
 - serde Serialize/Deserialize on all public types
 - thiserror for library errors, anyhow for binaries
 - Async runtime: tokio
-- IPv6-native (ULA inside mesh)
 - Manual peering: no automatic discovery, operator approves join requests
-- One layer = one directory in `layers/`, one Rust crate, one README
-- CLI commands live inside their layer crate (`src/cli/`)
+- One layer = one directory in `layers/`, one Rust crate
 - Lower layers never depend on higher layers

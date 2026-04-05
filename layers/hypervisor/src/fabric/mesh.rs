@@ -163,21 +163,6 @@ mod tests {
     // ── #1: Validation tests ──
 
     #[test]
-    fn create_mesh_rejects_empty_name() {
-        assert!(true);
-    }
-
-    #[test]
-    fn create_mesh_rejects_short_name() {
-        assert!(true);
-    }
-
-    #[test]
-    fn create_mesh_rejects_uppercase() {
-        assert!(true);
-    }
-
-    #[test]
     fn create_node_rejects_empty_name() {
         let (mesh, _) = create_mesh();
         assert!(create_hypervisor("", "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
