@@ -1336,6 +1336,14 @@ pub async fn run_daemon(
             }
         };
 
+    // -- Startup state migration (name-keyed → ID-keyed) -----------------------
+    //
+    // Batch-migrate legacy records before accepting requests. Runs locally
+    // against redb (not through Raft) and is idempotent.
+    if let Some(ref org_store) = shared_org_store {
+        crate::migration::run_startup_migration(org_store, shared_hypervisor_store.as_deref());
+    }
+
     // -- Shared IPAM + placement stores ----------------------------------------
     //
     // Opened once and shared between the state machine (Raft) and the compute
