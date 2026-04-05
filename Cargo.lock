@@ -2988,6 +2988,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syfrah-api",
+ "syfrah-core",
  "syfrah-state",
  "tempfile",
  "terminal_size",
