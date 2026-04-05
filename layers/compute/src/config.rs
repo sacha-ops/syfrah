@@ -42,7 +42,11 @@ pub fn validate(spec: &VmSpec) -> Result<ValidatedSpec, Vec<ConfigError>> {
     let mut errors = Vec::new();
 
     // VM name: must be valid (no path traversal, special chars, etc.)
-    if let Err(e) = validate_name(&spec.id.to_string(), "VM") {
+    if let Err(e) = validate_name(&spec.name, "VM") {
+        errors.push(e);
+    }
+    // VM ID: must also be valid (generated IDs always pass, but validate for safety)
+    if let Err(e) = validate_name(&spec.id.to_string(), "VM ID") {
         errors.push(e);
     }
 
@@ -360,6 +364,7 @@ mod tests {
     fn minimal_spec() -> VmSpec {
         VmSpec {
             id: VmId("vm-test-1".to_string()),
+            name: "vm-test-1".to_string(),
             vcpus: 2,
             memory_mb: 512,
             image: "ubuntu-24.04".to_string(),
@@ -380,6 +385,7 @@ mod tests {
     fn full_spec() -> VmSpec {
         VmSpec {
             id: VmId("vm-full".to_string()),
+            name: "vm-full".to_string(),
             vcpus: 4,
             memory_mb: 4096,
             image: "ubuntu-24.04".to_string(),
@@ -548,6 +554,7 @@ mod tests {
     fn validate_collects_all_errors() {
         let spec = VmSpec {
             id: VmId("vm-bad".to_string()),
+            name: "vm-bad".to_string(),
             vcpus: 0,
             memory_mb: 10,
             image: String::new(),
@@ -730,6 +737,7 @@ mod tests {
     fn validate_truly_minimal_spec_1vcpu_128mb() {
         let spec = VmSpec {
             id: VmId("vm-tiny".to_string()),
+            name: "vm-tiny".to_string(),
             vcpus: 1,
             memory_mb: 128,
             image: "alpine".to_string(),
@@ -752,6 +760,7 @@ mod tests {
     fn validate_max_vcpus_large_memory() {
         let spec = VmSpec {
             id: VmId("vm-max".to_string()),
+            name: "vm-max".to_string(),
             vcpus: 256,
             memory_mb: 1_048_576, // 1 TB
             image: "ubuntu-24.04".to_string(),
@@ -810,6 +819,7 @@ mod tests {
     fn validate_multiple_errors_vcpus_memory_image() {
         let spec = VmSpec {
             id: VmId("vm-multi-err".to_string()),
+            name: "vm-multi-err".to_string(),
             vcpus: 0,
             memory_mb: 0,
             image: String::new(),
@@ -850,6 +860,7 @@ mod tests {
         // resolve must NOT check filesystem existence — that is preflight's job
         let spec = VmSpec {
             id: VmId("vm-nopath".to_string()),
+            name: "vm-nopath".to_string(),
             vcpus: 2,
             memory_mb: 256,
             image: "doesnotexist".to_string(),
@@ -1050,6 +1061,7 @@ mod tests {
     fn full_pipeline_validate_resolve_map() {
         let spec = VmSpec {
             id: VmId("vm-e2e".to_string()),
+            name: "vm-e2e".to_string(),
             vcpus: 4,
             memory_mb: 4096,
             image: "debian-12".to_string(),
@@ -1244,7 +1256,7 @@ mod tests {
     #[test]
     fn validate_vm_name_in_spec_rejected() {
         let mut spec = minimal_spec();
-        spec.id = VmId("../escape".to_string());
+        spec.name = "../escape".to_string();
         let errors = validate(&spec).unwrap_err();
         assert!(errors
             .iter()
