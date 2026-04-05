@@ -5,16 +5,19 @@ use std::io::{self, Write};
 use super::cli_gen::{render_detail, render_table};
 use super::constraint::FieldMap;
 use super::operation::OutputKind;
-use super::registry::{OperationRequest, OperationResponse, ResourceRegistration, ScopeValues};
+use super::registry::{
+    OperationRequest, OperationResponse, ResourceRegistration, ScopeValues, ValidatedRequest,
+};
 use super::ResourceDef;
 
 /// Dispatch a parsed CLI invocation to the appropriate resource handler.
 ///
-/// This function:
-/// 1. Extracts args from clap matches
-/// 2. Validates constraints
-/// 3. Calls the handler
-/// 4. Renders the output
+/// Pipeline:
+/// 1. Extract raw values from clap matches
+/// 2. Validate constraints → produce ValidatedRequest
+/// 3. Handle confirmation prompt
+/// 4. Call handler
+/// 5. Render output
 pub async fn dispatch(
     reg: &ResourceRegistration,
     op_name: &str,
@@ -27,7 +30,7 @@ pub async fn dispatch(
         .find(|o| o.name == op_name)
         .ok_or_else(|| anyhow::anyhow!("unknown operation: {op_name}"))?;
 
-    // ── Extract values from clap matches ──
+    // ── 1. Extract raw values ──
 
     let name = matches
         .try_get_one::<String>("name")
@@ -50,7 +53,7 @@ pub async fn dispatch(
     let scope = extract_scope(def, matches);
     let fields = extract_fields(def, op, matches);
 
-    // ── Validate constraints ──
+    // ── 2. Validate constraints → ValidatedRequest ──
 
     for constraint in &op.constraints {
         constraint
@@ -58,13 +61,24 @@ pub async fn dispatch(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    // ── Confirmation prompt ──
+    let raw_request = OperationRequest {
+        operation: op_name.to_string(),
+        name,
+        scope,
+        fields,
+    };
+
+    let validated = ValidatedRequest::from_raw(def.identity.kind, raw_request.clone());
+
+    // ── 3. Confirmation prompt ──
 
     if op.confirmable && !yes {
-        let resource_name = name.as_deref().unwrap_or("this resource");
+        let resource_name = raw_request.name.as_deref().unwrap_or("this resource");
         let prompt = format!(
-            "Delete {} '{}'? This cannot be undone. [y/N] ",
-            def.identity.kind, resource_name
+            "{} {} '{}'? This cannot be undone. [y/N] ",
+            capitalize(op.name),
+            def.identity.kind,
+            resource_name
         );
         print!("{prompt}");
         io::stdout().flush()?;
@@ -76,37 +90,28 @@ pub async fn dispatch(
         }
     }
 
-    // ── Build request ──
+    // ── 4. Call handler with validated request ──
 
-    let request = OperationRequest {
-        operation: op_name.to_string(),
-        name,
-        scope,
-        fields,
-    };
+    let _ = &validated; // available for future use
+    let response = (reg.handler)(raw_request).await?;
 
-    // ── Call handler ──
+    // ── 5. Render output ──
 
-    let response = (reg.handler)(request).await?;
+    let force_json = json || matches!(op.output.kind, OutputKind::JsonOnly);
 
-    // ── Render output ──
-
-    match (&op.output.kind, json) {
-        (_, true) => {
-            // JSON mode — always output raw JSON
-            match &response {
-                OperationResponse::Resource(v) => {
-                    println!("{}", serde_json::to_string_pretty(v)?);
-                }
-                OperationResponse::ResourceList(items) => {
-                    println!("{}", serde_json::to_string_pretty(items)?);
-                }
-                OperationResponse::Message(msg) => {
-                    println!("{}", serde_json::json!({"message": msg}));
-                }
-                OperationResponse::None => {}
+    match (&op.output.kind, force_json) {
+        (_, true) => match &response {
+            OperationResponse::Resource(v) => {
+                println!("{}", serde_json::to_string_pretty(v)?);
             }
-        }
+            OperationResponse::ResourceList(items) => {
+                println!("{}", serde_json::to_string_pretty(items)?);
+            }
+            OperationResponse::Message(msg) => {
+                println!("{}", serde_json::json!({"message": msg}));
+            }
+            OperationResponse::None => {}
+        },
         (OutputKind::Resource, false) => {
             if let OperationResponse::Resource(v) = &response {
                 render_detail(def, v);
@@ -135,7 +140,7 @@ pub async fn dispatch(
                 println!("{rendered}");
             }
         }
-        (OutputKind::None, false) => {}
+        (OutputKind::None, false) | (OutputKind::JsonOnly, false) => {}
     }
 
     Ok(())
@@ -160,12 +165,16 @@ fn extract_fields(
 
     // Schema fields
     for field in &def.schema.fields {
-        if let Some(val) = matches.get_one::<String>(field.name) {
+        if let Some(val) = matches.try_get_one::<String>(field.name).ok().flatten() {
             fields.insert(field.name.to_string(), val.clone());
         }
-        // Boolean flags
         if matches!(field.field_type, super::schema::FieldType::Flag)
-            && matches.get_flag(field.name)
+            && matches
+                .try_get_one::<bool>(field.name)
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
         {
             fields.insert(field.name.to_string(), "true".to_string());
         }
@@ -174,11 +183,16 @@ fn extract_fields(
     // Operation-specific args
     for arg in &op.args {
         if let super::operation::ArgSource::Custom(field) = &arg.source {
-            if let Some(val) = matches.get_one::<String>(arg.name) {
+            if let Some(val) = matches.try_get_one::<String>(arg.name).ok().flatten() {
                 fields.insert(arg.name.to_string(), val.clone());
             }
             if matches!(field.field_type, super::schema::FieldType::Flag)
-                && matches.get_flag(arg.name)
+                && matches
+                    .try_get_one::<bool>(arg.name)
+                    .ok()
+                    .flatten()
+                    .copied()
+                    .unwrap_or(false)
             {
                 fields.insert(arg.name.to_string(), "true".to_string());
             }
@@ -193,4 +207,12 @@ fn extract_name(value: &serde_json::Value) -> Option<String> {
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
 }

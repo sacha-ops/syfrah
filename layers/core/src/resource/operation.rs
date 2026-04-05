@@ -81,6 +81,19 @@ pub enum OutputKind {
     ResourceList,
     /// A simple text message
     Message,
+    /// JSON only — no table/detail rendering, always output JSON
+    JsonOnly,
+}
+
+/// Typed filter for list operations.
+#[derive(Debug, Clone)]
+pub struct FilterDef {
+    /// Filter name (used as --flag)
+    pub name: &'static str,
+    /// Field type for validation
+    pub field_type: super::schema::FieldType,
+    /// Help text
+    pub description: &'static str,
 }
 
 // ── Convenience constructors ───────────────────────────────

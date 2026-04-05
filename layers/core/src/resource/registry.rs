@@ -34,14 +34,28 @@ impl ScopeValues {
     }
 }
 
-/// A validated request — constraints have been checked.
+/// A validated request — constraints have been checked, fields normalized.
+/// Created by the dispatch layer after parsing + validation.
 #[derive(Debug, Clone)]
 pub struct ValidatedRequest {
-    pub resource_kind: String,
+    pub resource_kind: &'static str,
     pub operation: String,
     pub name: Option<String>,
     pub scope: ScopeValues,
     pub fields: FieldMap,
+}
+
+impl ValidatedRequest {
+    /// Create from a raw request after validation succeeds.
+    pub fn from_raw(kind: &'static str, req: OperationRequest) -> Self {
+        Self {
+            resource_kind: kind,
+            operation: req.operation,
+            name: req.name,
+            scope: req.scope,
+            fields: req.fields,
+        }
+    }
 }
 
 /// Response from a resource handler.

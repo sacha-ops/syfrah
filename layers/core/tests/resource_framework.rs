@@ -459,3 +459,194 @@ fn field_builder_chain() {
     assert_eq!(f.short, Some('n'));
     assert_eq!(f.visibility, CliVisibility::Advanced);
 }
+
+// ── Builder Tests ──────────────────────────────────
+
+#[test]
+fn builder_creates_full_resource() {
+    let def = ResourceDef::build("lb", "Load Balancer")
+        .plural("load-balancers")
+        .alias("loadbalancer")
+        .parent("org", "--org", "Organization")
+        .field(FieldDef::string("algorithm", "Balancing algorithm"))
+        .field(FieldDef::string("description", "LB description").mutable())
+        .crud()
+        .action("add-target", "Add a backend target")
+        .op(|op| {
+            op.with_arg(OperationArg::required(
+                "vm",
+                FieldDef::resource_ref("vm", "Target VM", "vm"),
+            ))
+            .with_arg(OperationArg::required(
+                "port",
+                FieldDef::integer("port", "Target port"),
+            ))
+        })
+        .column("NAME", "name")
+        .column("ALGORITHM", "algorithm")
+        .column("STATUS", "status")
+        .empty_message("No load balancers found.")
+        .detail_section(
+            None,
+            vec![
+                DetailField::new("Name", "name"),
+                DetailField::new("Algorithm", "algorithm"),
+            ],
+        )
+        .done();
+
+    assert_eq!(def.identity.kind, "lb");
+    assert_eq!(def.identity.plural, "load-balancers");
+    assert_eq!(def.identity.aliases, &["loadbalancer"]);
+    assert_eq!(def.scope.parents.len(), 1);
+    assert_eq!(def.scope.parents[0].kind, "org");
+    assert_eq!(def.schema.fields.len(), 2);
+    assert_eq!(def.operations.len(), 5); // create + list + get + delete + add-target
+    assert!(def.presentation.table.is_some());
+    assert_eq!(def.presentation.table.as_ref().unwrap().columns.len(), 3);
+    assert!(def.presentation.detail.is_some());
+}
+
+#[test]
+fn builder_auto_pluralizes() {
+    let def = ResourceDef::build("widget", "A widget").list().done();
+
+    assert_eq!(def.identity.plural, "widgets");
+}
+
+#[test]
+fn builder_crud_adds_all_four() {
+    let def = ResourceDef::build("thing", "A thing").crud().done();
+
+    let op_names: Vec<&str> = def.operations.iter().map(|o| o.name).collect();
+    assert!(op_names.contains(&"create"));
+    assert!(op_names.contains(&"list"));
+    assert!(op_names.contains(&"get"));
+    assert!(op_names.contains(&"delete"));
+}
+
+#[test]
+fn builder_generated_command_has_all_subcommands() {
+    let def = ResourceDef::build("lb", "Load Balancer")
+        .crud()
+        .action("drain", "Drain all connections")
+        .op(|op| op.with_confirm())
+        .done();
+
+    let cmd = generate_command(&def);
+    let subs: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+    assert!(subs.contains(&"create"));
+    assert!(subs.contains(&"list"));
+    assert!(subs.contains(&"get"));
+    assert!(subs.contains(&"delete"));
+    assert!(subs.contains(&"drain"));
+}
+
+// ── DisplayFormat Rendering Tests ──────────────────────────────────
+
+#[test]
+fn format_value_yes_no() {
+    let val = serde_json::json!({"active": true, "archived": false});
+    assert_eq!(format_value(&val, "active", &DisplayFormat::YesNo), "yes");
+    assert_eq!(format_value(&val, "archived", &DisplayFormat::YesNo), "no");
+}
+
+#[test]
+fn format_value_bytes() {
+    let val = serde_json::json!({"size": 1073741824});
+    assert_eq!(format_value(&val, "size", &DisplayFormat::Bytes), "1.0 GiB");
+
+    let val = serde_json::json!({"size": 1048576});
+    assert_eq!(format_value(&val, "size", &DisplayFormat::Bytes), "1.0 MiB");
+
+    let val = serde_json::json!({"size": 1024});
+    assert_eq!(format_value(&val, "size", &DisplayFormat::Bytes), "1.0 KiB");
+
+    let val = serde_json::json!({"size": 42});
+    assert_eq!(format_value(&val, "size", &DisplayFormat::Bytes), "42 B");
+}
+
+#[test]
+fn format_value_duration() {
+    let val = serde_json::json!({"uptime": 90061});
+    assert_eq!(
+        format_value(&val, "uptime", &DisplayFormat::Duration),
+        "1d 1h"
+    );
+
+    let val = serde_json::json!({"uptime": 3661});
+    assert_eq!(
+        format_value(&val, "uptime", &DisplayFormat::Duration),
+        "1h 1m"
+    );
+
+    let val = serde_json::json!({"uptime": 65});
+    assert_eq!(
+        format_value(&val, "uptime", &DisplayFormat::Duration),
+        "1m 5s"
+    );
+
+    let val = serde_json::json!({"uptime": 42});
+    assert_eq!(
+        format_value(&val, "uptime", &DisplayFormat::Duration),
+        "42s"
+    );
+}
+
+#[test]
+fn format_value_timestamp() {
+    // 2026-04-05 15:33:27 UTC = 1775403207
+    let val = serde_json::json!({"created_at": 1775403207});
+    let formatted = format_value(&val, "created_at", &DisplayFormat::Timestamp);
+    assert!(formatted.contains("2026"), "expected 2026 in: {formatted}");
+    assert!(formatted.contains("UTC"), "expected UTC in: {formatted}");
+}
+
+#[test]
+fn format_value_masked() {
+    let val = serde_json::json!({"secret": "syf_sk_abc123def456"});
+    let formatted = format_value(&val, "secret", &DisplayFormat::Masked);
+    assert!(
+        formatted.starts_with("****"),
+        "expected masked: {formatted}"
+    );
+    assert!(formatted.ends_with("f456"), "expected suffix: {formatted}");
+}
+
+#[test]
+fn format_value_missing_field() {
+    let val = serde_json::json!({"name": "test"});
+    assert_eq!(
+        format_value(&val, "nonexistent", &DisplayFormat::Plain),
+        "-"
+    );
+}
+
+// ── ValidatedRequest Tests ──────────────────────────────────
+
+#[test]
+fn validated_request_from_raw() {
+    let raw = OperationRequest {
+        operation: "create".to_string(),
+        name: Some("my-vpc".to_string()),
+        scope: ScopeValues::default(),
+        fields: std::collections::HashMap::new(),
+    };
+    let validated = ValidatedRequest::from_raw("vpc", raw);
+    assert_eq!(validated.resource_kind, "vpc");
+    assert_eq!(validated.operation, "create");
+    assert_eq!(validated.name, Some("my-vpc".to_string()));
+}
+
+// ── FilterDef Tests ──────────────────────────────────
+
+#[test]
+fn filter_def_construction() {
+    use syfrah_core::resource::FilterDef;
+    let f = FilterDef {
+        name: "zone",
+        field_type: FieldType::String,
+        description: "Filter by zone",
+    };
+    assert_eq!(f.name, "zone");
+}
