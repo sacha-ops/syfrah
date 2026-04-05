@@ -11,6 +11,8 @@ pub mod mesh;
 pub mod ops;
 pub mod peer;
 pub mod peering;
+pub mod peering_client;
+pub mod peering_server;
 pub mod service;
 pub mod state;
 pub mod wg;

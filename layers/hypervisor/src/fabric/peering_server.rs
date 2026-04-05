@@ -1,0 +1,265 @@
+//! Peering TCP server — accepts join requests from new nodes.
+//!
+//! One-shot: listens, accepts one connection, processes the join, exits.
+//! Or can run in a loop for multiple joins with a timeout.
+
+use base64::Engine as _;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use syfrah_core::error::SyfrahError;
+use syfrah_state::LayerDb;
+
+use super::peer::Peer;
+use super::peering::{JoinRequest, JoinResponse, PeerInfo};
+use super::service;
+use super::state::FabricState;
+
+/// Start a peering listener that accepts join requests.
+///
+/// - `pin`: required PIN for auto-accept
+/// - `timeout`: how long to listen before giving up
+/// - `max_joins`: max number of joins to accept (0 = unlimited until timeout)
+pub async fn listen(
+    db: &LayerDb,
+    pin: &str,
+    bind_addr: SocketAddr,
+    timeout: Duration,
+    max_joins: usize,
+) -> Result<usize, SyfrahError> {
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| SyfrahError::internal(format!("failed to bind peering port: {e}")))?;
+
+    tracing::info!(addr = %bind_addr, pin = pin, "peering listener started");
+
+    let mut accepted = 0;
+
+    loop {
+        let accept = tokio::time::timeout(timeout, listener.accept()).await;
+
+        match accept {
+            Ok(Ok((mut stream, peer_addr))) => {
+                tracing::info!(peer = %peer_addr, "incoming join request");
+
+                match handle_join(&mut stream, db, pin).await {
+                    Ok(peer_name) => {
+                        tracing::info!(peer = %peer_addr, name = %peer_name, "join accepted");
+                        accepted += 1;
+                        if max_joins > 0 && accepted >= max_joins {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_addr, error = %e, "join rejected");
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "accept error");
+            }
+            Err(_) => {
+                // Timeout
+                tracing::info!("peering listener timeout");
+                break;
+            }
+        }
+    }
+
+    Ok(accepted)
+}
+
+/// Handle a single join request on a TCP stream.
+async fn handle_join(
+    stream: &mut tokio::net::TcpStream,
+    db: &LayerDb,
+    expected_pin: &str,
+) -> Result<String, SyfrahError> {
+    // Read request (length-prefixed JSON)
+    let req = read_json::<JoinRequest>(stream).await?;
+
+    // Validate PIN
+    if !super::peering::validate_pin(expected_pin, req.pin.as_deref()) {
+        let resp = JoinResponse::rejected("invalid PIN");
+        write_json(stream, &resp).await?;
+        return Err(SyfrahError::permission_denied("invalid PIN"));
+    }
+
+    // Load current state
+    let mut state = FabricState::load(db)
+        .map_err(|e| SyfrahError::internal(e.to_string()))?
+        .ok_or_else(|| SyfrahError::precondition("not initialized"))?;
+
+    // Build peer list for response (existing peers + self)
+    let self_info = PeerInfo {
+        name: state.hypervisor.name.clone(),
+        region: state.hypervisor.region.clone(),
+        zone: state.hypervisor.zone.clone(),
+        wg_public_key: state.hypervisor.wg_public_key.clone(),
+        wg_port: state.hypervisor.wg_port,
+        endpoint: state.hypervisor.endpoint.clone(),
+        mesh_ipv6: state.hypervisor.mesh_ipv6,
+    };
+
+    let existing_peers: Vec<PeerInfo> = state
+        .peers
+        .peers
+        .iter()
+        .map(|p| PeerInfo {
+            name: p.name.clone(),
+            region: p.region.clone(),
+            zone: p.zone.clone(),
+            wg_public_key: p.wg_public_key.clone(),
+            wg_port: 51820,
+            endpoint: p.endpoint.clone(),
+            mesh_ipv6: p.mesh_ipv6,
+        })
+        .collect();
+
+    // Send response with mesh secret + peer list
+    let resp = JoinResponse::accepted(
+        &state.mesh.name,
+        &state.secret,
+        state.mesh.prefix,
+        existing_peers,
+        self_info,
+    );
+    write_json(stream, &resp).await?;
+
+    // Derive the new peer's mesh IPv6
+    let pub_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.wg_public_key)
+        .unwrap_or_default();
+    let peer_ipv6 = syfrah_core::addressing::derive_node_address(&state.mesh.prefix, &pub_bytes);
+
+    // Add the new peer to our state
+    let new_peer = Peer::new(
+        req.name.clone(),
+        req.region,
+        req.zone,
+        req.wg_public_key.clone(),
+        req.endpoint,
+        peer_ipv6,
+    );
+    let _ = state.peers.add(new_peer);
+    state
+        .save(db)
+        .map_err(|e| SyfrahError::internal(e.to_string()))?;
+
+    // Update WireGuard config with new peer
+    let peers_for_wg: Vec<_> = state
+        .peers
+        .peers
+        .iter()
+        .map(|p| {
+            (
+                p.wg_public_key.clone(),
+                "25".to_string(),
+                p.mesh_ipv6,
+                p.endpoint.clone(),
+            )
+        })
+        .collect();
+
+    service::update_config(
+        &state.hypervisor.wg_private_key,
+        state.hypervisor.wg_port,
+        &state.hypervisor.mesh_ipv6,
+        &peers_for_wg,
+    )?;
+
+    Ok(req.name)
+}
+
+/// Read a length-prefixed JSON message from a TCP stream.
+pub async fn read_json<T: serde::de::DeserializeOwned>(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<T, SyfrahError> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| SyfrahError::network(format!("read length failed: {e}")))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > 1_048_576 {
+        return Err(SyfrahError::validation("message too large"));
+    }
+
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| SyfrahError::network(format!("read body failed: {e}")))?;
+
+    serde_json::from_slice(&buf).map_err(|e| SyfrahError::validation(format!("invalid JSON: {e}")))
+}
+
+/// Write a length-prefixed JSON message to a TCP stream.
+pub async fn write_json<T: serde::Serialize>(
+    stream: &mut tokio::net::TcpStream,
+    msg: &T,
+) -> Result<(), SyfrahError> {
+    let data = serde_json::to_vec(msg)
+        .map_err(|e| SyfrahError::internal(format!("serialize failed: {e}")))?;
+    let len = (data.len() as u32).to_be_bytes();
+
+    stream
+        .write_all(&len)
+        .await
+        .map_err(|e| SyfrahError::network(format!("write failed: {e}")))?;
+    stream
+        .write_all(&data)
+        .await
+        .map_err(|e| SyfrahError::network(format!("write failed: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| SyfrahError::network(format!("flush failed: {e}")))?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Peering server requires network — tested in integration tests.
+    // Unit tests cover the JSON framing.
+
+    #[tokio::test]
+    async fn json_roundtrip_over_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req: JoinRequest = read_json(&mut stream).await.unwrap();
+            assert_eq!(req.name, "test-node");
+
+            let resp = JoinResponse::rejected("test rejection");
+            write_json(&mut stream, &resp).await.unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = JoinRequest {
+            name: "test-node".into(),
+            region: "eu".into(),
+            zone: "fsn1".into(),
+            wg_public_key: "key".into(),
+            wg_port: 51820,
+            endpoint: None,
+            pin: Some("1234".into()),
+        };
+        write_json(&mut client, &req).await.unwrap();
+
+        let resp: JoinResponse = read_json(&mut client).await.unwrap();
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason.as_deref(), Some("test rejection"));
+
+        server.await.unwrap();
+    }
+}
