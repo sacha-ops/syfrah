@@ -10,3 +10,4 @@
 //! - **storage**: ZeroFS volumes, S3 backend (future)
 
 pub mod fabric;
+pub mod handlers;
