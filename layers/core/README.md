@@ -408,7 +408,7 @@ Warning: storage: both cache_memory_mb and cache_disk_gb are 0 — no caching at
 
 ## Logging (`syfrah_core::logging`)
 
-Structured logging based on `tracing`. Consistent across daemon and CLI.
+Structured logging based on `tracing`. 8 features beyond basic setup.
 
 ### Setup
 
@@ -416,48 +416,63 @@ Structured logging based on `tracing`. Consistent across daemon and CLI.
 use syfrah_core::logging;
 use syfrah_core::config::LoggingConfig;
 
-// Daemon: init from config
+// Daemon: init from config (installs panic hook, noise filters, metrics)
 let config = LoggingConfig { level: "info".into(), format: "text".into(), ..Default::default() };
-let _guard = logging::init(&config);  // hold guard for program lifetime
+let _guard = logging::init(&config);  // must_use — hold for program lifetime
+
+// Global context: node/region/zone on every log line
+let _span = logging::global_context("node-1", "eu", "fsn1").entered();
 
 // CLI: minimal logging (warn level, stderr)
 let _guard = logging::init_cli();
 
-// Then use tracing macros everywhere
 tracing::info!("daemon started");
 tracing::warn!(zone = "fsn1", "peer unreachable");
-tracing::debug!(vpc_id = %id, "creating vpc");
 ```
 
-### Modes
+### Features
 
-| Mode | When | Output |
-|------|------|--------|
-| **text** | Human at terminal | `2026-04-05T15:33:27Z INFO syfrah_fabric::daemon: daemon started` |
-| **json** | Log aggregation | `{"timestamp":"...","level":"INFO","target":"...","message":"..."}` |
-| **file** | Background daemon | Writes to file + stderr simultaneously |
+| # | Feature | What |
+|---|---------|------|
+| 1 | **File rotation** | Daily rolling via `tracing-appender` (not `never` anymore) |
+| 2 | **Panic hook** | Panics logged through tracing before abort |
+| 3 | **Global context** | `global_context("node", "region", "zone")` → fields on every line |
+| 4 | **Per-module filtering** | `level = "info,syfrah_fabric=debug"` in config |
+| 5 | **Noise suppression** | hyper, tokio, redb, rustls default to `warn` |
+| 6 | **Log sampling** | (planned — not yet implemented) |
+| 7 | **Metrics** | `logging::warn_count()`, `logging::error_count()` — atomic counters |
+| 8 | **must_use guard** | Compiler warns if `LogGuard` is dropped accidentally |
 
-### Config
+### Per-module filtering
 
 ```toml
 [logging]
-level = "info"        # trace, debug, info, warn, error
-format = "text"       # text, json
-file = ""             # empty = stderr only, or path like "/var/log/syfrah.log"
-max_file_size_mb = 50
-max_files = 3
+level = "info,syfrah_fabric=debug,syfrah_fabric::daemon=trace"
 ```
 
-Override with env: `RUST_LOG=debug syfrah fabric start`
-Override with env: `SYFRAH_LOG_LEVEL=trace syfrah fabric start`
+Or via env: `RUST_LOG=info,syfrah_fabric=debug syfrah fabric start`
 
-### Properties
+### Noise suppression
 
-- **RUST_LOG respected** — standard Rust convention takes precedence
-- **File + stderr** — when file is set, logs go to both
-- **Non-blocking writes** — file output is buffered async, never blocks daemon
-- **Guard pattern** — `LogGuard` must be held; dropping it flushes pending logs
-- **Structured fields** — `tracing::info!(zone = "fsn1", "message")` for machine-parseable context
+These dependencies are silenced to `warn` by default (unless overridden by `RUST_LOG`):
+`hyper`, `tokio`, `mio`, `redb`, `rustls`, `h2`, `tower`, `reqwest`
+
+### Log metrics
+
+```rust
+use syfrah_core::logging;
+
+let warns = logging::warn_count();   // warnings since init
+let errors = logging::error_count(); // errors since init
+// Useful for health checks and alerting
+```
+
+### Panic handling
+
+```
+2026-04-05T15:33:27Z ERROR syfrah: PANIC: index out of bounds  location=layers/fabric/src/daemon.rs:42:5  panic=true
+```
+Panics are captured, logged as ERROR with location, then the default handler runs.
 
 ---
 
