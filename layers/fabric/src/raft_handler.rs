@@ -76,6 +76,7 @@ fn is_read_request(req: &OrgRequest) -> bool {
             | OrgRequest::RouteTableList { .. }
             | OrgRequest::RouteList { .. }
             | OrgRequest::SubnetResolve { .. }
+            | OrgRequest::Resolve { .. }
     )
 }
 
