@@ -4,3 +4,8 @@ pub mod ids;
 pub mod mesh;
 pub mod secret;
 pub mod storage;
+
+pub use ids::{
+    EnvId, HypervisorId, NatGwId, NicId, OrgId, PeeringId, ProjectId, RouteTableId, RuleId, SgId,
+    SnapshotId, SubnetId, VmId, VolumeId, VpcId,
+};
