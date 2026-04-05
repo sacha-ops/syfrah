@@ -1892,25 +1892,67 @@ pub async fn run_daemon(
     // S3 health probe (ADR-006 §25) — periodic PUT+GET+DELETE probe
     // against S3 to track reachability and latency. The handle is read
     // by the gossip agent to populate S3 health fields in reports.
+    //
+    // Read S3 credentials from the storage config stored in redb (same
+    // source that ZeroFS uses) instead of environment variables, so the
+    // health probe authenticates correctly against real S3 endpoints.
+    // Fall back to env vars only if no stored config exists yet.
     let s3_health_handle: Option<syfrah_storage::S3HealthHandle> = {
         let s3_probe_shutdown_rx = storage_shutdown_rx.clone();
-        let s3_health_probe_config = syfrah_storage::S3HealthProbeConfig {
-            endpoint: std::env::var("S3_ENDPOINT").unwrap_or_default(),
-            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "syfrah".to_string()),
-            access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
-            secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
-            thresholds: syfrah_storage::S3HealthThresholds::default(),
+
+        // Try to read S3 config from the storage store (redb) first.
+        let stored_cfg = shared_storage_store.as_ref().and_then(|store| {
+            let region = my_record
+                .zone
+                .as_deref()
+                .filter(|z| !z.is_empty())
+                .or(my_record.region.as_deref())
+                .unwrap_or("default");
+            if let Ok(Some(cfg)) = store.get_storage_config(region) {
+                return Some(cfg);
+            }
+            // Fallback: first available config.
+            if let Ok(configs) = store.list_storage_configs() {
+                return configs.into_iter().next().map(|(_, cfg)| cfg);
+            }
+            None
+        });
+
+        let s3_health_probe_config = if let Some(cfg) = stored_cfg {
+            syfrah_storage::S3HealthProbeConfig {
+                endpoint: cfg.s3_endpoint,
+                bucket: cfg.s3_bucket,
+                access_key: cfg.s3_access_key,
+                secret_key: cfg.s3_secret_key,
+                thresholds: syfrah_storage::S3HealthThresholds::default(),
+            }
+        } else {
+            // Env-var fallback for bootstrapping before first configure.
+            syfrah_storage::S3HealthProbeConfig {
+                endpoint: std::env::var("S3_ENDPOINT").unwrap_or_default(),
+                bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "syfrah".to_string()),
+                access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
+                secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
+                thresholds: syfrah_storage::S3HealthThresholds::default(),
+            }
         };
+
         if !s3_health_probe_config.endpoint.is_empty() {
             let handle =
                 syfrah_storage::start_s3_health_probe(s3_health_probe_config, s3_probe_shutdown_rx);
             info!("S3 health probe started");
             Some(handle)
         } else {
-            info!("S3 health probe skipped: S3_ENDPOINT not configured");
+            info!("S3 health probe skipped: no S3 endpoint configured");
             None
         }
     };
+
+    // Wire the S3 health handle into the storage layer handler so that
+    // `syfrah storage health` can report live probe results.
+    if let (Some(ref handler), Some(ref handle)) = (&raft_storage_handler, &s3_health_handle) {
+        handler.set_s3_health_handle(handle.clone()).await;
+    }
 
     // -- Forge HTTP API server -----------------------------------------------
     //
