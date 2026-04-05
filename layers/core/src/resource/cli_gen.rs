@@ -240,9 +240,7 @@ pub fn render_table(def: &ResourceDef, items: &[serde_json::Value]) {
     };
 
     if items.is_empty() {
-        let msg = table_def
-            .empty_message
-            .unwrap_or("No resources found.");
+        let msg = table_def.empty_message.unwrap_or("No resources found.");
         println!("{msg}");
         return;
     }
