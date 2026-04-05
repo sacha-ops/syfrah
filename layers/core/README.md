@@ -1,5 +1,78 @@
 # syfrah-core
 
+Core building blocks for the Syfrah cloud platform. Contains:
+
+- **Resource framework** — declarative CLI generation from resource definitions
+- **Typed IDs** — ULID-backed, sortable, validated resource identifiers
+
+---
+
+## Typed IDs (`syfrah_core::id`)
+
+Every resource has a generated, immutable ID. IDs are the primary key everywhere — Raft, stores, API, logs. Names are for humans, IDs are for machines.
+
+### Format
+
+```
+{prefix}-{26-char-ULID}
+vpc-01JAXZ7KG8MN2P4Q6R9S0T1V2
+```
+
+### Properties
+
+| Property | How |
+|----------|-----|
+| **Sortable** | ULID encodes timestamp first → lexicographic order = chronological order |
+| **Unique** | 48-bit timestamp + 80-bit random per millisecond |
+| **Typed** | `VpcId`, `OrgId`, `HypervisorId` — compiler catches misuse |
+| **Validated** | `FromStr` rejects malformed IDs; `From<&str>` is unchecked (for deserialization) |
+| **Introspectable** | `created_at_ms()` extracts creation timestamp from any ID |
+
+### 17 ID types
+
+`OrgId`, `ProjectId`, `EnvId`, `VpcId`, `SubnetId`, `SgId`, `HypervisorId`, `VmId`, `VolumeId`, `SnapshotId`, `NicId`, `NatGwId`, `RouteTableId`, `RuleId`, `PeeringId`, `NodeId`, `MeshId`
+
+### Usage
+
+```rust
+use syfrah_core::id::VpcId;
+
+// Generate
+let id = VpcId::generate();
+assert!(id.as_str().starts_with("vpc-"));
+
+// Parse with validation
+let parsed: VpcId = "vpc-01JAXZ7KG8MN2P4Q6R9S0T1V2".parse().unwrap();
+assert!("org-01JAXZ7KG8MN2P4Q6R9S0T1V2".parse::<VpcId>().is_err()); // wrong prefix
+
+// Introspect
+let ts = id.created_at_ms().unwrap(); // milliseconds since epoch
+let ulid = id.ulid_part().unwrap();   // raw ULID string
+
+// Classify input
+VpcId::looks_like_id("vpc-01JAX...");  // true — it's an ID
+VpcId::looks_like_id("my-vpc");        // false — it's a name
+
+// Works in HashMaps (Deref<str> + Borrow<str>)
+use std::collections::HashMap;
+let mut map: HashMap<VpcId, String> = HashMap::new();
+map.insert(id.clone(), "my-vpc".into());
+assert!(map.contains_key(id.as_str())); // lookup by &str
+```
+
+### Serde
+
+IDs serialize as plain strings (transparent), so JSON looks like:
+```json
+{"id": "vpc-01JAXZ7KG8MN2P4Q6R9S0T1V2", "name": "my-vpc"}
+```
+
+Not `{"id": {"VpcId": "..."}}`.
+
+---
+
+## Resource Framework (`syfrah_core::resource`)
+
 The declarative resource framework that powers all of Syfrah's CLI (and future API). Instead of writing CLI commands by hand, you define **what a resource is** and the framework generates everything else.
 
 ## Why
