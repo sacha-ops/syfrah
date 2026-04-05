@@ -31,21 +31,28 @@ const VNI_COUNTER_TABLE: &str = "vni_counter";
 const VNI_COUNTER_KEY: &str = "counter";
 const VNI_START: u32 = 100;
 
-// ── Name-to-ID index tables ──────────────────────────────────────────
-// Each index maps a scoped name key to a resource ID so that name-based
-// lookups continue to work after switching primary keys to IDs.
+// Name → ID index tables for ID-keyed resources (org layer)
+const ORG_NAME_IDX: &str = "org_name_idx";
+const PROJECT_NAME_IDX: &str = "project_name_idx";
+const ENV_NAME_IDX: &str = "env_name_idx";
 
-/// VPC name → VPC ID. Key: "{org_scope}/{vpc_name}" (org_scope is org name
-/// or project org prefix). Unique per org.
+// Name → ID index tables for networking resources
 const VPC_NAME_INDEX: &str = "idx_vpc_name";
-/// Subnet name → Subnet ID. Key: "{vpc_id}/{subnet_name}". Unique per VPC.
 const SUBNET_NAME_INDEX: &str = "idx_subnet_name";
-/// Security group name → SG ID. Key: "{vpc_id}/{sg_name}". Unique per VPC.
 const SG_NAME_INDEX: &str = "idx_sg_name";
-/// NAT gateway name → NatGw ID. Key: "{vpc_id}/{nat_name}". Unique per VPC.
 const NAT_GW_NAME_INDEX: &str = "idx_nat_gw_name";
-/// Route table name → RouteTable ID. Key: "{vpc_id}/{table_name}". Unique per VPC.
 const ROUTE_TABLE_NAME_INDEX: &str = "idx_route_table_name";
+
+/// Generate a random ID with the given prefix.
+/// Format: `{prefix}-{12-hex-chars}` (e.g., `org-a1b2c3d4e5f6`)
+fn generate_id(prefix: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let hex: String = (0..12)
+        .map(|_| format!("{:x}", rng.gen::<u8>() % 16))
+        .collect();
+    format!("{prefix}-{hex}")
+}
 
 /// Persistent store for organizations backed by redb.
 pub struct OrgStore {
@@ -80,6 +87,9 @@ impl OrgStore {
             SUBNET_ROUTE_ASSOC_TABLE,
             NAT_GATEWAYS_TABLE,
             VNI_COUNTER_TABLE,
+            ORG_NAME_IDX,
+            PROJECT_NAME_IDX,
+            ENV_NAME_IDX,
             VPC_NAME_INDEX,
             SUBNET_NAME_INDEX,
             SG_NAME_INDEX,
@@ -90,10 +100,17 @@ impl OrgStore {
 
     // ── Org operations ───────────────────────────────────────────────
 
-    /// Create a new organization. Validates the name, checks for duplicates.
+    /// Create a new organization. Validates the name, generates a unique OrgId,
+    /// stores keyed by ID with a name→ID index for lookups.
     pub fn create(&self, name: &str) -> Result<Org> {
         validate_name(name, "org")?;
 
+        // Check name uniqueness via the name index
+        if self.db.exists(ORG_NAME_IDX, name)? {
+            return Err(OrgError::AlreadyExists(name.to_string()));
+        }
+
+        // Backward compat: also reject if a legacy name-keyed record exists
         if self.db.exists(TABLE, name)? {
             return Err(OrgError::AlreadyExists(name.to_string()));
         }
@@ -103,19 +120,57 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = OrgId(generate_id("org"));
         let org = Org {
-            id: OrgId(format!("org-{name}")),
+            id: id.clone(),
             name: name.to_string(),
             created_at: now,
         };
 
-        self.db.set(TABLE, name, &org)?;
+        // Store keyed by ID
+        self.db.set(TABLE, &id.0, &org)?;
+        // Name → ID index
+        self.db.set(ORG_NAME_IDX, name, &id.0)?;
         Ok(org)
     }
 
-    /// Get an organization by name. Returns `None` if it doesn't exist.
+    /// Get an organization by its ID.
+    pub fn get_by_id(&self, id: &OrgId) -> Result<Option<Org>> {
+        Ok(self.db.get(TABLE, &id.0)?)
+    }
+
+    /// Get an organization by name. Uses name→ID index, with fallback
+    /// migration for legacy name-keyed records.
     pub fn get(&self, name: &str) -> Result<Option<Org>> {
-        Ok(self.db.get(TABLE, name)?)
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(ORG_NAME_IDX, name)? {
+            return Ok(self.db.get(TABLE, &id_str)?);
+        }
+
+        // Fallback: check for legacy name-keyed record and migrate it
+        if let Some(mut org) = self.db.get::<Org>(TABLE, name)? {
+            // Migrate: generate a real ID, re-key, build index
+            let new_id = OrgId(generate_id("org"));
+            org.id = new_id.clone();
+            self.db.set(TABLE, &new_id.0, &org)?;
+            self.db.set(ORG_NAME_IDX, name, &new_id.0)?;
+            self.db.delete(TABLE, name)?;
+            return Ok(Some(org));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve an org name to its OrgId.
+    pub fn resolve_org_id(&self, name: &str) -> Result<OrgId> {
+        if let Some(id_str) = self.db.get::<String>(ORG_NAME_IDX, name)? {
+            return Ok(OrgId(id_str));
+        }
+        // Try legacy migration via get()
+        if let Some(org) = self.get(name)? {
+            return Ok(org.id);
+        }
+        Err(OrgError::NotFound(name.to_string()))
     }
 
     /// List all organizations.
@@ -124,16 +179,14 @@ impl OrgStore {
         Ok(entries.into_iter().map(|(_, org)| org).collect())
     }
 
-    /// Delete an organization by name. Fails if it has projects.
+    /// Delete an organization by name. Fails if it has projects or VPCs.
     pub fn delete(&self, name: &str) -> Result<()> {
-        if !self.db.exists(TABLE, name)? {
-            return Err(OrgError::NotFound(name.to_string()));
-        }
+        let org = self
+            .get(name)?
+            .ok_or_else(|| OrgError::NotFound(name.to_string()))?;
 
         // Check for child VPCs (org-owned or project-owned).
-        // list_vpcs_by_org already includes project-scoped VPCs.
-        let org_id = OrgId(name.to_string());
-        let all_vpcs = self.list_vpcs_by_org(&org_id)?;
+        let all_vpcs = self.list_vpcs_by_org(&org.id)?;
         if !all_vpcs.is_empty() {
             return Err(OrgError::OrgHasVpcs {
                 org: name.to_string(),
@@ -147,28 +200,41 @@ impl OrgStore {
             return Err(OrgError::OrgHasProjects(name.to_string()));
         }
 
-        self.db.delete(TABLE, name)?;
+        self.db.delete(TABLE, &org.id.0)?;
+        self.db.delete(ORG_NAME_IDX, name)?;
         Ok(())
     }
 
     // ── Project operations ───────────────────────────────────────────
 
-    /// Build the redb key for a project: "org_name/project_name".
-    fn project_key(org: &str, project: &str) -> String {
+    /// Build the legacy redb key for a project: "org_name/project_name".
+    /// Used for backward-compatible index lookups.
+    fn project_name_key(org: &str, project: &str) -> String {
         format!("{}/{}", org, project)
     }
 
-    /// Create a new project within an organization.
+    /// Create a new project within an organization. Generates a unique
+    /// ProjectId, stores keyed by ID, and creates a name index entry.
     pub fn create_project(&self, org: &str, name: &str) -> Result<Project> {
         validate_name(name, "project")?;
 
-        // Verify org exists
-        if !self.db.exists(TABLE, org)? {
-            return Err(OrgError::NotFound(org.to_string()));
+        // Verify org exists (resolves via name index)
+        let org_obj = self
+            .get(org)?
+            .ok_or_else(|| OrgError::NotFound(org.to_string()))?;
+
+        let name_key = Self::project_name_key(org, name);
+
+        // Check name uniqueness via name index
+        if self.db.exists(PROJECT_NAME_IDX, &name_key)? {
+            return Err(OrgError::ProjectAlreadyExists {
+                org: org.to_string(),
+                project: name.to_string(),
+            });
         }
 
-        let key = Self::project_key(org, name);
-        if self.db.exists(PROJECTS_TABLE, &key)? {
+        // Backward compat: reject if legacy composite-keyed record exists
+        if self.db.exists(PROJECTS_TABLE, &name_key)? {
             return Err(OrgError::ProjectAlreadyExists {
                 org: org.to_string(),
                 project: name.to_string(),
@@ -180,44 +246,103 @@ impl OrgStore {
             .unwrap_or_default()
             .as_secs();
 
+        let id = ProjectId(generate_id("proj"));
         let project = Project {
-            id: ProjectId(key.clone()),
+            id: id.clone(),
             name: name.to_string(),
-            org_id: OrgId(org.to_string()),
+            org_id: org_obj.id.clone(),
             created_at: now,
         };
 
-        self.db.set(PROJECTS_TABLE, &key, &project)?;
+        // Store keyed by project ID
+        self.db.set(PROJECTS_TABLE, &id.0, &project)?;
+        // Name index: "org_name/project_name" → project_id
+        self.db.set(PROJECT_NAME_IDX, &name_key, &id.0)?;
         Ok(project)
     }
 
-    /// Get a project by org and project name.
+    /// Get a project by its ID.
+    pub fn get_project_by_id(&self, id: &ProjectId) -> Result<Option<Project>> {
+        Ok(self.db.get(PROJECTS_TABLE, &id.0)?)
+    }
+
+    /// Get a project by org name and project name.
     pub fn get_project(&self, org: &str, name: &str) -> Result<Option<Project>> {
-        let key = Self::project_key(org, name);
-        Ok(self.db.get(PROJECTS_TABLE, &key)?)
+        let name_key = Self::project_name_key(org, name);
+
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(PROJECT_NAME_IDX, &name_key)? {
+            return Ok(self.db.get(PROJECTS_TABLE, &id_str)?);
+        }
+
+        // Fallback: legacy composite-keyed record, migrate
+        if let Some(mut project) = self.db.get::<Project>(PROJECTS_TABLE, &name_key)? {
+            let new_id = ProjectId(generate_id("proj"));
+            // Also fix the org_id if it's a bare name
+            if let Some(org_obj) = self.get(org)? {
+                project.org_id = org_obj.id.clone();
+            }
+            project.id = new_id.clone();
+            self.db.set(PROJECTS_TABLE, &new_id.0, &project)?;
+            self.db.set(PROJECT_NAME_IDX, &name_key, &new_id.0)?;
+            self.db.delete(PROJECTS_TABLE, &name_key)?;
+            return Ok(Some(project));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve an org/project name pair to its ProjectId.
+    pub fn resolve_project_id(&self, org: &str, project: &str) -> Result<ProjectId> {
+        let name_key = Self::project_name_key(org, project);
+        if let Some(id_str) = self.db.get::<String>(PROJECT_NAME_IDX, &name_key)? {
+            return Ok(ProjectId(id_str));
+        }
+        // Try legacy migration via get_project()
+        if let Some(p) = self.get_project(org, project)? {
+            return Ok(p.id);
+        }
+        Err(OrgError::ProjectNotFound {
+            org: org.to_string(),
+            project: project.to_string(),
+        })
     }
 
     /// List all projects in an organization.
     pub fn list_projects(&self, org: &str) -> Result<Vec<Project>> {
-        let all: Vec<(String, Project)> = self.db.list(PROJECTS_TABLE)?;
+        // Use the name index to find projects for this org
         let prefix = format!("{}/", org);
-        Ok(all
-            .into_iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(_, project)| project)
-            .collect())
+        let idx_entries: Vec<(String, String)> = self.db.list(PROJECT_NAME_IDX)?;
+        let mut projects = Vec::new();
+        for (key, id_str) in &idx_entries {
+            if key.starts_with(&prefix) {
+                if let Some(project) = self.db.get::<Project>(PROJECTS_TABLE, id_str)? {
+                    projects.push(project);
+                }
+            }
+        }
+
+        // Fallback: check for legacy composite-keyed entries not yet migrated
+        if projects.is_empty() {
+            let all: Vec<(String, Project)> = self.db.list(PROJECTS_TABLE)?;
+            for (key, project) in all {
+                if key.starts_with(&prefix) {
+                    projects.push(project);
+                }
+            }
+        }
+
+        Ok(projects)
     }
 
     /// Delete a project. Fails if it has any environments.
     pub fn delete_project(&self, org: &str, name: &str) -> Result<()> {
-        let key = Self::project_key(org, name);
-
-        if !self.db.exists(PROJECTS_TABLE, &key)? {
-            return Err(OrgError::ProjectNotFound {
+        let project = self
+            .get_project(org, name)?
+            .ok_or_else(|| OrgError::ProjectNotFound {
                 org: org.to_string(),
                 project: name.to_string(),
-            });
-        }
+            })?;
 
         // Check for child environments
         let envs = self.list_envs(org, name)?;
@@ -228,17 +353,21 @@ impl OrgStore {
             });
         }
 
-        self.db.delete(PROJECTS_TABLE, &key)?;
+        let name_key = Self::project_name_key(org, name);
+        self.db.delete(PROJECTS_TABLE, &project.id.0)?;
+        self.db.delete(PROJECT_NAME_IDX, &name_key)?;
         Ok(())
     }
 
-    // ── Environment operations ──────────────────────────────────────
+    // ── Environment operations ──────────────���───────────────────────
 
-    fn env_key(org: &str, project: &str, env: &str) -> String {
+    /// Build the name-index key for an environment: "org/project/env".
+    fn env_name_key(org: &str, project: &str, env: &str) -> String {
         format!("{org}/{project}/{env}")
     }
 
-    /// Create an environment within a project.
+    /// Create an environment within a project. Generates a unique EnvironmentId,
+    /// stores keyed by ID, and creates a name index entry.
     pub fn create_env(
         &self,
         org: &str,
@@ -250,17 +379,23 @@ impl OrgStore {
     ) -> Result<Environment> {
         validate_name(name, "environment")?;
 
-        // Verify project exists
-        let project_key = Self::project_key(org, project);
-        if !self.db.exists(PROJECTS_TABLE, &project_key)? {
-            return Err(OrgError::ProjectNotFound {
-                org: org.to_string(),
-                project: project.to_string(),
-            });
+        // Verify project exists (resolves via name index)
+        let project_obj =
+            self.get_project(org, project)?
+                .ok_or_else(|| OrgError::ProjectNotFound {
+                    org: org.to_string(),
+                    project: project.to_string(),
+                })?;
+
+        let name_key = Self::env_name_key(org, project, name);
+
+        // Check name uniqueness via name index
+        if self.db.exists(ENV_NAME_IDX, &name_key)? {
+            return Err(OrgError::EnvAlreadyExists(name.to_string()));
         }
 
-        let env_key = Self::env_key(org, project, name);
-        if self.db.exists(ENVIRONMENTS_TABLE, &env_key)? {
+        // Backward compat: reject if legacy composite-keyed record exists
+        if self.db.exists(ENVIRONMENTS_TABLE, &name_key)? {
             return Err(OrgError::EnvAlreadyExists(name.to_string()));
         }
 
@@ -270,10 +405,11 @@ impl OrgStore {
             .as_secs();
         let expires_at = ttl.map(|t| created_at + t);
 
+        let id = EnvironmentId(generate_id("env"));
         let env = Environment {
-            id: EnvironmentId(env_key.clone()),
+            id: id.clone(),
             name: name.to_string(),
-            project_id: ProjectId(project_key),
+            project_id: project_obj.id.clone(),
             ttl,
             deletion_protection,
             labels,
@@ -281,28 +417,73 @@ impl OrgStore {
             expires_at,
         };
 
-        self.db.set(ENVIRONMENTS_TABLE, &env_key, &env)?;
+        // Store keyed by env ID
+        self.db.set(ENVIRONMENTS_TABLE, &id.0, &env)?;
+        // Name index: "org/project/env" → env_id
+        self.db.set(ENV_NAME_IDX, &name_key, &id.0)?;
         Ok(env)
+    }
+
+    /// Get an environment by its ID.
+    pub fn get_env_by_id(&self, id: &EnvironmentId) -> Result<Option<Environment>> {
+        Ok(self.db.get(ENVIRONMENTS_TABLE, &id.0)?)
     }
 
     /// Get an environment by org, project, and name.
     pub fn get_env(&self, org: &str, project: &str, name: &str) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-        self.db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))
+        let name_key = Self::env_name_key(org, project, name);
+
+        // Try name index first
+        if let Some(id_str) = self.db.get::<String>(ENV_NAME_IDX, &name_key)? {
+            return self
+                .db
+                .get::<Environment>(ENVIRONMENTS_TABLE, &id_str)?
+                .ok_or_else(|| OrgError::EnvNotFound(name.to_string()));
+        }
+
+        // Fallback: legacy composite-keyed record, migrate
+        if let Some(mut env) = self.db.get::<Environment>(ENVIRONMENTS_TABLE, &name_key)? {
+            let new_id = EnvironmentId(generate_id("env"));
+            // Fix the project_id if it's a legacy composite key
+            if let Some(proj) = self.get_project(org, project)? {
+                env.project_id = proj.id.clone();
+            }
+            env.id = new_id.clone();
+            self.db.set(ENVIRONMENTS_TABLE, &new_id.0, &env)?;
+            self.db.set(ENV_NAME_IDX, &name_key, &new_id.0)?;
+            self.db.delete(ENVIRONMENTS_TABLE, &name_key)?;
+            return Ok(env);
+        }
+
+        Err(OrgError::EnvNotFound(name.to_string()))
     }
 
     /// List environments for a given org and project.
     pub fn list_envs(&self, org: &str, project: &str) -> Result<Vec<Environment>> {
         let prefix = format!("{org}/{project}/");
-        Ok(self
-            .db
-            .list::<Environment>(ENVIRONMENTS_TABLE)?
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v)
-            .collect())
+
+        // Use the name index to find environments
+        let idx_entries: Vec<(String, String)> = self.db.list(ENV_NAME_IDX)?;
+        let mut envs = Vec::new();
+        for (key, id_str) in &idx_entries {
+            if key.starts_with(&prefix) {
+                if let Some(env) = self.db.get::<Environment>(ENVIRONMENTS_TABLE, id_str)? {
+                    envs.push(env);
+                }
+            }
+        }
+
+        // Fallback: legacy composite-keyed entries
+        if envs.is_empty() {
+            let all: Vec<(String, Environment)> = self.db.list(ENVIRONMENTS_TABLE)?;
+            for (key, env) in all {
+                if key.starts_with(&prefix) {
+                    envs.push(env);
+                }
+            }
+        }
+
+        Ok(envs)
     }
 
     /// Extend (or set) the TTL of an environment.
@@ -317,12 +498,7 @@ impl OrgStore {
         name: &str,
         ttl: u64,
     ) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-
-        let mut env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let mut env = self.get_env(org, project, name)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -331,7 +507,7 @@ impl OrgStore {
         env.ttl = Some(ttl);
         env.expires_at = Some(now + ttl);
 
-        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        self.db.set(ENVIRONMENTS_TABLE, &env.id.0, &env)?;
         Ok(env)
     }
 
@@ -343,56 +519,63 @@ impl OrgStore {
         name: &str,
         enabled: bool,
     ) -> Result<Environment> {
-        let key = Self::env_key(org, project, name);
-
-        let mut env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let mut env = self.get_env(org, project, name)?;
 
         env.deletion_protection = enabled;
-        self.db.set(ENVIRONMENTS_TABLE, &key, &env)?;
+        self.db.set(ENVIRONMENTS_TABLE, &env.id.0, &env)?;
         Ok(env)
     }
 
     /// Delete an environment. Fails if deletion protection is enabled.
     pub fn delete_env(&self, org: &str, project: &str, name: &str) -> Result<()> {
-        let key = Self::env_key(org, project, name);
-
-        let env = self
-            .db
-            .get::<Environment>(ENVIRONMENTS_TABLE, &key)?
-            .ok_or_else(|| OrgError::EnvNotFound(name.to_string()))?;
+        let env = self.get_env(org, project, name)?;
 
         if env.deletion_protection {
             return Err(OrgError::EnvProtected(name.to_string()));
         }
 
-        self.db.delete(ENVIRONMENTS_TABLE, &key)?;
+        let name_key = Self::env_name_key(org, project, name);
+        self.db.delete(ENVIRONMENTS_TABLE, &env.id.0)?;
+        self.db.delete(ENV_NAME_IDX, &name_key)?;
         Ok(())
     }
 
     // ── VPC operations ──────────────────────────────────────────────
 
-    /// Validate a CIDR string. Accepts patterns like "10.0.0.0/16", "10.1.0.0/24".
+    /// Resolve the org ID that owns a VPC owner.
+    fn resolve_owner_org_id(&self, owner: &VpcOwner) -> Result<OrgId> {
+        match owner {
+            VpcOwner::Org(org_id) => Ok(org_id.clone()),
+            VpcOwner::Project(proj_id) => {
+                if let Some(project) = self.get_project_by_id(proj_id)? {
+                    Ok(project.org_id)
+                } else {
+                    // Legacy fallback: project ID might be "org/project" format
+                    let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                    if let [org_name, _proj_name] = parts.as_slice() {
+                        self.resolve_org_id(org_name)
+                    } else {
+                        Err(OrgError::NotFound(proj_id.0.clone()))
+                    }
+                }
+            }
+        }
+    }
+
     /// Collect parsed CIDRs of all VPCs belonging to the same org as `owner`.
     fn existing_cidrs_for_org(&self, owner: &VpcOwner) -> Result<Vec<Ipv4Net>> {
-        let org_name = match owner {
-            VpcOwner::Org(org_id) => org_id.0.clone(),
-            VpcOwner::Project(proj_id) => proj_id
-                .0
-                .split('/')
-                .next()
-                .unwrap_or(&proj_id.0)
-                .to_string(),
-        };
-
+        let org_id = self.resolve_owner_org_id(owner)?;
         let all_vpcs = self.list_vpcs()?;
         Ok(all_vpcs
             .into_iter()
-            .filter(|v| match &v.owner {
-                VpcOwner::Org(oid) => oid.0 == org_name,
-                VpcOwner::Project(pid) => pid.0.starts_with(&format!("{org_name}/")),
+            .filter(|v| {
+                let vpc_org = match &v.owner {
+                    VpcOwner::Org(oid) => Some(oid.clone()),
+                    VpcOwner::Project(pid) => {
+                        self.get_project_by_id(pid).ok().flatten().map(|p| p.org_id)
+                    }
+                };
+                vpc_org.as_ref() == Some(&org_id)
             })
             .filter_map(|v| v.cidr.parse::<Ipv4Net>().ok())
             .collect())
@@ -441,26 +624,32 @@ impl OrgStore {
         // Validate that the parent org (and project, if applicable) exist.
         match &owner {
             VpcOwner::Org(org_id) => {
-                if !self.db.exists(TABLE, &org_id.0)? {
-                    return Err(OrgError::NotFound(org_id.0.clone()));
+                // Try ID-keyed lookup first, then name-based fallback
+                if self.get_by_id(org_id)?.is_none() {
+                    // Maybe org_id.0 is actually a name (legacy callers)
+                    if self.get(&org_id.0)?.is_none() {
+                        return Err(OrgError::NotFound(org_id.0.clone()));
+                    }
                 }
             }
             VpcOwner::Project(proj_id) => {
-                // Project IDs are "org/project"
-                let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
-                let (org_name, project_name) = match parts.as_slice() {
-                    [org, proj] => (*org, *proj),
-                    _ => return Err(OrgError::NotFound(proj_id.0.clone())),
-                };
-                if !self.db.exists(TABLE, org_name)? {
-                    return Err(OrgError::NotFound(org_name.to_string()));
-                }
-                let project_key = Self::project_key(org_name, project_name);
-                if !self.db.exists(PROJECTS_TABLE, &project_key)? {
-                    return Err(OrgError::ProjectNotFound {
-                        org: org_name.to_string(),
-                        project: project_name.to_string(),
-                    });
+                // Try ID-keyed lookup first
+                if self.get_project_by_id(proj_id)?.is_none() {
+                    // Legacy fallback: project ID might be "org/project" format
+                    let parts: Vec<&str> = proj_id.0.splitn(2, '/').collect();
+                    let (org_name, project_name) = match parts.as_slice() {
+                        [org, proj] => (*org, *proj),
+                        _ => return Err(OrgError::NotFound(proj_id.0.clone())),
+                    };
+                    if self.get(org_name)?.is_none() {
+                        return Err(OrgError::NotFound(org_name.to_string()));
+                    }
+                    if self.get_project(org_name, project_name)?.is_none() {
+                        return Err(OrgError::ProjectNotFound {
+                            org: org_name.to_string(),
+                            project: project_name.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -552,13 +741,19 @@ impl OrgStore {
     /// whose project belongs to the given org. Project IDs use the
     /// `{org_name}/{project_name}` convention.
     pub fn list_vpcs_by_org(&self, org_id: &OrgId) -> Result<Vec<Vpc>> {
-        let prefix = format!("{}/", org_id.0);
         let all = self.list_vpcs()?;
         Ok(all
             .into_iter()
             .filter(|vpc| match &vpc.owner {
                 VpcOwner::Org(oid) => oid == org_id,
-                VpcOwner::Project(pid) => pid.0.starts_with(&prefix),
+                VpcOwner::Project(pid) => {
+                    // Check if this project belongs to the given org
+                    self.get_project_by_id(pid)
+                        .ok()
+                        .flatten()
+                        .map(|p| p.org_id == *org_id)
+                        .unwrap_or(false)
+                }
             })
             .collect())
     }
@@ -2012,6 +2207,21 @@ mod tests {
         store.create_project("acme", "backend").unwrap();
     }
 
+    /// Helper: create an org and return its VpcOwner::Org.
+    fn org_owner(store: &OrgStore, name: &str) -> VpcOwner {
+        let org = store.get(name).unwrap().expect("org must exist");
+        VpcOwner::Org(org.id)
+    }
+
+    /// Helper: create an org+project and return its VpcOwner::Project.
+    fn project_owner(store: &OrgStore, org: &str, project: &str) -> VpcOwner {
+        let proj = store
+            .get_project(org, project)
+            .unwrap()
+            .expect("project must exist");
+        VpcOwner::Project(proj.id)
+    }
+
     // ── Org tests ───────────────────────────────────────────────────
 
     #[test]
@@ -2019,7 +2229,11 @@ mod tests {
         let (_dir, store) = temp_store();
         let org = store.create("acme").unwrap();
         assert_eq!(org.name, "acme");
-        assert_eq!(org.id.0, "org-acme");
+        assert!(
+            org.id.0.starts_with("org-"),
+            "ID should have org- prefix, got: {}",
+            org.id.0
+        );
         assert!(org.created_at > 0);
     }
 
@@ -2070,12 +2284,7 @@ mod tests {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
         store
-            .create_vpc(
-                "shared-net",
-                "10.0.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
+            .create_vpc("shared-net", "10.0.0.0/16", org_owner(&store, "acme"), true)
             .unwrap();
         let err = store.delete("acme").unwrap_err();
         assert!(matches!(err, OrgError::OrgHasVpcs { count: 1, .. }));
@@ -2090,7 +2299,7 @@ mod tests {
             .create_vpc(
                 "proj-net",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2127,11 +2336,16 @@ mod tests {
     #[test]
     fn create_project_succeeds_with_valid_org() {
         let (_dir, store) = temp_store();
-        store.create("acme").unwrap();
+        let org = store.create("acme").unwrap();
 
         let project = store.create_project("acme", "backend").unwrap();
         assert_eq!(project.name, "backend");
-        assert_eq!(project.org_id, OrgId("acme".to_string()));
+        assert_eq!(project.org_id, org.id);
+        assert!(
+            project.id.0.starts_with("proj-"),
+            "ID should have proj- prefix, got: {}",
+            project.id.0
+        );
 
         let fetched = store.get_project("acme", "backend").unwrap();
         assert!(fetched.is_some());
@@ -2182,12 +2396,19 @@ mod tests {
         let (_dir, store) = temp_store();
         setup_org_and_project(&store);
 
+        let project = store.get_project("acme", "backend").unwrap().unwrap();
+
         let env = store
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap();
 
         assert_eq!(env.name, "staging");
-        assert_eq!(env.project_id.0, "acme/backend");
+        assert_eq!(env.project_id, project.id);
+        assert!(
+            env.id.0.starts_with("env-"),
+            "ID should have env- prefix, got: {}",
+            env.id.0
+        );
         assert!(env.created_at > 0);
         assert_eq!(env.ttl, None);
         assert!(!env.deletion_protection);
@@ -2367,7 +2588,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2392,7 +2613,7 @@ mod tests {
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2400,7 +2621,7 @@ mod tests {
             .create_vpc(
                 "vpc-two",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2420,7 +2641,7 @@ mod tests {
                 .create_vpc(
                     &format!("vpc-{i}"),
                     &format!("10.{i}.0.0/16"),
-                    VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                    project_owner(&store, "acme", "backend"),
                     false,
                 )
                 .unwrap();
@@ -2438,7 +2659,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2447,7 +2668,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap_err();
@@ -2462,7 +2683,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2488,23 +2709,18 @@ mod tests {
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
         store
-            .create_vpc(
-                "vpc-two",
-                "10.2.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                true,
-            )
+            .create_vpc("vpc-two", "10.2.0.0/16", org_owner(&store, "acme"), true)
             .unwrap();
         store
             .create_vpc(
                 "vpc-three",
                 "10.3.0.0/16",
-                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                project_owner(&store, "acme", "frontend"),
                 false,
             )
             .unwrap();
@@ -2519,13 +2735,13 @@ mod tests {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
         store.create_project("acme", "frontend").unwrap();
-        let pid = ProjectId("acme/backend".to_string());
+        let backend_proj = store.get_project("acme", "backend").unwrap().unwrap();
 
         store
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(pid.clone()),
+                VpcOwner::Project(backend_proj.id.clone()),
                 false,
             )
             .unwrap();
@@ -2533,7 +2749,7 @@ mod tests {
             .create_vpc(
                 "vpc-two",
                 "10.2.0.0/16",
-                VpcOwner::Project(ProjectId("acme/frontend".to_string())),
+                project_owner(&store, "acme", "frontend"),
                 false,
             )
             .unwrap();
@@ -2541,12 +2757,12 @@ mod tests {
             .create_vpc(
                 "vpc-shared",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
 
-        let by_project = store.list_vpcs_by_project(&pid).unwrap();
+        let by_project = store.list_vpcs_by_project(&backend_proj.id).unwrap();
         assert_eq!(by_project.len(), 1);
         assert_eq!(by_project[0].name, "vpc-one");
     }
@@ -2556,13 +2772,13 @@ mod tests {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let oid = OrgId("acme".to_string());
+        let org = store.get("acme").unwrap().unwrap();
 
         store
             .create_vpc(
                 "vpc-one",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2570,12 +2786,12 @@ mod tests {
             .create_vpc(
                 "vpc-shared",
                 "10.100.0.0/16",
-                VpcOwner::Org(oid.clone()),
+                VpcOwner::Org(org.id.clone()),
                 true,
             )
             .unwrap();
 
-        let by_org = store.list_vpcs_by_org(&oid).unwrap();
+        let by_org = store.list_vpcs_by_org(&org.id).unwrap();
         assert_eq!(by_org.len(), 2);
         let names: Vec<&str> = by_org.iter().map(|v| v.name.as_str()).collect();
         assert!(
@@ -2626,24 +2842,16 @@ mod tests {
     #[test]
     fn non_private_cidr_rejected() {
         let (_dir, store) = temp_store();
+        // Dummy owner — CIDR validation happens before owner validation
+        let dummy = VpcOwner::Org(OrgId("dummy".to_string()));
 
         let err = store
-            .create_vpc(
-                "pub-vpc",
-                "8.8.8.0/24",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("pub-vpc", "8.8.8.0/24", dummy.clone(), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
 
         let err = store
-            .create_vpc(
-                "pub-vpc",
-                "1.0.0.0/8",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("pub-vpc", "1.0.0.0/8", dummy, false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
@@ -2651,26 +2859,18 @@ mod tests {
     #[test]
     fn extreme_prefix_rejected() {
         let (_dir, store) = temp_store();
+        // Dummy owner — CIDR validation happens before owner validation
+        let dummy = VpcOwner::Org(OrgId("dummy".to_string()));
 
         // Too small (< 8)
         let err = store
-            .create_vpc(
-                "huge-vpc",
-                "10.0.0.0/7",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("huge-vpc", "10.0.0.0/7", dummy.clone(), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
 
         // Too large (> 28)
         let err = store
-            .create_vpc(
-                "tiny-vpc",
-                "10.0.0.0/29",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
-                false,
-            )
+            .create_vpc("tiny-vpc", "10.0.0.0/29", dummy, false)
             .unwrap_err();
         assert!(matches!(err, OrgError::InvalidCidr(_)));
     }
@@ -2681,21 +2881,11 @@ mod tests {
         store.create("acme").unwrap();
 
         store
-            .create_vpc(
-                "vpc-one",
-                "10.1.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("vpc-one", "10.1.0.0/16", org_owner(&store, "acme"), false)
             .unwrap();
 
         let err = store
-            .create_vpc(
-                "vpc-two",
-                "10.1.0.0/24",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("vpc-two", "10.1.0.0/24", org_owner(&store, "acme"), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::CidrOverlap { .. }));
     }
@@ -2736,18 +2926,13 @@ mod tests {
             .create_vpc(
                 "proj-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
         let err = store
-            .create_vpc(
-                "org-vpc",
-                "10.1.5.0/24",
-                VpcOwner::Org(OrgId("acme".to_string())),
-                false,
-            )
+            .create_vpc("org-vpc", "10.1.5.0/24", org_owner(&store, "acme"), false)
             .unwrap_err();
         assert!(matches!(err, OrgError::CidrOverlap { .. }));
     }
@@ -2784,6 +2969,7 @@ mod tests {
     fn create_vpc_fails_when_project_not_found() {
         let (_dir, store) = temp_store();
         store.create("acme").unwrap();
+        // Use a legacy-style "org/project" ID to test project-not-found path
         let err = store
             .create_vpc(
                 "my-vpc",
@@ -2807,7 +2993,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2826,7 +3012,7 @@ mod tests {
             .create_vpc(
                 "private-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -2845,7 +3031,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2863,7 +3049,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2882,7 +3068,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2905,7 +3091,7 @@ mod tests {
                 .create_vpc(
                     "shared-vpc",
                     "10.100.0.0/16",
-                    VpcOwner::Org(OrgId("acme".to_string())),
+                    org_owner(&store, "acme"),
                     true,
                 )
                 .unwrap();
@@ -2930,7 +3116,7 @@ mod tests {
             .create_vpc(
                 "shared-vpc",
                 "10.100.0.0/16",
-                VpcOwner::Org(OrgId("acme".to_string())),
+                org_owner(&store, "acme"),
                 true,
             )
             .unwrap();
@@ -2948,21 +3134,18 @@ mod tests {
     fn setup_for_subnet(store: &OrgStore) -> (String, EnvironmentId) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
         store
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(store, "acme", "backend"),
                 false,
             )
             .unwrap();
-        (
-            "default".to_string(),
-            EnvironmentId("acme/backend/production".to_string()),
-        )
+        ("default".to_string(), env.id)
     }
 
     #[test]
@@ -3110,7 +3293,7 @@ mod tests {
             .create_vpc(
                 "default",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3165,10 +3348,10 @@ mod tests {
         let (vpc_name, env_id) = setup_for_subnet(&store);
 
         // Create second env
-        store
+        let staging = store
             .create_env("acme", "backend", "staging", None, false, HashMap::new())
             .unwrap();
-        let staging_env = EnvironmentId("acme/backend/staging".to_string());
+        let staging_env = staging.id;
 
         store
             .create_subnet(&vpc_name, &env_id, "prod-sub", Some("10.1.1.0/24"))
@@ -3231,7 +3414,7 @@ mod tests {
     fn setup_for_peering(store: &OrgStore) -> (String, String) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(store, "acme", "backend");
         store
             .create_vpc("vpc-alpha", "10.1.0.0/16", owner.clone(), false)
             .unwrap();
@@ -3338,7 +3521,7 @@ mod tests {
         let (a, b) = setup_for_peering(&store);
 
         // Add a third VPC
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(&store, "acme", "backend");
         store
             .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
             .unwrap();
@@ -3355,7 +3538,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let (a, b) = setup_for_peering(&store);
 
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(&store, "acme", "backend");
         store
             .create_vpc("vpc-gamma", "10.3.0.0/16", owner, false)
             .unwrap();
@@ -3437,7 +3620,7 @@ mod tests {
     fn setup_vpc_for_sg(store: &OrgStore) -> VpcId {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        let owner = VpcOwner::Project(ProjectId("acme/backend".to_string()));
+        let owner = project_owner(store, "acme", "backend");
         let vpc = store
             .create_vpc("myvpc", "10.1.0.0/16", owner, false)
             .unwrap();
@@ -3530,7 +3713,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3551,7 +3734,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3573,7 +3756,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3592,7 +3775,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3612,7 +3795,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3629,7 +3812,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3649,7 +3832,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3674,7 +3857,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3692,7 +3875,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3715,17 +3898,17 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
         // Create an environment for the subnet.
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3747,16 +3930,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3778,16 +3961,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         let subnet = store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3819,16 +4002,16 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
 
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
 
-        let env_id = EnvironmentId("acme/backend/production".to_string());
+        let env_id = env.id;
         let subnet = store
             .create_subnet("myvpc", &env_id, "web", Some("10.1.1.0/24"))
             .unwrap();
@@ -3850,7 +4033,7 @@ mod tests {
             .create_vpc(
                 "myvpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(&store, "acme", "backend"),
                 false,
             )
             .unwrap();
@@ -3873,20 +4056,19 @@ mod tests {
     fn setup_vpc_and_subnet(store: &OrgStore) -> (Vpc, Subnet) {
         store.create("acme").unwrap();
         store.create_project("acme", "backend").unwrap();
-        store
+        let env = store
             .create_env("acme", "backend", "production", None, false, HashMap::new())
             .unwrap();
         let vpc = store
             .create_vpc(
                 "test-vpc",
                 "10.1.0.0/16",
-                VpcOwner::Project(ProjectId("acme/backend".to_string())),
+                project_owner(store, "acme", "backend"),
                 false,
             )
             .unwrap();
-        let env_id = EnvironmentId("acme/backend/production".to_string());
         let subnet = store
-            .create_subnet("test-vpc", &env_id, "frontend", Some("10.1.1.0/24"))
+            .create_subnet("test-vpc", &env.id, "frontend", Some("10.1.1.0/24"))
             .unwrap();
         (vpc, subnet)
     }

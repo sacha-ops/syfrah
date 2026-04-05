@@ -581,9 +581,21 @@ pub struct VmPlacement {
 // Hypervisor model (ADR-004)
 // ---------------------------------------------------------------------------
 
-/// Unique identifier for a hypervisor. Format: `hv-{ulid}`.
+/// Unique identifier for a hypervisor. Format: `hv-{timestamp_hex}{random_hex}`.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HypervisorId(pub String);
+
+impl HypervisorId {
+    /// Generate a new unique hypervisor ID.
+    pub fn generate() -> Self {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let rand: u32 = (ts as u32) ^ std::process::id();
+        Self(format!("hv-{ts:010x}{rand:08x}"))
+    }
+}
 
 impl fmt::Display for HypervisorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

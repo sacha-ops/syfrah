@@ -696,7 +696,7 @@ mod tests {
     use std::sync::Arc;
 
     use syfrah_org::ipam::IpamStore;
-    use syfrah_org::types::{EnvironmentId, ProjectId, VpcOwner};
+    use syfrah_org::types::VpcOwner;
     use syfrah_org::PlacementStore;
     use syfrah_overlay::MockBackend;
     use tempfile::TempDir;
@@ -736,9 +736,11 @@ mod tests {
             org_store.create(ORG_NAME).unwrap();
             org_store.create_project(ORG_NAME, PROJECT_NAME).unwrap();
 
-            let project_id = ProjectId(format!("{ORG_NAME}/{PROJECT_NAME}"));
-            let env_id = EnvironmentId(format!("{ORG_NAME}/{PROJECT_NAME}/{ENV_NAME}"));
-            org_store
+            let project = org_store
+                .get_project(ORG_NAME, PROJECT_NAME)
+                .unwrap()
+                .unwrap();
+            let env = org_store
                 .create_env(
                     ORG_NAME,
                     PROJECT_NAME,
@@ -748,8 +750,9 @@ mod tests {
                     HashMap::new(),
                 )
                 .unwrap();
+            let env_id = env.id;
             org_store
-                .create_vpc(VPC_NAME, VPC_CIDR, VpcOwner::Project(project_id), false)
+                .create_vpc(VPC_NAME, VPC_CIDR, VpcOwner::Project(project.id), false)
                 .unwrap();
             org_store
                 .create_subnet(VPC_NAME, &env_id, SUBNET_NAME, Some(SUBNET_CIDR))

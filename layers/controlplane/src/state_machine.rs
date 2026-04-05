@@ -1534,7 +1534,7 @@ impl RedbStateMachine {
                             .unwrap_or_default()
                             .as_secs();
                         let hv = syfrah_org::Hypervisor {
-                            id: syfrah_org::HypervisorId(format!("hv-{name}")),
+                            id: syfrah_org::HypervisorId::generate(),
                             name: name.clone(),
                             region: region.clone(),
                             zone: zone.clone(),
@@ -3068,7 +3068,9 @@ mod tests {
         };
         let resp = sm.apply_command(&cmd);
         match resp {
-            StateMachineResponse::Created(id) => assert!(id.contains("testorg")),
+            StateMachineResponse::Created(id) => {
+                assert!(id.starts_with("org-"), "expected org- prefix, got: {id}")
+            }
             other => panic!("expected Created, got {other:?}"),
         }
         // Verify it was actually created.
@@ -3117,7 +3119,9 @@ mod tests {
             org: "acme".to_string(),
         });
         match resp {
-            StateMachineResponse::Created(id) => assert!(id.contains("backend")),
+            StateMachineResponse::Created(id) => {
+                assert!(id.starts_with("proj-"), "expected proj- prefix, got: {id}")
+            }
             other => panic!("expected Created, got {other:?}"),
         }
     }
