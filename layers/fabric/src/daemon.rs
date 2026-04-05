@@ -220,6 +220,11 @@ pub fn setup_init(config: &DaemonConfig) -> anyhow::Result<DaemonReady> {
     println!("  \u{26a0} Peering is not active. New nodes cannot join yet.");
     println!("    To accept nodes with a PIN:  syfrah fabric peering start --pin <PIN>");
     println!("    To approve manually:         syfrah fabric peering start");
+    println!();
+    println!("  Next step: configure storage for this zone:");
+    println!(
+        "  syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
+    );
 
     let my_record = build_record(
         &config.node_name,
@@ -498,6 +503,11 @@ async fn finalize_join(
     println!();
     ui::warn("The mesh secret is stored in ~/.syfrah/state.json");
     println!("    Keep this file safe \u{2014} it grants full mesh access.");
+    println!();
+    println!("  Next step: configure storage for this zone:");
+    println!(
+        "  syfrah storage configure --zone {zone} --s3-endpoint <url> --s3-bucket <bucket> --s3-access-key <key> --s3-secret-key <secret>"
+    );
 
     let my_record = build_record(
         &config.node_name,
