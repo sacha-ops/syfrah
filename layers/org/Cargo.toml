@@ -10,6 +10,7 @@ categories.workspace = true
 
 [dependencies]
 syfrah-api = { path = "../api" }
+syfrah-core = { path = "../core" }
 syfrah-state = { path = "../state" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

@@ -16,7 +16,9 @@ pub mod types;
 pub mod validation;
 pub mod vpc;
 
-pub use api::{send_org_request, OrgLayerHandler, OrgRequest, OrgResponse, ResolvedSubnet};
+pub use api::{
+    resolve_name, send_org_request, OrgLayerHandler, OrgRequest, OrgResponse, ResolvedSubnet,
+};
 pub use cli::{
     EnvCommand, HypervisorCommand, NatGwCommand, OrgCommand, ProjectCommand, RouteCommand,
     RouteTableAction, SgCommand, SubnetCommand, VpcCommand,
