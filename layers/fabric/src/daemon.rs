@@ -855,7 +855,7 @@ async fn auto_bootstrap_raft(node_name: &str) -> anyhow::Result<()> {
 /// Called after the Raft client is injected into the hypervisor handler.
 /// Skips gracefully if:
 /// - The operator passed `--no-hypervisor`
-/// - KVM is not available on this node
+/// - No compute runtime is available (no KVM, crun, or runsc)
 /// - The hypervisor is already registered and enabled
 async fn auto_register_and_enable_hypervisor(
     raft_client: syfrah_controlplane::RaftClient,
@@ -872,9 +872,9 @@ async fn auto_register_and_enable_hypervisor(
         return;
     }
 
-    // Check KVM capability.
-    if !syfrah_org::discovery::kvm_available() {
-        info!("hypervisor: auto-registration skipped (no KVM on this node)");
+    // Check for any compute capability (KVM for VMs, or crun/runsc for containers).
+    if !syfrah_org::discovery::compute_capable() {
+        info!("hypervisor: auto-registration skipped (no KVM, crun, or runsc on this node)");
         return;
     }
 
