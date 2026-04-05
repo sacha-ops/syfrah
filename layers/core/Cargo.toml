@@ -27,6 +27,11 @@ http = "1"
 clap = { workspace = true, features = ["derive", "env"] }
 rand = "0.8"
 ulid = "1.2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+sha2 = "0.10"
+hkdf = "0.12"
+bs58 = "0.5"
 toml = "0.8"
 async-trait = "0.1"
 dirs = "5"

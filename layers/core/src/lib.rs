@@ -1,9 +1,13 @@
+pub mod addressing;
 pub mod api;
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod id;
 pub mod logging;
+pub mod process;
 pub mod resource;
 pub mod transport;
 pub mod ui;
 pub mod validate;
+pub mod version;

@@ -11,6 +11,10 @@ Core building blocks for the Syfrah cloud platform. Contains:
 - **Logging** — structured logging setup with file rotation, JSON/text modes, runtime reconfiguration
 - **UI** — terminal output system: tables, spinners, progress bars, colors, responsive layout
 - **API** — auto-generated REST routes from ResourceDef, error responses, server config
+- **Crypto** — WireGuard keypairs, mesh secret, HKDF derivation, SHA-256, secure random
+- **Addressing** — IPv6 ULA mesh prefix generation, node address derivation
+- **Process** — daemon fork, PID file, signal handling, graceful shutdown
+- **Version** — semver with 4 channels (dev/beta/rc/stable), feature flags
 
 ---
 
