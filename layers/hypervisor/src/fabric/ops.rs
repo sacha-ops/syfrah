@@ -82,6 +82,10 @@ pub fn init(
 
 /// Start a peering listener to accept join requests.
 ///
+/// Also starts background tasks for:
+/// - Health check loop (monitors peer reachability via WG handshakes)
+/// - Announce listener (receives peer announcements from other nodes)
+///
 /// Blocks until timeout or Ctrl+C. Opens DB per-request (no long-lived lock).
 pub async fn listen_for_peers(
     pin: &str,
@@ -94,13 +98,44 @@ pub async fn listen_for_peers(
 
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    // Pass a closure that opens a fresh DB each time — no long lock
     let db_opener = || {
         let dir = syfrah_core::process::syfrah_dir();
         let _ = std::fs::create_dir_all(&dir);
         syfrah_state::LayerDb::open("hypervisor").map_err(|e| SyfrahError::internal(e.to_string()))
     };
 
+    // Start health check loop in background
+    let health_db_opener = || {
+        let dir = syfrah_core::process::syfrah_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        syfrah_state::LayerDb::open("hypervisor").map_err(|e| SyfrahError::internal(e.to_string()))
+    };
+    tokio::spawn(async move {
+        super::health::run_loop(
+            health_db_opener,
+            super::health::DEFAULT_INTERVAL_SECS,
+            super::health::DEFAULT_STALE_THRESHOLD_SECS,
+        )
+        .await;
+    });
+
+    // Start announce listener in background (peering_port + 1 = announce port)
+    let announce_port = peering_port + 1;
+    let announce_addr: std::net::SocketAddr = format!("0.0.0.0:{announce_port}")
+        .parse()
+        .map_err(|_| SyfrahError::internal("invalid announce bind address"))?;
+    let announce_db_opener = || {
+        let dir = syfrah_core::process::syfrah_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        syfrah_state::LayerDb::open("hypervisor").map_err(|e| SyfrahError::internal(e.to_string()))
+    };
+    tokio::spawn(async move {
+        if let Err(e) = super::announce::listen(announce_db_opener, announce_addr).await {
+            tracing::warn!(error = %e, "announce listener stopped");
+        }
+    });
+
+    // Main peering listener (blocks)
     super::peering_server::listen(db_opener, pin, bind_addr, timeout, 0).await
 }
 

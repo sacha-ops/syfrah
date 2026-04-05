@@ -201,6 +201,52 @@ pub struct WgStatus {
     pub tx_bytes: u64,
 }
 
+/// Per-peer handshake info from `wg show dump`.
+#[derive(Debug, Clone)]
+pub struct PeerHandshake {
+    pub public_key: String,
+    pub latest_handshake: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub endpoint: Option<String>,
+}
+
+/// Get per-peer handshake timestamps from WireGuard.
+pub fn get_peer_handshakes() -> Result<Vec<PeerHandshake>, SyfrahError> {
+    let output = Command::new("wg")
+        .args(["show", INTERFACE_NAME, "dump"])
+        .output()
+        .map_err(|e| SyfrahError::internal(format!("wg show failed: {e}")))?;
+
+    if !output.status.success() {
+        return Err(SyfrahError::internal("wg show failed"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut peers = Vec::new();
+
+    // Skip first line (interface info)
+    for line in stdout.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 7 {
+            let endpoint = if fields[2] == "(none)" {
+                None
+            } else {
+                Some(fields[2].to_string())
+            };
+            peers.push(PeerHandshake {
+                public_key: fields[0].to_string(),
+                latest_handshake: fields[4].parse().unwrap_or(0),
+                rx_bytes: fields[5].parse().unwrap_or(0),
+                tx_bytes: fields[6].parse().unwrap_or(0),
+                endpoint,
+            });
+        }
+    }
+
+    Ok(peers)
+}
+
 /// Run a system command, returning error on failure.
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), SyfrahError> {
     let output = Command::new(cmd)

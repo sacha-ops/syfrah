@@ -130,6 +130,17 @@ async fn handle_join(
         .unwrap_or_default();
     let peer_ipv6 = syfrah_core::addressing::derive_node_address(&state.mesh.prefix, &pub_bytes);
 
+    // Build announce info before consuming req fields
+    let new_peer_info = PeerInfo {
+        name: req.name.clone(),
+        region: req.region.clone(),
+        zone: req.zone.clone(),
+        wg_public_key: req.wg_public_key.clone(),
+        wg_port: req.wg_port,
+        endpoint: req.endpoint.clone(),
+        mesh_ipv6: peer_ipv6,
+    };
+
     // Add peer + save + update WG — all in one shot, then DB is released
     let new_peer = Peer::new(
         req.name.clone(),
@@ -167,6 +178,37 @@ async fn handle_join(
         &state.hypervisor.mesh_ipv6,
         &peers_for_wg,
     )?;
+    let announcer_name = state.hypervisor.name.clone();
+    let wg_port = state.hypervisor.wg_port;
+
+    // Collect peers to announce to (all except the new one)
+    let new_key = new_peer_info.wg_public_key.clone();
+    let announce_targets: Vec<_> = state
+        .peers
+        .peers
+        .iter()
+        .filter(|p| p.wg_public_key != new_key)
+        .cloned()
+        .collect();
+
+    if !announce_targets.is_empty() {
+        tokio::spawn(async move {
+            let (ok, fail) = super::announce::broadcast_new_peer(
+                &new_peer_info,
+                &announcer_name,
+                &announce_targets,
+                wg_port,
+            )
+            .await;
+            if ok > 0 || fail > 0 {
+                tracing::info!(
+                    successes = ok,
+                    failures = fail,
+                    "peer announcement broadcast complete"
+                );
+            }
+        });
+    }
 
     Ok(req.name)
 }

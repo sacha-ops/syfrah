@@ -7,6 +7,8 @@
 //! - Peering protocol (join requests, approval)
 //! - State persistence
 
+pub mod announce;
+pub mod health;
 pub mod mesh;
 pub mod ops;
 pub mod peer;
