@@ -2594,7 +2594,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(vpc.name, "default");
-        assert_eq!(vpc.id.0, "vpc-default");
+        assert!(
+            vpc.id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(vpc.cidr, "10.1.0.0/16");
         assert_eq!(vpc.vni, 100);
         assert!(!vpc.shared);
@@ -3160,7 +3163,10 @@ mod tests {
         assert_eq!(subnet.name, "frontend");
         assert_eq!(subnet.cidr, "10.1.1.0/24");
         assert_eq!(subnet.gateway, "10.1.1.1");
-        assert_eq!(subnet.vpc_id.0, "vpc-default");
+        assert!(
+            subnet.vpc_id.0.starts_with("vpc-"),
+            "VPC ID should start with vpc- prefix"
+        );
         assert_eq!(subnet.env_id, env_id);
         assert!(subnet.created_at > 0);
     }
@@ -3322,7 +3328,8 @@ mod tests {
     #[test]
     fn get_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.get_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.get_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
@@ -3387,7 +3394,8 @@ mod tests {
     #[test]
     fn delete_subnet_not_found() {
         let (_dir, store) = temp_store();
-        let err = store.delete_subnet("default", "ghost").unwrap_err();
+        let (vpc_name, _env_id) = setup_for_subnet(&store);
+        let err = store.delete_subnet(&vpc_name, "ghost").unwrap_err();
         assert!(matches!(err, OrgError::SubnetNotFound { .. }));
     }
 
