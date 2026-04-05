@@ -260,31 +260,34 @@ async fn run_probe_loop(
 ///
 /// Returns (put_latency_ms, get_latency_ms) on success.
 ///
-/// **Auth placeholder:** Uses HTTP Basic Auth which is NOT supported by
-/// real S3 endpoints. AWS S3 and most S3-compatible backends (MinIO,
-/// Ceph RGW) require AWS Signature V4 request signing. Basic Auth is
-/// used here as a temporary placeholder so the probe logic can be
-/// validated end-to-end. Before deploying against a real S3 backend,
-/// replace with SigV4 signing (e.g. via `aws-sdk-s3`, `rust-s3`, or
-/// manual SigV4 implementation) using credentials from the storage
-/// config or `S3_ACCESS_KEY` / `S3_SECRET_KEY` environment variables.
-// TODO(s3-auth): replace basic_auth with AWS SigV4 request signing.
+/// Uses AWS Signature V4 request signing, which is required by AWS S3
+/// and all major S3-compatible backends (Hetzner Object Storage, MinIO,
+/// Ceph RGW).
 async fn probe_s3_once(
     client: &reqwest::Client,
     config: &S3HealthProbeConfig,
 ) -> Result<(u64, u64), String> {
     let test_key = format!("_syfrah_health_probe_{}", std::process::id());
     let test_body = b"syfrah-health-probe";
-    let object_url = build_s3_url(&config.endpoint, &config.bucket, &test_key);
 
     // -- PUT --
     let put_start = Instant::now();
+    let put_req = s3v4_request(
+        client,
+        &S3v4Params {
+            method: "PUT",
+            endpoint: &config.endpoint,
+            bucket: &config.bucket,
+            key: &test_key,
+            access_key: &config.access_key,
+            secret_key: &config.secret_key,
+            body: Some(test_body),
+        },
+    )
+    .map_err(|e| format!("PUT signing failed: {e}"))?;
+
     let put_resp = client
-        .put(&object_url)
-        .body(test_body.to_vec())
-        .header("Content-Type", "application/octet-stream")
-        .basic_auth(&config.access_key, Some(&config.secret_key))
-        .send()
+        .execute(put_req)
         .await
         .map_err(|e| format!("PUT request failed: {e}"))?;
 
@@ -295,10 +298,22 @@ async fn probe_s3_once(
 
     // -- GET --
     let get_start = Instant::now();
+    let get_req = s3v4_request(
+        client,
+        &S3v4Params {
+            method: "GET",
+            endpoint: &config.endpoint,
+            bucket: &config.bucket,
+            key: &test_key,
+            access_key: &config.access_key,
+            secret_key: &config.secret_key,
+            body: None,
+        },
+    )
+    .map_err(|e| format!("GET signing failed: {e}"))?;
+
     let get_resp = client
-        .get(&object_url)
-        .basic_auth(&config.access_key, Some(&config.secret_key))
-        .send()
+        .execute(get_req)
         .await
         .map_err(|e| format!("GET request failed: {e}"))?;
 
@@ -308,16 +323,168 @@ async fn probe_s3_once(
     let get_ms = get_start.elapsed().as_millis() as u64;
 
     // -- DELETE (best-effort, don't fail the probe on cleanup) --
-    let del_result = client
-        .delete(&object_url)
-        .basic_auth(&config.access_key, Some(&config.secret_key))
-        .send()
-        .await;
-    if let Err(e) = del_result {
-        debug!(error = %e, "S3 health probe: DELETE cleanup failed (non-fatal)");
+    let del_req = s3v4_request(
+        client,
+        &S3v4Params {
+            method: "DELETE",
+            endpoint: &config.endpoint,
+            bucket: &config.bucket,
+            key: &test_key,
+            access_key: &config.access_key,
+            secret_key: &config.secret_key,
+            body: None,
+        },
+    );
+    if let Ok(req) = del_req {
+        if let Err(e) = client.execute(req).await {
+            debug!(error = %e, "S3 health probe: DELETE cleanup failed (non-fatal)");
+        }
     }
 
     Ok((put_ms, get_ms))
+}
+
+/// Build an AWS SigV4-signed request for S3.
+///
+/// Implements the minimal subset of AWS Signature Version 4 needed for
+/// simple object operations (PUT, GET, DELETE) against S3-compatible
+/// endpoints using path-style addressing.
+/// Parameters for a single S3 SigV4-signed request.
+struct S3v4Params<'a> {
+    method: &'a str,
+    endpoint: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    body: Option<&'a [u8]>,
+}
+
+fn s3v4_request(
+    client: &reqwest::Client,
+    params: &S3v4Params<'_>,
+) -> Result<reqwest::Request, String> {
+    let S3v4Params {
+        method,
+        endpoint,
+        bucket,
+        key,
+        access_key,
+        secret_key,
+        body,
+    } = params;
+    use chrono::Utc;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let now = Utc::now();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+    // Parse host from endpoint URL.
+    let url = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid endpoint URL: {e}"))?;
+    let host = url.host_str().ok_or("endpoint has no host")?;
+    let host_header = if let Some(port) = url.port() {
+        format!("{host}:{port}")
+    } else {
+        host.to_string()
+    };
+
+    // Derive region from endpoint. For Hetzner/MinIO style endpoints, use
+    // "us-east-1" as the default region (S3 SigV4 region for path-style).
+    let region = "us-east-1";
+    let service = "s3";
+
+    // Payload hash.
+    let payload = body.unwrap_or(&b""[..]);
+    let payload_hash = hex::encode(Sha256::digest(payload));
+
+    // Canonical request.
+    let object_url = build_s3_url(endpoint, bucket, key);
+    let parsed_url =
+        reqwest::Url::parse(&object_url).map_err(|e| format!("invalid object URL: {e}"))?;
+    let canonical_uri = parsed_url.path().to_string();
+
+    let canonical_headers =
+        format!("host:{host_header}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+
+    // String to sign.
+    let credential_scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+
+    // Signing key.
+    type HmacSha256 = Hmac<Sha256>;
+    let k_date = {
+        let mut mac = HmacSha256::new_from_slice(format!("AWS4{secret_key}").as_bytes())
+            .map_err(|e| format!("HMAC init failed: {e}"))?;
+        mac.update(date_stamp.as_bytes());
+        mac.finalize().into_bytes()
+    };
+    let k_region = {
+        let mut mac =
+            HmacSha256::new_from_slice(&k_date).map_err(|e| format!("HMAC failed: {e}"))?;
+        mac.update(region.as_bytes());
+        mac.finalize().into_bytes()
+    };
+    let k_service = {
+        let mut mac =
+            HmacSha256::new_from_slice(&k_region).map_err(|e| format!("HMAC failed: {e}"))?;
+        mac.update(service.as_bytes());
+        mac.finalize().into_bytes()
+    };
+    let k_signing = {
+        let mut mac =
+            HmacSha256::new_from_slice(&k_service).map_err(|e| format!("HMAC failed: {e}"))?;
+        mac.update(b"aws4_request");
+        mac.finalize().into_bytes()
+    };
+
+    // Signature.
+    let signature = {
+        let mut mac =
+            HmacSha256::new_from_slice(&k_signing).map_err(|e| format!("HMAC failed: {e}"))?;
+        mac.update(string_to_sign.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    };
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, \
+         SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    // Build the request.
+    let reqwest_method = match *method {
+        "PUT" => reqwest::Method::PUT,
+        "GET" => reqwest::Method::GET,
+        "DELETE" => reqwest::Method::DELETE,
+        "HEAD" => reqwest::Method::HEAD,
+        other => return Err(format!("unsupported method: {other}")),
+    };
+
+    let mut builder = client
+        .request(reqwest_method, &object_url)
+        .header("Host", &host_header)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("Authorization", &authorization);
+
+    if let Some(b) = body {
+        builder = builder
+            .header("Content-Type", "application/octet-stream")
+            .body(b.to_vec());
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build request: {e}"))
 }
 
 /// Build the S3 object URL. Supports path-style addressing which is the

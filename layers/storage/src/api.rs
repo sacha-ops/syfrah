@@ -246,6 +246,8 @@ pub struct StorageLayerHandler {
     region: String,
     /// Local node/hypervisor name (used as hypervisor_id in VolumeAttach).
     local_node_name: String,
+    /// Optional S3 health probe handle -- set after the probe is started.
+    s3_health_handle: RwLock<Option<crate::s3_health::S3HealthHandle>>,
 }
 
 impl StorageLayerHandler {
@@ -256,6 +258,7 @@ impl StorageLayerHandler {
             store: None,
             region: String::new(),
             local_node_name: String::new(),
+            s3_health_handle: RwLock::new(None),
         }
     }
 
@@ -266,6 +269,7 @@ impl StorageLayerHandler {
             store: Some(store),
             region,
             local_node_name,
+            s3_health_handle: RwLock::new(None),
         }
     }
 
@@ -273,6 +277,12 @@ impl StorageLayerHandler {
     pub async fn set_raft_client(&self, client: RaftClient) {
         let mut guard = self.raft_client.write().await;
         *guard = Some(client);
+    }
+
+    /// Set the S3 health probe handle (called after the probe is started).
+    pub async fn set_s3_health_handle(&self, handle: crate::s3_health::S3HealthHandle) {
+        let mut guard = self.s3_health_handle.write().await;
+        *guard = Some(handle);
     }
 }
 
@@ -652,23 +662,41 @@ impl StorageLayerHandler {
                 }
             }
 
-            // ----- Health: reads StorageConfig from store -----
+            // ----- Health: reads StorageConfig from store + S3 probe snapshot -----
             StorageRequest::Health => {
                 let config = self.get_storage_config();
                 match config {
                     Some(cfg) => {
-                        // Return config-based report. The actual S3 probe runs in
-                        // the background (start_s3_health_probe); here we surface
-                        // configured values so the CLI can verify configuration.
+                        // Read the latest S3 health probe snapshot if available.
+                        let snapshot = {
+                            let guard = self.s3_health_handle.read().await;
+                            guard.as_ref().map(|h| h.snapshot())
+                        };
+
+                        let (s3_reachable, bucket_accessible, put_ms, get_ms, del_ms, s3_err) =
+                            match snapshot {
+                                Some(snap) => (
+                                    snap.s3_reachable,
+                                    // Bucket is accessible when reachable (probe does PUT+GET).
+                                    snap.s3_reachable,
+                                    snap.s3_put_latency_ms,
+                                    snap.s3_get_latency_ms,
+                                    None, // DELETE latency not tracked in snapshot
+                                    snap.last_error,
+                                ),
+                                // No probe running — report unknown rather than false.
+                                None => (false, false, None, None, None, None),
+                            };
+
                         StorageResponse::Health(StorageHealthReport {
                             s3_endpoint: cfg.s3_endpoint,
                             s3_bucket: cfg.s3_bucket,
-                            s3_reachable: false,
-                            bucket_accessible: false,
-                            put_latency_ms: None,
-                            get_latency_ms: None,
-                            delete_latency_ms: None,
-                            s3_error: None,
+                            s3_reachable,
+                            bucket_accessible,
+                            put_latency_ms: put_ms,
+                            get_latency_ms: get_ms,
+                            delete_latency_ms: del_ms,
+                            s3_error: s3_err,
                             cache_disk_path: cfg.cache_disk_path,
                             cache_disk_total_bytes: 0,
                             cache_disk_available_bytes: 0,
