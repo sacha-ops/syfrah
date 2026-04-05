@@ -47,7 +47,12 @@ pub struct NodeIdentity {
 }
 
 /// Create a new mesh (called by `hypervisor init`).
-pub fn create_mesh(name: &str) -> (MeshIdentity, MeshSecret) {
+/// Validates the mesh name before creation.
+pub fn create_mesh(
+    name: &str,
+) -> Result<(MeshIdentity, MeshSecret), syfrah_core::error::SyfrahError> {
+    syfrah_core::validate::name(name)?;
+
     let secret = MeshSecret::generate();
     let prefix = addressing::generate_mesh_prefix();
     let id = MeshId::generate();
@@ -58,10 +63,11 @@ pub fn create_mesh(name: &str) -> (MeshIdentity, MeshSecret) {
         prefix,
     };
 
-    (mesh, secret)
+    Ok((mesh, secret))
 }
 
 /// Create a new node identity (called by both init and join).
+/// Validates name, region, zone, and port.
 pub fn create_node(
     name: &str,
     region: &str,
@@ -69,16 +75,20 @@ pub fn create_node(
     port: u16,
     endpoint: Option<String>,
     mesh_prefix: &Ipv6Addr,
-) -> NodeIdentity {
+) -> Result<NodeIdentity, syfrah_core::error::SyfrahError> {
+    syfrah_core::validate::name(name)?;
+    syfrah_core::validate::region(region)?;
+    syfrah_core::validate::zone(zone)?;
+    syfrah_core::validate::port(port)?;
+
     let (wg_private, wg_public) = crypto::generate_wg_keypair();
 
-    // Decode public key for address derivation
     let pub_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &wg_public)
         .unwrap_or_default();
 
     let mesh_ipv6 = addressing::derive_node_address(mesh_prefix, &pub_bytes);
 
-    NodeIdentity {
+    Ok(NodeIdentity {
         name: name.to_string(),
         region: region.to_string(),
         zone: zone.to_string(),
@@ -87,7 +97,7 @@ pub fn create_node(
         wg_port: port,
         endpoint,
         mesh_ipv6,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -96,26 +106,25 @@ mod tests {
 
     #[test]
     fn create_mesh_generates_valid_identity() {
-        let (mesh, secret) = create_mesh("my-cloud");
+        let (mesh, secret) = create_mesh("my-cloud").unwrap();
         assert_eq!(mesh.name, "my-cloud");
         assert!(mesh.id.as_str().starts_with("mesh-"));
         assert!(secret.to_string().starts_with("syf_sk_"));
-        // Prefix should be ULA
         let first = mesh.prefix.segments()[0];
         assert!((0xfd00..=0xfdff).contains(&first));
     }
 
     #[test]
     fn create_mesh_unique() {
-        let (a, _) = create_mesh("a");
-        let (b, _) = create_mesh("b");
+        let (a, _) = create_mesh("mesh-aaa").unwrap();
+        let (b, _) = create_mesh("mesh-bbb").unwrap();
         assert_ne!(a.id.as_str(), b.id.as_str());
     }
 
     #[test]
     fn create_node_has_valid_identity() {
-        let (mesh, _) = create_mesh("test");
-        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix);
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
 
         assert_eq!(node.name, "node-1");
         assert_eq!(node.region, "eu");
@@ -123,22 +132,21 @@ mod tests {
         assert_eq!(node.wg_port, 51820);
         assert!(!node.wg_private_key.is_empty());
         assert!(!node.wg_public_key.is_empty());
-        // IPv6 should be in the mesh prefix
         assert!(addressing::is_in_prefix(&node.mesh_ipv6, &mesh.prefix));
     }
 
     #[test]
     fn create_node_unique_keys() {
-        let (mesh, _) = create_mesh("test");
-        let a = create_node("a", "eu", "fsn1", 51820, None, &mesh.prefix);
-        let b = create_node("b", "eu", "fsn1", 51820, None, &mesh.prefix);
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let a = create_node("node-aaa", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let b = create_node("node-bbb", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
         assert_ne!(a.wg_public_key, b.wg_public_key);
         assert_ne!(a.mesh_ipv6, b.mesh_ipv6);
     }
 
     #[test]
     fn create_node_with_endpoint() {
-        let (mesh, _) = create_mesh("test");
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
         let node = create_node(
             "node-1",
             "eu",
@@ -146,18 +154,103 @@ mod tests {
             51820,
             Some("46.224.166.60:51820".into()),
             &mesh.prefix,
-        );
+        )
+        .unwrap();
         assert_eq!(node.endpoint, Some("46.224.166.60:51820".into()));
     }
 
     #[test]
     fn node_identity_serde_roundtrip() {
-        let (mesh, _) = create_mesh("test");
-        let node = create_node("n1", "eu", "fsn1", 51820, None, &mesh.prefix);
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
         let json = serde_json::to_string(&node).unwrap();
         let back: NodeIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.name, "n1");
-        // Public key should be present
+        assert_eq!(back.name, "node-1");
         assert!(json.contains(&node.wg_public_key));
+    }
+
+    // ── #1: Validation tests ──
+
+    #[test]
+    fn create_mesh_rejects_empty_name() {
+        assert!(create_mesh("").is_err());
+    }
+
+    #[test]
+    fn create_mesh_rejects_short_name() {
+        assert!(create_mesh("ab").is_err());
+    }
+
+    #[test]
+    fn create_mesh_rejects_uppercase() {
+        assert!(create_mesh("MyCloud").is_err());
+    }
+
+    #[test]
+    fn create_node_rejects_empty_name() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        assert!(create_node("", "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
+    }
+
+    #[test]
+    fn create_node_rejects_bad_region() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        assert!(create_node("node-1", "EU!", "fsn1", 51820, None, &mesh.prefix).is_err());
+    }
+
+    #[test]
+    fn create_node_rejects_bad_zone() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        assert!(create_node("node-1", "eu", "FSN 1", 51820, None, &mesh.prefix).is_err());
+    }
+
+    #[test]
+    fn create_node_rejects_port_zero() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        assert!(create_node("node-1", "eu", "fsn1", 0, None, &mesh.prefix).is_err());
+    }
+
+    // ── #5: Private key persistence ──
+
+    #[test]
+    fn private_key_survives_serde() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let node = create_node("node-1", "eu", "fsn1", 51820, None, &mesh.prefix).unwrap();
+        let original_private = node.wg_private_key.clone();
+        assert!(!original_private.is_empty());
+
+        let json = serde_json::to_string(&node).unwrap();
+        let back: NodeIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wg_private_key, original_private);
+    }
+
+    #[test]
+    fn private_key_default_when_missing() {
+        // Simulate receiving peer info without private key
+        let json = r#"{"name":"n1","region":"eu","zone":"fsn1","wg_public_key":"abc","wg_port":51820,"mesh_ipv6":"fd01::1"}"#;
+        let node: NodeIdentity = serde_json::from_str(json).unwrap();
+        assert_eq!(node.wg_private_key, ""); // defaults to empty
+        assert_eq!(node.name, "n1");
+    }
+
+    // ── #2: Limits ──
+
+    #[test]
+    fn create_node_long_name() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let long_name = "a".repeat(63); // max allowed
+        assert!(create_node(&long_name, "eu", "fsn1", 51820, None, &mesh.prefix).is_ok());
+
+        let too_long = "a".repeat(64);
+        assert!(create_node(&too_long, "eu", "fsn1", 51820, None, &mesh.prefix).is_err());
+    }
+
+    #[test]
+    fn mesh_identity_serde() {
+        let (mesh, _) = create_mesh("test-mesh").unwrap();
+        let json = serde_json::to_string(&mesh).unwrap();
+        let back: MeshIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test-mesh");
+        assert_eq!(back.prefix, mesh.prefix);
     }
 }
