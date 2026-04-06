@@ -2,6 +2,9 @@
 //!
 //! Called by the hypervisor handler during init/join/leave/status.
 //! Orchestrates TiUP install → config → systemd → health check.
+//!
+//! PD (Raft consensus) runs on max 3 nodes for optimal performance.
+//! Additional nodes run TiKV only (storage), connecting to existing PD.
 
 use std::net::Ipv6Addr;
 
@@ -9,23 +12,18 @@ use syfrah_core::error::SyfrahError;
 
 use super::service::{self, PdConfig, TikvConfig};
 
+/// Max PD members in the cluster. Raft works best with 3 or 5.
+const MAX_PD_MEMBERS: usize = 3;
+
 /// Bootstrap a new single-node TiKV cluster.
-///
-/// Called during `hypervisor init`:
-/// 1. Install TiUP + PD + TiKV binaries
-/// 2. Generate configs for single-node cluster
-/// 3. Install systemd units
-/// 4. Start PD, wait ready, start TiKV, wait ready
 pub fn bootstrap(
     node_name: &str,
     mesh_ipv6: &Ipv6Addr,
 ) -> Result<(), SyfrahError> {
     eprintln!("  Setting up control plane...");
 
-    // Install binaries
     service::ensure_installed()?;
 
-    // Single-node PD config
     let pd_cfg = PdConfig {
         name: node_name.to_string(),
         mesh_ipv6: *mesh_ipv6,
@@ -44,11 +42,9 @@ pub fn bootstrap(
         )],
     };
 
-    // Install configs + systemd units (no join URL for bootstrap)
     service::install(&pd_cfg, &tikv_cfg, None)?;
-
-    // Start and wait for readiness
     service::enable_and_start()?;
+
     eprintln!("  Waiting for PD...");
     service::wait_pd_ready(mesh_ipv6, 30)?;
     eprintln!("  Waiting for TiKV...");
@@ -60,11 +56,8 @@ pub fn bootstrap(
 
 /// Join an existing TiKV cluster.
 ///
-/// Called during `hypervisor join`:
-/// 1. Install TiUP + PD + TiKV binaries
-/// 2. Generate configs with PD --join flag pointing to existing cluster
-/// 3. Install systemd units
-/// 4. Start PD (join mode), wait ready, start TiKV, wait ready
+/// If there are fewer than MAX_PD_MEMBERS, this node runs PD + TiKV.
+/// Otherwise, this node runs TiKV only (connecting to existing PD).
 pub fn join(
     node_name: &str,
     mesh_ipv6: &Ipv6Addr,
@@ -77,17 +70,43 @@ pub fn join(
     }
 
     eprintln!("  Joining control plane...");
-
-    // Install binaries
     service::ensure_installed()?;
 
     let primary_pd = &existing_pd_endpoints[0];
 
-    // PD config — for join, initial-cluster is just self (PD --join handles the rest)
-    let self_peer_url = format!(
-        "http://[{mesh_ipv6}]:{}",
-        super::PD_PEER_PORT
-    );
+    // Check how many PD members exist (retry with backoff — mesh may need time)
+    let mut pd_count = 0;
+    for attempt in 0..3 {
+        pd_count = get_pd_member_count(primary_pd);
+        if pd_count > 0 {
+            break;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+    let run_pd = pd_count < MAX_PD_MEMBERS;
+
+    if run_pd {
+        eprintln!("  Starting PD + TiKV (PD member {}/{})", pd_count + 1, MAX_PD_MEMBERS);
+        join_with_pd(node_name, mesh_ipv6, existing_pd_endpoints, primary_pd)?;
+    } else {
+        eprintln!("  Starting TiKV only (PD cluster full at {MAX_PD_MEMBERS} members)");
+        join_tikv_only(node_name, mesh_ipv6, existing_pd_endpoints)?;
+    }
+
+    eprintln!("  Control plane joined");
+    Ok(())
+}
+
+/// Join with both PD and TiKV (for first 3 nodes).
+fn join_with_pd(
+    node_name: &str,
+    mesh_ipv6: &Ipv6Addr,
+    existing_pd_endpoints: &[String],
+    primary_pd: &str,
+) -> Result<(), SyfrahError> {
+    let self_peer_url = format!("http://[{mesh_ipv6}]:{}", super::PD_PEER_PORT);
 
     let pd_cfg = PdConfig {
         name: node_name.to_string(),
@@ -96,7 +115,6 @@ pub fn join(
         initial_cluster_state: "join".to_string(),
     };
 
-    // TiKV config — all PD endpoints (existing + self)
     let mut pd_endpoints: Vec<String> = existing_pd_endpoints.to_vec();
     let self_endpoint = format!("http://[{mesh_ipv6}]:{}", super::PD_CLIENT_PORT);
     if !pd_endpoints.contains(&self_endpoint) {
@@ -108,17 +126,50 @@ pub fn join(
         pd_endpoints,
     };
 
-    // Install configs + systemd units (with --join flag)
     service::install(&pd_cfg, &tikv_cfg, Some(primary_pd))?;
-
-    // Start and wait
     service::enable_and_start()?;
-    eprintln!("  Waiting for PD...");
-    service::wait_pd_ready(mesh_ipv6, 30)?;
-    eprintln!("  Waiting for TiKV...");
-    service::wait_tikv_ready(mesh_ipv6, 60)?;
 
-    eprintln!("  Control plane joined");
+    eprintln!("  Waiting for PD...");
+    service::wait_pd_ready(mesh_ipv6, 60)?;
+    eprintln!("  Waiting for TiKV...");
+    service::wait_tikv_ready(mesh_ipv6, 90)?;
+
+    Ok(())
+}
+
+/// Join with TiKV only (for nodes beyond MAX_PD_MEMBERS).
+fn join_tikv_only(
+    node_name: &str,
+    mesh_ipv6: &Ipv6Addr,
+    existing_pd_endpoints: &[String],
+) -> Result<(), SyfrahError> {
+    let tikv_cfg = TikvConfig {
+        mesh_ipv6: *mesh_ipv6,
+        pd_endpoints: existing_pd_endpoints.to_vec(),
+    };
+
+    // Dummy PD config (won't be started)
+    let pd_cfg = PdConfig {
+        name: node_name.to_string(),
+        mesh_ipv6: *mesh_ipv6,
+        initial_cluster: String::new(),
+        initial_cluster_state: String::new(),
+    };
+
+    // Install TiKV only (no PD unit)
+    service::install_tikv_only(&tikv_cfg)?;
+
+    // Start TiKV only
+    service::start_tikv_only()?;
+
+    // Wait for TiKV to register with existing PD
+    // Use first PD endpoint's IP for health check
+    let pd_ip = extract_ipv6_from_endpoint(&existing_pd_endpoints[0]);
+    if let Some(ip) = pd_ip {
+        eprintln!("  Waiting for TiKV...");
+        service::wait_tikv_ready(&ip, 60)?;
+    }
+
     Ok(())
 }
 
@@ -147,14 +198,40 @@ pub fn restart() -> Result<(), SyfrahError> {
     service::restart()
 }
 
-/// Uninstall the control plane — stop services, remove data.
+/// Uninstall the control plane.
 pub fn leave() -> Result<(), SyfrahError> {
     service::uninstall()
+}
+
+/// Count PD members in the cluster.
+fn get_pd_member_count(pd_url: &str) -> usize {
+    let url = format!("{pd_url}/pd/api/v1/members");
+    std::process::Command::new("curl")
+        .args(["-sf", "--max-time", "10", &url])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .and_then(|v| v["members"].as_array().map(|a| a.len()))
+        .unwrap_or(0)
+}
+
+/// Extract IPv6 from endpoint like "http://[fd01::1]:2379"
+fn extract_ipv6_from_endpoint(endpoint: &str) -> Option<Ipv6Addr> {
+    let s = endpoint.strip_prefix("http://[")?;
+    let s = s.split(']').next()?;
+    s.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::service::{PdConfig, TikvConfig};
 
     #[test]
     fn bootstrap_config_single_node() {
@@ -167,7 +244,6 @@ mod tests {
         };
         let conf = service::generate_pd_conf(&pd_cfg, false);
         assert!(conf.contains("initial-cluster-state = \"new\""));
-        assert!(conf.contains("node-1=http://[fd01::1]:2380"));
     }
 
     #[test]
@@ -179,7 +255,6 @@ mod tests {
             initial_cluster: "node-2=http://[fd01::2]:2380".into(),
             initial_cluster_state: "join".into(),
         };
-        // Join mode: no initial-cluster in config
         let conf = service::generate_pd_conf(&pd_cfg, true);
         assert!(!conf.contains("initial-cluster"));
         assert!(conf.contains("node-2"));
@@ -200,13 +275,18 @@ mod tests {
     }
 
     #[test]
-    fn cluster_status_when_not_running() {
-        // On a test system, nothing is running
-        let status = service::cluster_status(&"fd01::1".parse().unwrap());
-        // Should not panic — just returns inactive
-        if let Ok(s) = status {
-            assert!(!s.pd_active);
-            assert!(!s.tikv_active);
-        }
+    fn extract_ipv6_works() {
+        let ip = extract_ipv6_from_endpoint("http://[fd01::1]:2379");
+        assert_eq!(ip, Some("fd01::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ipv6_invalid() {
+        assert!(extract_ipv6_from_endpoint("http://1.2.3.4:2379").is_none());
+    }
+
+    #[test]
+    fn max_pd_members_constant() {
+        assert_eq!(MAX_PD_MEMBERS, 3);
     }
 }

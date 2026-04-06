@@ -248,9 +248,9 @@ fn generate_tikv_unit() -> String {
     format!(
         r#"[Unit]
 Description=Syfrah TiKV Storage Engine
-After=network-online.target syfrah-pd.service
+After=network-online.target syfrah-wg.service
 Wants=network-online.target
-Requires=syfrah-pd.service
+Requires=syfrah-wg.service
 
 [Service]
 Type=simple
@@ -293,6 +293,24 @@ pub fn install(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig, join_url: Option<&str>)
     run_systemctl(&["daemon-reload"])?;
 
     Ok(())
+}
+
+/// Install TiKV only (no PD) — for nodes beyond the PD member limit.
+pub fn install_tikv_only(tikv_cfg: &TikvConfig) -> Result<(), SyfrahError> {
+    std::fs::create_dir_all(TIKV_DATA_DIR).map_err(SyfrahError::from)?;
+    std::fs::create_dir_all("/var/log/syfrah").map_err(SyfrahError::from)?;
+    std::fs::create_dir_all("/etc/syfrah").map_err(SyfrahError::from)?;
+
+    std::fs::write(TIKV_CONF_PATH, generate_tikv_conf(tikv_cfg)).map_err(SyfrahError::from)?;
+    std::fs::write(TIKV_UNIT_PATH, generate_tikv_unit()).map_err(SyfrahError::from)?;
+
+    run_systemctl(&["daemon-reload"])?;
+    Ok(())
+}
+
+/// Start TiKV only (no PD).
+pub fn start_tikv_only() -> Result<(), SyfrahError> {
+    run_systemctl(&["enable", "--now", TIKV_SERVICE])
 }
 
 /// Enable and start PD, then TiKV (order matters).
@@ -590,7 +608,7 @@ mod tests {
     fn generate_tikv_unit_valid() {
         let unit = generate_tikv_unit();
         assert!(unit.contains("[Unit]"));
-        assert!(unit.contains("syfrah-pd.service"));
+        assert!(unit.contains("syfrah-wg.service"));
         assert!(unit.contains("tikv --config="));
     }
 
