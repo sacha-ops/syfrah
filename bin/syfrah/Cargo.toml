@@ -16,6 +16,7 @@ path = "src/openapi.rs"
 
 [dependencies]
 syfrah-core = { path = "../../layers/core" }
+syfrah-state = { path = "../../layers/state" }
 syfrah-hypervisor = { path = "../../layers/hypervisor" }
 clap.workspace = true
 anyhow.workspace = true

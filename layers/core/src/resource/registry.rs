@@ -120,6 +120,11 @@ impl ResourceRegistry {
         &self.resources
     }
 
+    /// Consume the registry and return the registrations.
+    pub fn into_registrations(self) -> Vec<ResourceRegistration> {
+        self.resources
+    }
+
     /// Number of registered resources.
     pub fn len(&self) -> usize {
         self.resources.len()

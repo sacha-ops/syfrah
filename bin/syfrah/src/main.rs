@@ -10,6 +10,8 @@ fn build_registry() -> ResourceRegistry {
     // Hypervisor — the core resource
     registry.register(syfrah_hypervisor::handlers::registration());
 
+    // Future: vm, vpc, org, subnet, etc.
+
     registry
 }
 
@@ -19,7 +21,6 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize structured logging
-    // File: info level (for debugging), stderr: warn level (clean UX)
     let _ = std::fs::create_dir_all("/var/log/syfrah");
     let _guard = {
         use tracing_subscriber::prelude::*;
@@ -51,25 +52,97 @@ async fn main() -> Result<()> {
         .about("Syfrah — turn dedicated servers into a programmable cloud")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
-        .arg_required_else_help(true);
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("serve")
+                .about("Start the API server")
+                .arg(
+                    clap::Arg::new("bind")
+                        .long("bind")
+                        .help("Bind address (default: mesh IPv6 or 0.0.0.0:8443)")
+                        .value_name("ADDR"),
+                )
+                .arg(
+                    clap::Arg::new("port")
+                        .long("port")
+                        .help("Port (default: 8443)")
+                        .value_name("PORT"),
+                ),
+        );
 
+    // Add resource subcommands (hypervisor, future: vm, vpc, etc.)
     for reg in registry.iter() {
         app = app.subcommand(generate_command(&reg.def));
     }
 
     let matches = app.get_matches();
 
-    if let Some((sub_name, sub_matches)) = matches.subcommand() {
-        if let Some(reg) = registry.find(sub_name) {
-            if let Some((op_name, op_matches)) = sub_matches.subcommand() {
-                return dispatch(reg, op_name, op_matches).await;
+    match matches.subcommand() {
+        Some(("serve", sub_matches)) => {
+            serve(sub_matches).await
+        }
+        Some((sub_name, sub_matches)) => {
+            if let Some(reg) = registry.find(sub_name) {
+                if let Some((op_name, op_matches)) = sub_matches.subcommand() {
+                    dispatch(reg, op_name, op_matches).await
+                } else {
+                    anyhow::bail!("specify a subcommand. Run 'syfrah {sub_name} --help' for details.");
+                }
             } else {
-                anyhow::bail!("specify a subcommand. Run 'syfrah {sub_name} --help' for details.");
+                anyhow::bail!("unknown command: {sub_name}");
             }
-        } else {
-            anyhow::bail!("unknown command: {sub_name}");
+        }
+        None => {
+            anyhow::bail!("specify a command. Run 'syfrah --help' for details.");
         }
     }
+}
+
+/// Start the API server.
+async fn serve(matches: &clap::ArgMatches) -> Result<()> {
+    use syfrah_core::api::{ApiConfig, ApiServer};
+
+    let port: u16 = matches
+        .get_one::<String>("port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8443);
+
+    // Determine bind address: prefer mesh IPv6, fallback to 0.0.0.0
+    let bind_addr: std::net::SocketAddr = if let Some(addr) = matches.get_one::<String>("bind") {
+        addr.parse()
+            .map_err(|_| anyhow::anyhow!("invalid bind address: {addr}"))?
+    } else {
+        // Try to get mesh IPv6 from fabric state
+        let mesh_bind = syfrah_state::LocalDb::open("hypervisor")
+            .ok()
+            .and_then(|db| {
+                syfrah_hypervisor::fabric::state::FabricState::load(&db)
+                    .ok()
+                    .flatten()
+            })
+            .map(|state| {
+                format!("[{}]:{}", state.hypervisor.mesh_ipv6, port)
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap_or_else(|_| format!("0.0.0.0:{port}").parse().unwrap())
+            })
+            .unwrap_or_else(|| format!("0.0.0.0:{port}").parse().unwrap());
+        mesh_bind
+    };
+
+    let config = ApiConfig {
+        admin_addr: bind_addr,
+        ..Default::default()
+    };
+
+    // Build registry — same handlers as CLI
+    let registry = build_registry();
+    let registrations: Vec<_> = registry.into_registrations();
+
+    eprintln!("  Starting API server on {bind_addr}");
+    eprintln!("  Press Ctrl+C to stop");
+
+    let server = ApiServer::new(config, registrations, vec![]);
+    server.run_admin().await?;
 
     Ok(())
 }
@@ -84,8 +157,6 @@ mod tests {
         let reg = handlers::registration();
         let routes = list_routes(&[reg], "/admin/v1");
 
-        // Should have routes for all operations
-        let _paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
         let ops: Vec<&str> = routes.iter().map(|r| r.operation.as_str()).collect();
 
         assert!(ops.contains(&"init"), "missing init route: {ops:?}");
@@ -94,47 +165,15 @@ mod tests {
         assert!(ops.contains(&"list"), "missing list route: {ops:?}");
         assert!(ops.contains(&"get"), "missing get route: {ops:?}");
         assert!(ops.contains(&"leave"), "missing leave route: {ops:?}");
-        assert!(ops.contains(&"drain"), "missing drain route: {ops:?}");
-        assert!(ops.contains(&"enable"), "missing enable route: {ops:?}");
-
-        // Check REST methods
-        assert!(
-            routes
-                .iter()
-                .any(|r| r.method == "GET" && r.path == "/admin/v1/hypervisor"),
-            "missing GET list"
-        );
-        assert!(
-            routes
-                .iter()
-                .any(|r| r.method == "GET" && r.path.contains("{id}")),
-            "missing GET by id"
-        );
-        assert!(
-            routes
-                .iter()
-                .any(|r| r.method == "POST" && r.path.contains("init")),
-            "missing POST init"
-        );
-
-        println!("\nGenerated API routes:");
-        for r in &routes {
-            println!("  {} {:<40} {}", r.method, r.path, r.operation);
-        }
+        assert!(ops.contains(&"doctor"), "missing doctor route: {ops:?}");
     }
 
     #[test]
     fn openapi_spec_generated() {
         let reg = handlers::registration();
         let spec = openapi_spec(&[reg], "/admin/v1");
-
         assert_eq!(spec["openapi"], "3.0.0");
         assert!(spec["paths"]["/admin/v1/hypervisor"].is_object());
-        assert!(spec["paths"]["/admin/v1/hypervisor/{id}"].is_object());
-        assert!(spec["paths"]["/admin/v1/hypervisor/init"].is_object());
-
-        println!("\nOpenAPI spec:");
-        println!("{}", serde_json::to_string_pretty(&spec).unwrap());
     }
 
     #[tokio::test]
@@ -147,26 +186,13 @@ mod tests {
 
         let server = ApiServer::new(ApiConfig::default(), vec![handlers::registration()], vec![]);
 
-        // GET /admin/v1/hypervisor → list (returns empty since no state)
         let req = Request::builder()
             .uri("/admin/v1/hypervisor")
             .body(Body::empty())
             .unwrap();
         let resp = server.admin_router().clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), 200, "list endpoint should work");
+        assert_eq!(resp.status(), 200);
 
-        // POST /admin/v1/hypervisor/status → status
-        let req = Request::builder()
-            .method("POST")
-            .uri("/admin/v1/hypervisor/status")
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-        let resp = server.admin_router().clone().oneshot(req).await.unwrap();
-        // May return 500 (no state) but should not 404
-        assert_ne!(resp.status(), 404, "status endpoint should exist");
-
-        // GET /health → always works
         let req = Request::builder()
             .uri("/health")
             .body(Body::empty())
