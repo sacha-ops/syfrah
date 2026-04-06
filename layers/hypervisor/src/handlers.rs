@@ -138,11 +138,12 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     let db = open_db()?;
     let result = fabric::ops::init(&db, &node_name, region, zone, port)?;
 
-    // Bootstrap control plane (TiKV) on the mesh — rollback fabric on failure
+    // Bootstrap control plane (TiKV) on the mesh
+    // Don't rollback fabric on timeout — PD/TiKV will eventually start via systemd restart
     if let Err(e) = controlplane::ops::bootstrap(&node_name, &result.hypervisor.mesh_ipv6) {
-        tracing::error!(error = %e, "control plane bootstrap failed, rolling back fabric");
-        let _ = fabric::ops::leave(&db);
-        return Err(anyhow::anyhow!("control plane failed: {e}. Fabric rolled back."));
+        tracing::warn!(error = %e, "control plane bootstrap issue (services may still be starting)");
+        eprintln!("  Warning: control plane setup incomplete: {e}");
+        eprintln!("  Services will continue starting in background via systemd.");
     }
 
     eprintln!();
@@ -241,9 +242,9 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .map(|p| format!("http://[{}]:{}", p.mesh_ipv6, controlplane::PD_CLIENT_PORT))
         .collect();
     if let Err(e) = controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints) {
-        tracing::error!(error = %e, "control plane join failed, rolling back fabric");
-        let _ = fabric::ops::leave(&db);
-        return Err(anyhow::anyhow!("control plane failed: {e}. Fabric rolled back."));
+        tracing::warn!(error = %e, "control plane join issue (services may still be starting)");
+        eprintln!("  Warning: control plane setup incomplete: {e}");
+        eprintln!("  Services will continue starting in background via systemd.");
     }
 
     Ok(OperationResponse::Resource(serde_json::json!({
