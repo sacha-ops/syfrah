@@ -10,6 +10,8 @@
 pub mod announce;
 pub mod health;
 pub mod mesh;
+#[doc(hidden)]
+pub mod tls;
 pub mod ops;
 pub mod peer;
 pub mod peering;

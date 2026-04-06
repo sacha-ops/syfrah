@@ -138,10 +138,13 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     let db = open_db()?;
     let result = fabric::ops::init(&db, &node_name, region, zone, port)?;
 
-    // Bootstrap control plane (TiKV) on the mesh
-    controlplane::ops::bootstrap(&node_name, &result.hypervisor.mesh_ipv6)?;
+    // Bootstrap control plane (TiKV) on the mesh — rollback fabric on failure
+    if let Err(e) = controlplane::ops::bootstrap(&node_name, &result.hypervisor.mesh_ipv6) {
+        tracing::error!(error = %e, "control plane bootstrap failed, rolling back fabric");
+        let _ = fabric::ops::leave(&db);
+        return Err(anyhow::anyhow!("control plane failed: {e}. Fabric rolled back."));
+    }
 
-    // Print init result immediately
     eprintln!();
     eprintln!("  Hypervisor initialized");
     eprintln!();
@@ -237,7 +240,11 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .iter()
         .map(|p| format!("http://[{}]:{}", p.mesh_ipv6, controlplane::PD_CLIENT_PORT))
         .collect();
-    controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints)?;
+    if let Err(e) = controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints) {
+        tracing::error!(error = %e, "control plane join failed, rolling back fabric");
+        let _ = fabric::ops::leave(&db);
+        return Err(anyhow::anyhow!("control plane failed: {e}. Fabric rolled back."));
+    }
 
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": result.hypervisor.name,
@@ -334,9 +341,21 @@ async fn handle_stop() -> anyhow::Result<OperationResponse> {
 }
 
 async fn handle_leave() -> anyhow::Result<OperationResponse> {
-    // Controlplane first (depends on mesh), then fabric
-    let _ = controlplane::ops::leave();
     let db = open_db()?;
+    // Get mesh IPv6 for TiKV deregistration before leaving
+    let mesh_ipv6 = fabric::state::FabricState::load(&db)
+        .ok()
+        .flatten()
+        .map(|s| s.hypervisor.mesh_ipv6);
+
+    // Controlplane first (deregister store, then uninstall)
+    if let Some(ipv6) = mesh_ipv6 {
+        let _ = controlplane::ops::leave_with_mesh(&ipv6);
+    } else {
+        let _ = controlplane::ops::leave();
+    }
+
+    // Then fabric
     fabric::ops::leave(&db)?;
     Ok(OperationResponse::Message(
         "left the cluster. All services uninstalled.".into(),

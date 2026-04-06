@@ -198,7 +198,14 @@ pub fn restart() -> Result<(), SyfrahError> {
     service::restart()
 }
 
-/// Uninstall the control plane.
+/// Uninstall the control plane. Deregisters TiKV store first.
+pub fn leave_with_mesh(mesh_ipv6: &Ipv6Addr) -> Result<(), SyfrahError> {
+    // Deregister TiKV store before stopping
+    let _ = service::deregister_store(mesh_ipv6);
+    service::uninstall()
+}
+
+/// Uninstall without deregistration (fallback).
 pub fn leave() -> Result<(), SyfrahError> {
     service::uninstall()
 }

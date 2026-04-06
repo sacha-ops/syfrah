@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use syfrah_core::error::SyfrahError;
 use syfrah_state::LayerDb;
@@ -72,7 +73,11 @@ pub async fn listen(
         .await
         .map_err(|e| SyfrahError::internal(format!("failed to bind peering port: {e}")))?;
 
-    tracing::info!(addr = %bind_addr, "peering listener started");
+    // TLS setup
+    let tls_config = super::tls::server_config()?;
+    let tls_acceptor = TlsAcceptor::from(tls_config);
+
+    tracing::info!(addr = %bind_addr, "peering listener started (TLS)");
 
     let mut accepted = 0;
     let rate_limiter = Arc::new(Mutex::new(PinRateLimiter::new()));
@@ -81,7 +86,7 @@ pub async fn listen(
         let accept = tokio::time::timeout(timeout, listener.accept()).await;
 
         match accept {
-            Ok(Ok((mut stream, peer_addr))) => {
+            Ok(Ok((tcp_stream, peer_addr))) => {
                 // Check rate limit before processing
                 {
                     let rl = rate_limiter.lock().unwrap();
@@ -91,7 +96,16 @@ pub async fn listen(
                     }
                 }
 
-                tracing::info!(peer = %peer_addr, "incoming join request");
+                // TLS handshake
+                let mut stream = match tls_acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                        continue;
+                    }
+                };
+
+                tracing::info!(peer = %peer_addr, "incoming join request (TLS)");
 
                 let db = match db_opener() {
                     Ok(db) => db,
@@ -131,9 +145,9 @@ pub async fn listen(
     Ok(accepted)
 }
 
-/// Handle a single join request on a TCP stream.
+/// Handle a single join request on a stream.
 async fn handle_join(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
     db: &LayerDb,
     expected_pin: &str,
     peer_addr: SocketAddr,
@@ -290,9 +304,9 @@ async fn handle_join(
     Ok(req.name)
 }
 
-/// Read a length-prefixed JSON message from a TCP stream.
+/// Read a length-prefixed JSON message from a stream.
 pub async fn read_json<T: serde::de::DeserializeOwned>(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<T, SyfrahError> {
     let mut len_buf = [0u8; 4];
     stream
@@ -314,9 +328,9 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&buf).map_err(|e| SyfrahError::validation(format!("invalid JSON: {e}")))
 }
 
-/// Write a length-prefixed JSON message to a TCP stream.
+/// Write a length-prefixed JSON message to a stream.
 pub async fn write_json<T: serde::Serialize>(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut (impl AsyncWriteExt + Unpin),
     msg: &T,
 ) -> Result<(), SyfrahError> {
     let data = serde_json::to_vec(msg)

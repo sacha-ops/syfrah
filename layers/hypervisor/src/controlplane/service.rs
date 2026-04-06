@@ -355,9 +355,57 @@ pub fn tikv_is_active() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if both are installed.
+/// Check if any controlplane service is installed.
 pub fn is_installed() -> bool {
-    Path::new(PD_UNIT_PATH).exists() && Path::new(TIKV_UNIT_PATH).exists()
+    Path::new(PD_UNIT_PATH).exists() || Path::new(TIKV_UNIT_PATH).exists()
+}
+
+/// Deregister this TiKV store from PD before leaving.
+/// Reads the local TiKV config to find our address, then deletes the store via PD API.
+pub fn deregister_store(mesh_ipv6: &std::net::Ipv6Addr) -> Result<(), SyfrahError> {
+    let our_addr = format!("[{}]:{}", mesh_ipv6, super::TIKV_PORT);
+
+    // Find a reachable PD endpoint from our config
+    let conf = std::fs::read_to_string(TIKV_CONF_PATH).unwrap_or_default();
+    let pd_endpoint = conf
+        .lines()
+        .find(|l| l.contains("http://"))
+        .and_then(|l| l.trim().trim_matches('"').trim_matches(',').split('"').find(|s| s.starts_with("http://")))
+        .map(|s| s.to_string());
+
+    let pd_url = match pd_endpoint {
+        Some(url) => url,
+        None => return Ok(()), // No PD endpoint found, nothing to deregister
+    };
+
+    // Get store list and find our store ID
+    let stores_url = format!("{pd_url}/pd/api/v1/stores");
+    let output = Command::new("curl")
+        .args(["-sf", "--max-time", "5", &stores_url])
+        .output()
+        .ok();
+
+    if let Some(output) = output {
+        if output.status.success() {
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(stores) = body["stores"].as_array() {
+                    for store in stores {
+                        let addr = store["store"]["address"].as_str().unwrap_or("");
+                        let store_id = store["store"]["id"].as_u64().unwrap_or(0);
+                        if addr == our_addr && store_id > 0 {
+                            tracing::info!(store_id, "deregistering TiKV store");
+                            let delete_url = format!("{pd_url}/pd/api/v1/store/{store_id}");
+                            let _ = Command::new("curl")
+                                .args(["-sf", "-X", "DELETE", "--max-time", "5", &delete_url])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Uninstall everything — stop services, remove configs, data.

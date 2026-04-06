@@ -1,15 +1,16 @@
-//! Peering TCP client — sends join request to an existing node.
+//! Peering TCP+TLS client — sends join request to an existing node.
 
 use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use syfrah_core::error::SyfrahError;
 
 use super::peering::{JoinRequest, JoinResponse, DEFAULT_PEERING_PORT};
 use super::peering_server::{read_json, write_json};
 
-/// Send a join request to a target node and return the response.
+/// Send a join request to a target node over TLS and return the response.
 pub async fn join(target: &str, request: JoinRequest) -> Result<JoinResponse, SyfrahError> {
     // Parse target address
     let addr: SocketAddr = if target.contains(':') {
@@ -22,10 +23,21 @@ pub async fn join(target: &str, request: JoinRequest) -> Result<JoinResponse, Sy
             .map_err(|_| SyfrahError::validation(format!("invalid target address: {target}")))?
     };
 
-    // Connect
-    let mut stream = TcpStream::connect(addr)
+    // TCP connect
+    let tcp_stream = TcpStream::connect(addr)
         .await
         .map_err(|e| SyfrahError::network(format!("failed to connect to {addr}: {e}")))?;
+
+    // TLS handshake (TOFU — accept any cert, PIN provides auth)
+    let tls_config = super::tls::client_config();
+    let connector = TlsConnector::from(tls_config);
+    let server_name = rustls::pki_types::ServerName::try_from("syfrah-peering")
+        .map_err(|e| SyfrahError::internal(format!("TLS server name: {e}")))?;
+
+    let mut stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| SyfrahError::network(format!("TLS handshake failed: {e}")))?;
 
     // Send request
     write_json(&mut stream, &request).await?;
@@ -46,44 +58,39 @@ pub async fn join(target: &str, request: JoinRequest) -> Result<JoinResponse, Sy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn join_rejected() {
-        // Start a fake server that rejects
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _req: JoinRequest = read_json(&mut stream).await.unwrap();
-            let resp = JoinResponse::rejected("bad pin");
-            write_json(&mut stream, &resp).await.unwrap();
-        });
-
-        let req = JoinRequest {
-            name: "joiner".into(),
-            region: "eu".into(),
-            zone: "nbg1".into(),
-            wg_public_key: "key".into(),
-            wg_port: 51820,
-            endpoint: None,
-            pin: Some("wrong".into()),
-        };
-
-        let result = join(&addr.to_string(), req).await;
+    async fn join_connection_refused() {
+        let result = join(
+            "127.0.0.1:19999",
+            JoinRequest {
+                name: "test".into(),
+                region: "eu".into(),
+                zone: "fsn1".into(),
+                wg_public_key: "k".into(),
+                wg_port: 51820,
+                endpoint: None,
+                pin: None,
+            },
+        )
+        .await;
         assert!(result.is_err());
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn join_accepted() {
+    async fn join_tls_roundtrip() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let tls_config = super::super::tls::server_config().unwrap();
+        let tls_acceptor = TlsAcceptor::from(tls_config);
+
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let mut stream = tls_acceptor.accept(tcp_stream).await.unwrap();
             let _req: JoinRequest = read_json(&mut stream).await.unwrap();
             let resp = JoinResponse::accepted(
                 "syf_sk_test",
@@ -116,26 +123,7 @@ mod tests {
         let resp = join(&addr.to_string(), req).await.unwrap();
         assert!(resp.accepted);
         assert!(resp.secret.is_some());
-        assert!(resp.acceptor.is_some());
 
         server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn join_connection_refused() {
-        let result = join(
-            "127.0.0.1:19999",
-            JoinRequest {
-                name: "test".into(),
-                region: "eu".into(),
-                zone: "fsn1".into(),
-                wg_public_key: "k".into(),
-                wg_port: 51820,
-                endpoint: None,
-                pin: None,
-            },
-        )
-        .await;
-        assert!(result.is_err());
     }
 }

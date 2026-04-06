@@ -15,6 +15,9 @@ fn build_registry() -> ResourceRegistry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize structured logging
+    let _guard = syfrah_core::logging::init_cli();
+
     let registry = build_registry();
 
     let mut app = Command::new("syfrah")
