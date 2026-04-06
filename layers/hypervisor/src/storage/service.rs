@@ -163,6 +163,14 @@ pub fn install_region(config: &RegionStorage) -> Result<(), SyfrahError> {
     // Write systemd unit (creds in env vars — not in config file)
     let unit = generate_unit(&config.region, &config.s3_access_key, &config.s3_secret_key);
     std::fs::write(unit_path(&config.region), &unit).map_err(SyfrahError::from)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            unit_path(&config.region),
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
 
     run_systemctl(&["daemon-reload"])?;
 

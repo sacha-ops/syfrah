@@ -209,7 +209,7 @@ async fn handle_join(
     // Derive the new peer's mesh IPv6
     let pub_bytes = base64::engine::general_purpose::STANDARD
         .decode(&req.wg_public_key)
-        .unwrap_or_default();
+        .map_err(|e| SyfrahError::validation(format!("invalid WireGuard key: {e}")))?;
     let peer_ipv6 = syfrah_core::addressing::derive_node_address(&state.mesh.prefix, &pub_bytes);
 
     // Build announce info before consuming req fields
@@ -241,7 +241,8 @@ async fn handle_join(
         req.endpoint,
         peer_ipv6,
     );
-    let _ = state.peers.add(new_peer);
+    state.peers.add(new_peer)
+        .map_err(|e| SyfrahError::internal(format!("peer add failed: {e}")))?;
 
     // Update WireGuard FIRST — if this fails, state is unchanged
     let peers_for_wg: Vec<_> = state
@@ -356,7 +357,7 @@ pub async fn write_json<T: serde::Serialize>(
 
 /// Validate a peer-provided field against injection attacks.
 /// Rejects newlines, control characters, and excessive length.
-fn validate_peer_field(value: &str, field_name: &str) -> Result<(), SyfrahError> {
+pub fn validate_peer_field(value: &str, field_name: &str) -> Result<(), SyfrahError> {
     if value.len() > 256 {
         return Err(SyfrahError::validation(format!(
             "{field_name} too long (max 256 chars)"

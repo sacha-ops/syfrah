@@ -212,7 +212,7 @@ pub async fn join(
     use base64::Engine as _;
     let pub_bytes = base64::engine::general_purpose::STANDARD
         .decode(&wg_public)
-        .unwrap_or_default();
+        .map_err(|e| SyfrahError::internal(format!("invalid WireGuard key: {e}")))?;
     let mesh_ipv6 = syfrah_core::addressing::derive_node_address(&prefix, &pub_bytes);
 
     // Validate our identity

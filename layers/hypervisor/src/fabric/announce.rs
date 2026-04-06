@@ -145,6 +145,12 @@ async fn handle_announce(
 ) -> Result<String, SyfrahError> {
     let announce: PeerAnnounce = read_json(stream).await?;
 
+    // Validate peer data from untrusted source
+    super::peering_server::validate_peer_field(&announce.peer.name, "name")?;
+    super::peering_server::validate_peer_field(&announce.peer.region, "region")?;
+    super::peering_server::validate_peer_field(&announce.peer.zone, "zone")?;
+    super::peering_server::validate_peer_field(&announce.peer.wg_public_key, "wg_public_key")?;
+
     let mut state = super::state::FabricState::load(db)
         .map_err(|e| SyfrahError::internal(e.to_string()))?
         .ok_or_else(|| SyfrahError::precondition("not initialized"))?;
@@ -167,7 +173,10 @@ async fn handle_announce(
         announce.peer.endpoint,
         announce.peer.mesh_ipv6,
     );
-    let _ = state.peers.add(new_peer);
+    if let Err(e) = state.peers.add(new_peer) {
+        tracing::debug!(error = %e, "announce: peer already known");
+        return Ok(peer_name);
+    }
 
     // Persist immediately
     state
