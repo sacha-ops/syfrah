@@ -9,6 +9,7 @@ use std::pin::Pin;
 use syfrah_core::resource::*;
 use syfrah_state::LayerDb;
 
+use crate::controlplane;
 use crate::fabric;
 
 /// Build the hypervisor ResourceDef.
@@ -137,9 +138,12 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
     let db = open_db()?;
     let result = fabric::ops::init(&db, &node_name, region, zone, port)?;
 
+    // Bootstrap control plane (TiKV) on the mesh
+    controlplane::ops::bootstrap(&node_name, &result.hypervisor.mesh_ipv6)?;
+
     // Print init result immediately
     eprintln!();
-    eprintln!("  Mesh initialized");
+    eprintln!("  Hypervisor initialized");
     eprintln!();
     eprintln!("  name     {}", result.hypervisor.name);
     eprintln!("  id       {}", result.hypervisor.id.as_str());
@@ -223,6 +227,18 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
     let db = open_db()?;
     let result = fabric::ops::join(&db, &target, &node_name, region, zone, port, pin).await?;
 
+    // Join control plane — build PD endpoints from peers' mesh addresses
+    let state = fabric::state::FabricState::load(&db)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("state missing after join"))?;
+    let pd_endpoints: Vec<String> = state
+        .peers
+        .peers
+        .iter()
+        .map(|p| format!("http://[{}]:{}", p.mesh_ipv6, controlplane::PD_CLIENT_PORT))
+        .collect();
+    controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints)?;
+
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": result.hypervisor.name,
         "id": result.hypervisor.id.as_str(),
@@ -276,6 +292,13 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
     let db = open_db()?;
     let s = fabric::ops::status(&db)?;
 
+    // Control plane status (best-effort — may not be installed yet)
+    let cp = controlplane::ops::status(&s.mesh_ipv6.parse().unwrap_or(std::net::Ipv6Addr::UNSPECIFIED));
+    let (pd_active, tikv_active, pd_members, tikv_stores, leader) = match cp {
+        Ok(cs) => (cs.pd_active, cs.tikv_active, cs.pd_members, cs.tikv_stores, cs.leader),
+        Err(_) => (false, false, 0, 0, None),
+    };
+
     Ok(OperationResponse::Resource(serde_json::json!({
         "name": s.hypervisor_name,
         "id": s.hypervisor_id,
@@ -284,34 +307,39 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
         "zone": s.zone,
         "mesh_ipv6": s.mesh_ipv6,
         "state": s.state,
-        "service": if s.service_active { "running" } else { "stopped" },
+        "wg": if s.service_active { "running" } else { "stopped" },
         "wg_interface": s.wg_interface_up,
         "peers": s.peer_count,
         "wg_port": s.wg_port,
         "rx_bytes": s.rx_bytes,
         "tx_bytes": s.tx_bytes,
+        "pd": if pd_active { "running" } else { "stopped" },
+        "tikv": if tikv_active { "running" } else { "stopped" },
+        "pd_members": pd_members,
+        "tikv_stores": tikv_stores,
+        "leader": leader,
     })))
 }
 
 async fn handle_start() -> anyhow::Result<OperationResponse> {
     fabric::ops::start()?;
-    Ok(OperationResponse::Message(
-        "WireGuard service started.".into(),
-    ))
+    let _ = controlplane::ops::start();
+    Ok(OperationResponse::Message("services started.".into()))
 }
 
 async fn handle_stop() -> anyhow::Result<OperationResponse> {
+    let _ = controlplane::ops::stop();
     fabric::ops::stop()?;
-    Ok(OperationResponse::Message(
-        "WireGuard service stopped.".into(),
-    ))
+    Ok(OperationResponse::Message("services stopped.".into()))
 }
 
 async fn handle_leave() -> anyhow::Result<OperationResponse> {
+    // Controlplane first (depends on mesh), then fabric
+    let _ = controlplane::ops::leave();
     let db = open_db()?;
     fabric::ops::leave(&db)?;
     Ok(OperationResponse::Message(
-        "left the cluster. WireGuard service uninstalled.".into(),
+        "left the cluster. All services uninstalled.".into(),
     ))
 }
 
