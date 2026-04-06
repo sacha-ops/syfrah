@@ -1,5 +1,5 @@
 [package]
-name = "syfrah-integration-tests"
+name = "syfrah-hypervisor-e2e"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -9,9 +9,9 @@ name = "peering"
 path = "peering_test.rs"
 
 [dependencies]
-syfrah-core = { path = "../../layers/core" }
-syfrah-state = { path = "../../layers/state" }
-syfrah-hypervisor = { path = "../../layers/hypervisor" }
+syfrah-core = { path = "../../../core" }
+syfrah-state = { path = "../../../state" }
+syfrah-hypervisor = { path = "../../" }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }

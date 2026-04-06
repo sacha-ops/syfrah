@@ -6,7 +6,6 @@ on:
     paths:
       - 'layers/**'
       - 'bin/**'
-      - 'tests/**'
       - 'Cargo.toml'
   pull_request:
     branches: [main, v2]
@@ -15,21 +14,52 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  integration:
-    name: Integration tests
+  # Discover all e2e test crates dynamically
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      e2e_crates: ${{ steps.find.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          crates=$(find layers -path '*/tests/e2e/Cargo.toml' \
+            -exec grep -oP 'name = "\K[^"]+' {} \; \
+            | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "Discovered E2E crates: $crates"
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+
+  # Run each layer's E2E tests in parallel
+  e2e:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJson(needs.discover.outputs.e2e_crates) }}
+    name: "e2e: ${{ matrix.crate }}"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run E2E tests
+        run: cargo test -p ${{ matrix.crate }} --verbose
+
+  # Unit tests + clippy (whole workspace)
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run integration tests
-        run: cargo test -p syfrah-integration-tests --verbose
-
-      - name: Run unit tests
-        run: cargo test --workspace --exclude syfrah-integration-tests
+      - name: Unit tests
+        run: |
+          # Exclude e2e crates from unit test run
+          cargo test --workspace \
+            $(find layers -path '*/tests/e2e/Cargo.toml' \
+              -exec grep -oP 'name = "\K[^"]+' {} \; \
+              | sed 's/^/--exclude /')
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings

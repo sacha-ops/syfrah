@@ -2298,6 +2298,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "syfrah-core-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.8",
+ "http 1.4.0",
+ "serde_json",
+ "syfrah-core",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "syfrah-hypervisor"
 version = "2.0.0"
 dependencies = [
@@ -2320,7 +2332,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "syfrah-integration-tests"
+name = "syfrah-hypervisor-e2e"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.8",

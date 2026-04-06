@@ -2,10 +2,11 @@
 resolver = "2"
 members = [
     "layers/core",
+    "layers/core/tests/e2e",
     "layers/state",
     "layers/hypervisor",
+    "layers/hypervisor/tests/e2e",
     "bin/syfrah",
-    "tests/integration",
 ]
 
 [workspace.package]
