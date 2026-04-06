@@ -146,40 +146,6 @@ pub fn leave() -> Result<(), SyfrahError> {
     service::uninstall()
 }
 
-/// Get PD member list from the PD API: Vec<(name, peer_url)>.
-fn get_pd_members(pd_url: &str) -> Result<Vec<(String, String)>, SyfrahError> {
-    let url = format!("{pd_url}/pd/api/v1/members");
-    let output = std::process::Command::new("curl")
-        .args(["-sf", "--max-time", "5", &url])
-        .output()
-        .map_err(|e| SyfrahError::internal(format!("curl failed: {e}")))?;
-
-    if !output.status.success() {
-        return Err(SyfrahError::internal("failed to get PD members"));
-    }
-
-    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| SyfrahError::internal(format!("parse PD members: {e}")))?;
-
-    let mut members = Vec::new();
-    if let Some(arr) = body["members"].as_array() {
-        for m in arr {
-            let name = m["name"].as_str().unwrap_or("").to_string();
-            let peer_url = m["peer_urls"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !name.is_empty() && !peer_url.is_empty() {
-                members.push((name, peer_url));
-            }
-        }
-    }
-
-    Ok(members)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

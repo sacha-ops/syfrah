@@ -482,42 +482,6 @@ pub struct ClusterStatus {
     pub leader: Option<String>,
 }
 
-/// Add a new PD member to an existing cluster via PD HTTP API.
-pub fn add_pd_member(
-    existing_pd_url: &str,
-    new_name: &str,
-    new_peer_url: &str,
-) -> Result<(), SyfrahError> {
-    let url = format!("{existing_pd_url}/pd/api/v1/members");
-    let body = serde_json::json!({
-        "name": new_name,
-        "peer-urls": [new_peer_url],
-    });
-
-    let output = Command::new("curl")
-        .args([
-            "-sf",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body.to_string(),
-            &url,
-        ])
-        .output()
-        .map_err(|e| SyfrahError::internal(format!("curl failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SyfrahError::internal(format!(
-            "PD member add failed: {stderr}"
-        )));
-    }
-
-    Ok(())
-}
-
 /// Query PD HTTP API.
 fn pd_api_get(pd_url: &str, path: &str) -> Result<serde_json::Value, SyfrahError> {
     let url = format!("{pd_url}{path}");

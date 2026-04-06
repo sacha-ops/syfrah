@@ -147,7 +147,15 @@ async fn handle_join(
         mesh_ipv6: peer_ipv6,
     };
 
-    // Add peer + save + update WG — all in one shot, then DB is released
+    // Skip if we already have this peer (duplicate join)
+    if state.peers.find_by_key(&req.wg_public_key).is_some()
+        || state.peers.find_by_name(&req.name).is_some()
+    {
+        tracing::info!(peer = %req.name, "duplicate join, already known");
+        return Ok(req.name);
+    }
+
+    // Add peer + save + update WG
     let new_peer = Peer::new(
         req.name.clone(),
         req.region,

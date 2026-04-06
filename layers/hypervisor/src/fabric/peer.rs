@@ -97,7 +97,7 @@ impl PeerList {
         Self { peers: Vec::new() }
     }
 
-    /// Add a peer. Returns error if public key already exists.
+    /// Add a peer. Returns error if public key or name already exists.
     pub fn add(&mut self, peer: Peer) -> Result<(), String> {
         if self
             .peers
@@ -108,6 +108,9 @@ impl PeerList {
                 "peer with key {} already exists",
                 peer.wg_public_key
             ));
+        }
+        if self.peers.iter().any(|p| p.name == peer.name) {
+            return Err(format!("peer with name {} already exists", peer.name));
         }
         self.peers.push(peer);
         Ok(())
