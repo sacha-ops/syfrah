@@ -20,12 +20,6 @@ pub struct InitResult {
     pub pin: String,
 }
 
-/// Initialize a new mesh on this node.
-///
-/// 1. Create mesh + hypervisor identity
-/// 2. Install WireGuard systemd service
-/// 3. Start the service
-/// 4. Persist state
 /// Configuration for fabric init.
 pub struct InitConfig<'a> {
     pub node_name: &'a str,
