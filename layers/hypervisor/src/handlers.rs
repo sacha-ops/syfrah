@@ -241,7 +241,8 @@ async fn handle_join(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .iter()
         .map(|p| format!("http://[{}]:{}", p.mesh_ipv6, controlplane::PD_CLIENT_PORT))
         .collect();
-    if let Err(e) = controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints) {
+    let peer_count = state.peers.len();
+    if let Err(e) = controlplane::ops::join(&node_name, &result.hypervisor.mesh_ipv6, &pd_endpoints, peer_count) {
         tracing::warn!(error = %e, "control plane join issue (services may still be starting)");
         eprintln!("  Warning: control plane setup incomplete: {e}");
         eprintln!("  Services will continue starting in background via systemd.");

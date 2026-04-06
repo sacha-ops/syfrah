@@ -58,10 +58,18 @@ pub fn bootstrap(
 ///
 /// If there are fewer than MAX_PD_MEMBERS, this node runs PD + TiKV.
 /// Otherwise, this node runs TiKV only (connecting to existing PD).
+/// Join an existing TiKV cluster.
+///
+/// `peer_count` is the number of peers already known (from fabric join).
+/// - 0-1 peers → this is the 2nd or 3rd node → run PD + TiKV
+/// - 2+ peers → 3+ nodes already exist → run TiKV only
+///
+/// This avoids the race condition of querying PD API during rapid joins.
 pub fn join(
     node_name: &str,
     mesh_ipv6: &Ipv6Addr,
     existing_pd_endpoints: &[String],
+    peer_count: usize,
 ) -> Result<(), SyfrahError> {
     if existing_pd_endpoints.is_empty() {
         return Err(SyfrahError::precondition(
@@ -74,21 +82,14 @@ pub fn join(
 
     let primary_pd = &existing_pd_endpoints[0];
 
-    // Check how many PD members exist (retry with backoff — mesh may need time)
-    let mut pd_count = 0;
-    for attempt in 0..3 {
-        pd_count = get_pd_member_count(primary_pd);
-        if pd_count > 0 {
-            break;
-        }
-        if attempt < 2 {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-        }
-    }
-    let run_pd = pd_count < MAX_PD_MEMBERS;
+    // Use peer count to decide: first 2 joiners run PD, rest run TiKV-only
+    // peer_count=1 means we're the 2nd node (1 peer = the init node)
+    // peer_count=2 means we're the 3rd node (2 peers)
+    // peer_count>=3 means 4th+ node → TiKV only
+    let run_pd = peer_count < (MAX_PD_MEMBERS - 1); // -1 because init node already has PD
 
     if run_pd {
-        eprintln!("  Starting PD + TiKV (PD member {}/{})", pd_count + 1, MAX_PD_MEMBERS);
+        eprintln!("  Starting PD + TiKV (node {} of {})", peer_count + 1, MAX_PD_MEMBERS);
         join_with_pd(node_name, mesh_ipv6, existing_pd_endpoints, primary_pd)?;
     } else {
         eprintln!("  Starting TiKV only (PD cluster full at {MAX_PD_MEMBERS} members)");
@@ -266,24 +267,6 @@ fn cleanup_zombie_members(pd_url: &str) {
             }
         }
     }
-}
-
-/// Count PD members in the cluster.
-fn get_pd_member_count(pd_url: &str) -> usize {
-    let url = format!("{pd_url}/pd/api/v1/members");
-    std::process::Command::new("curl")
-        .args(["-sf", "--max-time", "10", &url])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .and_then(|v| v["members"].as_array().map(|a| a.len()))
-        .unwrap_or(0)
 }
 
 /// Extract IPv6 from endpoint like "http://[fd01::1]:2379"
