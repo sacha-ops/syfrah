@@ -12,3 +12,4 @@
 pub mod controlplane;
 pub mod fabric;
 pub mod handlers;
+pub mod storage;

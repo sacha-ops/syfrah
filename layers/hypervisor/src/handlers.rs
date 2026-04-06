@@ -11,6 +11,7 @@ use syfrah_state::LayerDb;
 
 use crate::controlplane;
 use crate::fabric;
+use crate::storage;
 
 /// Build the hypervisor ResourceDef.
 pub fn resource_def() -> ResourceDef {
@@ -333,10 +334,14 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
 async fn handle_start() -> anyhow::Result<OperationResponse> {
     fabric::ops::start()?;
     let _ = controlplane::ops::start();
+    let db = open_db()?;
+    let _ = storage::ops::start_all(&db);
     Ok(OperationResponse::Message("services started.".into()))
 }
 
 async fn handle_stop() -> anyhow::Result<OperationResponse> {
+    let db = open_db()?;
+    let _ = storage::ops::stop_all(&db);
     let _ = controlplane::ops::stop();
     fabric::ops::stop()?;
     Ok(OperationResponse::Message("services stopped.".into()))
@@ -350,14 +355,17 @@ async fn handle_leave() -> anyhow::Result<OperationResponse> {
         .flatten()
         .map(|s| s.hypervisor.mesh_ipv6);
 
-    // Controlplane first (deregister store, then uninstall)
+    // Storage first (stop ZeroFS instances)
+    let _ = storage::ops::leave();
+
+    // Controlplane (deregister TiKV store, then uninstall)
     if let Some(ipv6) = mesh_ipv6 {
         let _ = controlplane::ops::leave_with_mesh(&ipv6);
     } else {
         let _ = controlplane::ops::leave();
     }
 
-    // Then fabric
+    // Fabric last (WireGuard mesh)
     fabric::ops::leave(&db)?;
     Ok(OperationResponse::Message(
         "left the cluster. All services uninstalled.".into(),
