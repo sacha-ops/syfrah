@@ -19,7 +19,31 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize structured logging
-    let _guard = syfrah_core::logging::init_cli();
+    // File: info level (for debugging), stderr: warn level (clean UX)
+    let _ = std::fs::create_dir_all("/var/log/syfrah");
+    let _guard = {
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{fmt, EnvFilter};
+
+        let file_appender = tracing_appender::rolling::daily("/var/log/syfrah", "syfrah.log");
+        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_writer(file_writer)
+                    .with_filter(EnvFilter::new("info")),
+            )
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_writer(std::io::stderr)
+                    .with_filter(EnvFilter::new("warn")),
+            );
+        tracing::subscriber::set_global_default(subscriber).ok();
+        file_guard
+    };
 
     let registry = build_registry();
 

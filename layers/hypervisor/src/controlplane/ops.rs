@@ -20,6 +20,7 @@ pub fn bootstrap(
     node_name: &str,
     mesh_ipv6: &Ipv6Addr,
 ) -> Result<(), SyfrahError> {
+    tracing::info!(node_name, %mesh_ipv6, "controlplane bootstrap starting");
     eprintln!("  Setting up control plane...");
 
     service::ensure_installed()?;
@@ -77,6 +78,7 @@ pub fn join(
         ));
     }
 
+    tracing::info!(node_name, %mesh_ipv6, peer_count, "controlplane join starting");
     eprintln!("  Joining control plane...");
     service::ensure_installed()?;
 

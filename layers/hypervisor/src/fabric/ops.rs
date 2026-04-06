@@ -34,6 +34,8 @@ pub fn init(
     zone: &str,
     port: u16,
 ) -> Result<InitResult, SyfrahError> {
+    tracing::info!(node_name, region, zone, port, "fabric init starting");
+
     // Check not already initialized
     if FabricState::exists(db).map_err(|e| SyfrahError::internal(e.to_string()))? {
         return Err(SyfrahError::conflict(

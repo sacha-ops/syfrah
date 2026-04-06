@@ -2254,6 +2254,9 @@ dependencies = [
  "syfrah-hypervisor",
  "tokio",
  "tower 0.5.3",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
