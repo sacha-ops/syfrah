@@ -6,9 +6,12 @@ on:
     paths:
       - 'layers/**'
       - 'bin/**'
+      - 'tests/**'
       - 'Cargo.toml'
+      - '.github/workflows/e2e.yml'
   pull_request:
     branches: [main, v2]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
