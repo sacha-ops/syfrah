@@ -1,0 +1,462 @@
+//! TiKV + PD service management — install, configure, start, stop.
+//!
+//! Same pattern as fabric/service.rs for WireGuard:
+//! - Auto-install binaries via TiUP
+//! - Generate config files
+//! - Install systemd units
+//! - Start/stop/status
+
+use std::net::Ipv6Addr;
+use std::path::Path;
+use std::process::Command;
+
+use syfrah_core::error::SyfrahError;
+
+// ═══════════════════════════════════════════════════
+// Paths
+// ═══════════════════════════════════════════════════
+
+const TIUP_HOME: &str = "/opt/syfrah/tiup";
+const PD_DATA_DIR: &str = "/var/lib/syfrah/pd";
+const TIKV_DATA_DIR: &str = "/var/lib/syfrah/tikv";
+const PD_CONF_PATH: &str = "/etc/syfrah/pd.toml";
+const TIKV_CONF_PATH: &str = "/etc/syfrah/tikv.toml";
+const PD_UNIT_PATH: &str = "/etc/systemd/system/syfrah-pd.service";
+const TIKV_UNIT_PATH: &str = "/etc/systemd/system/syfrah-tikv.service";
+
+const PD_SERVICE: &str = "syfrah-pd";
+const TIKV_SERVICE: &str = "syfrah-tikv";
+
+// ═══════════════════════════════════════════════════
+// Install TiUP + components
+// ═══════════════════════════════════════════════════
+
+/// Check if TiUP is installed.
+fn tiup_available() -> bool {
+    Path::new(&format!("{TIUP_HOME}/bin/tiup")).exists()
+}
+
+/// Check if PD binary is available.
+fn pd_available() -> bool {
+    // TiUP installs components under TIUP_HOME/components/pd/...
+    Command::new(format!("{TIUP_HOME}/bin/tiup"))
+        .args(["list", "--installed"])
+        .env("TIUP_HOME", TIUP_HOME)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.contains("pd"))
+        .unwrap_or(false)
+}
+
+/// Install TiUP and TiKV components.
+pub fn ensure_installed() -> Result<(), SyfrahError> {
+    // Create dirs
+    std::fs::create_dir_all(TIUP_HOME).map_err(SyfrahError::from)?;
+    std::fs::create_dir_all("/etc/syfrah").map_err(SyfrahError::from)?;
+
+    if !tiup_available() {
+        eprintln!("  Installing TiUP...");
+
+        let output = Command::new("sh")
+            .args(["-c", &format!(
+                "curl -fsSL https://tiup-mirrors.pingcap.com/tiup-linux-$(uname -m).tar.gz | tar -xz -C {TIUP_HOME}/bin/"
+            )])
+            .output()
+            .map_err(|e| SyfrahError::internal(format!("tiup download failed: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SyfrahError::internal(format!("tiup install failed: {stderr}")));
+        }
+    }
+
+    // Ensure bin dir exists
+    std::fs::create_dir_all(format!("{TIUP_HOME}/bin")).map_err(SyfrahError::from)?;
+
+    if !pd_available() {
+        eprintln!("  Installing PD + TiKV components...");
+
+        let output = Command::new(format!("{TIUP_HOME}/bin/tiup"))
+            .args(["install", "pd", "tikv"])
+            .env("TIUP_HOME", TIUP_HOME)
+            .output()
+            .map_err(|e| SyfrahError::internal(format!("component install failed: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SyfrahError::internal(format!(
+                "PD/TiKV install failed: {stderr}"
+            )));
+        }
+
+        eprintln!("  PD + TiKV installed");
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════
+// Config generation
+// ═══════════════════════════════════════════════════
+
+/// PD config for a node.
+pub struct PdConfig {
+    /// This node's name (unique in cluster).
+    pub name: String,
+    /// Mesh IPv6 address for this node.
+    pub mesh_ipv6: Ipv6Addr,
+    /// Initial cluster string: "name1=http://[ipv6_1]:2380,name2=http://[ipv6_2]:2380"
+    pub initial_cluster: String,
+    /// "new" for first node, "join" for subsequent.
+    pub initial_cluster_state: String,
+}
+
+/// Generate pd.toml config.
+pub fn generate_pd_conf(cfg: &PdConfig) -> String {
+    format!(
+        r#"# Syfrah PD configuration — auto-generated
+name = "{name}"
+data-dir = "{PD_DATA_DIR}"
+
+client-urls = "http://[{ip}]:{client_port}"
+peer-urls = "http://[{ip}]:{peer_port}"
+advertise-client-urls = "http://[{ip}]:{client_port}"
+advertise-peer-urls = "http://[{ip}]:{peer_port}"
+
+initial-cluster = "{initial_cluster}"
+initial-cluster-state = "{initial_cluster_state}"
+
+[log]
+level = "warn"
+
+[log.file]
+filename = "/var/log/syfrah/pd.log"
+max-size = 50
+"#,
+        name = cfg.name,
+        ip = cfg.mesh_ipv6,
+        client_port = super::PD_CLIENT_PORT,
+        peer_port = super::PD_PEER_PORT,
+        initial_cluster = cfg.initial_cluster,
+        initial_cluster_state = cfg.initial_cluster_state,
+    )
+}
+
+/// TiKV config for a node.
+pub struct TikvConfig {
+    /// Mesh IPv6 address.
+    pub mesh_ipv6: Ipv6Addr,
+    /// PD endpoints: "http://[ipv6_1]:2379,http://[ipv6_2]:2379"
+    pub pd_endpoints: Vec<String>,
+}
+
+/// Generate tikv.toml config.
+pub fn generate_tikv_conf(cfg: &TikvConfig) -> String {
+    let pd_endpoints: Vec<String> = cfg
+        .pd_endpoints
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect();
+
+    format!(
+        r#"# Syfrah TiKV configuration — auto-generated
+[server]
+addr = "[{ip}]:{tikv_port}"
+advertise-addr = "[{ip}]:{tikv_port}"
+
+[storage]
+data-dir = "{TIKV_DATA_DIR}"
+
+[pd]
+endpoints = [{pd_list}]
+
+[log]
+level = "warn"
+
+[log.file]
+filename = "/var/log/syfrah/tikv.log"
+max-size = 50
+
+[raftstore]
+# Reduce resource usage for small clusters
+capacity = "0"
+"#,
+        ip = cfg.mesh_ipv6,
+        tikv_port = super::TIKV_PORT,
+        pd_list = pd_endpoints.join(", "),
+    )
+}
+
+// ═══════════════════════════════════════════════════
+// Systemd units
+// ═══════════════════════════════════════════════════
+
+fn generate_pd_unit() -> String {
+    format!(
+        r#"[Unit]
+Description=Syfrah Placement Driver (PD)
+After=network-online.target syfrah-wg.service
+Wants=network-online.target
+Requires=syfrah-wg.service
+
+[Service]
+Type=simple
+ExecStart={TIUP_HOME}/bin/tiup pd --config={PD_CONF_PATH}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
+fn generate_tikv_unit() -> String {
+    format!(
+        r#"[Unit]
+Description=Syfrah TiKV Storage Engine
+After=network-online.target syfrah-pd.service
+Wants=network-online.target
+Requires=syfrah-pd.service
+
+[Service]
+Type=simple
+ExecStart={TIUP_HOME}/bin/tiup tikv --config={TIKV_CONF_PATH}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
+// ═══════════════════════════════════════════════════
+// Install, start, stop
+// ═══════════════════════════════════════════════════
+
+/// Install PD + TiKV configs and systemd units.
+pub fn install(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig) -> Result<(), SyfrahError> {
+    // Create directories
+    std::fs::create_dir_all(PD_DATA_DIR).map_err(SyfrahError::from)?;
+    std::fs::create_dir_all(TIKV_DATA_DIR).map_err(SyfrahError::from)?;
+    std::fs::create_dir_all("/var/log/syfrah").map_err(SyfrahError::from)?;
+    std::fs::create_dir_all("/etc/syfrah").map_err(SyfrahError::from)?;
+
+    // Write configs
+    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg)).map_err(SyfrahError::from)?;
+    std::fs::write(TIKV_CONF_PATH, generate_tikv_conf(tikv_cfg)).map_err(SyfrahError::from)?;
+
+    // Write systemd units
+    std::fs::write(PD_UNIT_PATH, generate_pd_unit()).map_err(SyfrahError::from)?;
+    std::fs::write(TIKV_UNIT_PATH, generate_tikv_unit()).map_err(SyfrahError::from)?;
+
+    // Reload systemd
+    run_systemctl(&["daemon-reload"])?;
+
+    Ok(())
+}
+
+/// Enable and start PD, then TiKV (order matters).
+pub fn enable_and_start() -> Result<(), SyfrahError> {
+    run_systemctl(&["enable", "--now", PD_SERVICE])?;
+    // Wait for PD to be ready before starting TiKV
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    run_systemctl(&["enable", "--now", TIKV_SERVICE])?;
+    Ok(())
+}
+
+/// Start both services.
+pub fn start() -> Result<(), SyfrahError> {
+    run_systemctl(&["start", PD_SERVICE])?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    run_systemctl(&["start", TIKV_SERVICE])?;
+    Ok(())
+}
+
+/// Stop both services.
+pub fn stop() -> Result<(), SyfrahError> {
+    let _ = run_systemctl(&["stop", TIKV_SERVICE]);
+    let _ = run_systemctl(&["stop", PD_SERVICE]);
+    Ok(())
+}
+
+/// Check if PD is active.
+pub fn pd_is_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", PD_SERVICE])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if TiKV is active.
+pub fn tikv_is_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", TIKV_SERVICE])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if both are installed.
+pub fn is_installed() -> bool {
+    Path::new(PD_UNIT_PATH).exists() && Path::new(TIKV_UNIT_PATH).exists()
+}
+
+/// Uninstall everything — stop services, remove configs, data.
+pub fn uninstall() -> Result<(), SyfrahError> {
+    let _ = run_systemctl(&["disable", "--now", TIKV_SERVICE]);
+    let _ = run_systemctl(&["disable", "--now", PD_SERVICE]);
+
+    let _ = std::fs::remove_file(PD_UNIT_PATH);
+    let _ = std::fs::remove_file(TIKV_UNIT_PATH);
+    let _ = std::fs::remove_file(PD_CONF_PATH);
+    let _ = std::fs::remove_file(TIKV_CONF_PATH);
+    let _ = std::fs::remove_dir_all(PD_DATA_DIR);
+    let _ = std::fs::remove_dir_all(TIKV_DATA_DIR);
+
+    let _ = run_systemctl(&["daemon-reload"]);
+
+    Ok(())
+}
+
+/// Add a new PD member to an existing cluster via PD HTTP API.
+pub async fn add_pd_member(
+    existing_pd: &str,
+    new_name: &str,
+    new_peer_url: &str,
+) -> Result<(), SyfrahError> {
+    let url = format!("{existing_pd}/pd/api/v1/members");
+    let body = serde_json::json!({
+        "name": new_name,
+        "peer-urls": [new_peer_url],
+    });
+
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body.to_string(),
+            &url,
+        ])
+        .output()
+        .map_err(|e| SyfrahError::internal(format!("curl failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SyfrahError::internal(format!(
+            "PD member add failed: {stderr}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<(), SyfrahError> {
+    let output = Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| SyfrahError::internal(format!("systemctl failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SyfrahError::internal(format!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_pd_conf_single_node() {
+        let cfg = PdConfig {
+            name: "node-1".into(),
+            mesh_ipv6: "fd01::1".parse().unwrap(),
+            initial_cluster: "node-1=http://[fd01::1]:2380".into(),
+            initial_cluster_state: "new".into(),
+        };
+        let conf = generate_pd_conf(&cfg);
+        assert!(conf.contains("name = \"node-1\""));
+        assert!(conf.contains("[fd01::1]:2379"));
+        assert!(conf.contains("[fd01::1]:2380"));
+        assert!(conf.contains("initial-cluster-state = \"new\""));
+    }
+
+    #[test]
+    fn generate_pd_conf_join() {
+        let cfg = PdConfig {
+            name: "node-2".into(),
+            mesh_ipv6: "fd01::2".parse().unwrap(),
+            initial_cluster: "node-1=http://[fd01::1]:2380,node-2=http://[fd01::2]:2380".into(),
+            initial_cluster_state: "join".into(),
+        };
+        let conf = generate_pd_conf(&cfg);
+        assert!(conf.contains("initial-cluster-state = \"join\""));
+        assert!(conf.contains("node-1=http://[fd01::1]:2380"));
+    }
+
+    #[test]
+    fn generate_tikv_conf_basic() {
+        let cfg = TikvConfig {
+            mesh_ipv6: "fd01::1".parse().unwrap(),
+            pd_endpoints: vec!["http://[fd01::1]:2379".into()],
+        };
+        let conf = generate_tikv_conf(&cfg);
+        assert!(conf.contains("[fd01::1]:20160"));
+        assert!(conf.contains("http://[fd01::1]:2379"));
+    }
+
+    #[test]
+    fn generate_tikv_conf_multi_pd() {
+        let cfg = TikvConfig {
+            mesh_ipv6: "fd01::1".parse().unwrap(),
+            pd_endpoints: vec![
+                "http://[fd01::1]:2379".into(),
+                "http://[fd01::2]:2379".into(),
+                "http://[fd01::3]:2379".into(),
+            ],
+        };
+        let conf = generate_tikv_conf(&cfg);
+        assert!(conf.contains("fd01::2"));
+        assert!(conf.contains("fd01::3"));
+    }
+
+    #[test]
+    fn generate_pd_unit_valid() {
+        let unit = generate_pd_unit();
+        assert!(unit.contains("[Unit]"));
+        assert!(unit.contains("[Service]"));
+        assert!(unit.contains("[Install]"));
+        assert!(unit.contains("syfrah-wg.service"));
+        assert!(unit.contains("pd --config="));
+    }
+
+    #[test]
+    fn generate_tikv_unit_valid() {
+        let unit = generate_tikv_unit();
+        assert!(unit.contains("[Unit]"));
+        assert!(unit.contains("syfrah-pd.service"));
+        assert!(unit.contains("tikv --config="));
+    }
+
+    #[test]
+    fn is_installed_false_by_default() {
+        // On test system without syfrah
+        assert!(!is_installed());
+    }
+}
