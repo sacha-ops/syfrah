@@ -368,7 +368,8 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
 }
 
 async fn handle_start() -> anyhow::Result<OperationResponse> {
-    fabric::ops::start()?;
+    let db = open_db()?;
+    fabric::ops::start(&db)?;
     let _ = controlplane::ops::start();
     let db = open_db()?;
     let _ = storage::ops::start_all(&db);
@@ -385,7 +386,7 @@ async fn handle_stop() -> anyhow::Result<OperationResponse> {
     let db = open_db()?;
     let _ = storage::ops::stop_all(&db);
     let _ = controlplane::ops::stop();
-    fabric::ops::stop()?;
+    fabric::ops::stop(&db)?;
     Ok(OperationResponse::Message("services stopped.".into()))
 }
 

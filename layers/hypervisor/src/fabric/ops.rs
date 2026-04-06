@@ -393,35 +393,41 @@ pub fn status(db: &LayerDb) -> Result<StatusResult, SyfrahError> {
     })
 }
 
-/// Start the WireGuard service.
-pub fn start() -> Result<(), SyfrahError> {
-    if !service::is_installed() {
-        return Err(SyfrahError::precondition(
-            "not initialized. Run 'syfrah hypervisor init' first.",
-        ));
-    }
-    if service::is_active() {
+/// Start the fabric network service.
+pub fn start(db: &LayerDb) -> Result<(), SyfrahError> {
+    let state = FabricState::load(db)
+        .map_err(|e| SyfrahError::internal(e.to_string()))?
+        .ok_or_else(|| SyfrahError::precondition("not initialized. Run 'syfrah hypervisor init' first."))?;
+
+    let backend = super::backend::create_backend(state.network_mode);
+    if backend.is_active() {
         return Ok(()); // already running, idempotent
     }
-    service::start()
+    backend.start()
 }
 
-/// Stop the WireGuard service.
-pub fn stop() -> Result<(), SyfrahError> {
-    if !service::is_active() {
-        return Ok(()); // already stopped, idempotent
+/// Stop the fabric network service.
+pub fn stop(db: &LayerDb) -> Result<(), SyfrahError> {
+    let state = match FabricState::load(db).map_err(|e| SyfrahError::internal(e.to_string()))? {
+        Some(s) => s,
+        None => return Ok(()), // not initialized, nothing to stop
+    };
+    let backend = super::backend::create_backend(state.network_mode);
+    if !backend.is_active() {
+        return Ok(());
     }
-    service::stop()
+    backend.stop()
 }
 
 /// Leave the cluster — uninstall service, remove state.
 pub fn leave(db: &LayerDb) -> Result<(), SyfrahError> {
-    // Uninstall systemd service + config
-    service::uninstall()?;
-
-    // Cleanup interface if still up
-    if wg::interface_exists() {
-        let _ = wg::destroy_interface();
+    // Get backend from state (if available)
+    if let Some(state) = FabricState::load(db).ok().flatten() {
+        let backend = super::backend::create_backend(state.network_mode);
+        let _ = backend.teardown();
+    } else {
+        // Fallback: try WG teardown anyway
+        let _ = service::uninstall();
     }
 
     // Delete state

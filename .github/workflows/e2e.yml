@@ -50,6 +50,22 @@ jobs:
       - name: Run E2E tests
         run: cargo test -p ${{ matrix.crate }} --verbose
 
+  # CLI E2E tests (run the binary like a real user)
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Run CLI E2E tests
+        run: |
+          for script in $(find layers -path '*/tests/e2e/cli_test.sh'); do
+            echo "=== Running $script ==="
+            SYFRAH_BIN=target/release/syfrah bash "$script"
+          done
+
   # Unit tests + clippy (whole workspace)
   unit:
     runs-on: ubuntu-latest
