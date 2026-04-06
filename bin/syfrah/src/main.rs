@@ -21,29 +21,47 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize structured logging
-    let _ = std::fs::create_dir_all("/var/log/syfrah");
+    // File: info level (if writable), stderr: warn level always
     let _guard = {
         use tracing_subscriber::prelude::*;
         use tracing_subscriber::{fmt, EnvFilter};
 
-        let file_appender = tracing_appender::rolling::daily("/var/log/syfrah", "syfrah.log");
-        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+        let log_dir = "/var/log/syfrah";
+        let can_write = std::fs::create_dir_all(log_dir).is_ok()
+            && std::fs::metadata(log_dir)
+                .map(|m| !m.permissions().readonly())
+                .unwrap_or(false);
 
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_writer(file_writer)
-                    .with_filter(EnvFilter::new("info")),
-            )
-            .with(
+        if can_write {
+            let file_appender = tracing_appender::rolling::daily(log_dir, "syfrah.log");
+            let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_writer(file_writer)
+                        .with_filter(EnvFilter::new("info")),
+                )
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_writer(std::io::stderr)
+                        .with_filter(EnvFilter::new("warn")),
+                );
+            tracing::subscriber::set_global_default(subscriber).ok();
+            Some(file_guard)
+        } else {
+            // Fallback: stderr only (non-root, CI, containers)
+            let subscriber = tracing_subscriber::registry().with(
                 fmt::layer()
                     .with_target(true)
                     .with_writer(std::io::stderr)
                     .with_filter(EnvFilter::new("warn")),
             );
-        tracing::subscriber::set_global_default(subscriber).ok();
-        file_guard
+            tracing::subscriber::set_global_default(subscriber).ok();
+            None
+        }
     };
 
     let registry = build_registry();
