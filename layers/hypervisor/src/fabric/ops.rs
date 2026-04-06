@@ -28,13 +28,13 @@ pub struct InitResult {
 /// 4. Persist state
 pub fn init(
     db: &LayerDb,
-
     node_name: &str,
     region: &str,
     zone: &str,
     port: u16,
+    network_mode: super::backend::NetworkMode,
 ) -> Result<InitResult, SyfrahError> {
-    tracing::info!(node_name, region, zone, port, "fabric init starting");
+    tracing::info!(node_name, region, zone, port, %network_mode, "fabric init starting");
 
     // Check not already initialized
     if FabricState::exists(db).map_err(|e| SyfrahError::internal(e.to_string()))? {
@@ -45,16 +45,16 @@ pub fn init(
         ));
     }
 
-    // Ensure WireGuard is installed
-    service::ensure_wireguard()?;
+    // Create backend from mode
+    let backend = super::backend::create_backend(network_mode);
+    backend.ensure_installed()?;
 
     // Create identities
     let (mesh_id, secret) = mesh::create_mesh();
     let hv = mesh::create_hypervisor(node_name, region, zone, port, None, &mesh_id.prefix)?;
 
-    // Install and start WireGuard service
-    service::install(&hv.wg_private_key, port, &hv.mesh_ipv6, &[])?;
-    service::enable_and_start()?;
+    // Setup network via backend
+    backend.setup(&hv.wg_private_key, port, &hv.mesh_ipv6, &[])?;
 
     // Persist state
     let secret_str = secret.to_string();
@@ -63,6 +63,7 @@ pub fn init(
         hypervisor: hv.clone(),
         secret: secret_str.clone(),
         peers: PeerList::new(),
+        network_mode,
     };
     state
         .save(db)
@@ -307,6 +308,7 @@ pub async fn join(
         hypervisor: hv.clone(),
         secret: secret_str,
         peers,
+        network_mode: super::backend::NetworkMode::default(), // Join inherits WG for now
     };
     state
         .save(db)

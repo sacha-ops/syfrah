@@ -215,6 +215,7 @@ mod tests {
             hypervisor: hv,
             secret: secret.to_string(),
             peers: super::super::peer::PeerList::new(),
+            network_mode: super::super::backend::NetworkMode::default(),
         };
         state.save(&db).unwrap();
 
@@ -252,6 +253,7 @@ mod tests {
             hypervisor: hv,
             secret: secret.to_string(),
             peers,
+            network_mode: super::super::backend::NetworkMode::default(),
         };
         state.save(&db).unwrap();
 

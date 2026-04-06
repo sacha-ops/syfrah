@@ -25,6 +25,7 @@ pub fn resource_def() -> ResourceDef {
                 .with_arg(OperationArg::optional("region", FieldDef::string("region", "Region label").with_default("default")))
                 .with_arg(OperationArg::optional("zone", FieldDef::string("zone", "Zone label").with_default("default")))
                 .with_arg(OperationArg::optional("port", FieldDef::integer("port", "WireGuard listen port").with_default("51820")))
+                .with_arg(OperationArg::optional("mode", FieldDef::string("mode", "Network mode: wireguard (default), direct, mock").with_default("wireguard")))
                 .with_arg(OperationArg::optional("peering", FieldDef::flag("peering", "Start peering listener after init (accepts joins)")))
                 .with_output(OutputKind::Resource)
                 .with_example("syfrah hypervisor init --name my-cloud --region eu --zone fsn1 --peering")
@@ -126,6 +127,14 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .and_then(|s| s.parse().ok())
         .unwrap_or(51820);
 
+    let network_mode: fabric::NetworkMode = req
+        .fields
+        .get("mode")
+        .map(|s| s.as_str())
+        .unwrap_or("wireguard")
+        .parse()
+        .unwrap_or_default();
+
     let node_name = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -139,7 +148,7 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .unwrap_or(false);
 
     let db = open_db()?;
-    let result = fabric::ops::init(&db, &node_name, region, zone, port)?;
+    let result = fabric::ops::init(&db, &node_name, region, zone, port, network_mode)?;
 
     // Bootstrap control plane (TiKV) on the mesh
     // Don't rollback fabric on timeout — PD/TiKV will eventually start via systemd restart

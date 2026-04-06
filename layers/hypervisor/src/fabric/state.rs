@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use syfrah_state::LayerDb;
 
+use super::backend::NetworkMode;
 use super::mesh::{HypervisorIdentity, MeshIdentity};
 use super::peer::PeerList;
 
@@ -20,6 +21,9 @@ pub struct FabricState {
     pub secret: String,
     /// Known peers.
     pub peers: PeerList,
+    /// Network backend mode.
+    #[serde(default)]
+    pub network_mode: NetworkMode,
 }
 
 const STATE_TABLE: &str = "fabric";
@@ -70,6 +74,7 @@ mod tests {
             hypervisor: node,
             secret: secret.to_string(),
             peers: PeerList::new(),
+            network_mode: super::super::backend::NetworkMode::default(),
         }
     }
 
