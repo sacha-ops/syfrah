@@ -1,0 +1,50 @@
+---
+title: Core Layer
+description: Pure types, shared primitives, and the foundation every other Syfrah layer builds on.
+sidebar:
+  order: 1
+---
+
+The Core layer is the foundation of Syfrah. It contains no I/O, no async code, and no external dependencies beyond well-audited libraries. Everything in Core is a pure type, a pure function, or a validated data structure.
+
+Every other layer — State, Forge, Networking, Compute — imports from Core. Nothing in Core imports from any other Syfrah layer. This makes Core the stable base that the rest of the system depends on.
+
+## Why a dedicated Core layer?
+
+Syfrah is a distributed system. Errors, IDs, addresses, and validation logic appear everywhere. Without a shared foundation, these things end up duplicated, inconsistent, or subtly incompatible.
+
+Core solves this by providing a single source of truth for:
+
+- **How errors are represented** — every error has a code, a message, a suggestion, and optional context
+- **How identities are structured** — every resource has a typed ULID that encodes what it is and when it was created
+- **How addresses are assigned** — IPv6 ULA addressing derived deterministically from cryptographic keys
+- **How configuration is loaded** — a consistent priority chain from file to env to CLI flags
+- **How input is validated** — names, ports, regions, and durations validated at entry points before any state changes
+
+## Modules
+
+| Module | Purpose |
+|--------|---------|
+| [addressing](/syfrah/layers/core/addressing) | IPv6 ULA address assignment for mesh nodes |
+| [api](/syfrah/layers/core/transport) | Control socket request/response types |
+| [config](/syfrah/layers/core/config) | Configuration loading and validation |
+| [crypto](/syfrah/layers/core/crypto) | WireGuard keypairs, mesh secrets, HKDF derivation |
+| [error](/syfrah/layers/core/error) | Unified error model with codes and suggestions |
+| [id](/syfrah/layers/core/id) | ULID-backed typed resource identifiers |
+| [logging](/syfrah/layers/core/logging) | Structured tracing setup with file rotation |
+| [process](/syfrah/layers/core/process) | Directory paths and socket locations |
+| [resource](/syfrah/layers/core/transport) | Resource kind enumeration |
+| [transport](/syfrah/layers/core/transport) | Unix domain socket transport with length-prefixed JSON |
+| [ui](/syfrah/layers/core/logging) | Terminal output helpers |
+| [validate](/syfrah/layers/core/validate) | Input validation for names, ports, regions, durations |
+| [version](/syfrah/layers/core/version) | Semver with channel support and compatibility checking |
+
+## Design principles
+
+**No I/O in Core.** Functions in Core never read files, open sockets, or spawn threads. This makes them trivially testable and composable. When I/O is needed, it happens in the layers above.
+
+**Errors are actionable.** Every `SyfrahError` carries a suggestion — a human-readable hint about what to do next. Errors are never just codes or raw strings.
+
+**Types encode intent.** An `OrgId` and a `VpcId` are different types even though both are ULIDs. You cannot accidentally pass one where the other is expected. The type system enforces correctness at compile time.
+
+**Validation at the boundary.** All user-supplied input is validated as soon as it enters the system — in the CLI, in the API, before any state changes are made. Validation rules live in Core so they are consistent everywhere.

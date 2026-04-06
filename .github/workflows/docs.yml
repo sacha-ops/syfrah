@@ -31,6 +31,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Sync docs from layers
+        run: bash scripts/sync-docs.sh
+
       - name: Generate OpenAPI spec
         run: |
           cargo run --bin syfrah-openapi --release > docs/public/openapi.json

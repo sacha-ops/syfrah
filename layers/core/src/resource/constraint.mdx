@@ -1,0 +1,104 @@
+---
+title: Field Constraints
+description: Cross-field validation rules — Requires, Forbids, Conflicts, OneOf, AtLeastOne, and Custom — validated before any handler runs.
+sidebar:
+  order: 6
+---
+
+Field constraints express rules that span multiple fields. Type validation (`--port` must be an integer) is handled by `FieldDef`. Constraints handle everything else: "if you set `--private`, you must also set `--cidr`", or "you can't use both `--image` and `--snapshot`".
+
+Constraints are checked after all individual fields are parsed and validated, but before the operation handler is called. If a constraint fails, the user sees a clear error explaining what went wrong and what to do about it.
+
+## Requires
+
+`Requires(A, B)` — if field A is set, field B must also be set.
+
+```rust
+Constraint::requires("private", "cidr")
+// "The --private flag requires --cidr to be set."
+```
+
+Use this when one option only makes sense in combination with another.
+
+## Forbids
+
+`Forbids(A, B)` — if field A is set, field B must NOT be set.
+
+```rust
+Constraint::forbids("no-auth", "token")
+// "--no-auth cannot be used with --token."
+```
+
+Use this when two options are logically incompatible.
+
+## Conflicts
+
+`Conflicts(A, B)` — A and B cannot both be set. This is symmetric: it's an error if either is set while the other is also set.
+
+```rust
+Constraint::conflicts("image", "snapshot")
+// "--image and --snapshot cannot be used together. Choose one."
+```
+
+`Conflicts` is bidirectional. `Forbids` is one-directional (A forbids B, but B does not forbid A).
+
+## OneOf
+
+`OneOf([A, B, C, ...])` — exactly one of the listed fields must be set.
+
+```rust
+Constraint::one_of(&["image", "snapshot", "blank"])
+// "Exactly one of --image, --snapshot, or --blank must be provided."
+```
+
+Use this for mutually exclusive required choices where the user must pick exactly one.
+
+## AtLeastOne
+
+`AtLeastOne([A, B, C, ...])` — at least one of the listed fields must be set.
+
+```rust
+Constraint::at_least_one(&["name", "description", "tags"])
+// "At least one of --name, --description, or --tags must be provided."
+```
+
+Use this for updates where the user must change something, but the specific field doesn't matter.
+
+## Custom
+
+`Custom` takes a closure that receives all parsed field values and can apply arbitrary logic.
+
+```rust
+Constraint::custom(|fields| {
+    if let (Some(start), Some(end)) = (fields.get_int("start"), fields.get_int("end")) {
+        if start >= end {
+            return Err("--start must be less than --end".into());
+        }
+    }
+    Ok(())
+})
+```
+
+Custom constraints have access to all field values after parsing. They return `Ok(())` on success or an error string on failure. The framework wraps the error in the standard error format with suggestion text.
+
+## Attaching constraints to operations
+
+Constraints are added to operations, not to fields directly. The same field can be unconstrained in one operation and constrained in another.
+
+```rust
+Operation::create()
+    .with_arg(OperationArg::optional(FieldDef::flag("private", "Private network")))
+    .with_arg(OperationArg::optional(FieldDef::string("cidr", "CIDR block")))
+    .with_constraint(Constraint::requires("private", "cidr"))
+```
+
+## Constraint evaluation order
+
+1. All individual fields are parsed and type-validated.
+2. `Requires` constraints are checked.
+3. `Forbids` and `Conflicts` constraints are checked.
+4. `OneOf` and `AtLeastOne` constraints are checked.
+5. `Custom` constraints are checked, in declaration order.
+6. If all constraints pass, the handler is called.
+
+When multiple constraints fail, all failures are collected and reported together so the user can fix everything in one go.

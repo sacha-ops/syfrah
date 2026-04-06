@@ -1,0 +1,55 @@
+---
+title: Peering Server
+description: The TCP server that accepts join requests from new nodes — PIN validation, secret handoff, and peer announcement.
+sidebar:
+  order: 8
+---
+
+The peering server is the TCP listener that runs on every active Syfrah hypervisor. When another node wants to join the mesh, it connects here. The server validates the PIN, sends back the mesh secret and peer list, and then announces the new node to everyone else.
+
+The server listens on **WireGuard port + 1**. If your WireGuard port is 51820, the peering server is on 51821. Make sure this port is reachable from nodes that need to join.
+
+## Connection lifecycle
+
+For each incoming connection, the server follows this sequence:
+
+1. **Accept TCP connection** from the joiner
+2. **Read JoinRequest** (length-prefixed JSON)
+3. **Validate PIN** — if wrong, close the connection immediately
+4. **Open the database** to read current `FabricState`
+5. **Build JoinResponse** with the mesh secret, prefix, and current peer list
+6. **Send JoinResponse** to the joiner
+7. **Add the new peer** to local `FabricState` and persist it
+8. **Announce the new peer** to all existing peers via `PeerAnnounce`
+9. **Close the connection**
+
+## Per-request database open
+
+The database is opened fresh for each join request rather than held open across requests. This is a deliberate design choice. redb uses a single-writer model, and holding a write lock for the duration of a TCP connection would block any other operation (like `syfrah hv status`) that needs to read state while a slow join is in progress.
+
+Opening per-request adds a small amount of latency to joins, but joins are rare and not latency-sensitive.
+
+## Announcing new peers
+
+After a join completes, the server connects to each existing peer's peering port and sends a `PeerAnnounce` message containing the new node's `Peer` record. Each existing peer then:
+
+- Adds the new node to its own `PeerList`
+- Calls `wg set syfrah0 peer ...` to add the peer to the live interface
+- Rewrites `syfrah0.conf` to persist the change across restarts
+
+This means a new node is fully connected to the whole mesh within seconds of a successful join — no manual configuration on other nodes is needed.
+
+## Firewall requirements
+
+The peering port must be open on the accepting node. If you use nftables or iptables:
+
+```sh
+# Allow peering connections (WG port + 1)
+nft add rule inet filter input tcp dport 51821 accept
+```
+
+The WireGuard port itself (51820 by default) also needs to be open for UDP traffic.
+
+## Logging
+
+The peering server logs each connection attempt, including the source IP and whether the PIN was accepted or rejected. This gives you an audit trail of who has joined the mesh and when.

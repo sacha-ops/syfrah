@@ -1,0 +1,82 @@
+---
+title: Confirmation Prompts
+description: How destructive operations ask for confirmation before proceeding, and how to bypass confirmation in scripts with --yes.
+sidebar:
+  order: 4
+---
+
+Destructive operations — deleting a resource, leaving a mesh, draining a hypervisor — require explicit confirmation before executing. This is a safety guard that prevents accidental data loss from a mistyped command.
+
+## How confirmation works
+
+When an operation is marked with `.with_confirm()` in its definition, the dispatch layer adds a confirmation step before calling the handler:
+
+```
+$ syfrah vpc delete vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+
+This will permanently delete VPC "production" (vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ).
+This action cannot be undone.
+
+? Are you sure? [y/N]: _
+```
+
+Pressing `y` or `Y` proceeds. Anything else (including just pressing Enter) cancels:
+
+```
+Cancelled.
+```
+
+The default is always "No" — the user must affirmatively choose to proceed.
+
+## When confirmation is shown
+
+Confirmation is shown when:
+- The operation has `.with_confirm()` declared
+- stdin is a TTY
+- `--yes` is not provided
+
+If stdin is not a TTY (piped, CI), confirmation is skipped and the operation is **not** executed — the command errors instead:
+
+```bash
+$ echo "" | syfrah vpc delete vpc-01HW...
+Error: this operation requires confirmation
+  Hint: use --yes to confirm in non-interactive contexts
+```
+
+This prevents accidental execution in scripts where a prompt would hang.
+
+## Bypassing confirmation with --yes
+
+The `--yes` flag skips the confirmation prompt and proceeds immediately. It is injected automatically on any operation with `.with_confirm()` — you don't need to declare it.
+
+```bash
+# In a script, always use --yes for destructive operations
+syfrah vpc delete "$VPC_ID" --yes
+syfrah hypervisor drain "$HV_ID" --yes --timeout 600
+```
+
+In CI/CD pipelines, always use `--yes`. Never rely on interactive confirmation in automation.
+
+## What the confirmation message includes
+
+The confirmation message is generated from the resource name and the resource being operated on. For a delete:
+
+```
+This will permanently delete VPC "production" (vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ).
+This action cannot be undone.
+```
+
+For a drain:
+
+```
+This will drain all workloads from hypervisor "hv-eu-west-1" (hv-01HWKZ3P8B0E7D2N5FVYMR4CXJ).
+Running VMs will be migrated to other hypervisors. This may take several minutes.
+```
+
+The secondary description line can be customized per operation:
+
+```rust
+Operation::action("drain", "Gracefully drain workloads")
+    .with_confirm()
+    .confirm_message("Running VMs will be migrated to other hypervisors. This may take several minutes.")
+```

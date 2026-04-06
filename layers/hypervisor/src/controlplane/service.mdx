@@ -1,0 +1,77 @@
+---
+title: Service
+description: Installing, configuring, and managing the PD and TiKV systemd services via TiUP.
+sidebar:
+  order: 2
+---
+
+The `service` module is the low-level machinery for running PD and TiKV on a node. It handles TiUP installation, configuration file generation, systemd unit management, and health polling. The higher-level [ops module](/syfrah/layers/hypervisor/controlplane/ops) calls into service to carry out bootstrap and join workflows.
+
+## Installation
+
+`ensure_installed` downloads and configures TiUP if it is not already present, then installs the PD and TiKV components:
+
+1. Downloads the TiUP binary for the current architecture (`amd64` or `arm64`) from the PingCAP mirror to `/opt/syfrah/tiup/bin/tiup`
+2. Sets the TiUP mirror to `https://tiup-mirrors.pingcap.com`
+3. Installs the `pd` and `tikv` components via `tiup install pd tikv`
+
+This runs automatically during `syfrah hv init` and `syfrah hv join`. If TiUP and both components are already present, the call is a no-op.
+
+## Configuration
+
+### PD config
+
+`generate_pd_conf` produces `/etc/syfrah/pd.toml`. Key settings:
+
+- **Client URL**: `http://[mesh_ipv6]:2379` — where TiKV and clients connect
+- **Peer URL**: `http://[mesh_ipv6]:2380` — for PD-to-PD Raft communication
+- **Data dir**: `/var/lib/syfrah/pd`
+- **Log**: `/var/log/syfrah/pd.log`
+
+For the bootstrap node, the config includes `initial-cluster` and `initial-cluster-state = "new"`. For joining nodes, those fields are omitted — the `--join` flag on the `ExecStart` line handles cluster membership instead.
+
+### TiKV config
+
+`generate_tikv_conf` produces `/etc/syfrah/tikv.toml`. Key settings:
+
+- **Server addr**: `[mesh_ipv6]:20160`
+- **PD endpoints**: list of all known PD client URLs
+- **Data dir**: `/var/lib/syfrah/tikv`
+- **Log**: `/var/log/syfrah/tikv.log`
+
+Both services require `syfrah-wg.service` — the WireGuard mesh must be up before TiKV or PD start, because they communicate over mesh IPv6 addresses.
+
+## Systemd units
+
+`install` writes `/etc/systemd/system/syfrah-pd.service` and `/etc/systemd/system/syfrah-tikv.service`, then runs `systemctl daemon-reload`. For joining nodes, the PD unit includes `--join=<primary_pd_url>` on its `ExecStart` line.
+
+`install_tikv_only` writes only the TiKV unit — used for nodes that join after the PD cluster is already at capacity.
+
+## Start, stop, and reload
+
+| Function | Effect |
+|---|---|
+| `enable_and_start` | Enable and start PD, wait 3 seconds, then enable and start TiKV |
+| `start_tikv_only` | Enable and start only TiKV (for PD-full nodes) |
+| `stop` | Stop TiKV first, then PD |
+| `restart` | Stop, short pause, start |
+| `reload` | Rewrite config files; PD gets `reload-or-restart`, TiKV gets a full restart |
+
+Order matters on startup: PD must be running and accepting connections before TiKV starts. The three-second delay in `enable_and_start` provides a simple buffer.
+
+## Waiting for readiness
+
+Two polling functions block until the service is healthy:
+
+- `wait_pd_ready(mesh_ipv6, timeout_secs)` — polls `GET /pd/api/v1/health` every second until it returns a 200 response
+- `wait_tikv_ready(mesh_ipv6, timeout_secs)` — polls `GET /pd/api/v1/stores` every second until the response includes at least one registered store
+
+Both functions return a timeout error if the deadline is exceeded. `bootstrap` gives PD 30 seconds and TiKV 60 seconds. `join` allows up to 120 seconds for each, since a joining node must first reach an existing PD over the mesh.
+
+## Cluster status
+
+`cluster_status` queries the PD HTTP API and returns a `ClusterStatus` struct with:
+
+- Whether PD and TiKV services are locally active
+- Number of PD members and TiKV stores in the cluster
+- Name of the current PD leader

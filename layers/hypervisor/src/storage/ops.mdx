@@ -1,0 +1,66 @@
+---
+title: Operations
+description: High-level storage orchestration — setup, teardown, and status for per-region ZeroFS instances.
+sidebar:
+  order: 4
+---
+
+The `storage/ops` module is the top-level entry point for storage lifecycle on a hypervisor node. It is called directly by the hypervisor handler and coordinates config validation, ZeroFS installation, systemd service management, and registry persistence.
+
+Each region runs its own ZeroFS instance backed by an S3-compatible bucket. A node can host multiple regions simultaneously.
+
+## setup_region
+
+```
+setup_region(db, config: RegionStorage) -> Result<()>
+```
+
+Brings up storage for one region in four steps:
+
+1. **Validate** — `config.validate()` checks that `region` is non-empty, `s3_endpoint` is a valid URL, and credentials are present. Returns an error immediately if any check fails.
+2. **Install ZeroFS** — `service::ensure_installed()` downloads and installs the ZeroFS binary if it is not already present.
+3. **Install config + systemd unit** — `service::install_region(&config)` writes the region-specific config file and registers a systemd unit.
+4. **Start** — `service::start_region(&config.region)` starts the systemd service. The region config is then persisted to the local registry via `RegionRegistry`.
+
+## remove_region
+
+```
+remove_region(db, region: &str) -> Result<()>
+```
+
+Stops the region's systemd service, removes its config and unit files, then removes the entry from the local registry. Safe to call on a region that is already stopped.
+
+## start_all / stop_all
+
+```
+start_all(db) -> Result<()>
+stop_all(db) -> Result<()>
+```
+
+`start_all` iterates the registry and starts any region that is not currently active (skips already-running services). `stop_all` stops every registered region regardless of state. Both functions swallow per-region errors so that one failing region does not block the others.
+
+## leave
+
+```
+leave() -> Result<()>
+```
+
+Called during `syfrah hypervisor leave`. Delegates to `service::uninstall_all()` which removes all region services and config files from the node. Does not touch the registry — the node is leaving the cluster entirely.
+
+## status
+
+```
+status(db) -> Vec<RegionStatus>
+```
+
+Returns a snapshot of all registered regions. Each `RegionStatus` contains:
+
+| Field | Description |
+|---|---|
+| `region` | Region identifier string |
+| `s3_endpoint` | S3-compatible endpoint URL |
+| `s3_bucket` | Bucket name |
+| `active` | `true` if the systemd service is currently running |
+| `is_default` | `true` if this is the node's default storage region |
+
+If the registry cannot be loaded an empty slice is returned rather than propagating an error, so status checks remain non-fatal during degraded startup.

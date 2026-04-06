@@ -1,0 +1,63 @@
+---
+title: WireGuard Interface
+description: Direct WireGuard interface management via wg and ip commands (no C bindings).
+sidebar:
+  order: 2
+---
+
+The `wireguard/wg` module manages the `syfrah0` WireGuard interface directly through the `wg` and `ip` CLI tools. It does not use netlink or any C bindings — all operations shell out to standard `wireguard-tools` commands, keeping the code portable and auditable.
+
+## Interface name
+
+The interface is always named `syfrah0` (`INTERFACE_NAME` constant). A single node has exactly one WireGuard interface per mesh.
+
+## Interface lifecycle
+
+### Create
+
+`create_interface(private_key, listen_port, mesh_ipv6)` performs three steps:
+
+1. `ip link add dev syfrah0 type wireguard` — create the kernel interface
+2. `wg set syfrah0 private-key /dev/stdin listen-port <port>` — configure key and port (key is written to stdin, never appears in the process argument list)
+3. `ip -6 addr add <mesh_ipv6>/128 dev syfrah0` + `ip link set up dev syfrah0` — assign address and bring up
+
+### Destroy
+
+`destroy_interface()` runs `ip link del dev syfrah0`. Any routes added for peers are automatically cleaned up by the kernel.
+
+## Peer management
+
+### Add peer
+
+`add_peer(peer, keepalive_secs)` calls `wg set syfrah0 peer <pubkey> allowed-ips <ipv6>/128 persistent-keepalive <n>`. If `peer.endpoint` is set it appends `endpoint <host:port>`. After configuring WireGuard it adds a host route: `ip -6 route add <peer_ipv6>/128 dev syfrah0`.
+
+### Remove peer
+
+`remove_peer(wg_public_key, mesh_ipv6)` calls `wg set syfrah0 peer <pubkey> remove` and deletes the corresponding route. Route deletion errors are ignored — the route may already be gone.
+
+## Status
+
+`get_status()` parses `wg show syfrah0 dump` and returns a `WgStatus`:
+
+| Field | Source |
+|---|---|
+| `interface` | constant `"syfrah0"` |
+| `listen_port` | column 3 of the interface line |
+| `peer_count` | number of peer lines |
+| `rx_bytes` | sum of column 6 across all peers |
+| `tx_bytes` | sum of column 7 across all peers |
+
+`interface_exists()` probes `ip link show dev syfrah0` and returns a boolean without throwing on failure.
+
+## Per-peer handshakes
+
+`get_peer_handshakes()` also parses `wg show syfrah0 dump` (skipping the interface line) and returns a `Vec<PeerHandshake>`:
+
+| Field | Description |
+|---|---|
+| `public_key` | peer's WireGuard public key |
+| `latest_handshake` | Unix timestamp of last handshake (0 = never) |
+| `rx_bytes` / `tx_bytes` | traffic counters for this peer |
+| `endpoint` | current endpoint, `None` if WireGuard reports `(none)` |
+
+This is used by the peering layer to detect stale peers and trigger reconnection.

@@ -1,0 +1,77 @@
+---
+title: WireGuard Interface
+description: How Syfrah creates and manages the syfrah0 WireGuard interface — using the wg and ip CLI tools under the hood.
+sidebar:
+  order: 5
+---
+
+The `wg` module is responsible for the WireGuard network interface itself. It talks to the kernel's WireGuard implementation via the `wg` and `ip` command-line tools, translating Syfrah's peer data into the low-level configuration that WireGuard needs.
+
+You do not use this module directly — it is called by the [service module](/syfrah/layers/hypervisor/fabric/service) and [ops](/syfrah/layers/hypervisor/fabric/ops). But understanding what it does helps you debug the network layer when things go wrong.
+
+## The interface: syfrah0
+
+All Syfrah mesh traffic flows through a single WireGuard interface named `syfrah0`. Every node in the mesh has this interface. The name is fixed — you will see it in `ip link`, `wg show`, and systemd logs.
+
+```sh
+ip link show syfrah0
+# 5: syfrah0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 ...
+
+wg show syfrah0
+# interface: syfrah0
+#   public key: ...
+#   listening port: 51820
+```
+
+## Operations
+
+### create interface
+
+Creates the `syfrah0` WireGuard interface and assigns this node's mesh IPv6 address to it. Called during `init` and `join` as part of service installation.
+
+### destroy interface
+
+Removes `syfrah0` entirely. Called during `leave` to clean up after the service is stopped. If the interface does not exist, this is a no-op.
+
+### add peer
+
+Configures a new peer on the existing interface:
+
+```sh
+wg set syfrah0 peer <pubkey> allowed-ips <mesh_ipv6>/128 endpoint <host>:<port>
+```
+
+This is used when a `PeerAnnounce` arrives and a running node needs to add the new joiner without restarting the service.
+
+### remove peer
+
+Removes a peer's WireGuard configuration:
+
+```sh
+wg set syfrah0 peer <pubkey> remove
+```
+
+Called when a peer leaves or is expelled from the mesh.
+
+### get status
+
+Reads the current WireGuard interface state. The returned data includes:
+
+| Field           | Description                                      |
+|-----------------|--------------------------------------------------|
+| `listen_port`   | Port the interface is listening on (e.g. 51820)  |
+| `peer_count`    | Number of configured peers                       |
+| `rx_bytes`      | Total bytes received across all peers            |
+| `tx_bytes`      | Total bytes sent across all peers                |
+
+This is what `syfrah hv status` uses to report the tunnel's health. The `last_handshake` timestamp for each peer also comes from here, which is how [PeerStatus](/syfrah/layers/hypervisor/fabric/peer) determines whether a peer is `Active` or `Unreachable`.
+
+## Dependencies
+
+The `wg` module requires:
+
+- `wireguard-tools` (provides the `wg` binary)
+- `iproute2` (provides the `ip` binary)
+- The `wireguard` kernel module (loaded automatically on most modern Linux kernels)
+
+If either binary is missing, init will fail with a clear error before any configuration is written.

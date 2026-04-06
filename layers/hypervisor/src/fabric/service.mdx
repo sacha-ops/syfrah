@@ -1,0 +1,91 @@
+---
+title: WireGuard Service
+description: How Syfrah manages the WireGuard systemd service — config generation, service lifecycle, and where files live on disk.
+sidebar:
+  order: 6
+---
+
+The `service` module manages the WireGuard systemd service that keeps the mesh tunnel running persistently. It generates the WireGuard configuration file and the systemd unit, and provides operations to install, start, stop, and remove them.
+
+## Service name and files
+
+| Item             | Path                                   |
+|------------------|----------------------------------------|
+| Service name     | `wg-quick@syfrah0`                     |
+| WireGuard config | `/etc/wireguard/syfrah0.conf`          |
+| systemd unit     | Managed by `wg-quick` (standard)      |
+
+The `wg-quick@syfrah0` service is a standard systemd instantiated unit provided by `wireguard-tools`. Syfrah writes the configuration file that `wg-quick` reads; it does not create a custom unit file.
+
+## The WireGuard config
+
+`syfrah0.conf` is generated from `FabricState`. A typical config looks like:
+
+```ini
+[Interface]
+PrivateKey = <this node's WG private key>
+Address = fd12:3456:789a::1/48
+ListenPort = 51820
+
+[Peer]
+PublicKey = <peer pubkey>
+AllowedIPs = fd12:3456:789a::2/128
+Endpoint = 203.0.113.20:51820
+PersistentKeepalive = 25
+
+[Peer]
+PublicKey = <peer pubkey>
+AllowedIPs = fd12:3456:789a::3/128
+Endpoint = 203.0.113.30:51820
+PersistentKeepalive = 25
+```
+
+Every known peer gets a `[Peer]` section. `AllowedIPs` is set to the peer's single mesh IPv6 address (`/128`), which means only mesh traffic is routed over the tunnel — not the peer's entire internet traffic.
+
+## Operations
+
+### install
+
+Writes `syfrah0.conf` to `/etc/wireguard/` with `0600` permissions (readable only by root). Called at the end of `init` and `join`, after the identity and peer list are ready.
+
+### enable_and_start
+
+Enables the service at boot and starts it immediately:
+
+```sh
+systemctl enable wg-quick@syfrah0
+systemctl start wg-quick@syfrah0
+```
+
+### start
+
+Starts the service without enabling it at boot. Used by `syfrah hv start` for a one-off restart without changing the boot configuration.
+
+### stop
+
+Stops the service:
+
+```sh
+systemctl stop wg-quick@syfrah0
+```
+
+The tunnel goes down and all peer connections are dropped. Configuration files are left in place.
+
+### update_config
+
+Rewrites `syfrah0.conf` from the current `FabricState` and reloads the service. Called when a `PeerAnnounce` arrives and the running node needs to persist the new peer to disk (in addition to the live `wg set` that the [wg module](/syfrah/layers/hypervisor/fabric/wg) performs).
+
+### uninstall
+
+Stops and disables the service, then removes `syfrah0.conf`:
+
+```sh
+systemctl disable --now wg-quick@syfrah0
+rm /etc/wireguard/syfrah0.conf
+```
+
+Called by `syfrah hv leave` as part of the full cleanup sequence.
+
+## Permissions
+
+All operations that write to `/etc/wireguard/` or invoke `systemctl` require root. Syfrah expects to be run as root on hypervisor nodes. If you are not root, these operations will fail with a permissions error.

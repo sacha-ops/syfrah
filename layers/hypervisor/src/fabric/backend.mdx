@@ -1,0 +1,62 @@
+---
+title: Network Backends
+description: The NetworkBackend trait and the three transport modes — WireGuard, direct, and mock.
+sidebar:
+  order: 12
+---
+
+The fabric layer is transport-agnostic. All networking goes through a `NetworkBackend` trait, and you choose the backend at init time with the `--mode` flag. This lets the same codebase work on the public internet, on a private datacenter network, and in tests — without any conditional logic scattered across the rest of the system.
+
+## The three modes
+
+### wireguard (default)
+
+Encrypted WireGuard mesh. Every node gets a private key; all traffic between nodes travels through an encrypted tunnel on the `syfrah0` interface. This is the right choice for any deployment where nodes communicate over the public internet or an untrusted network.
+
+```sh
+syfrah hv init --name web-01 --mode wireguard
+```
+
+`wireguard` is the default. You do not need to specify it explicitly.
+
+### direct
+
+Plain IP routing with no tunnel and no encryption. Syfrah still manages the peer list and mesh IPv6 addressing, but it does not install WireGuard or create a tunnel interface. This is appropriate for clusters running entirely on a private datacenter network where the underlay is trusted and you want to avoid the overhead of encapsulation.
+
+```sh
+syfrah hv init --name web-01 --mode direct
+```
+
+Use `direct` only when you control the network and trust the path between every node.
+
+### mock
+
+A no-op backend used for testing. The interface is always reported as up, all operations succeed without touching the system, and no network traffic is sent. The mock backend is not useful for production deployments.
+
+## Selecting a mode
+
+Pass `--mode` to `init` or `join`:
+
+```sh
+syfrah hv init --name web-01 --mode wireguard
+syfrah hv join --target 203.0.113.10 --name web-02 --mode direct
+```
+
+The mode is stored in `FabricState` and replayed on subsequent `start`, `stop`, and `leave` commands. All nodes in a cluster should use the same mode — mixing wireguard and direct nodes is not supported.
+
+## The NetworkBackend trait
+
+Every backend implements the same interface, so the fabric ops layer never needs to know which transport is in use. The contract includes:
+
+| Method | Purpose |
+|---|---|
+| `ensure_installed` | Install any required system packages |
+| `setup` | Create the network interface with the node's keys and initial peer list |
+| `add_peer` / `remove_peer` | Incrementally update the peer set |
+| `update_config` | Reconcile the full peer list (used on restart) |
+| `start` / `stop` / `teardown` | Service lifecycle |
+| `status` | Return interface state, listen port, peer count, bytes |
+| `is_up` / `is_active` | Quick health checks |
+| `mode` | Return the `NetworkMode` enum value for this backend |
+
+This design means adding a new transport in the future (e.g., a VXLAN backend) requires only implementing this trait — no changes to the fabric orchestration logic.

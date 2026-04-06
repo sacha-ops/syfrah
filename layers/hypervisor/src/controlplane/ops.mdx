@@ -1,0 +1,77 @@
+---
+title: Operations
+description: High-level control plane lifecycle — bootstrap a new cluster, join an existing one, and deregister when leaving.
+sidebar:
+  order: 3
+---
+
+The `ops` module orchestrates control plane lifecycle events. It sits above the [service module](/syfrah/layers/hypervisor/controlplane/service), combining installation, configuration, and health checks into three clear operations: bootstrap, join, and leave.
+
+## bootstrap
+
+`bootstrap` sets up the control plane on the very first node in the cluster. It always runs PD and TiKV together.
+
+**Steps:**
+
+1. `ensure_installed` — download TiUP and install PD + TiKV components
+2. Generate PD config with `initial-cluster-state = "new"` (single-member Raft group)
+3. Generate TiKV config pointing at the local PD
+4. Install systemd units and start both services (PD first, then TiKV)
+5. Poll until PD is healthy (30 s timeout)
+6. Poll until TiKV registers with PD (60 s timeout)
+
+After `bootstrap`, the node has a functional single-node TiKV cluster. It is ready to accept joins from other nodes.
+
+```sh
+# bootstrap is called automatically by syfrah hv init
+syfrah hv init --name web-01 --region us-east --zone us-east-1a
+```
+
+## join
+
+`join` adds the current node to an existing cluster. Whether it runs PD depends on how many nodes are already in the cluster.
+
+Syfrah uses `peer_count` — the number of peers already known from the fabric join handshake — to make this decision without querying the live PD API (which avoids a race condition during rapid parallel joins):
+
+| peer_count at join time | PD members so far | This node runs |
+|---|---|---|
+| 1 (we are the 2nd node) | 1 | PD + TiKV |
+| 2 (we are the 3rd node) | 2 | PD + TiKV |
+| 3+ (4th node or beyond) | 3 (full) | TiKV only |
+
+### Joining with PD
+
+For the 2nd and 3rd nodes:
+
+1. Verify mesh connectivity to an existing PD by polling its health endpoint
+2. Clean up any zombie PD members left from failed previous joins
+3. Install PD config in join mode (no `initial-cluster` in the file — the `--join` systemd flag handles it)
+4. Install TiKV config pointing at all known PD endpoints including this node's own
+5. Start PD (using `--join=<primary_pd_url>`), then TiKV
+6. Wait for PD and TiKV to be ready (up to 120 s each)
+
+### Joining TiKV only
+
+For the 4th node and beyond:
+
+1. Verify mesh connectivity to an existing PD
+2. Install TiKV config pointing at the existing PD cluster
+3. Start TiKV only (no PD unit installed)
+4. Wait for TiKV to register with PD (up to 60 s)
+
+## leave
+
+`leave` removes the node from the control plane cleanly.
+
+If the node's mesh IPv6 is available, `leave_with_mesh` first calls `deregister_store`: it reads the local TiKV config to find the PD endpoint, queries `GET /pd/api/v1/stores` to find this node's store ID, then sends `DELETE /pd/api/v1/store/<id>` to remove it. This prevents PD from waiting for a store that will never return.
+
+After deregistration (or if deregistration is skipped), `uninstall` stops both services, disables them, removes the systemd units, config files, and data directories.
+
+```sh
+# leave is called automatically by syfrah hv leave
+syfrah hv leave
+```
+
+## Status
+
+`status` proxies to `service::cluster_status` and returns the current health of the local PD and TiKV services along with cluster-wide member and store counts. This is what `syfrah hv doctor` uses for its controlplane section.

@@ -1,0 +1,59 @@
+---
+title: Hypervisor Handlers
+description: Thin translation layer that maps CLI commands to fabric operations. No logic lives here — handlers just wire the framework to the business layer.
+sidebar:
+  order: 2
+---
+
+The hypervisor handler layer sits between the CLI framework and the [fabric ops](/syfrah/layers/hypervisor/fabric/ops) module. Its job is narrow: take an `OperationRequest` from the framework, call the right fabric function, and return an `OperationResponse`. That is all.
+
+## Why a separate handler layer?
+
+Syfrah uses a command framework where each layer declares its supported operations via a `ResourceDef`. The framework handles argument parsing, validation, help text, and output formatting. Handlers are the glue that connects those parsed arguments to actual business logic.
+
+Keeping handlers thin means:
+
+- **The framework stays generic.** It does not know anything about WireGuard or meshes.
+- **The business logic stays testable.** Fabric ops can be tested directly without a CLI context.
+- **Changes to the CLI surface do not touch business logic**, and vice versa.
+
+## How it works
+
+Each command defined in the `ResourceDef` maps to a handler function. The handler unpacks the relevant arguments from the request, calls the corresponding fabric op, and wraps the result:
+
+```
+OperationRequest
+    └─ handler: init_handler
+         └─ fabric::ops::init(name, region, zone)
+              └─ OperationResponse
+```
+
+There are no conditionals in handlers. There is no state read or written in handlers. If a handler starts doing work beyond delegation, that work belongs in the ops layer instead.
+
+## ResourceDef
+
+The `ResourceDef` is where all commands, subcommands, and their arguments are declared. For the hypervisor, this includes:
+
+| Command   | Arguments                                 |
+|-----------|-------------------------------------------|
+| `init`    | `--name`, `--region`, `--zone`            |
+| `join`    | `--target`, `--name`, `--region`, `--zone`|
+| `status`  | _(none)_                                  |
+| `start`   | _(none)_                                  |
+| `stop`    | _(none)_                                  |
+| `leave`   | _(none)_                                  |
+| `peering` | _(none)_                                  |
+| `list`    | _(none)_                                  |
+| `get`     | `<name>`                                  |
+
+The framework reads this definition to generate help text, validate inputs, and route requests to the right handler.
+
+## Adding a new command
+
+To add a new command to the hypervisor layer:
+
+1. Add the command and its arguments to the `ResourceDef`
+2. Implement the operation in `fabric::ops`
+3. Add a one-line handler that calls it
+
+The handler itself should never exceed a few lines. If you find yourself writing conditional logic in a handler, move it to ops.

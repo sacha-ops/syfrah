@@ -1,0 +1,121 @@
+---
+title: Input Validation
+description: Consistent validation rules for names, regions, zones, ports, and durations — applied at every entry point.
+sidebar:
+  order: 6
+---
+
+Syfrah validates all user-supplied input at the boundary — in the CLI argument parser and in the API request handler — before any state changes are attempted. This module defines the rules.
+
+## The principle
+
+Validation in Core means the same rules apply everywhere. The CLI, the API, and any future interface all call the same validation functions. There is no way for the CLI to accept an input that the API would reject, or for validation to drift between surfaces over time.
+
+## Names
+
+Resource names must follow these rules:
+
+- 3 to 63 characters
+- Lowercase alphanumeric characters and hyphens only (`a-z`, `0-9`, `-`)
+- Must start with a letter
+- Must not end with a hyphen
+- Must not contain consecutive hyphens
+
+```
+Valid:   "production", "web-tier-01", "us-east"
+Invalid: "Production"    (uppercase)
+Invalid: "web_tier"      (underscore)
+Invalid: "-web"          (starts with hyphen)
+Invalid: "web-"          (ends with hyphen)
+Invalid: "w"             (too short)
+```
+
+These rules match DNS label rules, which matters because resource names often appear in DNS entries, WireGuard interface names, and Linux network interface names — all of which have similar constraints.
+
+## Regions and zones
+
+Regions follow the pattern `{provider}-{location}`:
+
+```
+Valid:   "htz-fsn1", "htz-nbg1", "htz-hel1"
+Invalid: "FSN1"          (not namespaced)
+Invalid: "hetzner_fsn1"  (underscore, not hyphen)
+```
+
+Zones follow the pattern `{region}-{letter}`:
+
+```
+Valid:   "htz-fsn1-a", "htz-fsn1-b"
+Invalid: "htz-fsn1-1"  (digit suffix, not letter)
+```
+
+## Ports
+
+Ports must be integers in the range 1–65535. Port 0 is not valid.
+
+```
+Valid:   80, 443, 22, 8080, 65535
+Invalid: 0       (reserved)
+Invalid: 65536   (out of range)
+Invalid: "http"  (must be numeric)
+```
+
+## Durations
+
+Durations are parsed from human-readable strings:
+
+| Format | Meaning |
+|--------|---------|
+| `60s`  | 60 seconds |
+| `5m`   | 5 minutes |
+| `2h`   | 2 hours |
+| `1d`   | 1 day |
+| `1h30m` | 1 hour 30 minutes |
+
+Rules:
+
+- Minimum duration: 60 seconds (sub-minute durations are not accepted for resource timeouts)
+- Maximum duration: 30 days
+- Units must be in descending order (hours before minutes before seconds)
+
+```
+Valid:   "5m", "1h", "30s", "2h30m", "1d"
+Invalid: "0"         (no unit)
+Invalid: "30"        (no unit)
+Invalid: "30sec"     (unknown unit, use "s")
+Invalid: "10s5m"     (wrong order)
+```
+
+## CIDR blocks
+
+IPv4 and IPv6 CIDR blocks are validated for:
+
+- Correct syntax (`a.b.c.d/prefix`)
+- Host bits must be zero — `10.0.0.0/8` is valid, `10.0.0.1/8` is not
+- Prefix length within range for the address family
+
+```
+Valid:   "10.0.0.0/8", "192.168.1.0/24", "fd00::/8"
+Invalid: "10.0.0.1/8"   (host bits set)
+Invalid: "256.0.0.0/8"  (invalid octet)
+Invalid: "10.0.0.0/33"  (prefix too long for IPv4)
+```
+
+## Validation errors
+
+All validation functions return a `SyfrahError` with code `InvalidInput`. The error message names the field and the rule that failed. The suggestion explains how to fix it.
+
+```json
+{
+  "code": "InvalidInput",
+  "message": "name 'Web-Tier' is invalid: uppercase letters are not allowed",
+  "suggestion": "use only lowercase letters, digits, and hyphens; name must start with a letter",
+  "context": {
+    "field": "name",
+    "value": "Web-Tier",
+    "rule": "lowercase_alphanumeric_hyphen"
+  }
+}
+```
+
+This means operators get actionable errors immediately — before the system has modified any state — and the error tells them exactly what to change.

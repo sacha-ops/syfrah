@@ -1,0 +1,90 @@
+---
+title: Process Utilities
+description: Directory layout, socket paths, and runtime file locations for the Syfrah process.
+sidebar:
+  order: 9
+---
+
+The process module defines where Syfrah stores its runtime files and how the CLI finds the daemon's control socket. It is a small module — its job is to centralize path logic so every part of Syfrah agrees on where things live.
+
+## Syfrah is not a daemon
+
+Syfrah is a CLI orchestrator. It does not fork into the background, does not write PID files, and does not have a traditional daemon lifecycle. There is no `syfrahd` to manage separately.
+
+The `syfrah` binary is invoked directly. When it needs to persist state or communicate with a running operation, it uses a Unix domain socket and an embedded database in `~/.syfrah/`.
+
+This design makes Syfrah easier to operate: no service manager configuration, no PID file cleanup, no init script. If the process exits — cleanly or not — there is nothing left running.
+
+## Directory layout
+
+All runtime and persistent files live under `~/.syfrah/`:
+
+```
+~/.syfrah/
+├── config.toml          # User configuration
+├── syfrah.sock          # Unix domain socket (present while running)
+├── data/
+│   ├── state.db         # Embedded state database (redb)
+│   └── backups/         # Pre-upgrade state snapshots
+├── logs/
+│   └── syfrah.log       # Log file (if file logging is enabled)
+└── keys/
+    └── node.key         # WireGuard private key (mode 600)
+```
+
+The `~/.syfrah/` directory is created by `syfrah init` with appropriate permissions (mode 700). The keys subdirectory is mode 700. The private key file is mode 600.
+
+## Socket path
+
+The default socket path is `~/.syfrah/syfrah.sock`. This is a Unix domain socket created when Syfrah starts and removed when it exits.
+
+The CLI sends commands to the daemon by connecting to this socket. If the socket does not exist, the CLI reports that no Syfrah instance is running and suggests starting one.
+
+The socket path can be overridden:
+
+```sh
+# Via config file
+# [daemon]
+# socket_path = "/run/syfrah/syfrah.sock"
+
+# Via environment variable
+SYFRAH_DAEMON_SOCKET_PATH=/run/syfrah/syfrah.sock syfrah vpc list
+
+# Via CLI flag
+syfrah --socket /run/syfrah/syfrah.sock vpc list
+```
+
+Overriding the socket path is useful when running multiple Syfrah instances (for example, one per environment on a developer workstation), or when running Syfrah in a container where the home directory may not be writable.
+
+## Directory initialization
+
+```sh
+syfrah init
+```
+
+This command:
+
+1. Creates `~/.syfrah/` and all subdirectories with correct permissions
+2. Generates a WireGuard keypair and writes the private key to `~/.syfrah/keys/node.key`
+3. Writes a default `config.toml`
+4. Registers the node with the control plane (if a mesh secret is provided)
+
+Running `syfrah init` on an already-initialized node is safe — it will not overwrite existing keys or config unless `--force` is passed.
+
+## Checking initialization status
+
+```sh
+syfrah status
+```
+
+Reports whether the required directories and files are present, whether the socket is active, and the current node state:
+
+```
+syfrah node status
+  initialized:  yes
+  socket:       active (~/.syfrah/syfrah.sock)
+  node id:      node-01HWKZ4A9C1F8E3M6GXZNQ5BYK
+  mesh:         mesh-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+  address:      fd3a:b7c2:9f01:e47f:2a01:b39c:d544:a1f0
+  uptime:       3h 42m
+```

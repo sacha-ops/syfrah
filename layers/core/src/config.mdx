@@ -1,0 +1,143 @@
+---
+title: Configuration
+description: How Syfrah loads, merges, and validates configuration from files, environment variables, and CLI flags.
+sidebar:
+  order: 7
+---
+
+Syfrah's configuration system has a clear priority chain: CLI flags beat environment variables, which beat the config file, which beats built-in defaults. You never need to worry about which source "wins" — higher-priority sources always override lower ones.
+
+## Config file location
+
+The config file lives at `~/.syfrah/config.toml`. This is created automatically by `syfrah init` with sensible defaults.
+
+```toml
+[daemon]
+socket_path = "~/.syfrah/syfrah.sock"
+log_level = "info"
+
+[wireguard]
+listen_port = 51820
+dns = ["1.1.1.1", "8.8.8.8"]
+
+[peering]
+timeout = "30s"
+retry_interval = "5s"
+
+[storage]
+data_dir = "~/.syfrah/data"
+cache_size_mb = 512
+
+[logging]
+format = "text"
+file = "~/.syfrah/logs/syfrah.log"
+rotation = "daily"
+```
+
+## Environment variables
+
+Every config key has a corresponding environment variable with the `SYFRAH_` prefix. Nested keys use `_` as the separator.
+
+| Config key | Environment variable |
+|------------|---------------------|
+| `daemon.log_level` | `SYFRAH_DAEMON_LOG_LEVEL` |
+| `wireguard.listen_port` | `SYFRAH_WIREGUARD_LISTEN_PORT` |
+| `peering.timeout` | `SYFRAH_PEERING_TIMEOUT` |
+| `storage.data_dir` | `SYFRAH_STORAGE_DATA_DIR` |
+| `logging.format` | `SYFRAH_LOGGING_FORMAT` |
+
+This makes Syfrah easy to configure in containerized or CI environments without writing config files.
+
+## Priority chain
+
+```
+CLI flags
+    ↓ (overrides)
+Environment variables (SYFRAH_*)
+    ↓ (overrides)
+~/.syfrah/config.toml
+    ↓ (overrides)
+Built-in defaults
+```
+
+A value is only taken from a source if it was explicitly set. An absent CLI flag does not override a config file value with an empty string.
+
+## Configuration sections
+
+### daemon
+
+Controls the Syfrah process itself.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `socket_path` | `~/.syfrah/syfrah.sock` | Unix socket path for CLI-daemon communication |
+| `log_level` | `info` | Logging verbosity: `trace`, `debug`, `info`, `warn`, `error` |
+
+### wireguard
+
+Controls WireGuard interface setup.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `listen_port` | `51820` | UDP port WireGuard listens on |
+| `dns` | `["1.1.1.1"]` | DNS resolvers for mesh peers |
+
+### peering
+
+Controls mesh peer discovery and join.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `timeout` | `30s` | Time to wait for a peer to respond during join |
+| `retry_interval` | `5s` | Interval between retry attempts |
+
+### storage
+
+Controls local state storage.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `data_dir` | `~/.syfrah/data` | Directory for the embedded database and working files |
+| `cache_size_mb` | `512` | In-memory cache for the embedded database |
+
+### logging
+
+Controls log output.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `format` | `text` | `text` for human-readable, `json` for structured |
+| `file` | none | Path to write logs to (in addition to stderr) |
+| `rotation` | `daily` | Log rotation frequency: `hourly`, `daily`, `never` |
+
+## Validation on load
+
+All config values are validated when the config is loaded. Invalid values cause the process to exit with a clear error message before doing any work.
+
+```
+Error: invalid configuration
+  wireguard.listen_port: 99999 is out of range (must be 1–65535)
+
+Suggestion: set SYFRAH_WIREGUARD_LISTEN_PORT to a valid port number,
+or update ~/.syfrah/config.toml
+```
+
+Duration values use the same [human-readable format](/syfrah/layers/core/validate) as the CLI — `30s`, `5m`, `2h`. The config file does not use raw seconds or milliseconds.
+
+## Inspecting resolved config
+
+To see the effective configuration after merging all sources:
+
+```sh
+syfrah config show
+```
+
+This prints the resolved config as TOML, with each value annotated by its source:
+
+```toml
+[daemon]
+log_level = "debug"  # from SYFRAH_DAEMON_LOG_LEVEL
+
+[wireguard]
+listen_port = 51820  # from default
+```

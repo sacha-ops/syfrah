@@ -1,0 +1,75 @@
+---
+title: Terminal Color
+description: ANSI color support, status-based coloring conventions, and NO_COLOR compliance.
+sidebar:
+  order: 2
+---
+
+The color module provides ANSI color output for the terminal. It is used by the table renderer, detail view, and status displays throughout the CLI.
+
+## Status color mapping
+
+The most common use of color is status values. When a column or detail field is marked `.colored()`, the value string is matched against a set of known status words and colored accordingly:
+
+| Status words | Color | Meaning |
+|-------------|-------|---------|
+| `active`, `running`, `available`, `healthy`, `ready`, `online` | Green | All good |
+| `stopped`, `inactive`, `disabled`, `offline` | Dim white | Not running, but not broken |
+| `error`, `failed`, `unhealthy`, `unreachable` | Red | Something is wrong |
+| `pending`, `starting`, `stopping`, `draining`, `provisioning` | Yellow | In-progress state |
+| `unknown` | Dim white | Status not available |
+
+Values that don't match any known status word are rendered without color.
+
+## Explicit colors
+
+For non-status values, you can apply color explicitly:
+
+```rust
+use syfrah_core::ui::color::{green, red, yellow, bold, dim};
+
+println!("{}", green("Success"));
+println!("{}", red("Error: something went wrong"));
+println!("{}", bold("Important"));
+println!("{}", dim("(optional)"));
+```
+
+These are simple wrapper functions that prepend and append ANSI escape codes. They return `String`, not a display type, so they compose naturally with string formatting.
+
+## NO_COLOR compliance
+
+The color module respects the [`NO_COLOR`](https://no-color.org/) environment variable. When `NO_COLOR` is set to any value, all color functions return the input string unchanged with no escape codes. This applies to both the status mapping and explicit color functions.
+
+```bash
+NO_COLOR=1 syfrah vm list   # plain text output, no color
+```
+
+Color is also automatically disabled when stdout is not a TTY (i.e., when output is piped). This prevents escape codes from appearing in files, logs, or downstream tools.
+
+## Checking color support at runtime
+
+```rust
+use syfrah_core::ui::color::is_color_enabled;
+
+if is_color_enabled() {
+    // safe to use color
+}
+```
+
+`is_color_enabled()` returns `false` if:
+- `NO_COLOR` is set
+- stdout is not a TTY
+- The `TERM` variable is `dumb`
+
+## Status dot
+
+The `StatusDot` display format renders a filled circle (`●`) before the status text, colored to match:
+
+```
+● running     (green)
+● stopped     (dim)
+● error       (red)
+● pending     (yellow)
+```
+
+This is applied with `DisplayFormat::StatusDot` on a column or detail field, and is the standard way to display resource status in Syfrah.

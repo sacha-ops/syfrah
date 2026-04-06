@@ -1,0 +1,62 @@
+---
+title: Peering Protocol
+description: The TCP-based join protocol types — JoinRequest, JoinResponse, and PeerAnnounce — and how PIN validation works.
+sidebar:
+  order: 7
+---
+
+When a new node wants to join a Syfrah mesh, it does not just connect to WireGuard directly. First it needs to prove it is authorized (via the PIN), then exchange identities and receive the peer list. This handshake is the peering protocol.
+
+The `peering` module defines the message types used in this exchange. The actual TCP server and client that send and receive these messages are in [peering-server](/syfrah/layers/hypervisor/fabric/peering-server) and [peering-client](/syfrah/layers/hypervisor/fabric/peering-client).
+
+## JoinRequest
+
+Sent by a node that wants to join, to a node that is already a mesh member.
+
+| Field      | Description                                                     |
+|------------|-----------------------------------------------------------------|
+| `name`     | Requested name for the new node (e.g. `web-02`)                 |
+| `region`   | Region the new node is in                                       |
+| `zone`     | Availability zone                                               |
+| `wg_pubkey`| New node's WireGuard public key                                 |
+| `port`     | WireGuard listen port the new node will use                     |
+| `endpoint` | New node's public IP or hostname                                |
+| `pin`      | 4-digit PIN derived from the mesh secret                        |
+
+The PIN is the gatekeeper. Without it, the join is rejected before any mesh data is shared.
+
+## JoinResponse
+
+Sent by the accepting node back to the joiner. Contains everything the new node needs to configure itself.
+
+| Field       | Description                                                     |
+|-------------|-----------------------------------------------------------------|
+| `accepted`  | `true` if the join was approved, `false` otherwise              |
+| `secret`    | The mesh shared secret (`syf_sk_...`), only sent if accepted    |
+| `prefix`    | The mesh's `/48` IPv6 prefix                                    |
+| `peers`     | The full `PeerList` — all existing nodes in the mesh            |
+| `acceptor`  | The accepting node's own `Peer` record (so the joiner can add it)|
+
+If `accepted` is `false`, the other fields are empty. The joiner should treat this as a fatal error and abort.
+
+## PeerAnnounce
+
+After a successful join, the accepting node broadcasts a `PeerAnnounce` to all existing peers so they add the new member to their WireGuard configs.
+
+| Field  | Description                      |
+|--------|----------------------------------|
+| `peer` | The `Peer` record for the new node |
+
+Each existing peer receives this message, adds the new node to its `PeerList`, calls `wg set` to add the peer to its live interface, and updates `syfrah0.conf` on disk.
+
+## PIN validation
+
+The PIN is a short code derived from the mesh secret. It is displayed when `syfrah hv init` runs and must be provided when running `syfrah hv join`.
+
+The PIN is not the full secret. It is a short human-typeable value that proves the person running `join` was given the PIN by someone who controls the mesh. The full secret is only transmitted after the PIN is accepted.
+
+If the PIN is wrong, the accepting node closes the connection immediately and logs the attempt.
+
+## Wire format
+
+Messages are encoded as JSON and sent over TCP with a length prefix. The length is a 4-byte big-endian unsigned integer that precedes each message payload. This framing allows the receiver to read exactly the right number of bytes for each message without delimiters.

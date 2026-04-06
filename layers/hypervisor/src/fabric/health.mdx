@@ -1,0 +1,69 @@
+---
+title: Fabric Health Checks
+description: How the hypervisor monitors peer reachability using WireGuard handshake timestamps.
+sidebar:
+  order: 10
+---
+
+The health check system keeps the peer list accurate by continuously polling WireGuard for handshake activity. It runs as a background task whenever the hypervisor is in peering mode.
+
+## How it works
+
+WireGuard performs a handshake every ~2 minutes when there is active traffic between peers. The health check exploits this: if a peer's last handshake is more than **5 minutes** in the past, the tunnel is almost certainly down.
+
+Each sweep:
+
+1. Runs `wg show dump` to get current handshake timestamps for all peers
+2. Compares each timestamp against the staleness threshold (default: 300 seconds)
+3. Updates peer status to `Active` or `Unreachable`
+4. Persists state only if at least one status changed
+5. Logs transitions: `peer now active` and `peer now unreachable`
+
+If the WireGuard interface is not running when a sweep fires, all peers are considered `Unreachable` for that sweep — but no status-change log entries are written.
+
+## Timing
+
+| Parameter | Default |
+|---|---|
+| Sweep interval | 30 seconds |
+| Staleness threshold | 300 seconds (5 minutes) |
+
+The threshold is deliberately longer than WireGuard's 2-minute handshake interval to tolerate brief traffic gaps without false positives.
+
+## DB access pattern
+
+The loop opens a fresh database connection at the start of each sweep and drops it when the sweep completes. This avoids holding a long-lived write lock that would block join requests or other operations between sweeps.
+
+## API
+
+Two entry points are exposed:
+
+**`check_once(db, stale_threshold_secs)`** — runs a single sweep synchronously. Returns a `HealthCheckResult` with counts of total, active, unreachable, and changed peers. Useful for one-shot checks or testing.
+
+**`run_loop(db_opener, interval_secs, stale_threshold_secs)`** — runs `check_once` in a loop forever, sleeping `interval_secs` between sweeps. Intended to be spawned as a `tokio::task`. Only logs when at least one peer status changed.
+
+```rust
+// Spawn health monitoring as a background task
+tokio::spawn(health::run_loop(
+    || LayerDb::open(path),
+    health::DEFAULT_INTERVAL_SECS,
+    health::DEFAULT_STALE_THRESHOLD_SECS,
+));
+```
+
+## Status transitions
+
+The health checker only writes to the database when peer status changes. Stable meshes with all peers active produce no writes and no log output — silent is healthy.
+
+When a transition does occur:
+
+```
+INFO peer now active    peer=web-02
+WARN peer now unreachable peer=web-03
+```
+
+A summary is logged after any sweep that produced changes:
+
+```
+INFO health check complete total=3 active=2 unreachable=1 changed=1
+```

@@ -1,0 +1,42 @@
+---
+title: Peering Client
+description: The TCP client used during join — connects to an existing node's peering port, sends credentials, and receives the mesh secret and peer list.
+sidebar:
+  order: 9
+---
+
+The peering client is the other half of the join handshake. When you run `syfrah hv join`, the peering client connects to the target node's peering port, authenticates, and retrieves everything needed to become a mesh member.
+
+You do not use the peering client directly — it is invoked automatically by the [join flow in ops](/syfrah/layers/hypervisor/fabric/ops#join). This page explains what it does so you can understand and debug the join process.
+
+## What the client does
+
+1. **Resolves the target** — takes the `--target` address from `syfrah hv join` and connects to `target:(wg_port + 1)` over TCP
+2. **Sends a JoinRequest** — includes this node's name, region, zone, WireGuard public key, listen port, endpoint, and PIN
+3. **Reads the JoinResponse** — waits for the accepting node to reply
+4. **Checks acceptance** — if `accepted` is `false`, the client returns an error and the join aborts
+5. **Returns the response** to the ops layer, which uses it to complete setup
+
+## Wire protocol
+
+The client uses the same length-prefixed JSON protocol as the server. Each message is preceded by a 4-byte big-endian length. The client writes the JoinRequest, then reads the JoinResponse in a single TCP round trip.
+
+There is no retry logic in the client itself. If the connection fails or the response cannot be read, the error is returned to the ops layer. The user sees a clear error and can retry `syfrah hv join` manually.
+
+## What you need before joining
+
+| Requirement         | Where to get it                                       |
+|---------------------|-------------------------------------------------------|
+| Target IP/hostname  | The public address of any running mesh member         |
+| PIN                 | Displayed when the mesh was created with `syfrah hv init` |
+| Open peering port   | Target node must have WG port + 1 reachable over TCP  |
+
+## Troubleshooting join failures
+
+**Connection refused**: The target node's peering port (WG port + 1) is not reachable. Check that the target is running (`syfrah hv status` on that node) and that the firewall allows TCP on the peering port.
+
+**PIN rejected**: The PIN does not match. The PIN is displayed once when `syfrah hv init` runs. If you have lost it, you can derive it from the mesh secret — see `syfrah hv peering --show-pin`.
+
+**Timeout**: The target may be unreachable from this network, or behind a firewall that drops rather than rejects connections. Check routing and firewall rules on both sides.
+
+**Name conflict**: The name you chose with `--name` is already taken by another node in the mesh. Choose a different name and retry.

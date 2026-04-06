@@ -1,0 +1,41 @@
+---
+title: Overview
+description: The distributed key-value store at the heart of the Syfrah control plane — TiKV backed by PD, auto-installed via TiUP.
+sidebar:
+  order: 1
+---
+
+The Syfrah control plane is a distributed, replicated key-value store built on [TiKV](https://tikv.org/) and its placement driver (PD). It provides cluster-wide state — VM records, placement decisions, resource allocations — that must survive individual node failures and remain consistent across the mesh.
+
+## Components
+
+**PD (Placement Driver)** is the control plane for TiKV. It manages cluster membership, shard routing, and leader election using the Raft consensus algorithm. PD exposes an HTTP API on port 2379 that TiKV nodes and Syfrah services use to discover shard locations.
+
+**TiKV** is the storage engine. It stores data in RocksDB and replicates it across nodes using Raft. Every TiKV node registers itself with PD on startup.
+
+## Cluster topology
+
+Syfrah manages the cluster topology automatically based on how many nodes have joined the mesh.
+
+PD uses Raft consensus, which works best with an odd number of members (3 or 5). Syfrah caps PD membership at **3 nodes**. The first three nodes that join the mesh each run both PD and TiKV. Every subsequent node runs TiKV only, connecting to the existing three-member PD cluster.
+
+| Node | Runs |
+|---|---|
+| 1st (bootstrap) | PD + TiKV |
+| 2nd joiner | PD + TiKV |
+| 3rd joiner | PD + TiKV |
+| 4th+ joiners | TiKV only |
+
+This means a single-node cluster has a PD instance running alongside TiKV. That is intentional — the cluster is designed to grow, and starting PD from day one means no migration is needed when you add nodes.
+
+## Installation
+
+TiKV and PD are installed automatically via [TiUP](https://tiup.io/) when a node runs `syfrah hv init` or `syfrah hv join`. You do not need to install them manually.
+
+TiUP is placed at `/opt/syfrah/tiup/`. PD and TiKV binaries are managed as TiUP components. Config files land in `/etc/syfrah/` and data in `/var/lib/syfrah/`. Both services run as systemd units (`syfrah-pd` and `syfrah-tikv`).
+
+## Sub-modules
+
+- [Service](/syfrah/layers/hypervisor/controlplane/service) — install, configure, and manage PD + TiKV systemd services
+- [Operations](/syfrah/layers/hypervisor/controlplane/ops) — bootstrap, join, and leave the control plane cluster
+- [Store](/syfrah/layers/hypervisor/controlplane/store) — `ClusterDb` async client for reading and writing distributed state

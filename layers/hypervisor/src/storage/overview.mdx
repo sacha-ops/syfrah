@@ -1,0 +1,40 @@
+---
+title: Overview
+description: ZeroFS — S3-backed block storage for Syfrah VMs, with per-region buckets, encryption, compression, and NBD export.
+sidebar:
+  order: 1
+---
+
+Syfrah's storage layer gives VMs persistent block devices backed by object storage. The engine is [ZeroFS](https://github.com/barre/zerofs), a filesystem that treats an S3 bucket as its backing store and exposes block devices to the host via NBD (Network Block Device).
+
+## How it works
+
+ZeroFS runs as a daemon on each hypervisor node. It mounts an S3 bucket and presents block devices at the OS level. VMs attach to those block devices through the NBD interface. From the VM's perspective it is a regular block device; ZeroFS handles caching, encryption, and synchronization with S3 transparently.
+
+## Regions and buckets
+
+Storage is organized into regions. Each region maps to exactly one S3 bucket. A node can serve multiple regions simultaneously — each gets its own ZeroFS instance and systemd service (`syfrah-zerofs-<region>`).
+
+The region identifier (e.g., `eu`, `us-east`) is chosen by the operator when the region is registered. It does not need to match an S3 region name.
+
+## Encryption and compression
+
+ZeroFS is configured with:
+
+- **Encryption**: always enabled — data is encrypted before being written to S3
+- **Compression**: LZ4 — fast, low-overhead compression applied before encryption
+
+Both are on by default for every region. There is no option to disable them through the Syfrah CLI.
+
+## Local cache
+
+Each region has a local disk cache at `/var/lib/syfrah/zerofs/<region>` capped at 10 GB. Hot data stays local, reducing S3 request latency and costs.
+
+## NBD export
+
+ZeroFS is configured with NBD enabled and NFS disabled. Block devices are served locally at `127.0.0.1` and attached by the VM manager. No NBD traffic leaves the host.
+
+## Sub-modules
+
+- [Regions](/syfrah/layers/hypervisor/storage/region) — `RegionStorage` config and the `RegionRegistry` that persists all configured regions
+- [Service](/syfrah/layers/hypervisor/storage/service) — ZeroFS installation, per-region TOML config, and systemd lifecycle

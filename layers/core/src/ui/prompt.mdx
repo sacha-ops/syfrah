@@ -1,0 +1,108 @@
+---
+title: Interactive Prompts
+description: How Syfrah prompts for missing required arguments when stdin is a TTY, and falls back to errors in non-interactive contexts.
+sidebar:
+  order: 3
+---
+
+When a required argument is missing and the CLI is running interactively (stdin is a TTY), Syfrah prompts the user to supply it rather than immediately printing an error. This makes the CLI comfortable to use without memorizing every flag, while still being fully scriptable.
+
+## How prompting works
+
+The dispatch layer checks each required argument after parsing. If a required argument is missing:
+
+1. If stdin is a TTY: show an interactive prompt
+2. If stdin is not a TTY: exit with an error
+
+```bash
+# Interactive — prompts for --name
+$ syfrah vpc create
+
+? VPC name: production
+? Description (leave blank to skip): staging network
+
+Created VPC "production" (vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ)
+```
+
+```bash
+# Non-interactive — error immediately
+$ syfrah vpc create < /dev/null
+Error: missing required argument --name
+  Hint: run with --name <value> to specify the VPC name
+```
+
+## Prompt types
+
+The prompts module uses [dialoguer](https://github.com/console-rs/dialoguer) under the hood and exposes three prompt types:
+
+### Text input
+
+For string fields without a restricted set of values:
+
+```rust
+Prompt::text("VPC name", /* optional default */ None)
+```
+
+Renders as:
+```
+? VPC name: _
+```
+
+### Selection
+
+For fields with a defined set of valid values:
+
+```rust
+Prompt::select("Region", &["eu-west", "us-east", "ap-south"])
+```
+
+Renders as:
+```
+? Region:
+  > eu-west
+    us-east
+    ap-south
+```
+
+The user navigates with arrow keys and selects with Enter.
+
+### Password
+
+For secret values that should not echo:
+
+```rust
+Prompt::password("API token")
+```
+
+Renders as:
+```
+? API token: ••••••••
+```
+
+Input is hidden. The value is not logged or stored in shell history.
+
+## Optional fields
+
+Optional fields are never prompted. If an optional field is absent, it remains absent and the handler sees `None` for that field. Prompting only happens for required fields.
+
+## Scope prompts
+
+When scope flags (`--org`, `--project`, `--vpc`) are missing and stdin is a TTY, the prompt module fetches the available options and presents a selection list:
+
+```
+? Organization:
+  > my-org (org-01HW...)
+    other-org (org-01HW...)
+```
+
+This makes it possible to use scoped resources without remembering or copy-pasting IDs.
+
+## Disabling prompts
+
+Prompts can be disabled by redirecting stdin or by running in a non-TTY environment. There is no `--no-prompt` flag — non-interactive behavior is automatic when stdin is not a terminal.
+
+In scripts, always provide all required arguments explicitly to avoid any ambiguity:
+
+```bash
+syfrah vpc create --org "$ORG_ID" --name production
+```

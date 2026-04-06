@@ -1,0 +1,71 @@
+---
+title: Human-Readable Time Formatting
+description: How timestamps are displayed as relative ("2 hours ago") or absolute ("2026-04-05 14:32") time in CLI output.
+sidebar:
+  order: 6
+---
+
+Raw ISO 8601 timestamps are hard to scan in a table. `2026-04-05T12:30:00Z` tells you the exact moment but not how long ago that was. The time formatting module converts timestamps into human-readable relative or absolute strings for CLI output.
+
+## Relative time
+
+`DisplayFormat::RelativeTime` converts a timestamp to a relative duration:
+
+| Elapsed | Display |
+|---------|---------|
+| < 10 seconds | `just now` |
+| < 60 seconds | `42 seconds ago` |
+| < 60 minutes | `3 minutes ago` |
+| < 24 hours | `2 hours ago` |
+| < 7 days | `3 days ago` |
+| < 30 days | `2 weeks ago` |
+| < 365 days | `3 months ago` |
+| >= 365 days | `2 years ago` |
+
+Relative time is the default format for `created_at`, `updated_at`, and similar timestamp fields in table and detail output. It is most useful for recent resources.
+
+## Absolute time
+
+`DisplayFormat::AbsoluteTime` formats a timestamp as a local date and time:
+
+```
+2026-04-05 14:32:00
+```
+
+Timestamps are displayed in the user's local timezone when one is configured, falling back to UTC. The format is always `YYYY-MM-DD HH:MM:SS`.
+
+Absolute time is useful when the exact moment matters more than the relative elapsed time — for example, in audit event lists or for resources created more than a few days ago.
+
+## Using in column and detail definitions
+
+```rust
+// Table column — relative time
+ColumnDef::new("created_at", "Created").format(DisplayFormat::RelativeTime)
+
+// Detail field — absolute time
+DetailField::new("created_at", "Created at").format(DisplayFormat::AbsoluteTime)
+DetailField::new("updated_at", "Last updated").format(DisplayFormat::RelativeTime)
+```
+
+## Using directly
+
+The formatting functions are also available for direct use:
+
+```rust
+use syfrah_core::ui::time_fmt::{relative_time, absolute_time};
+use chrono::Utc;
+
+let ts = some_resource.created_at;
+
+println!("Created: {}", relative_time(ts));
+// "Created: 3 hours ago"
+
+println!("Exact time: {}", absolute_time(ts));
+// "Exact time: 2026-04-05 11:30:00"
+```
+
+Both functions accept any `chrono::DateTime<Utc>` value.
+
+## Timestamps in JSON output
+
+When using `--output json`, timestamps are always returned as ISO 8601 strings (`2026-04-05T14:32:00Z`), regardless of the display format configured on the column or field. The formatting is a display-layer concern only — it never affects the underlying data.

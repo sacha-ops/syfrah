@@ -1,0 +1,94 @@
+---
+title: Typed Resource IDs
+description: ULID-backed identifiers that encode resource type, creation time, and uniqueness in a single string.
+sidebar:
+  order: 2
+---
+
+Every resource in Syfrah has a unique identifier. These aren't plain UUIDs — they are typed, sortable, and human-readable at a glance.
+
+## Format
+
+```
+{prefix}-{26-char-crockford-base32}
+```
+
+For example:
+
+```
+org-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+hv-01HWKZ4A9C1F8E3M6GXZNQ5BYK
+```
+
+The prefix tells you what kind of resource it is. The 26-character suffix is a [ULID](https://github.com/ulid/spec) encoded in Crockford Base32 — 48 bits of millisecond timestamp followed by 80 bits of randomness.
+
+## Why ULIDs instead of UUIDs?
+
+UUIDs are random. Two UUIDs give you no information about which was created first. ULIDs embed a timestamp, so they sort chronologically. A list of resource IDs sorted lexicographically is also sorted by creation time.
+
+ULIDs are also more compact and readable than UUIDs. Compare:
+
+```
+UUID:  550e8400-e29b-41d4-a716-446655440000
+ULID:  01HWKZ3P8B0E7D2N5FVYMR4CXJ
+```
+
+The typed prefix adds resource-type information without sacrificing any of these properties.
+
+## ID types
+
+Syfrah defines 17 typed ID types:
+
+| Type | Prefix | Resource |
+|------|--------|---------|
+| `OrgId` | `org-` | Organization |
+| `VpcId` | `vpc-` | Virtual Private Cloud |
+| `HypervisorId` | `hv-` | Hypervisor node |
+| `MeshId` | `mesh-` | WireGuard mesh network |
+| `NodeId` | `node-` | Mesh node (member of a mesh) |
+| `VmId` | `vm-` | Virtual machine |
+| `VolumeId` | `vol-` | Storage volume |
+| `SnapshotId` | `snap-` | Volume snapshot |
+| `ImageId` | `img-` | VM boot image |
+| `NetworkId` | `net-` | Network attachment |
+| `SubnetId` | `sub-` | Subnet |
+| `GatewayId` | `gw-` | Gateway |
+| `RouteId` | `rt-` | Route entry |
+| `FirewallId` | `fw-` | Firewall ruleset |
+| `KeyId` | `key-` | SSH or API key |
+| `TokenId` | `tok-` | Auth token |
+| `EventId` | `evt-` | Audit event |
+
+## Parsing and validation
+
+IDs are validated on parse. An ID string that doesn't match `{prefix}-{26-chars}` or contains invalid Crockford Base32 characters is rejected immediately with a descriptive error.
+
+```
+// Correct
+"vpc-01HWKZ3P8B0E7D2N5FVYMR4CXJ" -> VpcId (valid)
+
+// Wrong prefix for the expected type
+"org-01HWKZ3P8B0E7D2N5FVYMR4CXJ" -> error: expected vpc- prefix, got org-
+
+// Malformed suffix
+"vpc-notavalidulid" -> error: invalid Crockford Base32 characters
+```
+
+## Names vs. IDs
+
+Resources can have both a name and an ID. Names are for humans — they're mutable, descriptive, and subject to naming rules (see [validate](/syfrah/layers/core/validate)). IDs are for machines — they're immutable, globally unique, and used in all API calls and state references.
+
+When you reference a resource in the CLI, you can often use the name. Internally, everything uses the ID. The distinction matters when scripting: if you rename a VPC, scripts referencing it by name break. Scripts referencing it by ID do not.
+
+## Sorting by creation time
+
+Because the ULID timestamp is in the most-significant bits, lexicographic sort equals chronological sort:
+
+```
+org-01HWKZ2AAAAAAAAAAAAAAAAAAA  (created first)
+org-01HWKZ3P8B0E7D2N5FVYMR4CXJ (created second)
+org-01HWKZ9ZZZZZZZZZZZZZZZZZZZ  (created third)
+```
+
+This is useful when paginating resource lists — a lexicographic cursor gives you stable, time-ordered pagination without a separate `created_at` index.

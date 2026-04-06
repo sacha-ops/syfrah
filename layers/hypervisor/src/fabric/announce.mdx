@@ -1,0 +1,68 @@
+---
+title: Fabric Peer Announcement
+description: How the hypervisor broadcasts new nodes to existing mesh members after a join.
+sidebar:
+  order: 11
+---
+
+When a new node joins the mesh, the accepting hypervisor needs to tell every other existing peer about it. That is what the announce system does. Without it, peers that were already in the mesh when the new node joined would not have a WireGuard entry for it and could not route traffic to it.
+
+## Flow
+
+After a join request is accepted:
+
+1. The accepting node calls `broadcast_new_peer()` with the new node's `PeerInfo` and the list of all existing peers
+2. For each existing peer, it opens a TCP connection to that peer's announce port and sends a `PeerAnnounce` message
+3. Each receiving peer runs `handle_announce()`, which adds the new node to its `PeerList`, persists state, and updates its WireGuard config
+
+The new node itself receives the full peer list directly in the `JoinResponse`, so it does not need an announcement.
+
+## Port allocation
+
+Three ports are used by the fabric subsystem, all relative to the WireGuard port:
+
+| Purpose | Port |
+|---|---|
+| WireGuard data plane | `wg_port` (default 51820) |
+| Peering listener (join requests) | `wg_port + 1` (51821) |
+| Announce listener | `wg_port + 2` (51822) |
+
+The announce listener is always at `wg_port + 2`. When broadcasting, the accepting node connects to `[mesh_ipv6]:51822` on each peer.
+
+## Protocol
+
+Announcements use the same length-prefixed JSON framing as the peering protocol. The message type is `PeerAnnounce`:
+
+```json
+{
+  "peer": {
+    "name": "web-03",
+    "region": "eu",
+    "zone": "fsn1",
+    "wg_public_key": "...",
+    "wg_port": 51820,
+    "endpoint": "203.0.113.30",
+    "mesh_ipv6": "fd01::3"
+  },
+  "announced_by": "web-01"
+}
+```
+
+## Best-effort delivery
+
+Announcements are fire-and-forget per peer. If a peer is down or unreachable, the failure is logged and the broadcast continues to the remaining peers. A failed announcement does not fail the join.
+
+```
+WARN failed to announce new peer  peer=web-04  error=connection refused
+INFO announced new peer           peer=web-02  new_peer=web-03
+```
+
+`broadcast_new_peer()` returns `(successes, failures)` so the caller can log a summary.
+
+## Idempotency
+
+The announce listener checks whether the incoming peer is already known before adding it. If a duplicate announcement arrives (e.g. from two acceptors racing), the second one is silently skipped.
+
+## DB access
+
+Like the health checker, the announce listener opens a fresh database connection per incoming request and drops it immediately after. This keeps the write lock window short and avoids blocking concurrent operations.

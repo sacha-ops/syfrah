@@ -1,0 +1,62 @@
+---
+title: Mesh Identity
+description: How a Syfrah mesh is defined — shared secrets, ULA IPv6 prefixes, and per-node identities with WireGuard keys.
+sidebar:
+  order: 1
+---
+
+A Syfrah mesh is a private network shared by a group of hypervisors. Two things define a mesh: a shared secret and an IPv6 address space. Every node in the mesh shares these two values. Everything else — the node's name, its WireGuard keys, its endpoint — is per-node.
+
+## MeshIdentity
+
+`MeshIdentity` captures the two mesh-wide values:
+
+| Field    | Description                                         |
+|----------|-----------------------------------------------------|
+| `id`     | A UUID that uniquely identifies this mesh           |
+| `prefix` | A `/48` ULA IPv6 prefix (e.g. `fd12:3456:789a::/48`) |
+
+The `/48` prefix gives the mesh `2^80` addresses, which is more than enough for any cluster. Addresses within that prefix are assigned to nodes by the [IPAM](/syfrah/layers/control-plane/ipam) system.
+
+## HypervisorIdentity
+
+Each node in the mesh has a `HypervisorIdentity` that describes it fully:
+
+| Field        | Description                                              |
+|--------------|----------------------------------------------------------|
+| `id`         | UUID for this hypervisor                                 |
+| `name`       | Human-readable name (e.g. `web-01`)                      |
+| `region`     | Region this node is in (e.g. `us-east`)                  |
+| `zone`       | Availability zone (e.g. `us-east-1a`)                    |
+| `wg_pubkey`  | WireGuard public key                                     |
+| `wg_privkey` | WireGuard private key (stored locally, never transmitted)|
+| `port`       | WireGuard listen port                                    |
+| `endpoint`   | Public IP or hostname other nodes use to reach this one  |
+| `mesh_ipv6`  | This node's address within the mesh prefix               |
+
+The private key never leaves the node. Only the public key is shared with peers during the join process.
+
+## Creating a mesh
+
+`create_mesh()` generates a new `MeshIdentity` with a fresh UUID and a randomly chosen ULA prefix. This is called once, when the first node runs `syfrah hv init`.
+
+```sh
+syfrah hv init --name web-01 --region us-east --zone us-east-1a
+# Outputs the mesh secret: syf_sk_...
+```
+
+The mesh secret encodes the shared secret and the prefix. Keep it safe — anyone with the secret can join the mesh.
+
+## Creating a hypervisor identity
+
+`create_hypervisor()` builds a `HypervisorIdentity` from the supplied name, region, zone, and a freshly generated WireGuard keypair. It validates that:
+
+- The name is non-empty and does not conflict with existing peers
+- The endpoint (if provided) is a valid address
+- The port is in an acceptable range
+
+If validation fails, the init or join flow aborts with a clear error before any state is written.
+
+## How identities relate to state
+
+Both `MeshIdentity` and `HypervisorIdentity` are part of [`FabricState`](/syfrah/layers/hypervisor/fabric/state), which is the full snapshot of this node's mesh membership. You rarely interact with these types directly — the init and join flows handle everything.

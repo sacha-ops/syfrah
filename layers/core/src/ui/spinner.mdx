@@ -1,0 +1,82 @@
+---
+title: Progress Spinners
+description: Animated spinners for long-running CLI operations — started before the operation, stopped with a status message when complete.
+sidebar:
+  order: 5
+---
+
+Some operations take a noticeable amount of time: provisioning a VM, joining a mesh, draining a hypervisor. A spinner gives visual feedback that something is happening and the CLI hasn't hung.
+
+## Basic usage
+
+```rust
+use syfrah_core::ui::Spinner;
+
+let spinner = Spinner::start("Provisioning VM...");
+
+// do the work
+let result = create_vm(params).await?;
+
+spinner.success("VM created.");
+// or
+spinner.failure("Failed to create VM.");
+```
+
+The spinner animates in the terminal while the future is running. When `.success()` or `.failure()` is called, the animation stops and the final message is printed on the same line.
+
+## Spinner output
+
+While running:
+```
+⠸ Provisioning VM...
+```
+
+After `.success()`:
+```
+✓ VM created.
+```
+
+After `.failure()`:
+```
+✗ Failed to create VM.
+```
+
+The `✓` is green and `✗` is red when color is enabled. When color is disabled or output is not a TTY, the check and cross are still printed but without color.
+
+## Non-TTY behavior
+
+When stdout is not a TTY (piped output, CI), the spinner is automatically suppressed. The start message is printed once as a plain line, and the completion message is printed on a new line:
+
+```
+Provisioning VM...
+VM created.
+```
+
+No animation, no escape codes. This keeps logs readable and avoids polluting piped output with control characters.
+
+## Spinner in dispatch
+
+The dispatch layer automatically wraps operations in a spinner when:
+- stdin is a TTY
+- The operation is not a `list` or `get` (those are fast enough that a spinner isn't useful)
+- The operation doesn't produce streaming output
+
+The spinner message is derived from the operation name and resource: "Creating VPC...", "Deleting hypervisor...", "Running drain...".
+
+## Custom spinners
+
+For custom operations outside of dispatch, use `Spinner` directly. The spinner is a lightweight struct that owns a background thread for the animation. Call `.stop()` if you need to stop the animation without printing a final message:
+
+```rust
+let spinner = Spinner::start("Waiting for peers...");
+
+for _ in 0..30 {
+    if check_peers_ready().await {
+        spinner.success("All peers connected.");
+        return Ok(());
+    }
+    sleep(Duration::from_secs(2)).await;
+}
+
+spinner.failure("Timed out waiting for peers.");
+```

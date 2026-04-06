@@ -1,0 +1,100 @@
+---
+title: Presentation
+description: How list output and detail views are configured — columns, field formatting, status coloring, and byte display.
+sidebar:
+  order: 7
+---
+
+The presentation layer controls how resources look when displayed. `list` operations render a table; `get` operations render a detail view. Both are configured in the `ResourceDef` and driven automatically — your handler just returns data.
+
+## ColumnDef — table output
+
+`ColumnDef` configures a column in the table rendered by `list`. Each column maps a field name from the response to a display header.
+
+```rust
+ResourceDef::build("vm", "Virtual machine")
+    .column(ColumnDef::new("id", "ID"))
+    .column(ColumnDef::new("name", "Name"))
+    .column(ColumnDef::new("status", "Status").colored())
+    .column(ColumnDef::new("vcpus", "vCPUs").right_aligned())
+    .column(ColumnDef::new("memory_bytes", "Memory").format(DisplayFormat::Bytes))
+    .column(ColumnDef::new("created_at", "Created").format(DisplayFormat::RelativeTime))
+```
+
+### Column options
+
+| Option | Effect |
+|--------|--------|
+| `.colored()` | Apply status-based color (see [color docs](/syfrah/layers/core/ui/color)) |
+| `.right_aligned()` | Right-align numeric values |
+| `.truncate(n)` | Truncate to n characters and append `…` |
+| `.format(DisplayFormat)` | Apply a display formatter |
+
+### DisplayFormat
+
+`DisplayFormat` controls how raw values are transformed before display.
+
+| Format | Input | Output |
+|--------|-------|--------|
+| `DisplayFormat::Bytes` | `1073741824` | `1.0 GiB` |
+| `DisplayFormat::RelativeTime` | ISO 8601 timestamp | `2 hours ago` |
+| `DisplayFormat::AbsoluteTime` | ISO 8601 timestamp | `2026-04-05 14:32:00` |
+| `DisplayFormat::StatusDot` | `"active"` | `● active` (colored) |
+
+## DetailField — get output
+
+`DetailField` configures a row in the key-value detail view rendered by `get`. The layout is a two-column view with the field label on the left and value on the right.
+
+```rust
+ResourceDef::build("vm", "Virtual machine")
+    .detail(DetailField::new("id", "ID"))
+    .detail(DetailField::new("name", "Name"))
+    .detail(DetailField::new("status", "Status").colored())
+    .detail(DetailField::new("hypervisor_id", "Hypervisor"))
+    .detail(DetailField::new("vcpus", "vCPUs"))
+    .detail(DetailField::new("memory_bytes", "Memory").format(DisplayFormat::Bytes))
+    .detail(DetailField::new("created_at", "Created").format(DisplayFormat::RelativeTime))
+    .detail(DetailField::new("updated_at", "Last updated").format(DisplayFormat::RelativeTime))
+```
+
+Example output:
+
+```
+ID          vm-01HWKZ3P8B0E7D2N5FVYMR4CXJ
+Name        web-server-1
+Status      ● running
+Hypervisor  hv-01HWKZ4A9C1F8E3M6GXZNQ5BYK
+vCPUs       4
+Memory      8.0 GiB
+Created     3 hours ago
+Last updated  12 minutes ago
+```
+
+## Status coloring
+
+Columns and detail fields marked `.colored()` apply color based on the value string. See the [color module docs](/syfrah/layers/core/ui/color) for the full mapping. The defaults are:
+
+| Value | Color |
+|-------|-------|
+| `active`, `running`, `available`, `healthy` | Green |
+| `stopped`, `inactive`, `disabled` | Dim white |
+| `error`, `failed`, `unhealthy` | Red |
+| `pending`, `starting`, `draining` | Yellow |
+| `unknown` | Dim white |
+
+## Column ordering
+
+Columns appear in the table in the order they are declared on the `ResourceDef`. Put the most important columns first. IDs are often most useful at the end where truncation is less disruptive to scanning.
+
+## Output format flags
+
+The table and detail renderers respect the `--output` / `-o` flag, which is automatically added to all operations:
+
+| Flag | Output |
+|------|--------|
+| (none) | Human-readable table or detail view |
+| `-o json` | Raw JSON response |
+| `-o yaml` | YAML response |
+| `-o id` | IDs only (useful for scripting) |
+
+These flags are injected automatically — you don't need to declare them.
