@@ -53,6 +53,7 @@ pub fn resource_def() -> ResourceDef {
                 .with_arg(OperationArg::optional("timeout", FieldDef::integer("timeout", "Listener timeout in seconds").with_default("3600")))
                 .with_example("syfrah hypervisor peering")
             )
+        .action("doctor", "Diagnose hypervisor health")
         // Future
         .action("drain", "Evacuate all VMs before maintenance").op(|op| op.with_confirm())
         .action("enable", "Enable for VM scheduling")
@@ -88,6 +89,7 @@ pub fn handler() -> HandlerFn {
                 "get" => handle_get(req).await,
                 "join" => handle_join(req).await,
                 "peering" => handle_peering(req).await,
+                "doctor" => handle_doctor().await,
                 "drain" => Ok(OperationResponse::Message("drain: not yet implemented".into())),
                 "enable" => Ok(OperationResponse::Message("enable: not yet implemented".into())),
                 other => Ok(OperationResponse::Message(format!("unknown: {other}"))),
@@ -337,6 +339,12 @@ async fn handle_start() -> anyhow::Result<OperationResponse> {
     let db = open_db()?;
     let _ = storage::ops::start_all(&db);
     Ok(OperationResponse::Message("services started.".into()))
+}
+
+async fn handle_doctor() -> anyhow::Result<OperationResponse> {
+    let report = crate::doctor::run();
+    report.print();
+    Ok(OperationResponse::None)
 }
 
 async fn handle_stop() -> anyhow::Result<OperationResponse> {

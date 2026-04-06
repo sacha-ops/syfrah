@@ -2302,6 +2302,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "dirs",
  "hostname",
  "rcgen",
  "rustls 0.23.37",

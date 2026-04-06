@@ -16,6 +16,7 @@ tracing.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
 hostname = "0.4"
+dirs = "5"
 tikv-client = "0.4"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
