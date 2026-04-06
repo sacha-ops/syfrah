@@ -2,8 +2,10 @@
 //!
 //! Opens the DB per-request (no long-lived lock).
 
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +13,47 @@ use tokio::net::TcpListener;
 
 use syfrah_core::error::SyfrahError;
 use syfrah_state::LayerDb;
+
+/// Max PIN failures per IP before blocking.
+const MAX_PIN_FAILURES: u32 = 5;
+/// Duration to block an IP after too many failures.
+const PIN_BLOCK_DURATION: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Simple per-IP rate limiter for PIN brute-force protection.
+struct PinRateLimiter {
+    failures: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl PinRateLimiter {
+    fn new() -> Self {
+        Self {
+            failures: HashMap::new(),
+        }
+    }
+
+    fn is_blocked(&self, ip: &IpAddr) -> bool {
+        if let Some((count, since)) = self.failures.get(ip) {
+            if *count >= MAX_PIN_FAILURES && since.elapsed() < PIN_BLOCK_DURATION {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record_failure(&mut self, ip: IpAddr) {
+        let entry = self.failures.entry(ip).or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= PIN_BLOCK_DURATION {
+            // Reset after block period
+            *entry = (1, Instant::now());
+        } else {
+            entry.0 += 1;
+        }
+    }
+
+    fn record_success(&mut self, ip: &IpAddr) {
+        self.failures.remove(ip);
+    }
+}
 
 use super::peer::Peer;
 use super::peering::{JoinRequest, JoinResponse, PeerInfo};
@@ -29,18 +72,27 @@ pub async fn listen(
         .await
         .map_err(|e| SyfrahError::internal(format!("failed to bind peering port: {e}")))?;
 
-    tracing::info!(addr = %bind_addr, pin = pin, "peering listener started");
+    tracing::info!(addr = %bind_addr, "peering listener started");
 
     let mut accepted = 0;
+    let rate_limiter = Arc::new(Mutex::new(PinRateLimiter::new()));
 
     loop {
         let accept = tokio::time::timeout(timeout, listener.accept()).await;
 
         match accept {
             Ok(Ok((mut stream, peer_addr))) => {
+                // Check rate limit before processing
+                {
+                    let rl = rate_limiter.lock().unwrap();
+                    if rl.is_blocked(&peer_addr.ip()) {
+                        tracing::warn!(peer = %peer_addr, "blocked (too many failed PIN attempts)");
+                        continue;
+                    }
+                }
+
                 tracing::info!(peer = %peer_addr, "incoming join request");
 
-                // Open DB fresh for each request — no long-lived lock
                 let db = match db_opener() {
                     Ok(db) => db,
                     Err(e) => {
@@ -51,15 +103,16 @@ pub async fn listen(
 
                 match handle_join(&mut stream, &db, pin, peer_addr).await {
                     Ok(peer_name) => {
+                        rate_limiter.lock().unwrap().record_success(&peer_addr.ip());
                         tracing::info!(peer = %peer_addr, name = %peer_name, "join accepted");
                         accepted += 1;
-                        // DB is dropped here — lock released
                         drop(db);
                         if max_joins > 0 && accepted >= max_joins {
                             break;
                         }
                     }
                     Err(e) => {
+                        rate_limiter.lock().unwrap().record_failure(peer_addr.ip());
                         tracing::warn!(peer = %peer_addr, error = %e, "join rejected");
                         drop(db);
                     }
@@ -86,6 +139,15 @@ async fn handle_join(
     peer_addr: SocketAddr,
 ) -> Result<String, SyfrahError> {
     let mut req = read_json::<JoinRequest>(stream).await?;
+
+    // Validate peer-provided fields against injection (newlines, control chars)
+    validate_peer_field(&req.name, "name")?;
+    validate_peer_field(&req.region, "region")?;
+    validate_peer_field(&req.zone, "zone")?;
+    validate_peer_field(&req.wg_public_key, "wg_public_key")?;
+    if let Some(ref ep) = req.endpoint {
+        validate_peer_field(ep, "endpoint")?;
+    }
 
     // If the joiner didn't specify an endpoint, use their TCP source IP + WG port
     if req.endpoint.is_none() {
@@ -121,13 +183,13 @@ async fn handle_join(
             region: p.region.clone(),
             zone: p.zone.clone(),
             wg_public_key: p.wg_public_key.clone(),
-            wg_port: 51820,
+            wg_port: p.wg_port,
             endpoint: p.endpoint.clone(),
             mesh_ipv6: p.mesh_ipv6,
         })
         .collect();
 
-    let resp = JoinResponse::accepted(&state.secret, state.mesh.prefix, existing_peers, self_info);
+    let resp = JoinResponse::accepted(&state.secret, state.mesh.prefix, state.mesh.id.as_str(), existing_peers, self_info);
     write_json(stream, &resp).await?;
 
     // Derive the new peer's mesh IPv6
@@ -161,6 +223,7 @@ async fn handle_join(
         req.region,
         req.zone,
         req.wg_public_key,
+        req.wg_port,
         req.endpoint,
         peer_ipv6,
     );
@@ -273,6 +336,22 @@ pub async fn write_json<T: serde::Serialize>(
         .await
         .map_err(|e| SyfrahError::network(format!("flush failed: {e}")))?;
 
+    Ok(())
+}
+
+/// Validate a peer-provided field against injection attacks.
+/// Rejects newlines, control characters, and excessive length.
+fn validate_peer_field(value: &str, field_name: &str) -> Result<(), SyfrahError> {
+    if value.len() > 256 {
+        return Err(SyfrahError::validation(format!(
+            "{field_name} too long (max 256 chars)"
+        )));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(SyfrahError::validation(format!(
+            "{field_name} contains control characters"
+        )));
+    }
     Ok(())
 }
 

@@ -46,6 +46,9 @@ pub struct JoinResponse {
     pub secret: Option<String>,
     /// Mesh prefix (only if accepted).
     pub prefix: Option<Ipv6Addr>,
+    /// Mesh ID (only if accepted).
+    #[serde(default)]
+    pub mesh_id: Option<String>,
     /// Existing peers in the mesh (only if accepted).
     pub peers: Vec<PeerInfo>,
     /// The accepting node's info.
@@ -77,15 +80,16 @@ impl JoinResponse {
     pub fn accepted(
         secret: &str,
         prefix: Ipv6Addr,
+        mesh_id: &str,
         peers: Vec<PeerInfo>,
         acceptor: PeerInfo,
     ) -> Self {
         Self {
             accepted: true,
             reason: None,
-
             secret: Some(secret.to_string()),
             prefix: Some(prefix),
+            mesh_id: Some(mesh_id.to_string()),
             peers,
             acceptor: Some(acceptor),
         }
@@ -96,9 +100,9 @@ impl JoinResponse {
         Self {
             accepted: false,
             reason: Some(reason.to_string()),
-
             secret: None,
             prefix: None,
+            mesh_id: None,
             peers: Vec::new(),
             acceptor: None,
         }
@@ -139,6 +143,7 @@ mod tests {
         let resp = JoinResponse::accepted(
             "syf_sk_test",
             "fd01::".parse().unwrap(),
+            "mesh-test",
             vec![],
             PeerInfo {
                 name: "node-1".into(),
@@ -169,6 +174,7 @@ mod tests {
         let resp = JoinResponse::accepted(
             "secret",
             "fd01::".parse().unwrap(),
+            "mesh-test",
             vec![PeerInfo {
                 name: "p1".into(),
                 region: "eu".into(),

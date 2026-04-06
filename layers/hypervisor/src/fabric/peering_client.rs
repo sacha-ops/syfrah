@@ -88,6 +88,7 @@ mod tests {
             let resp = JoinResponse::accepted(
                 "syf_sk_test",
                 "fd01::".parse().unwrap(),
+                "mesh-test",
                 vec![],
                 super::super::peering::PeerInfo {
                     name: "init-node".into(),

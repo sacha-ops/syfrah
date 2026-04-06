@@ -119,6 +119,7 @@ mod tests {
                 "eu".into(),
                 "nbg1".into(),
                 "key-n2".into(),
+                51820,
                 Some("1.2.3.4:51820".into()),
                 "fd01::2".parse().unwrap(),
             ))
@@ -196,6 +197,7 @@ mod tests {
                 "eu".into(),
                 "nbg1".into(),
                 "key-n2".into(),
+                51820,
                 None,
                 "fd01::2".parse().unwrap(),
             ))

@@ -70,6 +70,12 @@ pub fn join(
     mesh_ipv6: &Ipv6Addr,
     existing_pd_endpoints: &[String],
 ) -> Result<(), SyfrahError> {
+    if existing_pd_endpoints.is_empty() {
+        return Err(SyfrahError::precondition(
+            "no PD endpoints available. Cannot join control plane.",
+        ));
+    }
+
     eprintln!("  Joining control plane...");
 
     // Install binaries

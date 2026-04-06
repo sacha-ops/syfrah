@@ -241,6 +241,7 @@ mod tests {
                 "eu".into(),
                 "nbg1".into(),
                 "key-2".into(),
+                51820,
                 None,
                 "fd01::2".parse().unwrap(),
             ))

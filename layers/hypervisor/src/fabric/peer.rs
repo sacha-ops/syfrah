@@ -6,6 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use syfrah_core::id::NodeId;
 
+fn default_wg_port() -> u16 {
+    51820
+}
+
 /// A remote peer in the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
@@ -19,6 +23,9 @@ pub struct Peer {
     pub zone: String,
     /// WireGuard public key (base64).
     pub wg_public_key: String,
+    /// WireGuard listen port.
+    #[serde(default = "default_wg_port")]
+    pub wg_port: u16,
     /// WireGuard endpoint (IP:port).
     pub endpoint: Option<String>,
     /// Peer's mesh IPv6 address.
@@ -47,6 +54,7 @@ impl Peer {
         region: String,
         zone: String,
         wg_public_key: String,
+        wg_port: u16,
         endpoint: Option<String>,
         mesh_ipv6: Ipv6Addr,
     ) -> Self {
@@ -61,6 +69,7 @@ impl Peer {
             region,
             zone,
             wg_public_key,
+            wg_port,
             endpoint,
             mesh_ipv6,
             status: PeerStatus::Active,
@@ -172,6 +181,7 @@ mod tests {
             "eu".into(),
             "fsn1".into(),
             format!("key-{name}"),
+            51820,
             Some("1.2.3.4:51820".into()),
             "fd01::1".parse().unwrap(),
         )

@@ -163,6 +163,7 @@ async fn handle_announce(
         announce.peer.region,
         announce.peer.zone,
         announce.peer.wg_public_key,
+        announce.peer.wg_port,
         announce.peer.endpoint,
         announce.peer.mesh_ipv6,
     );

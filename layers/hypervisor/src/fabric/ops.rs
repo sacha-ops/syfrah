@@ -228,9 +228,14 @@ pub async fn join(
         mesh_ipv6,
     };
 
-    // Build mesh identity
+    // Use mesh ID from the accepting node (consistent across cluster)
+    let mesh_id_str = response
+        .mesh_id
+        .unwrap_or_else(|| syfrah_core::id::MeshId::generate().to_string());
     let mesh_id = MeshIdentity {
-        id: syfrah_core::id::MeshId::generate(),
+        id: mesh_id_str
+            .parse()
+            .unwrap_or_else(|_| syfrah_core::id::MeshId::generate()),
         prefix,
     };
 
@@ -253,6 +258,7 @@ pub async fn join(
             acceptor.region.clone(),
             acceptor.zone.clone(),
             acceptor.wg_public_key.clone(),
+            acceptor.wg_port,
             endpoint,
             acceptor.mesh_ipv6,
         ));
@@ -263,6 +269,7 @@ pub async fn join(
             p.region.clone(),
             p.zone.clone(),
             p.wg_public_key.clone(),
+            p.wg_port,
             p.endpoint.clone(),
             p.mesh_ipv6,
         ));
