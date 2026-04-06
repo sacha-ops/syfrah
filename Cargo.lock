@@ -2174,18 +2174,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syfrah-controlplane"
-version = "2.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "syfrah-core",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "syfrah-core"
 version = "2.0.0"
 dependencies = [
@@ -2234,6 +2222,7 @@ dependencies = [
  "syfrah-core",
  "syfrah-state",
  "tempfile",
+ "tikv-client",
  "tokio",
  "tracing",
 ]

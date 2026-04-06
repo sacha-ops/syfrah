@@ -4,7 +4,6 @@ members = [
     "layers/core",
     "layers/state",
     "layers/hypervisor",
-    "layers/controlplane",
     "bin/syfrah",
 ]
 
