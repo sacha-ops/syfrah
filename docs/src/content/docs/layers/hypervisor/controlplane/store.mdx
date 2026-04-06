@@ -1,0 +1,92 @@
+---
+title: Store
+description: ClusterDb — the async TiKV client for reading and writing distributed cluster state.
+sidebar:
+  order: 4
+---
+
+`ClusterDb` is the async interface that the rest of Syfrah uses to read and write state in the distributed TiKV cluster. It wraps the TiKV Raw client and adds namespace-based key isolation and automatic JSON serialization.
+
+## Connecting
+
+```rust
+let db = ClusterDb::connect(&["http://[fd01::1]:2379"]).await?;
+```
+
+Pass one or more PD endpoint URLs. The TiKV client library handles discovering the actual TiKV nodes from PD and routing requests to the right shards automatically.
+
+## Namespaced keys
+
+All operations take a `namespace` and a `key`. Internally the key is stored as `{namespace}/{key}`. This partitions data by subsystem without any risk of collision between, for example, VM records and network allocations.
+
+```rust
+// Stored at "vms/vm-001"
+db.put("vms", "vm-001", &vm_record).await?;
+
+// Stored at "networks/net-abc"
+db.put("networks", "net-abc", &net_record).await?;
+```
+
+## Operations
+
+### put
+
+Write a serializable value. The value is JSON-serialized before storage.
+
+```rust
+db.put("vms", "vm-001", &serde_json::json!({"name": "web-1", "vcpus": 2})).await?;
+```
+
+### get
+
+Read a deserializable value. Returns `None` if the key does not exist.
+
+```rust
+let vm: Option<VmRecord> = db.get("vms", "vm-001").await?;
+```
+
+### delete
+
+Remove a key.
+
+```rust
+db.delete("vms", "vm-001").await?;
+```
+
+### list
+
+Scan all keys with a given prefix within a namespace. Returns a vector of `(key, value)` pairs. The namespace prefix is stripped from the returned keys.
+
+```rust
+// Returns all keys starting with "vms/vm-" as ("vm-001", ...), ("vm-002", ...) etc.
+let vms: Vec<(String, VmRecord)> = db.list("vms", "vm-").await?;
+```
+
+The scan limit is 10,000 entries per call. For larger datasets, use a more specific prefix.
+
+### exists
+
+Check whether a key is present without deserializing the value.
+
+```rust
+if db.exists("vms", "vm-001").await? {
+    // ...
+}
+```
+
+### batch_put
+
+Write multiple key-value pairs in a single batch. This is not a transaction — it does not provide atomicity across keys — but it is more efficient than issuing individual puts for a large number of entries.
+
+```rust
+db.batch_put("vms", &[
+    ("vm-001", &record_a),
+    ("vm-002", &record_b),
+]).await?;
+```
+
+## Relationship to LocalDb
+
+`ClusterDb` is the distributed counterpart to `LocalDb` (the embedded redb store used for node-local state like `FabricState`). They share the same key naming convention — `namespace/key` — so patterns developed with `LocalDb` transfer directly.
+
+`LocalDb` is for per-node state that does not need to be replicated. `ClusterDb` is for cluster-wide state that must survive a node failure and be visible from any node in the mesh.

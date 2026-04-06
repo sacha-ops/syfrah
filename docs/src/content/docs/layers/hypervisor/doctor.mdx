@@ -1,0 +1,86 @@
+---
+title: Doctor
+description: Run a health diagnostic across all hypervisor sub-systems — fabric, controlplane, storage, and system resources.
+sidebar:
+  order: 3
+---
+
+The `doctor` command inspects every sub-system on the current node and prints a color-coded report. It is the fastest way to confirm a node is healthy after initial setup or to triage a problem.
+
+```sh
+syfrah hv doctor
+```
+
+## What gets checked
+
+Doctor runs four sections in sequence. Each section reports individual checks as **pass** (green ✓), **warn** (yellow !), **fail** (red ✗), or **skip** (grey -). Skipped checks indicate the sub-system is not installed or not yet configured — they do not count as failures.
+
+### Fabric
+
+Checks the WireGuard mesh connectivity layer:
+
+| Check | Pass condition |
+|---|---|
+| wireguard-tools | `wg` binary is present on PATH |
+| syfrah0 interface | The `syfrah0` interface is up |
+| wg service | `wg-quick@syfrah0` systemd service is active |
+| wg config | `/etc/wireguard/syfrah0.conf` exists |
+| peers | All configured peers are reachable |
+| mesh ping | ICMPv6 ping to a sample of up to 3 peers responds |
+
+If the node has no peers yet (freshly initialized), the peer checks report OK rather than a warning.
+
+### Controlplane
+
+Checks the TiKV distributed key-value cluster:
+
+| Check | Pass condition |
+|---|---|
+| tiup | TiUP binary present at `/opt/syfrah/tiup/bin/tiup` |
+| pd service | `syfrah-pd` systemd service is active (or skipped on TiKV-only nodes) |
+| tikv service | `syfrah-tikv` systemd service is active |
+| pd health | All PD members respond as healthy via the PD HTTP API |
+| pd leader | A leader has been elected |
+| tikv stores | At least one TiKV store is registered with PD |
+
+If TiUP is not installed, all controlplane checks are skipped — the section header still appears but no failures are counted.
+
+### Storage
+
+Checks the ZeroFS S3-backed storage layer:
+
+| Check | Pass condition |
+|---|---|
+| zerofs | ZeroFS binary present at `/usr/local/bin/zerofs` |
+| region `<name>` | For each configured region, the `syfrah-zerofs-<name>` service is active |
+
+If no regions are configured, doctor reports "none configured" as OK. If a region is configured but its service is not running, it reports a warning.
+
+### System
+
+Checks host-level resources:
+
+| Check | Pass condition |
+|---|---|
+| disk space | `/var/lib/syfrah` has more than 1 GB free |
+| logs | `/var/log/syfrah` exists and is writable |
+| state file | `~/.syfrah/hypervisor.json` exists and is valid JSON |
+
+Disk space between 256 MB and 1 GB reports a warning; below 256 MB reports a failure.
+
+## Summary line
+
+After all sections, doctor prints a summary:
+
+```
+  3 passed, 1 warnings, 0 errors
+```
+
+The process exits with a non-zero code if any check has status **fail**.
+
+## When to use doctor
+
+- **After `syfrah hv init`** — confirm the mesh, controlplane, and storage are all up
+- **After `syfrah hv join`** — verify the new node joined every sub-system correctly
+- **During incident triage** — narrow down which layer has a problem before digging into logs
+- **In CI or runbooks** — `syfrah hv doctor` as a post-deploy smoke test

@@ -9,14 +9,17 @@ sidebar:
 
 ## What FabricState contains
 
-| Field                 | Description                                                     |
-|-----------------------|-----------------------------------------------------------------|
-| `mesh`                | The `MeshIdentity` — mesh UUID and `/48` prefix                 |
-| `hypervisor`          | This node's `HypervisorIdentity` — keys, endpoint, mesh address |
-| `secret`              | The shared mesh secret used to authenticate joins               |
-| `peers`               | The `PeerList` — all known peers and their current status       |
+| Field            | Description                                                     |
+|------------------|-----------------------------------------------------------------|
+| `mesh`           | The `MeshIdentity` — mesh UUID and `/48` prefix                 |
+| `hypervisor`     | This node's `HypervisorIdentity` — keys, endpoint, mesh address |
+| `secret`         | The shared mesh secret used to authenticate joins               |
+| `peers`          | The `PeerList` — all known peers and their current status       |
+| `network_mode`   | The `NetworkMode` the node was initialized with (`wireguard`, `direct`, or `mock`) |
 
-All four fields must be present for a node to be considered initialized. If any are missing, the node is in a partial state and most commands will refuse to run.
+All five fields must be present for a node to be considered initialized. If any are missing, the node is in a partial state and most commands will refuse to run.
+
+`network_mode` is set at `init` or `join` time from `InitConfig.mode` and is replayed on every `start`, `stop`, and `leave` to ensure the correct [network backend](/syfrah/layers/hypervisor/fabric/backend) is used. Changing the mode after initialization requires a full `leave` and `init` cycle.
 
 ## Storage location
 

@@ -1,0 +1,83 @@
+---
+title: Service
+description: Installing ZeroFS, generating per-region TOML config, and managing the syfrah-zerofs-<region> systemd units.
+sidebar:
+  order: 3
+---
+
+The `service` module handles the ZeroFS binary lifecycle and the per-region systemd services. Each configured region gets its own isolated ZeroFS instance managed by a dedicated service unit.
+
+## Installation
+
+`ensure_installed` checks for the ZeroFS binary at `/usr/local/bin/zerofs`. If it is missing, it attempts to download a pre-compiled release from GitHub:
+
+```
+https://github.com/barre/zerofs/releases/latest/download/zerofs-<arch>-unknown-linux-gnu
+```
+
+If the direct download fails, it falls back to `cargo install zerofs`. Both attempts must succeed before continuing. The binary is marked executable after download.
+
+ZeroFS installation is triggered automatically when a storage region is first added to a node.
+
+## Per-region configuration
+
+`generate_config` produces a TOML file at `/etc/syfrah/zerofs/<region>.toml` for each region. The config covers:
+
+```toml
+[storage]
+type = "s3"
+endpoint = "<s3_endpoint>"
+bucket = "<s3_bucket>"
+access_key = "${ZEROFS_S3_ACCESS_KEY}"   # injected at runtime via env var
+secret_key = "${ZEROFS_S3_SECRET_KEY}"   # injected at runtime via env var
+
+[cache]
+path = "/var/lib/syfrah/zerofs/<region>"
+size = "10GB"
+
+[encryption]
+enabled = true
+
+[compression]
+algorithm = "lz4"
+
+[nbd]
+enabled = true
+
+[server]
+bind = "127.0.0.1"
+```
+
+**S3 credentials are never written into the config file.** The config uses `${ZEROFS_S3_ACCESS_KEY}` and `${ZEROFS_S3_SECRET_KEY}` as placeholders. The actual values are injected through `Environment=` directives in the systemd unit, which is created with permissions `0600` (owner-readable only).
+
+The TOML config file itself is also written with `0600` permissions to prevent other users from reading the endpoint and bucket details.
+
+## Systemd units
+
+Each region gets a systemd unit at `/etc/systemd/system/syfrah-zerofs-<region>.service`. The unit:
+
+- Depends on `network-online.target` and `syfrah-wg.service` (the mesh must be up)
+- Sets `ZEROFS_S3_ACCESS_KEY` and `ZEROFS_S3_SECRET_KEY` as environment variables
+- Runs `zerofs run -c /etc/syfrah/zerofs/<region>.toml`
+- Restarts on failure with a 5-second backoff
+
+## Service lifecycle
+
+| Function | Effect |
+|---|---|
+| `install_region(config)` | Write TOML config + systemd unit, reload systemd daemon |
+| `start_region(region)` | `systemctl enable --now syfrah-zerofs-<region>` |
+| `stop_region(region)` | `systemctl stop syfrah-zerofs-<region>` |
+| `is_region_active(region)` | Check if the service is currently running |
+| `uninstall_region(region)` | Stop + disable, remove unit and config files, delete cache dir |
+| `uninstall_all` | Discover and remove all `syfrah-zerofs-*` units and their data |
+
+Service names follow the pattern `syfrah-zerofs-<region>`, e.g., `syfrah-zerofs-eu` or `syfrah-zerofs-us-east`.
+
+## Directories
+
+| Path | Purpose |
+|---|---|
+| `/etc/syfrah/zerofs/` | Per-region TOML config files |
+| `/var/lib/syfrah/zerofs/<region>/` | Local read cache |
+| `/mnt/syfrah/<region>/` | Mount point (created but used by ZeroFS internally) |

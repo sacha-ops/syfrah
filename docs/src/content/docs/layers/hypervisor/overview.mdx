@@ -91,6 +91,36 @@ syfrah hv list
 syfrah hv get web-01
 ```
 
+### doctor
+
+Run a full health diagnostic across all sub-systems:
+
+```sh
+syfrah hv doctor
+```
+
+Checks fabric, controlplane, storage, and system resources. Prints colored pass/warn/fail output and exits non-zero if any check fails. See [Doctor](/syfrah/layers/hypervisor/doctor) for details.
+
+## Network backend modes
+
+The fabric layer supports three network backends selected with `--mode` at init or join time:
+
+| Mode | Description |
+|---|---|
+| `wireguard` (default) | Encrypted WireGuard mesh — use this for any public internet deployment |
+| `direct` | Plain IP routing, no tunnel — for trusted private networks |
+| `mock` | No-op backend for testing |
+
+```sh
+syfrah hv init --name web-01 --mode wireguard
+syfrah hv join --target 203.0.113.10 --name web-02 --mode direct
+```
+
+Two additional flags control the WireGuard interface:
+
+- `--interface` — override the interface name (default: `syfrah0`)
+- `--endpoint` — explicitly set this node's public endpoint (`host:port`) advertised to peers
+
 ## Sub-modules
 
 The hypervisor layer is built on the [fabric](/syfrah/layers/hypervisor/fabric/mesh) sub-module, which handles the lower-level details:
@@ -101,3 +131,22 @@ The hypervisor layer is built on the [fabric](/syfrah/layers/hypervisor/fabric/m
 - [wg](/syfrah/layers/hypervisor/fabric/wg) — WireGuard interface management
 - [service](/syfrah/layers/hypervisor/fabric/service) — systemd service lifecycle
 - [peering](/syfrah/layers/hypervisor/fabric/peering) — join protocol types
+- [backend](/syfrah/layers/hypervisor/fabric/backend) — network backend trait and mode selection
+- [tls](/syfrah/layers/hypervisor/fabric/tls) — TLS for the peering protocol
+
+### Controlplane
+
+The [controlplane](/syfrah/layers/hypervisor/controlplane/overview) sub-module manages the distributed TiKV key-value cluster:
+
+- [overview](/syfrah/layers/hypervisor/controlplane/overview) — TiKV + PD architecture, cluster topology
+- [service](/syfrah/layers/hypervisor/controlplane/service) — install, configure, and manage PD + TiKV services
+- [ops](/syfrah/layers/hypervisor/controlplane/ops) — bootstrap, join, and leave the control plane
+- [store](/syfrah/layers/hypervisor/controlplane/store) — `ClusterDb` async client for distributed state
+
+### Storage
+
+The [storage](/syfrah/layers/hypervisor/storage/overview) sub-module manages ZeroFS S3-backed block storage:
+
+- [overview](/syfrah/layers/hypervisor/storage/overview) — ZeroFS, S3 regions, encryption, NBD
+- [region](/syfrah/layers/hypervisor/storage/region) — `RegionStorage` config and `RegionRegistry`
+- [service](/syfrah/layers/hypervisor/storage/service) — ZeroFS installation and per-region systemd units

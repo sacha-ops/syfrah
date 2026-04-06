@@ -1,0 +1,37 @@
+---
+title: TLS
+description: How the peering server secures join connections — self-signed certificates, TOFU, and PIN-based authentication.
+sidebar:
+  order: 13
+---
+
+When a new node wants to join a mesh, it opens a TCP connection to the existing node's peering port. That connection is TLS-encrypted. Understanding the TLS model helps clarify what is protected and what provides the actual authentication.
+
+## Self-signed certificate
+
+The peering server generates a fresh self-signed TLS certificate at startup — there is no CA, no certificate pinning, and no DNS name to verify. The certificate is ephemeral: a new one is generated each time the peering listener starts.
+
+The certificate is issued for the name `syfrah-peering` and is signed with a freshly generated key pair. It is never written to disk.
+
+## Trust on first use (TOFU)
+
+The joining node connects to the peering server and deliberately skips certificate verification. It accepts whatever certificate the server presents. This is Trust on First Use (TOFU): the first connection is trusted unconditionally.
+
+This might sound insecure, but the threat model is different from traditional TLS. Certificate verification proves the server is who it claims to be, but in a new mesh there is no prior trust to anchor against. The certificate's only job here is to establish an encrypted channel.
+
+## PIN provides the authentication
+
+The actual authentication happens at the application layer, not the TLS layer. After the TLS handshake completes, the joining node sends a `JoinRequest` that includes a PIN. The PIN is derived from the mesh secret and must match what the server expects. If the PIN is wrong, the connection is rejected before any mesh data is returned.
+
+The division of responsibility is:
+
+| Layer | Responsibility |
+|---|---|
+| TLS | Encrypts the connection — nobody can eavesdrop |
+| PIN | Authenticates the joiner — proves they have the mesh secret |
+
+An attacker who intercepts the connection sees only encrypted bytes. An attacker who can make a TCP connection but does not know the PIN cannot learn the mesh secret or join the mesh.
+
+## Why not a proper PKI?
+
+A proper PKI would require either a pre-shared CA certificate (which would need distributing out-of-band before the first join) or a certificate signed by a public CA (which requires a domain name and an internet-accessible server). Neither is practical for a system designed to run on arbitrary bare-metal. The PIN-based model achieves equivalent security with much less operational overhead.

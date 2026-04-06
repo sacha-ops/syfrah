@@ -1,0 +1,55 @@
+---
+title: Regions
+description: RegionStorage config and the RegionRegistry that persists all S3-backed storage regions on a node.
+sidebar:
+  order: 2
+---
+
+A region is the unit of storage configuration in Syfrah. Every region corresponds to one S3 bucket on one endpoint. The `region` module defines the configuration types and the local registry that persists them.
+
+## RegionStorage
+
+`RegionStorage` holds everything ZeroFS needs to connect to and use an S3 bucket:
+
+| Field | Description |
+|---|---|
+| `region` | Short identifier used in service names and CLI output (e.g., `eu`, `us-east`) |
+| `s3_endpoint` | Full URL of the S3 endpoint (`https://...`) |
+| `s3_bucket` | Bucket name |
+| `s3_access_key` | S3 access key |
+| `s3_secret_key` | S3 secret key |
+| `s3_region` | AWS region string (e.g., `eu-central-1`); leave empty for non-AWS providers |
+| `is_default` | Whether this is the default region when none is specified |
+
+The `s3_endpoint` field must start with `http://` or `https://`. All other non-optional fields must be non-empty. Syfrah validates this before saving.
+
+Credentials are stored as plain text in the local state file. They are passed to ZeroFS at runtime through environment variables in the systemd unit — they are never written into the ZeroFS TOML config file.
+
+## RegionRegistry
+
+`RegionRegistry` is the local collection of all configured regions on a node. It is persisted to `~/.syfrah/` via the state layer under the key `"regions"/"config"`.
+
+### Operations
+
+**upsert** — add a new region or replace an existing one (matched by region identifier):
+
+```sh
+syfrah storage region add --region eu --endpoint https://s3.eu.example.com \
+  --bucket syfrah-eu --access-key AKID --secret-key SECRET
+```
+
+**remove** — delete a region from the registry:
+
+```sh
+syfrah storage region remove --region eu
+```
+
+**find** — look up a specific region by name. Used internally by the service layer when installing or starting a region's ZeroFS instance.
+
+**default_region** — returns the region marked `is_default`, or the first region if none is explicitly marked. Used when a command needs a region but none was specified.
+
+### Persistence
+
+The registry is loaded at the start of any storage command and saved after any mutation. It uses the same atomic-write guarantees as all state layer operations: a save either fully commits or leaves the previous value intact.
+
+The registry is local to each node. A node only knows about the regions it has been explicitly configured to serve. There is no automatic replication of region configuration across the mesh — each node must be configured independently.

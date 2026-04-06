@@ -7,6 +7,23 @@ sidebar:
 
 The `ops` module is where the work actually happens. Every high-level `syfrah hv` command ultimately calls a function here. Ops orchestrates the other fabric sub-modules — identity, WireGuard, systemd, peering, state — into coherent multi-step workflows.
 
+## InitConfig
+
+`init` and `join` accept an `InitConfig` struct that consolidates all the parameters that influence how the node is set up:
+
+| Field | Flag | Description |
+|---|---|---|
+| `name` | `--name` | Unique node name within the mesh |
+| `region` | `--region` | Region identifier (e.g., `us-east`) |
+| `zone` | `--zone` | Availability zone (e.g., `us-east-1a`) |
+| `mode` | `--mode` | Network backend: `wireguard` (default), `direct`, or `mock` |
+| `interface` | `--interface` | WireGuard interface name (default: `syfrah0`) |
+| `endpoint` | `--endpoint` | This node's public endpoint (`host:port`) advertised to peers |
+
+The `--mode` flag selects the [network backend](/syfrah/layers/hypervisor/fabric/backend). All nodes in a cluster should use the same mode.
+
+The `--endpoint` flag is optional. If omitted, Syfrah detects the public IP automatically. Set it explicitly when running behind NAT or when you want to control which address peers connect to.
+
 ## init
 
 `init` bootstraps the first node in a new mesh.
@@ -15,15 +32,18 @@ The `ops` module is where the work actually happens. Every high-level `syfrah hv
 
 1. Generates a `MeshIdentity` (UUID + `/48` prefix) via `create_mesh()`
 2. Generates a `HypervisorIdentity` (WG keypair, assigns mesh IPv6) via `create_hypervisor()`
-3. Installs the WireGuard systemd service via the [service module](/syfrah/layers/hypervisor/fabric/service)
-4. Starts the service
-5. Persists `FabricState` to `~/.syfrah/fabric.redb`
-6. Derives a short PIN from the mesh secret for use during peer joins
+3. Selects the network backend from `InitConfig.mode` via `create_backend()`
+4. Installs the backend service via the [service module](/syfrah/layers/hypervisor/fabric/service)
+5. Starts the service
+6. Persists `FabricState` (including `network_mode`) to `~/.syfrah/fabric.redb`
+7. Derives a short PIN from the mesh secret for use during peer joins
 
 **Usage:**
 
 ```sh
 syfrah hv init --name web-01 --region us-east --zone us-east-1a
+syfrah hv init --name web-01 --region us-east --zone us-east-1a --mode direct
+syfrah hv init --name web-01 --region us-east --zone us-east-1a --endpoint 203.0.113.10:51820
 # Mesh secret: syf_sk_AbC123...
 # PIN: 7842
 ```
