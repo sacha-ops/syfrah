@@ -1,0 +1,22 @@
+[package]
+name = "syfrah-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "peering"
+path = "peering_test.rs"
+
+[dependencies]
+syfrah-core = { path = "../../layers/core" }
+syfrah-state = { path = "../../layers/state" }
+syfrah-hypervisor = { path = "../../layers/hypervisor" }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+tempfile = "3"
+axum = "0.8"
+http = "1"
+tower = "0.5"
+serde_json = "1"

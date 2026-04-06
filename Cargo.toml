@@ -5,6 +5,7 @@ members = [
     "layers/state",
     "layers/hypervisor",
     "bin/syfrah",
+    "tests/integration",
 ]
 
 [workspace.package]

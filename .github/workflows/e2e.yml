@@ -1,0 +1,35 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, v2]
+    paths:
+      - 'layers/**'
+      - 'bin/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+  pull_request:
+    branches: [main, v2]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests
+        run: cargo test -p syfrah-integration-tests --verbose
+
+      - name: Run unit tests
+        run: cargo test --workspace --exclude syfrah-integration-tests
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
