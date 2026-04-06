@@ -324,13 +324,136 @@ pub fn uninstall() -> Result<(), SyfrahError> {
     Ok(())
 }
 
+/// Reload configs without full restart (PD hot-reload + TiKV syncconf).
+pub fn reload(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig) -> Result<(), SyfrahError> {
+    // Rewrite configs
+    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg)).map_err(SyfrahError::from)?;
+    std::fs::write(TIKV_CONF_PATH, generate_tikv_conf(tikv_cfg)).map_err(SyfrahError::from)?;
+
+    // PD supports SIGHUP for config reload
+    if pd_is_active() {
+        let _ = Command::new("systemctl").args(["reload-or-restart", PD_SERVICE]).output();
+    }
+    // TiKV needs restart for config changes
+    if tikv_is_active() {
+        let _ = run_systemctl(&["restart", TIKV_SERVICE]);
+    }
+
+    Ok(())
+}
+
+/// Restart both services (stop then start, ordered).
+pub fn restart() -> Result<(), SyfrahError> {
+    stop()?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    start()
+}
+
+/// Wait for PD to be healthy (responds on client URL).
+pub fn wait_pd_ready(mesh_ipv6: &Ipv6Addr, timeout_secs: u64) -> Result<(), SyfrahError> {
+    let url = format!("http://[{}]:{}/pd/api/v1/health", mesh_ipv6, super::PD_CLIENT_PORT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    while std::time::Instant::now() < deadline {
+        let result = Command::new("curl")
+            .args(["-sf", "--max-time", "2", &url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if result.map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Err(SyfrahError::timeout("PD health check", timeout_secs))
+}
+
+/// Wait for TiKV to register with PD (at least 1 store).
+pub fn wait_tikv_ready(mesh_ipv6: &Ipv6Addr, timeout_secs: u64) -> Result<(), SyfrahError> {
+    let url = format!(
+        "http://[{}]:{}/pd/api/v1/stores",
+        mesh_ipv6,
+        super::PD_CLIENT_PORT
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    while std::time::Instant::now() < deadline {
+        if let Ok(output) = Command::new("curl")
+            .args(["-sf", "--max-time", "2", &url])
+            .output()
+        {
+            if output.status.success() {
+                let body = String::from_utf8_lossy(&output.stdout);
+                // PD returns {"count": N, "stores": [...]}
+                if body.contains("\"count\"") && !body.contains("\"count\":0") {
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Err(SyfrahError::timeout("TiKV store registration", timeout_secs))
+}
+
+/// Get cluster status from PD API.
+pub fn cluster_status(mesh_ipv6: &Ipv6Addr) -> Result<ClusterStatus, SyfrahError> {
+    let pd_url = format!(
+        "http://[{}]:{}",
+        mesh_ipv6,
+        super::PD_CLIENT_PORT
+    );
+
+    let members = pd_api_get(&pd_url, "/pd/api/v1/members");
+    let stores = pd_api_get(&pd_url, "/pd/api/v1/stores");
+
+    let member_count = members
+        .as_ref()
+        .ok()
+        .and_then(|v| v["members"].as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    let store_count = stores
+        .as_ref()
+        .ok()
+        .and_then(|v| v["count"].as_u64())
+        .unwrap_or(0) as usize;
+
+    let leader = members
+        .as_ref()
+        .ok()
+        .and_then(|v| v["leader"]["name"].as_str())
+        .map(|s| s.to_string());
+
+    Ok(ClusterStatus {
+        pd_active: pd_is_active(),
+        tikv_active: tikv_is_active(),
+        pd_members: member_count,
+        tikv_stores: store_count,
+        leader,
+    })
+}
+
+/// Cluster health status.
+#[derive(Debug, Clone)]
+pub struct ClusterStatus {
+    pub pd_active: bool,
+    pub tikv_active: bool,
+    pub pd_members: usize,
+    pub tikv_stores: usize,
+    pub leader: Option<String>,
+}
+
 /// Add a new PD member to an existing cluster via PD HTTP API.
-pub async fn add_pd_member(
-    existing_pd: &str,
+pub fn add_pd_member(
+    existing_pd_url: &str,
     new_name: &str,
     new_peer_url: &str,
 ) -> Result<(), SyfrahError> {
-    let url = format!("{existing_pd}/pd/api/v1/members");
+    let url = format!("{existing_pd_url}/pd/api/v1/members");
     let body = serde_json::json!({
         "name": new_name,
         "peer-urls": [new_peer_url],
@@ -338,7 +461,7 @@ pub async fn add_pd_member(
 
     let output = Command::new("curl")
         .args([
-            "-s",
+            "-sf",
             "-X",
             "POST",
             "-H",
@@ -358,6 +481,22 @@ pub async fn add_pd_member(
     }
 
     Ok(())
+}
+
+/// Query PD HTTP API.
+fn pd_api_get(pd_url: &str, path: &str) -> Result<serde_json::Value, SyfrahError> {
+    let url = format!("{pd_url}{path}");
+    let output = Command::new("curl")
+        .args(["-sf", "--max-time", "5", &url])
+        .output()
+        .map_err(|e| SyfrahError::internal(format!("curl failed: {e}")))?;
+
+    if !output.status.success() {
+        return Err(SyfrahError::internal("PD API request failed"));
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| SyfrahError::internal(format!("PD API parse failed: {e}")))
 }
 
 fn run_systemctl(args: &[&str]) -> Result<(), SyfrahError> {
