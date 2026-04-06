@@ -24,3 +24,4 @@ tokio.workspace = true
 axum.workspace = true
 http = "1"
 tower.workspace = true
+rustls = { version = "0.23", features = ["ring"] }

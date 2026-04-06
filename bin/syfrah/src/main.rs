@@ -15,6 +15,9 @@ fn build_registry() -> ResourceRegistry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize crypto provider (for TLS in peering)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize structured logging
     let _guard = syfrah_core::logging::init_cli();
 
