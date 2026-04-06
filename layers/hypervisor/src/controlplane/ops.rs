@@ -106,6 +106,10 @@ fn join_with_pd(
     existing_pd_endpoints: &[String],
     primary_pd: &str,
 ) -> Result<(), SyfrahError> {
+    // Wait for mesh connectivity to PD before attempting join
+    eprintln!("  Verifying mesh connectivity to PD...");
+    wait_mesh_connectivity(primary_pd, 30)?;
+
     let self_peer_url = format!("http://[{mesh_ipv6}]:{}", super::PD_PEER_PORT);
 
     let pd_cfg = PdConfig {
@@ -130,30 +134,26 @@ fn join_with_pd(
     service::enable_and_start()?;
 
     eprintln!("  Waiting for PD...");
-    service::wait_pd_ready(mesh_ipv6, 60)?;
+    service::wait_pd_ready(mesh_ipv6, 120)?;
     eprintln!("  Waiting for TiKV...");
-    service::wait_tikv_ready(mesh_ipv6, 90)?;
+    service::wait_tikv_ready(mesh_ipv6, 120)?;
 
     Ok(())
 }
 
 /// Join with TiKV only (for nodes beyond MAX_PD_MEMBERS).
 fn join_tikv_only(
-    node_name: &str,
+    _node_name: &str,
     mesh_ipv6: &Ipv6Addr,
     existing_pd_endpoints: &[String],
 ) -> Result<(), SyfrahError> {
+    // Wait for mesh connectivity to PD
+    eprintln!("  Verifying mesh connectivity to PD...");
+    wait_mesh_connectivity(&existing_pd_endpoints[0], 30)?;
+
     let tikv_cfg = TikvConfig {
         mesh_ipv6: *mesh_ipv6,
         pd_endpoints: existing_pd_endpoints.to_vec(),
-    };
-
-    // Dummy PD config (won't be started)
-    let pd_cfg = PdConfig {
-        name: node_name.to_string(),
-        mesh_ipv6: *mesh_ipv6,
-        initial_cluster: String::new(),
-        initial_cluster_state: String::new(),
     };
 
     // Install TiKV only (no PD unit)
@@ -201,6 +201,64 @@ pub fn restart() -> Result<(), SyfrahError> {
 /// Uninstall the control plane.
 pub fn leave() -> Result<(), SyfrahError> {
     service::uninstall()
+}
+
+/// Wait for mesh connectivity to a PD endpoint (HTTP health check).
+fn wait_mesh_connectivity(pd_url: &str, timeout_secs: u64) -> Result<(), SyfrahError> {
+    let url = format!("{pd_url}/pd/api/v1/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    while std::time::Instant::now() < deadline {
+        if std::process::Command::new("curl")
+            .args(["-sf", "--max-time", "3", &url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            // Also clean up any zombie PD members before joining
+            cleanup_zombie_members(pd_url);
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    Err(SyfrahError::timeout("mesh connectivity to PD", timeout_secs))
+}
+
+/// Remove unhealthy PD members (zombies from failed joins).
+fn cleanup_zombie_members(pd_url: &str) {
+    let url = format!("{pd_url}/pd/api/v1/health");
+    let output = match std::process::Command::new("curl")
+        .args(["-sf", "--max-time", "5", &url])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+
+    let health: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    if let Some(members) = health.as_array() {
+        for member in members {
+            let healthy = member["health"].as_bool().unwrap_or(true);
+            let name = member["name"].as_str().unwrap_or("");
+            let member_id = member["member_id"].as_u64().unwrap_or(0);
+
+            // Remove unhealthy members with no name (zombie from failed join)
+            if !healthy && name.is_empty() && member_id > 0 {
+                eprintln!("  Removing zombie PD member {member_id}...");
+                let delete_url = format!("{pd_url}/pd/api/v1/members/id/{member_id}");
+                let _ = std::process::Command::new("curl")
+                    .args(["-sf", "-X", "DELETE", "--max-time", "5", &delete_url])
+                    .output();
+            }
+        }
+    }
 }
 
 /// Count PD members in the cluster.
