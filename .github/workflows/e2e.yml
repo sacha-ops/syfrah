@@ -23,8 +23,10 @@ jobs:
       - uses: actions/checkout@v4
       - id: find
         run: |
+          # Extract package names (not test names) from e2e Cargo.toml files
           crates=$(find layers -path '*/tests/e2e/Cargo.toml' \
-            -exec grep -oP 'name = "\K[^"]+' {} \; \
+            -exec grep -m1 'name = ' {} \; \
+            | grep -oP 'name = "\K[^"]+' \
             | jq -R -s -c 'split("\n") | map(select(. != ""))')
           echo "Discovered E2E crates: $crates"
           echo "crates=$crates" >> "$GITHUB_OUTPUT"
