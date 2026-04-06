@@ -68,11 +68,15 @@ pub fn init(
         .save(db)
         .map_err(|e| SyfrahError::internal(e.to_string()))?;
 
-    let secret_masked = format!(
-        "{}...{}",
-        &secret_str[..10],
-        &secret_str[secret_str.len() - 4..]
-    );
+    let secret_masked = if secret_str.len() >= 14 {
+        format!(
+            "{}...{}",
+            &secret_str[..10],
+            &secret_str[secret_str.len() - 4..]
+        )
+    } else {
+        "***".to_string()
+    };
 
     // Derive a PIN from the secret for peering
     let pin = secret.derive_pin();

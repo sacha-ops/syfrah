@@ -123,7 +123,7 @@ impl LocalDb {
 
         let compound_key = format!("{table}/{key}");
 
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         data.insert(compound_key, json_value);
         self.flush(&data)
     }
@@ -135,7 +135,7 @@ impl LocalDb {
         key: &str,
     ) -> Result<Option<T>> {
         let compound_key = format!("{table}/{key}");
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
 
         match data.get(&compound_key) {
             Some(val) => {
@@ -150,7 +150,7 @@ impl LocalDb {
     /// Delete a key.
     pub fn delete(&self, table: &str, key: &str) -> Result<()> {
         let compound_key = format!("{table}/{key}");
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         data.remove(&compound_key);
         self.flush(&data)
     }
@@ -158,7 +158,7 @@ impl LocalDb {
     /// Check if a key exists.
     pub fn exists(&self, table: &str, key: &str) -> Result<bool> {
         let compound_key = format!("{table}/{key}");
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         Ok(data.contains_key(&compound_key))
     }
 

@@ -305,7 +305,10 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
     let s = fabric::ops::status(&db)?;
 
     // Control plane status (best-effort — may not be installed yet)
-    let cp = controlplane::ops::status(&s.mesh_ipv6.parse().unwrap_or(std::net::Ipv6Addr::UNSPECIFIED));
+    let mesh_ip: std::net::Ipv6Addr = s.mesh_ipv6.parse().map_err(|_| {
+        anyhow::anyhow!("corrupt state: invalid mesh_ipv6 '{}'", s.mesh_ipv6)
+    })?;
+    let cp = controlplane::ops::status(&mesh_ip);
     let (pd_active, tikv_active, pd_members, tikv_stores, leader) = match cp {
         Ok(cs) => (cs.pd_active, cs.tikv_active, cs.pd_members, cs.tikv_stores, cs.leader),
         Err(_) => (false, false, 0, 0, None),
@@ -318,7 +321,7 @@ async fn handle_status() -> anyhow::Result<OperationResponse> {
         "region": s.region,
         "zone": s.zone,
         "mesh_ipv6": s.mesh_ipv6,
-        "state": s.state,
+        "state": if s.service_active && tikv_active { &s.state } else if s.service_active { "degraded" } else { "down" },
         "wg": if s.service_active { "running" } else { "stopped" },
         "wg_interface": s.wg_interface_up,
         "peers": s.peer_count,

@@ -89,7 +89,7 @@ pub async fn listen(
             Ok(Ok((tcp_stream, peer_addr))) => {
                 // Check rate limit before processing
                 {
-                    let rl = rate_limiter.lock().unwrap();
+                    let rl = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                     if rl.is_blocked(&peer_addr.ip()) {
                         tracing::warn!(peer = %peer_addr, "blocked (too many failed PIN attempts)");
                         continue;
@@ -117,7 +117,7 @@ pub async fn listen(
 
                 match handle_join(&mut stream, &db, pin, peer_addr).await {
                     Ok(peer_name) => {
-                        rate_limiter.lock().unwrap().record_success(&peer_addr.ip());
+                        rate_limiter.lock().unwrap_or_else(|e| e.into_inner()).record_success(&peer_addr.ip());
                         tracing::info!(peer = %peer_addr, name = %peer_name, "join accepted");
                         accepted += 1;
                         drop(db);
@@ -126,7 +126,7 @@ pub async fn listen(
                         }
                     }
                     Err(e) => {
-                        rate_limiter.lock().unwrap().record_failure(peer_addr.ip());
+                        rate_limiter.lock().unwrap_or_else(|e| e.into_inner()).record_failure(peer_addr.ip());
                         tracing::warn!(peer = %peer_addr, error = %e, "join rejected");
                         drop(db);
                     }
@@ -243,12 +243,7 @@ async fn handle_join(
     );
     let _ = state.peers.add(new_peer);
 
-    // Bug 3 fix: save immediately, don't defer
-    state
-        .save(db)
-        .map_err(|e| SyfrahError::internal(e.to_string()))?;
-
-    // Update WireGuard config with new peer
+    // Update WireGuard FIRST — if this fails, state is unchanged
     let peers_for_wg: Vec<_> = state
         .peers
         .peers
@@ -269,6 +264,12 @@ async fn handle_join(
         &state.hypervisor.mesh_ipv6,
         &peers_for_wg,
     )?;
+
+    // Save state AFTER WireGuard succeeds — no split-brain
+    state
+        .save(db)
+        .map_err(|e| SyfrahError::internal(e.to_string()))?;
+
     let announcer_name = state.hypervisor.name.clone();
     let wg_port = state.hypervisor.wg_port;
 
