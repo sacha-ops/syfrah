@@ -1,0 +1,69 @@
+---
+title: WireGuard Service
+description: systemd service management for the Syfrah WireGuard mesh (syfrah-wg).
+sidebar:
+  order: 1
+---
+
+The `wireguard/service` module manages WireGuard as a persistent systemd service. It installs `wireguard-tools` if absent, writes the `wg-quick` config, registers a `syfrah-wg` systemd unit, and provides lifecycle operations. The service survives reboots and runs independently of the `syfrah` process.
+
+## Files on disk
+
+| Path | Purpose |
+|---|---|
+| `/etc/wireguard/syfrah0.conf` | `wg-quick` interface config (mode `0600`) |
+| `/etc/systemd/system/syfrah-wg.service` | systemd unit (`Type=oneshot`, `RemainAfterExit=yes`) |
+
+## Package installation
+
+`ensure_wireguard()` checks for `wg-quick` and installs `wireguard-tools` if missing. It auto-detects the package manager in this order:
+
+- `apt-get` (Debian / Ubuntu) — runs `apt-get update` first
+- `dnf` (Fedora / RHEL 8+)
+- `yum` (CentOS / older RHEL)
+- `pacman` (Arch)
+- `apk` (Alpine)
+- `zypper` (openSUSE)
+
+If none of these are present the function returns a precondition error asking the operator to install `wireguard-tools` manually.
+
+## Config generation
+
+`generate_wg_conf(private_key, listen_port, mesh_ipv6, peers)` produces a `wg-quick` config:
+
+```ini
+[Interface]
+PrivateKey = <private_key>
+ListenPort = <listen_port>
+Address    = <mesh_ipv6>/128
+
+[Peer]
+PublicKey          = <pubkey>
+AllowedIPs         = <peer_ipv6>/128
+PersistentKeepalive = 25
+Endpoint           = <host:port>   # omitted when unknown
+```
+
+Each peer entry sets `PersistentKeepalive = 25`. `Endpoint` is only written when provided.
+
+## Lifecycle functions
+
+| Function | Effect |
+|---|---|
+| `install(key, port, ipv6, peers)` | Write config + unit, `systemctl daemon-reload` |
+| `enable_and_start()` | `systemctl enable --now syfrah-wg` |
+| `start()` | `systemctl start syfrah-wg` |
+| `stop()` | `systemctl stop syfrah-wg` |
+| `uninstall()` | Disable, remove unit + config, reload daemon |
+| `update_config(key, port, ipv6, peers)` | Rewrite config, apply with `wg syncconf` (no teardown); falls back to service restart on error |
+
+## Status checks
+
+- `is_installed()` — returns `true` if the unit file exists at `/etc/systemd/system/syfrah-wg.service`
+- `is_active()` — delegates to `systemctl is-active --quiet syfrah-wg`
+- `is_enabled()` — delegates to `systemctl is-enabled --quiet syfrah-wg`
+- `wg_quick_available()` — returns `true` if `wg-quick` is on `$PATH`
+
+## Live config reload
+
+`update_config` uses `wg syncconf syfrah0 /etc/wireguard/syfrah0.conf` to apply peer changes without bringing the interface down. If `syncconf` fails the service is restarted as a fallback, ensuring peers are always in sync.

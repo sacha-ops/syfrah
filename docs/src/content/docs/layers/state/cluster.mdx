@@ -1,0 +1,81 @@
+---
+title: Cluster Store
+description: Distributed key-value store backed by TiKV for replicated cluster state across the mesh.
+sidebar:
+  order: 2
+---
+
+`ClusterDb` is the distributed state layer for the Syfrah mesh. It wraps TiKV's raw client with a namespaced, JSON-serialized API that mirrors the `LocalDb` (redb) interface. While `LocalDb` stores per-node state, `ClusterDb` stores state that must be consistent and visible to all nodes.
+
+## Connecting
+
+```rust
+let db = ClusterDb::connect(&["http://[fd01::1]:2379"]).await?;
+```
+
+Pass one or more PD (Placement Driver) endpoints. TiKV uses these to discover the data nodes. The client is cheaply cloneable — pass it around with `.clone()`.
+
+## Key namespace
+
+All keys are stored as `{namespace}/{key}`. The namespace partitions data by resource type (e.g. `"vms"`, `"networks"`, `"volumes"`). Callers never construct the full key — the namespace and short key are passed separately and composed internally.
+
+## API
+
+### put
+
+```rust
+db.put("vms", "vm-001", &my_struct).await?;
+```
+
+Serializes the value to JSON and writes it to TiKV. Overwrites any existing value for that key.
+
+### get
+
+```rust
+let vm: Option<MyStruct> = db.get("vms", "vm-001").await?;
+```
+
+Returns `None` if the key does not exist. Deserializes from JSON on hit.
+
+### delete
+
+```rust
+db.delete("vms", "vm-001").await?;
+```
+
+Removes the key. No-ops silently if the key is absent.
+
+### list
+
+```rust
+let vms: Vec<(String, MyStruct)> = db.list("vms", "").await?;
+```
+
+Scans all keys under `{namespace}/{prefix}` using a range query. Returns `(short_key, value)` pairs where `short_key` has the `{namespace}/` prefix stripped. Scans up to 10,000 results per call.
+
+The range end is computed by `prefix_end`: the last byte of the prefix string is incremented by one to form the exclusive upper bound. For example, prefix `"vms/"` produces end key `"vms0"`.
+
+### exists
+
+```rust
+let found: bool = db.exists("vms", "vm-001").await?;
+```
+
+Returns `true` if the key has a value. Performs a single `get` internally.
+
+### batch_put
+
+```rust
+db.batch_put("vms", &[("vm-001", &vm1), ("vm-002", &vm2)]).await?;
+```
+
+Writes multiple key-value pairs in a single TiKV `batch_put` call. All entries share the same namespace. Use this when creating multiple related resources to reduce round-trips.
+
+## Error handling
+
+All methods return `StateError`. Two variants are relevant:
+
+- `StateError::Database` — TiKV communication or operation failure
+- `StateError::Serialization` — JSON encode/decode failure
+
+Neither variant is retried automatically; the caller is responsible for retry logic.
