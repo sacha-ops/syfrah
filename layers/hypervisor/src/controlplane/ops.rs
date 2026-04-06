@@ -44,8 +44,8 @@ pub fn bootstrap(
         )],
     };
 
-    // Install configs + systemd units
-    service::install(&pd_cfg, &tikv_cfg)?;
+    // Install configs + systemd units (no join URL for bootstrap)
+    service::install(&pd_cfg, &tikv_cfg, None)?;
 
     // Start and wait for readiness
     service::enable_and_start()?;
@@ -62,10 +62,9 @@ pub fn bootstrap(
 ///
 /// Called during `hypervisor join`:
 /// 1. Install TiUP + PD + TiKV binaries
-/// 2. Add self as PD member via existing PD's API
-/// 3. Generate configs pointing to all known PD endpoints
-/// 4. Install systemd units
-/// 5. Start PD (join mode), wait ready, start TiKV, wait ready
+/// 2. Generate configs with PD --join flag pointing to existing cluster
+/// 3. Install systemd units
+/// 4. Start PD (join mode), wait ready, start TiKV, wait ready
 pub fn join(
     node_name: &str,
     mesh_ipv6: &Ipv6Addr,
@@ -76,47 +75,35 @@ pub fn join(
     // Install binaries
     service::ensure_installed()?;
 
-    // Register with existing PD cluster
     let primary_pd = &existing_pd_endpoints[0];
-    let new_peer_url = format!(
+
+    // PD config — for join, initial-cluster is just self (PD --join handles the rest)
+    let self_peer_url = format!(
         "http://[{mesh_ipv6}]:{}",
         super::PD_PEER_PORT
     );
-    service::add_pd_member(primary_pd, node_name, &new_peer_url)?;
 
-    // Build initial-cluster string with all members + self
-    let mut initial_cluster_parts: Vec<String> = Vec::new();
-    // Get existing members from PD API
-    if let Ok(members) = get_pd_members(primary_pd) {
-        for (name, peer_url) in &members {
-            initial_cluster_parts.push(format!("{name}={peer_url}"));
-        }
-    }
-    // Add ourselves
-    initial_cluster_parts.push(format!("{node_name}={new_peer_url}"));
-    let initial_cluster = initial_cluster_parts.join(",");
+    let pd_cfg = PdConfig {
+        name: node_name.to_string(),
+        mesh_ipv6: *mesh_ipv6,
+        initial_cluster: format!("{node_name}={self_peer_url}"),
+        initial_cluster_state: "join".to_string(),
+    };
 
-    // All PD endpoints (existing + self)
+    // TiKV config — all PD endpoints (existing + self)
     let mut pd_endpoints: Vec<String> = existing_pd_endpoints.to_vec();
     let self_endpoint = format!("http://[{mesh_ipv6}]:{}", super::PD_CLIENT_PORT);
     if !pd_endpoints.contains(&self_endpoint) {
         pd_endpoints.push(self_endpoint);
     }
 
-    let pd_cfg = PdConfig {
-        name: node_name.to_string(),
-        mesh_ipv6: *mesh_ipv6,
-        initial_cluster,
-        initial_cluster_state: "join".to_string(),
-    };
-
     let tikv_cfg = TikvConfig {
         mesh_ipv6: *mesh_ipv6,
         pd_endpoints,
     };
 
-    // Install configs + systemd units
-    service::install(&pd_cfg, &tikv_cfg)?;
+    // Install configs + systemd units (with --join flag)
+    service::install(&pd_cfg, &tikv_cfg, Some(primary_pd))?;
 
     // Start and wait
     service::enable_and_start()?;
@@ -206,7 +193,7 @@ mod tests {
             initial_cluster: format!("node-1=http://[{ip}]:2380"),
             initial_cluster_state: "new".into(),
         };
-        let conf = service::generate_pd_conf(&pd_cfg);
+        let conf = service::generate_pd_conf(&pd_cfg, false);
         assert!(conf.contains("initial-cluster-state = \"new\""));
         assert!(conf.contains("node-1=http://[fd01::1]:2380"));
     }
@@ -217,12 +204,12 @@ mod tests {
         let pd_cfg = PdConfig {
             name: "node-2".into(),
             mesh_ipv6: ip,
-            initial_cluster: "node-1=http://[fd01::1]:2380,node-2=http://[fd01::2]:2380".into(),
+            initial_cluster: "node-2=http://[fd01::2]:2380".into(),
             initial_cluster_state: "join".into(),
         };
-        let conf = service::generate_pd_conf(&pd_cfg);
-        assert!(conf.contains("initial-cluster-state = \"join\""));
-        assert!(conf.contains("node-1"));
+        // Join mode: no initial-cluster in config
+        let conf = service::generate_pd_conf(&pd_cfg, true);
+        assert!(!conf.contains("initial-cluster"));
         assert!(conf.contains("node-2"));
     }
 

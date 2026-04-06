@@ -52,15 +52,17 @@ fn pd_available() -> bool {
 /// Install TiUP and TiKV components.
 pub fn ensure_installed() -> Result<(), SyfrahError> {
     // Create dirs
-    std::fs::create_dir_all(TIUP_HOME).map_err(SyfrahError::from)?;
+    std::fs::create_dir_all(format!("{TIUP_HOME}/bin")).map_err(SyfrahError::from)?;
     std::fs::create_dir_all("/etc/syfrah").map_err(SyfrahError::from)?;
 
     if !tiup_available() {
         eprintln!("  Installing TiUP...");
 
+        // Map arch: x86_64→amd64, aarch64→arm64
         let output = Command::new("sh")
             .args(["-c", &format!(
-                "curl -fsSL https://tiup-mirrors.pingcap.com/tiup-linux-$(uname -m).tar.gz | tar -xz -C {TIUP_HOME}/bin/"
+                "ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/') && \
+                 curl -fsSL https://tiup-mirrors.pingcap.com/tiup-linux-$ARCH.tar.gz | tar -xz -C {TIUP_HOME}/bin/"
             )])
             .output()
             .map_err(|e| SyfrahError::internal(format!("tiup download failed: {e}")))?;
@@ -69,10 +71,19 @@ pub fn ensure_installed() -> Result<(), SyfrahError> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SyfrahError::internal(format!("tiup install failed: {stderr}")));
         }
-    }
 
-    // Ensure bin dir exists
-    std::fs::create_dir_all(format!("{TIUP_HOME}/bin")).map_err(SyfrahError::from)?;
+        // Initialize TiUP mirror
+        let init = Command::new(format!("{TIUP_HOME}/bin/tiup"))
+            .args(["mirror", "set", "https://tiup-mirrors.pingcap.com"])
+            .env("TIUP_HOME", TIUP_HOME)
+            .output()
+            .map_err(|e| SyfrahError::internal(format!("tiup mirror set failed: {e}")))?;
+
+        if !init.status.success() {
+            let stderr = String::from_utf8_lossy(&init.stderr);
+            return Err(SyfrahError::internal(format!("tiup mirror init failed: {stderr}")));
+        }
+    }
 
     if !pd_available() {
         eprintln!("  Installing PD + TiKV components...");
@@ -113,7 +124,20 @@ pub struct PdConfig {
 }
 
 /// Generate pd.toml config.
-pub fn generate_pd_conf(cfg: &PdConfig) -> String {
+/// For join mode, initial-cluster is omitted (--join flag handles it).
+pub fn generate_pd_conf(cfg: &PdConfig, is_join: bool) -> String {
+    let cluster_section = if is_join {
+        // join mode: no initial-cluster in config (--join flag on command line)
+        String::new()
+    } else {
+        format!(
+            r#"initial-cluster = "{}"
+initial-cluster-state = "new"
+"#,
+            cfg.initial_cluster
+        )
+    };
+
     format!(
         r#"# Syfrah PD configuration — auto-generated
 name = "{name}"
@@ -124,9 +148,7 @@ peer-urls = "http://[{ip}]:{peer_port}"
 advertise-client-urls = "http://[{ip}]:{client_port}"
 advertise-peer-urls = "http://[{ip}]:{peer_port}"
 
-initial-cluster = "{initial_cluster}"
-initial-cluster-state = "{initial_cluster_state}"
-
+{cluster_section}
 [log]
 level = "warn"
 
@@ -138,8 +160,6 @@ max-size = 50
         ip = cfg.mesh_ipv6,
         client_port = super::PD_CLIENT_PORT,
         peer_port = super::PD_PEER_PORT,
-        initial_cluster = cfg.initial_cluster,
-        initial_cluster_state = cfg.initial_cluster_state,
     )
 }
 
@@ -192,7 +212,16 @@ capacity = "0"
 // Systemd units
 // ═══════════════════════════════════════════════════
 
-fn generate_pd_unit() -> String {
+fn generate_pd_unit(join_url: Option<&str>) -> String {
+    let exec_start = match join_url {
+        Some(url) => format!(
+            "ExecStart={TIUP_HOME}/bin/tiup pd --config={PD_CONF_PATH} --join={url}"
+        ),
+        None => format!(
+            "ExecStart={TIUP_HOME}/bin/tiup pd --config={PD_CONF_PATH}"
+        ),
+    };
+
     format!(
         r#"[Unit]
 Description=Syfrah Placement Driver (PD)
@@ -202,7 +231,9 @@ Requires=syfrah-wg.service
 
 [Service]
 Type=simple
-ExecStart={TIUP_HOME}/bin/tiup pd --config={PD_CONF_PATH}
+Environment=HOME=/root
+Environment=TIUP_HOME={TIUP_HOME}
+{exec_start}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1000000
@@ -223,6 +254,8 @@ Requires=syfrah-pd.service
 
 [Service]
 Type=simple
+Environment=HOME=/root
+Environment=TIUP_HOME={TIUP_HOME}
 ExecStart={TIUP_HOME}/bin/tiup tikv --config={TIKV_CONF_PATH}
 Restart=on-failure
 RestartSec=5
@@ -239,7 +272,8 @@ WantedBy=multi-user.target
 // ═══════════════════════════════════════════════════
 
 /// Install PD + TiKV configs and systemd units.
-pub fn install(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig) -> Result<(), SyfrahError> {
+/// `join_url` is Some for joining an existing cluster.
+pub fn install(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig, join_url: Option<&str>) -> Result<(), SyfrahError> {
     // Create directories
     std::fs::create_dir_all(PD_DATA_DIR).map_err(SyfrahError::from)?;
     std::fs::create_dir_all(TIKV_DATA_DIR).map_err(SyfrahError::from)?;
@@ -247,11 +281,12 @@ pub fn install(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig) -> Result<(), SyfrahErr
     std::fs::create_dir_all("/etc/syfrah").map_err(SyfrahError::from)?;
 
     // Write configs
-    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg)).map_err(SyfrahError::from)?;
+    let is_join = join_url.is_some();
+    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg, is_join)).map_err(SyfrahError::from)?;
     std::fs::write(TIKV_CONF_PATH, generate_tikv_conf(tikv_cfg)).map_err(SyfrahError::from)?;
 
     // Write systemd units
-    std::fs::write(PD_UNIT_PATH, generate_pd_unit()).map_err(SyfrahError::from)?;
+    std::fs::write(PD_UNIT_PATH, generate_pd_unit(join_url)).map_err(SyfrahError::from)?;
     std::fs::write(TIKV_UNIT_PATH, generate_tikv_unit()).map_err(SyfrahError::from)?;
 
     // Reload systemd
@@ -327,7 +362,7 @@ pub fn uninstall() -> Result<(), SyfrahError> {
 /// Reload configs without full restart (PD hot-reload + TiKV syncconf).
 pub fn reload(pd_cfg: &PdConfig, tikv_cfg: &TikvConfig) -> Result<(), SyfrahError> {
     // Rewrite configs
-    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg)).map_err(SyfrahError::from)?;
+    std::fs::write(PD_CONF_PATH, generate_pd_conf(pd_cfg, false)).map_err(SyfrahError::from)?;
     std::fs::write(TIKV_CONF_PATH, generate_tikv_conf(tikv_cfg)).map_err(SyfrahError::from)?;
 
     // PD supports SIGHUP for config reload
@@ -529,7 +564,7 @@ mod tests {
             initial_cluster: "node-1=http://[fd01::1]:2380".into(),
             initial_cluster_state: "new".into(),
         };
-        let conf = generate_pd_conf(&cfg);
+        let conf = generate_pd_conf(&cfg, false);
         assert!(conf.contains("name = \"node-1\""));
         assert!(conf.contains("[fd01::1]:2379"));
         assert!(conf.contains("[fd01::1]:2380"));
@@ -537,16 +572,18 @@ mod tests {
     }
 
     #[test]
-    fn generate_pd_conf_join() {
+    fn generate_pd_conf_join_mode() {
         let cfg = PdConfig {
             name: "node-2".into(),
             mesh_ipv6: "fd01::2".parse().unwrap(),
-            initial_cluster: "node-1=http://[fd01::1]:2380,node-2=http://[fd01::2]:2380".into(),
+            initial_cluster: "node-2=http://[fd01::2]:2380".into(),
             initial_cluster_state: "join".into(),
         };
-        let conf = generate_pd_conf(&cfg);
-        assert!(conf.contains("initial-cluster-state = \"join\""));
-        assert!(conf.contains("node-1=http://[fd01::1]:2380"));
+        // In join mode, initial-cluster is omitted from config (--join flag handles it)
+        let conf = generate_pd_conf(&cfg, true);
+        assert!(!conf.contains("initial-cluster"));
+        assert!(conf.contains("name = \"node-2\""));
+        assert!(conf.contains("[fd01::2]:2379"));
     }
 
     #[test]
@@ -577,7 +614,7 @@ mod tests {
 
     #[test]
     fn generate_pd_unit_valid() {
-        let unit = generate_pd_unit();
+        let unit = generate_pd_unit(None);
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
         assert!(unit.contains("[Install]"));
