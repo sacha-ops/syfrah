@@ -207,7 +207,7 @@ mod tests {
         // Create state with no peers
         let (mesh, secret) = super::super::mesh::create_mesh();
         let hv = super::super::mesh::create_hypervisor(
-            "node-1", "eu", "fsn1", 51820, None, &mesh.prefix,
+            "node-1", "eu", "fsn1", 51820, None, "", &mesh.prefix,
         )
         .unwrap();
         let state = FabricState {
@@ -232,7 +232,7 @@ mod tests {
 
         let (mesh, secret) = super::super::mesh::create_mesh();
         let hv = super::super::mesh::create_hypervisor(
-            "node-1", "eu", "fsn1", 51820, None, &mesh.prefix,
+            "node-1", "eu", "fsn1", 51820, None, "", &mesh.prefix,
         )
         .unwrap();
         let mut peers = super::super::peer::PeerList::new();

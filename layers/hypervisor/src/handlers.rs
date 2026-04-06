@@ -26,6 +26,8 @@ pub fn resource_def() -> ResourceDef {
                 .with_arg(OperationArg::optional("zone", FieldDef::string("zone", "Zone label").with_default("default")))
                 .with_arg(OperationArg::optional("port", FieldDef::integer("port", "WireGuard listen port").with_default("51820")))
                 .with_arg(OperationArg::optional("mode", FieldDef::string("mode", "Network mode: wireguard (default), direct, mock").with_default("wireguard")))
+                .with_arg(OperationArg::optional("interface", FieldDef::string("interface", "Fabric network interface (e.g., eth1). Auto-detected if omitted")))
+                .with_arg(OperationArg::optional("endpoint", FieldDef::string("endpoint", "Public endpoint IP for peering (auto-detected if omitted)")))
                 .with_arg(OperationArg::optional("peering", FieldDef::flag("peering", "Start peering listener after init (accepts joins)")))
                 .with_output(OutputKind::Resource)
                 .with_example("syfrah hypervisor init --name my-cloud --region eu --zone fsn1 --peering")
@@ -135,6 +137,17 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .parse()
         .unwrap_or_default();
 
+    let fabric_interface = req
+        .fields
+        .get("interface")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let endpoint = req
+        .fields
+        .get("endpoint")
+        .cloned();
+
     let node_name = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -148,7 +161,16 @@ async fn handle_init(req: OperationRequest) -> anyhow::Result<OperationResponse>
         .unwrap_or(false);
 
     let db = open_db()?;
-    let result = fabric::ops::init(&db, &node_name, region, zone, port, network_mode)?;
+    let init_cfg = fabric::ops::InitConfig {
+        node_name: &node_name,
+        region,
+        zone,
+        port,
+        network_mode,
+        fabric_interface,
+        endpoint,
+    };
+    let result = fabric::ops::init(&db, &init_cfg)?;
 
     // Bootstrap control plane (TiKV) on the mesh
     // Don't rollback fabric on timeout — PD/TiKV will eventually start via systemd restart

@@ -67,7 +67,7 @@ mod tests {
     fn make_state() -> FabricState {
         let (mesh_id, secret) = mesh::create_mesh();
         let node =
-            mesh::create_hypervisor("node-1", "eu", "fsn1", 51820, None, &mesh_id.prefix).unwrap();
+            mesh::create_hypervisor("node-1", "eu", "fsn1", 51820, None, "", &mesh_id.prefix).unwrap();
 
         FabricState {
             mesh: mesh_id,

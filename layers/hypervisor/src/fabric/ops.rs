@@ -26,35 +26,46 @@ pub struct InitResult {
 /// 2. Install WireGuard systemd service
 /// 3. Start the service
 /// 4. Persist state
-pub fn init(
-    db: &LayerDb,
-    node_name: &str,
-    region: &str,
-    zone: &str,
-    port: u16,
-    network_mode: super::backend::NetworkMode,
-) -> Result<InitResult, SyfrahError> {
-    tracing::info!(node_name, region, zone, port, %network_mode, "fabric init starting");
+/// Configuration for fabric init.
+pub struct InitConfig<'a> {
+    pub node_name: &'a str,
+    pub region: &'a str,
+    pub zone: &'a str,
+    pub port: u16,
+    pub network_mode: super::backend::NetworkMode,
+    pub fabric_interface: &'a str,
+    pub endpoint: Option<String>,
+}
+
+pub fn init(db: &LayerDb, cfg: &InitConfig<'_>) -> Result<InitResult, SyfrahError> {
+    tracing::info!(
+        node_name = cfg.node_name, region = cfg.region, zone = cfg.zone,
+        port = cfg.port, %cfg.network_mode, fabric_interface = cfg.fabric_interface,
+        "fabric init starting"
+    );
 
     // Check not already initialized
     if FabricState::exists(db).map_err(|e| SyfrahError::internal(e.to_string()))? {
         return Err(SyfrahError::conflict(
             "hypervisor",
-            node_name,
+            cfg.node_name,
             "already initialized. Run 'syfrah hypervisor leave' first.",
         ));
     }
 
     // Create backend from mode
-    let backend = super::backend::create_backend(network_mode);
+    let backend = super::backend::create_backend(cfg.network_mode);
     backend.ensure_installed()?;
 
     // Create identities
     let (mesh_id, secret) = mesh::create_mesh();
-    let hv = mesh::create_hypervisor(node_name, region, zone, port, None, &mesh_id.prefix)?;
+    let hv = mesh::create_hypervisor(
+        cfg.node_name, cfg.region, cfg.zone, cfg.port,
+        cfg.endpoint.clone(), cfg.fabric_interface, &mesh_id.prefix,
+    )?;
 
     // Setup network via backend
-    backend.setup(&hv.wg_private_key, port, &hv.mesh_ipv6, &[])?;
+    backend.setup(&hv.wg_private_key, cfg.port, &hv.mesh_ipv6, &[])?;
 
     // Persist state
     let secret_str = secret.to_string();
@@ -63,7 +74,7 @@ pub fn init(
         hypervisor: hv.clone(),
         secret: secret_str.clone(),
         peers: PeerList::new(),
-        network_mode,
+        network_mode: cfg.network_mode,
     };
     state
         .save(db)
@@ -232,6 +243,7 @@ pub async fn join(
         wg_public_key: wg_public,
         wg_port: port,
         endpoint: None,
+        fabric_interface: String::new(),
         mesh_ipv6,
     };
 
